@@ -1,0 +1,18 @@
+{
+    "workbench.editorAssociations": {
+        "*.copilotmd": "vscode.markdown.preview.editor",
+        "*.parquet": "duckdb.dataFileViewer",
+        "*.csv": "duckdb.dataFileViewer",
+        "*.tsv": "duckdb.dataFileViewer",
+        "*.xlsx": "duckdb.dataFileViewer"
+    },
+    "duckdb.databases": [
+        {
+            "alias": "vect_db",
+            "type": "file",
+            "path": "c:\\Users\\cgauvin\\Documents\\Dev\\urban_rag\\data\\vect_db.duckdb",
+            "attached": false
+        }
+    ],
+    "duckdb.defaultDatabase": "memory"
+}

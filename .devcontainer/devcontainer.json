@@ -1,0 +1,60 @@
+{
+  "name": "urban_rag",
+  "build": {
+    "context": "..",
+    "dockerfile": "../Dockerfile",
+    "target": "dev"
+  },
+  "workspaceFolder": "/workspaces/urban_rag",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/urban_rag,type=bind,consistency=cached",
+  "remoteUser": "app",
+  "updateRemoteUserUID": true,
+
+  // Survive a rebuild: uv's download cache and the Hugging Face weights, which
+  // are pulled at run time rather than baked into the image (bge-m3 alone is
+  // ~2.2 GB). The venv is deliberately NOT a volume - it comes from the image
+  // layer, so a rebuilt image is never shadowed by a stale copy of itself.
+  "mounts": [
+    "source=urban-rag-uv-cache,target=/home/app/.cache/uv,type=volume",
+    "source=urban-rag-hf-cache,target=/home/app/.cache/huggingface,type=volume"
+  ],
+
+  "containerEnv": {
+    "DAGSTER_HOME": "/workspaces/urban_rag/.dagster_home",
+    "UV_PROJECT_ENVIRONMENT": "/opt/venv",
+    "UV_LINK_MODE": "copy"
+  },
+
+  // The dependency layers are already in the image, so this normally only
+  // installs the project itself (editable). `--extra rag` is not optional: the
+  // Dagster code location imports langchain_core at module scope.
+  "postCreateCommand": "mkdir -p .dagster_home data && uv sync --extra dev --extra rag",
+
+  "forwardPorts": [2500],
+  "portsAttributes": {
+    "2500": { "label": "Dagster UI", "onAutoForward": "notify" }
+  },
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "charliermarsh.ruff",
+        "tamasfe.even-better-toml"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/opt/venv/bin/python",
+        // The repo-level setting points at a Windows path; inside the container
+        // the same file lives here.
+        "duckdb.databases": [
+          {
+            "alias": "vect_db",
+            "type": "file",
+            "path": "/workspaces/urban_rag/data/vect_db.duckdb",
+            "attached": true
+          }
+        ]
+      }
+    }
+  }
+}

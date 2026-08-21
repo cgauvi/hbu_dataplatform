@@ -1,0 +1,54 @@
+# The deployment shape, not a dev convenience: `dagster dev` bundles the
+# webserver and the daemon into one process, and without a daemon the two daily
+# schedules in definitions.py never fire. Splitting them here is also what maps
+# onto two ECS services later.
+#
+#   make up      # build + start both
+#   make logs
+#   make down
+#
+# Runs against the default SQLite/filesystem storage in /dagster_home. On AWS,
+# point DAGSTER_HOME at a dagster.yaml with Postgres run/event storage, and
+# swap the named volumes for EFS (or write the parquet to S3).
+
+services:
+  webserver:
+    build:
+      context: .
+      target: runtime
+    image: urban-rag:latest
+    command: ["dagster-webserver", "-h", "0.0.0.0", "-p", "2500", "-m", "urban_rag.definitions"]
+    ports:
+      - "${PORT:-2500}:2500"
+    environment:
+      # Set these on a machine behind a TLS-inspecting proxy; requests and
+      # huggingface_hub both read them (see README "Setup").
+      REQUESTS_CA_BUNDLE: ${REQUESTS_CA_BUNDLE:-}
+      URBAN_RAG_EMBEDDING_MODEL: ${URBAN_RAG_EMBEDDING_MODEL:-}
+    volumes:
+      - data:/data
+      - dagster_home:/dagster_home
+    restart: unless-stopped
+
+  daemon:
+    build:
+      context: .
+      target: runtime
+    image: urban-rag:latest
+    command: ["dagster-daemon", "run", "-m", "urban_rag.definitions"]
+    environment:
+      REQUESTS_CA_BUNDLE: ${REQUESTS_CA_BUNDLE:-}
+      URBAN_RAG_EMBEDDING_MODEL: ${URBAN_RAG_EMBEDDING_MODEL:-}
+    volumes:
+      - data:/data
+      - dagster_home:/dagster_home
+    restart: unless-stopped
+    # Not a real dependency - the two are peers. It only staggers the first
+    # start so one process, not both, creates the SQLite schema in
+    # /dagster_home.
+    depends_on:
+      - webserver
+
+volumes:
+  data:
+  dagster_home:

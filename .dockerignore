@@ -1,0 +1,15 @@
+# The venv is rebuilt inside the image (and a Windows one would be useless there).
+.venv/
+# Scraped snapshots and the vector store: mounted at run time, not baked in.
+data/
+.dagster_home/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.git/
+.gitignore
+.vscode/
+.claude/
+.devcontainer/
+docker-compose.yml
