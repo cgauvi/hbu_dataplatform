@@ -1,10 +1,9 @@
-"""Turn Spectrum GeoJSON responses into (geo)parquet on the local disk."""
+"""Turn Spectrum GeoJSON responses into (geo)parquet, written locally or to S3."""
 
 from __future__ import annotations
 
 import json
 import re
-from pathlib import Path
 from typing import Any
 
 import geopandas as gpd
@@ -15,6 +14,7 @@ import pyarrow.parquet as pq
 from shapely.geometry import shape
 
 from urban_rag.spectrum import STYLE_COLUMN
+from urban_rag.storage import dirname, filesystem
 
 Frame = pd.DataFrame | gpd.GeoDataFrame
 
@@ -67,27 +67,38 @@ def features_to_frame(
     return frame
 
 
-def write_frame(frame: Frame, path: Path) -> Path:
-    """Write GeoParquet when there is geometry, plain parquet otherwise."""
-    path.parent.mkdir(parents=True, exist_ok=True)
+def write_frame(frame: Frame, path: str) -> str:
+    """Write GeoParquet when there is geometry, plain parquet otherwise.
+
+    ``path`` is a local path or an ``s3://`` URI - see `urban_rag.storage`.
+    The file is opened through fsspec and handed over as a file object, the
+    way `write_vectors` does: ``GeoDataFrame.to_parquet`` forwards its extra
+    keywords to ``pyarrow``, which rejects ``storage_options``, so a path plus
+    credentials is not a shape that works for both frame types.
+    """
+    path = str(path)
+    fs = filesystem(path)
+    fs.makedirs(dirname(path), exist_ok=True)
     try:
-        frame.to_parquet(path, index=False)
+        with fs.open(path, "wb") as handle:
+            frame.to_parquet(handle, index=False)
     except Exception:
         # A column with mixed python types (Spectrum is loosely typed) will
         # stop Arrow from inferring a schema. Stringify the offenders rather
         # than losing the whole table.
         frame = _stringify_object_columns(frame)
-        frame.to_parquet(path, index=False)
+        with fs.open(path, "wb") as handle:
+            frame.to_parquet(handle, index=False)
     return path
 
 
 def write_vectors(
     frame: pd.DataFrame,
     vectors: Any,
-    path: Path,
+    path: str,
     *,
     column: str = "embedding",
-) -> Path:
+) -> str:
     """Write ``frame`` plus one fixed-size list column of float32 vectors.
 
     Parquet itself has no fixed-size list type, so the width survives only in
@@ -103,13 +114,16 @@ def write_vectors(
             f"Expected one vector per row, got {vectors.shape} for {len(frame)} rows"
         )
 
+    path = str(path)
     table = pa.Table.from_pandas(frame, preserve_index=False)
     values = pa.array(vectors.reshape(-1), type=pa.float32())
     table = table.append_column(
         column, pa.FixedSizeListArray.from_arrays(values, vectors.shape[1])
     )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(table, path)
+    fs = filesystem(path)
+    fs.makedirs(dirname(path), exist_ok=True)
+    with fs.open(path, "wb") as handle:
+        pq.write_table(table, handle)
     return path
 
 

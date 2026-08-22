@@ -4,17 +4,23 @@ Three steps, kept apart so each can be re-run on its own: fetch and flatten
 the PDFs, cut them into chunks, embed the chunks. Re-chunking is cheap;
 re-embedding is not, and neither should force a re-download.
 
-Output lands beside the scrape, under the same hive keys::
+Each lands under its own asset prefix, keyed the same way as the scrape::
 
-    data/rag/neighborhood=VSMPE/scrape_date=2026-08-18/
-        documents.parquet   one row per linked PDF, with its text
-        chunks.parquet      one row per chunk
-        embeddings.parquet  chunks + a 1024-wide float32 bge-m3 vector
+    data/linked_documents/2026-08-18/VSMPE/documents.parquet
+    data/document_chunks/2026-08-18/VSMPE/chunks.parquet
+    data/document_embeddings/2026-08-18/VSMPE/embeddings.parquet
+
+so re-running one step replaces one prefix and leaves the other two alone.
+
+A fourth, `document_index`, publishes the result: it loads that partition's
+vectors into the Postgres/pgvector store the query side reads. It writes to a
+database rather than to the tree, so it is the one asset here that needs
+something outside the account's own storage to exist first - see
+`urban_rag.rag.pgvector`.
 """
 
 import json
 from datetime import datetime, timezone
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -37,7 +43,15 @@ from urban_rag.rag.documents import (
 )
 from urban_rag.frames import write_vectors
 from urban_rag.partitions import scrape_partitions
-from urban_rag.resources import DocumentStore, EmbeddingModel, GeoParquetStore
+from urban_rag.rag.pgvector import PostgresUnavailable
+from urban_rag.rag.results import IndexMismatch
+from urban_rag.resources import (
+    EmbeddingModel,
+    ParquetStore,
+    PdfCache,
+    PgVectorResource,
+)
+from urban_rag.storage import dirname, filesystem, join, storage_options
 
 GROUP = "rag"
 
@@ -46,9 +60,10 @@ CHUNKS_FILE = "chunks.parquet"
 EMBEDDINGS_FILE = "embeddings.parquet"
 
 #: Attribute columns worth carrying alongside a document, when the source
-#: table has them: the resolution number is what a user actually cites.
-_ID_COLUMN = "ID"
-_TITLE_COLUMNS = ("DESCRIPTION", "NOM_CAT")
+#: table has them: whichever citation number a user would actually reference
+#: (a resolution's ``ID``, or a zone's ``NUMERO_COMPLET``).
+_ID_COLUMNS = ("ID", "NUMERO_COMPLET")
+_TITLE_COLUMNS = ("DESCRIPTION", "NOM_CAT", "USAGE")
 
 
 @asset(
@@ -62,12 +77,14 @@ _TITLE_COLUMNS = ("DESCRIPTION", "NOM_CAT")
 )
 def linked_documents(
     context: AssetExecutionContext,
-    geoparquet: GeoParquetStore,
-    documents: DocumentStore,
+    store: ParquetStore,
+    pdf_cache: PdfCache,
 ) -> MaterializeResult:
     neighborhood, scrape_date = _partition(context)
-    source_dir = geoparquet.partition_dir(neighborhood, scrape_date)
-    fetcher = documents.fetcher()
+    source_dir = store.partition_dir(
+        neighborhood_features.key.path[-1], scrape_date, neighborhood
+    )
+    fetcher = pdf_cache.fetcher()
     fetched_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     rows: list[dict] = []
@@ -75,12 +92,16 @@ def linked_documents(
     from_cache = 0
 
     for slug, url_column in DOCUMENT_SOURCES.items():
-        path = source_dir / f"{slug}.parquet"
-        if not path.exists():
+        path = join(source_dir, f"{slug}.parquet")
+        if not filesystem(path).exists(path):
             context.log.warning("%s: not in this partition, skipped", slug)
             continue
 
-        frame = pd.read_parquet(path, columns=_wanted_columns(path, url_column))
+        frame = pd.read_parquet(
+            path,
+            columns=_wanted_columns(path, url_column),
+            storage_options=storage_options(path),
+        )
         links = document_urls(frame, url_column)
         context.log.info("%s: %d distinct link(s) in %s", slug, len(links), url_column)
         features = _features_by_url(frame, url_column)
@@ -100,6 +121,8 @@ def linked_documents(
                 {
                     "doc_id": document.doc_id,
                     "source_table": slug,
+                    "neighborhood": neighborhood,
+                    "scrape_date": scrape_date,
                     "url": url,
                     "num_pages": document.num_pages,
                     "num_chars": document.num_chars,
@@ -118,8 +141,7 @@ def linked_documents(
         )
 
     frame = pd.DataFrame(rows)
-    partition_dir = documents.partition_dir(neighborhood, scrape_date)
-    path = _write(frame, partition_dir, DOCUMENTS_FILE)
+    path = _write(frame, _partition_dir(context, store), DOCUMENTS_FILE)
 
     return MaterializeResult(
         metadata={
@@ -150,12 +172,16 @@ def linked_documents(
 )
 def document_chunks(
     context: AssetExecutionContext,
-    documents: DocumentStore,
+    store: ParquetStore,
     embedding_model: EmbeddingModel,
 ) -> MaterializeResult:
     neighborhood, scrape_date = _partition(context)
-    partition_dir = documents.partition_dir(neighborhood, scrape_date)
-    frame = _read(partition_dir, DOCUMENTS_FILE)
+    frame = _read(
+        store.partition_dir(
+            linked_documents.key.path[-1], scrape_date, neighborhood
+        ),
+        DOCUMENTS_FILE,
+    )
     ruler = embedding_model.ruler()
 
     rows: list[dict] = []
@@ -174,6 +200,8 @@ def document_chunks(
                 "num_tokens": chunk.num_tokens,
                 "text": chunk.text,
                 "source_table": document.source_table,
+                "neighborhood": document.neighborhood,
+                "scrape_date": document.scrape_date,
                 "url": document.url,
                 "title": document.title,
                 "feature_ids": document.feature_ids,
@@ -185,7 +213,7 @@ def document_chunks(
         raise Failure(f"{len(frame)} document(s) produced no chunk.")
 
     chunks_frame = pd.DataFrame(rows)
-    path = _write(chunks_frame, partition_dir, CHUNKS_FILE)
+    path = _write(chunks_frame, _partition_dir(context, store), CHUNKS_FILE)
     tokens = chunks_frame["num_tokens"]
 
     return MaterializeResult(
@@ -217,12 +245,16 @@ def document_chunks(
 )
 def document_embeddings(
     context: AssetExecutionContext,
-    documents: DocumentStore,
+    store: ParquetStore,
     embedding_model: EmbeddingModel,
 ) -> MaterializeResult:
     neighborhood, scrape_date = _partition(context)
-    partition_dir = documents.partition_dir(neighborhood, scrape_date)
-    frame = _read(partition_dir, CHUNKS_FILE)
+    frame = _read(
+        store.partition_dir(
+            document_chunks.key.path[-1], scrape_date, neighborhood
+        ),
+        CHUNKS_FILE,
+    )
 
     encoder = embedding_model.encoder()
     context.log.info(
@@ -233,7 +265,9 @@ def document_embeddings(
     )
 
     frame = frame.assign(model=encoder.model_name)
-    path = _write_vectors(frame, vectors, partition_dir, EMBEDDINGS_FILE)
+    path = _write_vectors(
+        frame, vectors, _partition_dir(context, store), EMBEDDINGS_FILE
+    )
 
     return MaterializeResult(
         metadata={
@@ -247,30 +281,107 @@ def document_embeddings(
     )
 
 
+@asset(
+    partitions_def=scrape_partitions,
+    deps=[document_embeddings],
+    group_name=GROUP,
+    description=(
+        "This partition's vectors published to the Postgres/pgvector store the "
+        "query side reads: upserted on chunk_id, newest scrape date wins."
+    ),
+)
+def document_index(
+    context: AssetExecutionContext,
+    store: ParquetStore,
+    pgvector: PgVectorResource,
+) -> MaterializeResult:
+    """Load `embeddings.parquet` into Postgres. A load, not a computation.
+
+    The only asset in this group that writes outside the parquet tree, and the
+    only one whose output another process is reading while it runs - so the
+    partition is upserted into the live table in one transaction rather than
+    replacing it, and the borough's superseded scrape dates are dropped after
+    the new one has landed. See `urban_rag.rag.pgvector`.
+    """
+    neighborhood, scrape_date = _partition(context)
+    path = join(
+        store.partition_dir(
+            document_embeddings.key.path[-1], scrape_date, neighborhood
+        ),
+        EMBEDDINGS_FILE,
+    )
+    if not filesystem(path).exists(path):
+        raise Failure(f"{path} is missing; materialize its upstream asset first.")
+
+    vector_store = pgvector.store()
+    try:
+        # Connect before reading a gigabyte of parquet: a closed security group
+        # or an expired password should cost the first second of the run.
+        vector_store.check_writable()
+        context.log.info("Loading %s into %s", path, vector_store.location)
+        result = vector_store.load_partition(
+            path,
+            neighborhood=neighborhood,
+            scrape_date=scrape_date,
+            prune=pgvector.prune_superseded,
+        )
+    except (PostgresUnavailable, IndexMismatch) as exc:
+        # Both carry a next step in their message; a Failure keeps it in the UI
+        # instead of burying it under a driver traceback.
+        raise Failure(str(exc)) from exc
+
+    context.log.info(
+        "%s chunk(s) upserted, %s superseded row(s) deleted",
+        result["loaded"],
+        result["pruned"],
+    )
+
+    return MaterializeResult(
+        metadata={
+            "dagster/row_count": result["copied"],
+            "num_copied": result["copied"],
+            "num_upserted": result["loaded"],
+            "num_pruned": result["pruned"],
+            "chunks_in_store": result["chunks"],
+            "documents_in_store": result["documents"],
+            "dimension": result["dimension"],
+            "model": result["embedding_model"],
+            "table": result["table"],
+            "target": result["location"],
+        }
+    )
+
+
 def _partition(context: AssetExecutionContext) -> tuple[str, str]:
     dimensions = context.partition_key.keys_by_dimension
     return dimensions["neighborhood"], dimensions["date"][:10]
 
 
-def _wanted_columns(path: Path, url_column: str) -> list[str]:
+def _partition_dir(context: AssetExecutionContext, store: ParquetStore) -> str:
+    """Where the running asset writes: `<root>/<asset>/<date>/<neighborhood>/`."""
+    neighborhood, scrape_date = _partition(context)
+    return store.partition_dir(
+        context.asset_key.path[-1], scrape_date, neighborhood
+    )
+
+
+def _wanted_columns(path: str, url_column: str) -> list[str]:
     """Everything but the geometry, which this pipeline has no use for."""
     import pyarrow.parquet as pq
 
-    available = set(pq.ParquetFile(path).schema.names)
-    keep = [url_column, _ID_COLUMN, *_TITLE_COLUMNS]
+    with filesystem(path).open(path, "rb") as handle:
+        available = set(pq.ParquetFile(handle).schema.names)
+    keep = [url_column, *_ID_COLUMNS, *_TITLE_COLUMNS]
     return [column for column in dict.fromkeys(keep) if column in available]
 
 
 def _features_by_url(frame: pd.DataFrame, url_column: str) -> dict[str, dict]:
     """Which map features point at each link, and what they call it."""
+    id_column = next((c for c in _ID_COLUMNS if c in frame.columns), None)
     title_column = next((c for c in _TITLE_COLUMNS if c in frame.columns), None)
     index: dict[str, dict] = {}
     for url, group in frame.groupby(url_column, sort=False):
-        ids = (
-            [_scalar(v) for v in group[_ID_COLUMN].tolist()]
-            if _ID_COLUMN in group.columns
-            else []
-        )
+        ids = [_scalar(v) for v in group[id_column].tolist()] if id_column else []
         titles = (
             [t for t in dict.fromkeys(group[title_column].dropna().astype(str)) if t]
             if title_column
@@ -294,22 +405,22 @@ def _as_document(row) -> Document:
     )
 
 
-def _read(partition_dir: Path, name: str) -> pd.DataFrame:
-    path = partition_dir / name
-    if not path.exists():
+def _read(partition_dir: str, name: str) -> pd.DataFrame:
+    path = join(partition_dir, name)
+    if not filesystem(path).exists(path):
         raise Failure(f"{path} is missing; materialize its upstream asset first.")
-    return pd.read_parquet(path)
+    return pd.read_parquet(path, storage_options=storage_options(path))
 
 
-def _write(frame: pd.DataFrame, partition_dir: Path, name: str) -> Path:
-    partition_dir.mkdir(parents=True, exist_ok=True)
-    path = partition_dir / name
-    frame.to_parquet(path, index=False)
+def _write(frame: pd.DataFrame, partition_dir: str, name: str) -> str:
+    path = join(partition_dir, name)
+    filesystem(path).makedirs(dirname(path), exist_ok=True)
+    frame.to_parquet(path, index=False, storage_options=storage_options(path))
     return path
 
 
-def _write_vectors(frame, vectors, partition_dir: Path, name: str) -> Path:
-    return write_vectors(frame, vectors, partition_dir / name)
+def _write_vectors(frame, vectors, partition_dir: str, name: str) -> str:
+    return write_vectors(frame, vectors, join(partition_dir, name))
 
 
 def _preview(title: str, text: str, limit: int = 600) -> str:

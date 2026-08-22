@@ -6,17 +6,14 @@
 #   docker build --target runtime --build-arg EXTRAS="" -t urban-rag:slim .
 #   docker build --target dev -t urban-rag:dev .        # what .devcontainer/ uses
 #
-# EXTRAS defaults to `--extra rag` because the code location does not currently
-# load without it: `resources.py` imports `rag.embeddings`, which subclasses
-# `langchain_core.embeddings.Embeddings` at module scope. That drags in torch
-# and, on Linux, the CUDA runtime behind it - several gigabytes against the
-# ~510 MB of the scrape alone.
+# EXTRAS defaults to `--extra rag` so the image built by `make docker-build`
+# behaves like a full checkout. Dropping it (EXTRAS="") also works - the code
+# location loads fine without it, since `rag.embeddings` (imported by
+# `resources.py` at module scope) only pulls in sentence-transformers/torch
+# lazily, inside methods - but the image then can't run `ask`/`search`/`index`.
 #
-# EXTRAS="" builds that ~510 MB image. It needs one change first: move
-# `langchain-core` out of the `rag` extra and into the base dependencies in
-# pyproject.toml, then re-lock. Nothing else in the import chain is heavy -
-# sentence-transformers and torch are already loaded lazily - so that single
-# pure-Python package is the whole difference.
+# EXTRAS="" builds a ~510 MB image instead of several gigabytes: torch and, on
+# Linux, the CUDA runtime behind it are what the `rag` extra actually costs.
 #
 # The virtualenv lives at /opt/venv, deliberately outside the project directory:
 # a bind-mounted workspace (devcontainer, `docker run -v $PWD:/app`) would

@@ -1,4 +1,4 @@
-"""Sentence-transformers embeddings, exposed as a LangChain `Embeddings`.
+"""Sentence-transformers embeddings for indexing and querying the corpus.
 
 The default model is multilingual because the corpus is not: borough tables and
 the resolutions they link to are written in French, and an English-only encoder
@@ -11,8 +11,6 @@ import contextlib
 import os
 from collections.abc import Iterator
 from functools import cached_property
-
-from langchain_core.embeddings import Embeddings
 
 #: 1024 dimensions, ~2.2 GB. Multilingual, accepts up to 8192 tokens, and needs
 #: no instruction prefix on either side. Override with URBAN_RAG_EMBEDDING_MODEL
@@ -27,8 +25,11 @@ CA_BUNDLE_ENV = "URBAN_RAG_HF_CA_BUNDLE"
 _INSTANCES: dict[tuple[str | None, str | None], "SentenceTransformerEmbeddings"] = {}
 
 
-class SentenceTransformerEmbeddings(Embeddings):
+class SentenceTransformerEmbeddings:
     """Wraps a sentence-transformers model for indexing and querying.
+
+    Exposes `embed_documents`/`embed_query`, the same duck-typed interface the
+    rest of `rag/` (retriever, chain) relies on.
 
     The e5 family is trained with asymmetric `query: ` / `passage: ` prefixes and
     loses a surprising amount of accuracy without them, so they are applied

@@ -40,6 +40,12 @@ DEFAULT_BASE_URL = (
     "/rest/Spatial/FeatureService"
 )
 
+#: Sent by every client in the project. Not decoration: donnees.montreal.ca
+#: answers 403 to the `python-requests/x.y` default that `requests` would
+#: otherwise send, and naming the caller is the polite thing to do on three
+#: public servers that owe this pipeline nothing.
+USER_AGENT = "urban-rag/0.1.0 (Dagster pipeline)"
+
 #: Geometry is stored in each table's native CRS (usually epsg:42104, an
 #: MTM-zone-8 variant). MI_Transform is the only way to get lon/lat out, as the
 #: service exposes no output-SRS parameter.
@@ -115,6 +121,7 @@ class SpectrumClient:
         )
         session.mount("https://", HTTPAdapter(max_retries=retry))
         session.headers["Accept"] = "application/json"
+        session.headers["User-Agent"] = USER_AGENT
         return session
 
     # -- transport ---------------------------------------------------------

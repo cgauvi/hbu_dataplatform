@@ -26,8 +26,8 @@
   },
 
   // The dependency layers are already in the image, so this normally only
-  // installs the project itself (editable). `--extra rag` is not optional: the
-  // Dagster code location imports langchain_core at module scope.
+  // installs the project itself (editable). `--extra rag` brings in the
+  // retrieval stack needed for `ask`/`search`/`index`.
   "postCreateCommand": "mkdir -p .dagster_home data && uv sync --extra dev --extra rag",
 
   "forwardPorts": [2500],

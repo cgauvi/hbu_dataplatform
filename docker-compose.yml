@@ -9,7 +9,8 @@
 #
 # Runs against the default SQLite/filesystem storage in /dagster_home. On AWS,
 # point DAGSTER_HOME at a dagster.yaml with Postgres run/event storage, and
-# swap the named volumes for EFS (or write the parquet to S3).
+# swap the named data volume for EFS. Set S3_BUCKET to write (geo)parquet
+# output to S3 instead of the /data volume - see README "Setup".
 
 services:
   webserver:
@@ -25,9 +26,35 @@ services:
       # huggingface_hub both read them (see README "Setup").
       REQUESTS_CA_BUNDLE: ${REQUESTS_CA_BUNDLE:-}
       URBAN_RAG_EMBEDDING_MODEL: ${URBAN_RAG_EMBEDDING_MODEL:-}
+      # When S3_BUCKET is set, (geo)parquet output goes to s3://S3_BUCKET/...
+      # instead of the /data volume, authenticated with AWS_PROFILE via the
+      # read-only ~/.aws mount below.
+      S3_BUCKET: ${S3_BUCKET:-}
+      AWS_PROFILE: ${AWS_PROFILE:-charles_gauvin_east_1}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+      # The shared vector store the `document_index` asset publishes to. With
+      # no host set that asset has nowhere to write and fails; every other
+      # asset is unaffected. Prefer SECRET_ID or IAM_AUTH over PASSWORD - see
+      # README "The shared vector store".
+      URBAN_RAG_PG_HOST: ${URBAN_RAG_PG_HOST:-}
+      URBAN_RAG_PG_DATABASE: ${URBAN_RAG_PG_DATABASE:-}
+      URBAN_RAG_PG_USER: ${URBAN_RAG_PG_USER:-}
+      URBAN_RAG_PG_PASSWORD: ${URBAN_RAG_PG_PASSWORD:-}
+      URBAN_RAG_PG_SECRET_ID: ${URBAN_RAG_PG_SECRET_ID:-}
+      URBAN_RAG_PG_IAM_AUTH: ${URBAN_RAG_PG_IAM_AUTH:-}
+      URBAN_RAG_PG_SSLMODE: ${URBAN_RAG_PG_SSLMODE:-}
+      # `verify-full` needs the RDS CA bundle inside the container. Leave
+      # this unset and libpq looks in ~/.postgresql/root.crt, which is what
+      # the mount below puts there.
+      URBAN_RAG_PG_SSLROOTCERT: ${URBAN_RAG_PG_SSLROOTCERT:-}
     volumes:
       - data:/data
       - dagster_home:/dagster_home
+      - ${HOME}/.aws:/home/app/.aws:ro
+      # The RDS CA bundle, where libpq looks for it by default:
+      #   curl -o ~/.postgresql/root.crt --create-dirs \
+      #        https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
+      - ${HOME}/.postgresql:/home/app/.postgresql:ro
     restart: unless-stopped
 
   daemon:
@@ -39,9 +66,32 @@ services:
     environment:
       REQUESTS_CA_BUNDLE: ${REQUESTS_CA_BUNDLE:-}
       URBAN_RAG_EMBEDDING_MODEL: ${URBAN_RAG_EMBEDDING_MODEL:-}
+      S3_BUCKET: ${S3_BUCKET:-}
+      AWS_PROFILE: ${AWS_PROFILE:-charles_gauvin_east_1}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+      # The shared vector store the `document_index` asset publishes to. With
+      # no host set that asset has nowhere to write and fails; every other
+      # asset is unaffected. Prefer SECRET_ID or IAM_AUTH over PASSWORD - see
+      # README "The shared vector store".
+      URBAN_RAG_PG_HOST: ${URBAN_RAG_PG_HOST:-}
+      URBAN_RAG_PG_DATABASE: ${URBAN_RAG_PG_DATABASE:-}
+      URBAN_RAG_PG_USER: ${URBAN_RAG_PG_USER:-}
+      URBAN_RAG_PG_PASSWORD: ${URBAN_RAG_PG_PASSWORD:-}
+      URBAN_RAG_PG_SECRET_ID: ${URBAN_RAG_PG_SECRET_ID:-}
+      URBAN_RAG_PG_IAM_AUTH: ${URBAN_RAG_PG_IAM_AUTH:-}
+      URBAN_RAG_PG_SSLMODE: ${URBAN_RAG_PG_SSLMODE:-}
+      # `verify-full` needs the RDS CA bundle inside the container. Leave
+      # this unset and libpq looks in ~/.postgresql/root.crt, which is what
+      # the mount below puts there.
+      URBAN_RAG_PG_SSLROOTCERT: ${URBAN_RAG_PG_SSLROOTCERT:-}
     volumes:
       - data:/data
       - dagster_home:/dagster_home
+      - ${HOME}/.aws:/home/app/.aws:ro
+      # The RDS CA bundle, where libpq looks for it by default:
+      #   curl -o ~/.postgresql/root.crt --create-dirs \
+      #        https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
+      - ${HOME}/.postgresql:/home/app/.postgresql:ro
     restart: unless-stopped
     # Not a real dependency - the two are peers. It only staggers the first
     # start so one process, not both, creates the SQLite schema in

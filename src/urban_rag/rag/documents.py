@@ -30,10 +30,11 @@ from urban_rag.spectrum import default_ca_bundle
 #: Tables whose URL column points at a document worth indexing, keyed by the
 #: file slug written by ``neighborhood_features``. Other tables carry links
 #: too, but to web pages (``Education__*``), photos (``Ruelle_verte__*``) or a
-#: single shared modality page (``Stationnement__*``, ``VSP_REG_PIIA``), so
-#: they stay out until each is worth its own extractor.
+#: single shared modality page (``Stationnement__*``, ``VSP_REG_PIIA``,
+#: ``VSP_REG_PPCMOI``), so they stay out until each is worth its own
+#: extractor.
 DOCUMENT_SOURCES: dict[str, str] = {
-    "Reglement_urbanisme__VSP_REG_PPCMOI": "EN_SAVOIR_PLUS",
+    "Reglement_urbanisme__VSP_REG_ZONE": "LIEN_GRILLE",
 }
 
 DEFAULT_MAX_TOKENS = 512

@@ -8,26 +8,42 @@ tells the model to cite them - none of which needs 3 GB of weights to check.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import pytest
-from langchain_core.documents import Document
-from langchain_core.language_models import FakeListChatModel
-from langchain_core.retrievers import BaseRetriever
 
 from urban_rag.rag.chain import build_chain, format_documents
 
 
-class StubRetriever(BaseRetriever):
-    documents: list[Document]
-    queries: list[str] = []
+@dataclass
+class FakeDocument:
+    text: str
+    metadata: dict
 
-    def _get_relevant_documents(self, query, *, run_manager=None):
+
+class StubRetriever:
+    def __init__(self, documents: list[FakeDocument]) -> None:
+        self.documents = documents
+        self.queries: list[str] = []
+
+    def get_relevant_documents(self, query: str) -> list[FakeDocument]:
         self.queries.append(query)
         return self.documents
 
 
-def make_document(index: int, text: str = "texte") -> Document:
-    return Document(
-        page_content=text,
+class FakeChatModel:
+    """Returns each of `responses` in turn, one per call."""
+
+    def __init__(self, responses: list[str]) -> None:
+        self._responses = iter(responses)
+
+    def invoke(self, messages: list[dict[str, str]]) -> str:
+        return next(self._responses)
+
+
+def make_document(index: int, text: str = "texte") -> FakeDocument:
+    return FakeDocument(
+        text=text,
         metadata={
             "url": f"http://x/PP_CA{index}.pdf",
             "doc_id": f"doc{index}",
@@ -60,7 +76,7 @@ def test_format_documents_counts_extracts_from_one_for_a_reader():
 def test_chain_returns_the_answer_alongside_its_sources():
     documents = [make_document(0), make_document(1)]
     chain = build_chain(
-        StubRetriever(documents=documents), FakeListChatModel(responses=["Oui [1]."])
+        StubRetriever(documents=documents), FakeChatModel(responses=["Oui [1]."])
     )
 
     result = chain.invoke("Quelles conditions ?")
@@ -74,8 +90,8 @@ def test_chain_returns_the_answer_alongside_its_sources():
 
 
 def test_the_question_reaches_the_retriever_verbatim():
-    retriever = StubRetriever(documents=[make_document(0)], queries=[])
-    chain = build_chain(retriever, FakeListChatModel(responses=["ok"]))
+    retriever = StubRetriever(documents=[make_document(0)])
+    chain = build_chain(retriever, FakeChatModel(responses=["ok"]))
 
     chain.invoke("Où sont les écoles ?")
 
@@ -84,8 +100,8 @@ def test_the_question_reaches_the_retriever_verbatim():
 
 def test_a_question_with_no_matches_still_produces_a_result():
     chain = build_chain(
-        StubRetriever(documents=[], queries=[]),
-        FakeListChatModel(responses=["Les extraits ne le disent pas."]),
+        StubRetriever(documents=[]),
+        FakeChatModel(responses=["Les extraits ne le disent pas."]),
     )
 
     result = chain.invoke("Quoi ?")
@@ -99,7 +115,7 @@ def test_a_question_with_no_matches_still_produces_a_result():
 def test_the_result_carries_every_stage(field):
     chain = build_chain(
         StubRetriever(documents=[make_document(0)]),
-        FakeListChatModel(responses=["a"]),
+        FakeChatModel(responses=["a"]),
     )
 
     assert field in chain.invoke("q")

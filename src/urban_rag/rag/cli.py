@@ -2,8 +2,13 @@
 
 Deliberately separate from the Dagster code location. The expensive half of the
 work - fetching PDFs, chunking, embedding - belongs to the `rag` asset group and
-its schedules; what is left here is loading those vectors into DuckDB and
+its schedules; what is left here is loading those vectors into a store and
 querying them, which is interactive and wants a shell rather than a run launcher.
+
+Two stores, one command set. `--backend duckdb` (the default) is the file in
+`data/`: no server, no credentials, one writer. `--backend postgres` is the
+shared RDS/pgvector store, configured entirely from `URBAN_RAG_PG_*` - see
+`rag.pgvector`. Set `URBAN_RAG_BACKEND=postgres` to stop typing it.
 """
 
 from __future__ import annotations
@@ -15,18 +20,26 @@ import textwrap
 import time
 from pathlib import Path
 
+from urban_rag.rag.pgvector import PgSettings, PgVectorStore, PostgresUnavailable
 from urban_rag.rag.store import IndexMismatch, VectorStore
 from urban_rag.rag.vss import StoreLocked, VSSUnavailable
+from urban_rag.storage import DATA_ROOT, join, output_root
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-DATA_ROOT = Path(os.environ.get("URBAN_RAG_DATA_DIR", PROJECT_ROOT / "data"))
-
-#: Where `document_embeddings` writes. The glob keeps the hive keys in the path,
-#: which is how `neighborhood` and `scrape_date` survive into the store.
-DEFAULT_SOURCE = str(DATA_ROOT / "rag" / "**" / "embeddings.parquet")
+#: Every partition `document_embeddings` has written: the glob spans
+#: `<date>/<neighborhood>/`, and each file carries those two as columns.
+#: `output_root()` is an `s3://` URI when `S3_BUCKET` is set - DuckDB's httpfs
+#: reads that glob directly, authenticated through `AWS_PROFILE`.
+DEFAULT_SOURCE = join(
+    output_root(), "document_embeddings", "**", "embeddings.parquet"
+)
 #: Matches the database registered in `.vscode/settings.json`, so the editor's
-#: DuckDB panel opens the same file the CLI writes.
+#: DuckDB panel opens the same file the CLI writes. Always local: DuckDB opens
+#: its own database file on disk regardless of where the source parquet lives.
 DEFAULT_STORE = DATA_ROOT / "vect_db.duckdb"
+
+#: Which store the commands act on when `--backend` is not given.
+BACKENDS = ("duckdb", "postgres")
+DEFAULT_BACKEND = os.environ.get("URBAN_RAG_BACKEND", "duckdb")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -34,7 +47,7 @@ def main(argv: list[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
     try:
         return arguments.handler(arguments)
-    except (IndexMismatch, StoreLocked, VSSUnavailable) as exc:
+    except (IndexMismatch, StoreLocked, VSSUnavailable, PostgresUnavailable) as exc:
         parser.exit(2, f"error: {exc}\n")
     except KeyboardInterrupt:
         parser.exit(130, "\ninterrupted\n")
@@ -44,9 +57,10 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _index(arguments: argparse.Namespace) -> int:
-    store = VectorStore(arguments.store)
-    # Take the write lock before anything else, so a database left open in the
-    # editor is reported now rather than after the load.
+    store = _store(arguments)
+    # Take the write lock (or open the connection) before anything else, so a
+    # database left open in the editor - or an unreachable one - is reported
+    # now rather than after the load.
     store.check_writable()
 
     started = time.monotonic()
@@ -61,7 +75,7 @@ def _index(arguments: argparse.Namespace) -> int:
     )
     print(
         f"  model {result['embedding_model']} ({result['dimension']}d)  "
-        f"-> {store.path}"
+        f"-> {store.location}"
     )
     return 0
 
@@ -97,9 +111,9 @@ def _ask(arguments: argparse.Namespace) -> int:
     if store is None:
         return 1
     from urban_rag.rag.chain import build_chain, build_llm
-    from urban_rag.rag.retriever import DuckDBVSSRetriever
+    from urban_rag.rag.retriever import VectorStoreRetriever
 
-    retriever = DuckDBVSSRetriever(
+    retriever = VectorStoreRetriever(
         store=store,
         embeddings=_embeddings(arguments, store),
         k=arguments.k,
@@ -129,7 +143,7 @@ def _status(arguments: argparse.Namespace) -> int:
     if store is None:
         return 1
     stats = store.stats()
-    print(f"store            {store.path}")
+    print(f"store            {store.location}")
     print(f"embedding model  {stats['embedding_model']} ({stats['dimension']}d)")
     print(f"schema version   {stats['schema_version']}")
     print(f"source           {stats.get('source_pattern', '?')}")
@@ -151,7 +165,7 @@ def _status(arguments: argparse.Namespace) -> int:
 # -- helpers ---------------------------------------------------------------
 
 
-def _embeddings(arguments: argparse.Namespace, store: VectorStore):
+def _embeddings(arguments: argparse.Namespace, store: VectorStore | PgVectorStore):
     """The encoder the question must be embedded with.
 
     Defaults to whatever model the store was built from rather than to the
@@ -164,10 +178,29 @@ def _embeddings(arguments: argparse.Namespace, store: VectorStore):
     return cached_embeddings(model, device=arguments.device)
 
 
-def _require_store(arguments: argparse.Namespace) -> VectorStore | None:
-    store = VectorStore(arguments.store)
+def _store(arguments: argparse.Namespace) -> VectorStore | PgVectorStore:
+    """The store `--backend` selects. Both answer the same four commands.
+
+    The Postgres one takes its endpoint and credentials from the environment,
+    not from flags: they are the same `URBAN_RAG_PG_*` variables the Dagster
+    code location reads, and a password does not belong in shell history.
+    `--dsn` is the exception, for a throwaway container.
+    """
+    if arguments.backend == "postgres":
+        return PgVectorStore(PgSettings.from_env(dsn=arguments.dsn))
+    return VectorStore(arguments.store)
+
+
+def _require_store(
+    arguments: argparse.Namespace,
+) -> VectorStore | PgVectorStore | None:
+    store = _store(arguments)
     if not store.exists():
-        print(f"No index at {store.path}. Run `urban-rag index` first.", file=sys.stderr)
+        flag = " --backend postgres" if arguments.backend == "postgres" else ""
+        print(
+            f"No index at {store.location}. Run `urban-rag index{flag}` first.",
+            file=sys.stderr,
+        )
         return None
     return store
 
@@ -188,7 +221,27 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     def add_common(subparser: argparse.ArgumentParser) -> None:
-        subparser.add_argument("--store", type=Path, default=DEFAULT_STORE)
+        subparser.add_argument(
+            "--backend",
+            choices=BACKENDS,
+            default=DEFAULT_BACKEND,
+            help="Which store to act on. Overrides URBAN_RAG_BACKEND.",
+        )
+        subparser.add_argument(
+            "--store",
+            type=Path,
+            default=DEFAULT_STORE,
+            help="The DuckDB file, for --backend duckdb.",
+        )
+        subparser.add_argument(
+            "--dsn",
+            default=None,
+            help=(
+                "libpq connection string, for --backend postgres. Defaults to "
+                "the URBAN_RAG_PG_* environment - which is where a password "
+                "belongs."
+            ),
+        )
         subparser.add_argument("--neighborhood", default=None)
         subparser.add_argument("--scrape-date", default=None)
 
