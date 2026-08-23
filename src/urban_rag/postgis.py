@@ -1,5 +1,5 @@
-"""Loading the latest lots and buildings into Postgres/PostGIS, and the
-spatial join between them.
+"""Loading the latest lots and buildings into Postgres/PostGIS, the spatial
+join between them, and the lots that join finds nothing on.
 
 `rag.lots` and `rag.buildings` are owned by hbu_infra (see its README and
 sql/002_spatial.sql) - this module only ever DELETEs/INSERTs into tables it
@@ -14,6 +14,12 @@ rather than to whichever lot its centroid happens to land on. Computed with
 `ST_Intersection` in Postgres rather than in GeoPandas: by the time this runs,
 PostGIS already holds both layers loaded and GiST-indexed, and the join is
 exactly the kind of thing that index is for.
+
+`rag.vacant_lots` reads that join back the other way round. `building_lots`
+answers "what is on this lot"; the rows it does *not* have are the interesting
+ones for a highest-and-best-use question, and a lot carrying nothing but a
+shed is the same answer as a lot carrying nothing at all. Both are selected
+here by one predicate over the clipped areas - see `compute_vacant_lots`.
 
 None of this is a live view. A partition is refreshed by deleting and
 reinserting its (neighborhood, scrape_date) rows, the same snapshot semantics
@@ -189,6 +195,154 @@ def compute_intersections(
         "intersections": inserted,
         "buildings_matched": int(buildings_matched),
         "total_area_m2": float(total_area_m2),
+    }
+
+
+#: The categories `compute_vacant_lots` sorts a candidate lot into. Kept here
+#: rather than only in SQL because the asset reports one count per category and
+#: a missing key would silently read as zero.
+VACANT_LOT_CATEGORIES: tuple[str, ...] = (
+    "no_building",
+    "shed_only",
+    "building_sliver",
+)
+
+#: Default cutoff for "there is effectively nothing built here", in square
+#: metres of footprint standing on the lot. A garden shed is 10-30 m2 and a
+#: detached garage 30-60, so 30 keeps the shed and drops the garage.
+DEFAULT_MAX_BUILT_AREA_M2 = 30.0
+
+
+def compute_vacant_lots(
+    connection: "Connection",
+    *,
+    neighborhood: str,
+    scrape_date: str,
+    max_built_area_m2: float = DEFAULT_MAX_BUILT_AREA_M2,
+) -> dict[str, object]:
+    """(Re)compute `rag.vacant_lots` for one (neighborhood, scrape_date).
+
+    A lot is a candidate when the footprint area standing on it is at most
+    ``max_built_area_m2`` - which is one predicate covering both halves of the
+    question, since a lot no building intersects has 0 m2 built on it and 0 is
+    under any threshold.
+
+    The area compared is the *clipped* `intersection_area_m2` summed over the
+    lot, not the whole area of the buildings that overlap it: a warehouse
+    straddling the boundary contributes only the slice actually inside, which
+    is what "how much of this lot is built on" means. That is also why the
+    category is not simply vacant-or-shed. Three cases fall out, and they are
+    different things to a reader:
+
+    * `no_building` - nothing intersects the lot at all.
+    * `shed_only`   - something does, and every building overlapping it is
+                      itself small enough to be a shed.
+    * `building_sliver` - something does, the built area here is still under
+                      the threshold, but the building it belongs to is large.
+                      A corner of the neighbour's triplex crossing the
+                      cadastral line, in other words: the lot is empty in
+                      substance, but calling it a shed would be wrong, and
+                      it is as often a footprint/cadastre alignment artifact
+                      as a real encroachment.
+
+    Assumes `compute_intersections` has already run for this partition, which
+    is what puts the rows in `rag.building_lots` that the lateral counts - a
+    lot looks empty either way, so this is a dependency on the asset, not
+    something the SQL can check for itself.
+    """
+    threshold = float(max_built_area_m2)
+    if threshold < 0:
+        raise ValueError(
+            f"max_built_area_m2 must not be negative, got {max_built_area_m2!r}"
+        )
+
+    cursor = connection.cursor()
+    cursor.execute(
+        "DELETE FROM rag.vacant_lots WHERE neighborhood = %s AND scrape_date = %s::date",
+        [neighborhood, scrape_date],
+    )
+    cursor.execute(
+        """
+        INSERT INTO rag.vacant_lots (
+            lot_uid, lot_number, neighborhood, scrape_date, category,
+            lot_area_m2, built_area_m2, built_pct_of_lot, num_buildings,
+            largest_building_area_m2, max_built_area_m2, geom
+        )
+        SELECT
+            l.lot_uid,
+            l.lot_number,
+            l.neighborhood,
+            l.scrape_date,
+            CASE
+                WHEN built.num_buildings = 0 THEN 'no_building'
+                WHEN built.largest_building_area_m2 > %(threshold)s THEN 'building_sliver'
+                ELSE 'shed_only'
+            END,
+            l.area_m2,
+            built.built_area_m2,
+            CASE WHEN l.area_m2 > 0
+                 THEN 100.0 * built.built_area_m2 / l.area_m2
+                 ELSE NULL
+            END,
+            built.num_buildings,
+            built.largest_building_area_m2,
+            %(threshold)s,
+            l.geom
+        FROM rag.lots l
+        -- An aggregate over zero rows rather than a LEFT JOIN plus GROUP BY:
+        -- the lot with no building at all is the case this asset exists for,
+        -- and it has to survive the join to be seen. count(*) is 0 and the
+        -- COALESCEd sums are 0.0 for exactly that lot.
+        CROSS JOIN LATERAL (
+            SELECT
+                count(*) AS num_buildings,
+                COALESCE(sum(bl.intersection_area_m2), 0.0) AS built_area_m2,
+                COALESCE(max(bl.building_area_m2), 0.0) AS largest_building_area_m2
+            FROM rag.building_lots bl
+            WHERE bl.lot_uid = l.lot_uid
+              AND bl.neighborhood = l.neighborhood
+              AND bl.scrape_date = l.scrape_date
+        ) AS built
+        WHERE l.neighborhood = %(neighborhood)s
+          AND l.scrape_date = %(scrape_date)s::date
+          AND built.built_area_m2 <= %(threshold)s
+        """,
+        {
+            "neighborhood": neighborhood,
+            "scrape_date": scrape_date,
+            "threshold": threshold,
+        },
+    )
+    inserted = max(cursor.rowcount, 0)
+
+    cursor.execute(
+        """
+        SELECT category, count(*), COALESCE(sum(lot_area_m2), 0)
+        FROM rag.vacant_lots
+        WHERE neighborhood = %s AND scrape_date = %s::date
+        GROUP BY category
+        """,
+        [neighborhood, scrape_date],
+    )
+    counted: dict[str, int] = {}
+    total_lot_area_m2 = 0.0
+    for category, count, area in cursor.fetchall():
+        counted[category] = int(count)
+        total_lot_area_m2 += float(area)
+
+    # The denominator: without it "412 candidates" says nothing about whether
+    # the borough is half empty or the threshold is wrong.
+    cursor.execute(
+        "SELECT count(*) FROM rag.lots WHERE neighborhood = %s AND scrape_date = %s::date",
+        [neighborhood, scrape_date],
+    )
+    (num_lots,) = cursor.fetchone()
+
+    return {
+        "candidates": inserted,
+        "num_lots": int(num_lots),
+        "by_category": {name: counted.get(name, 0) for name in VACANT_LOT_CATEGORIES},
+        "total_lot_area_m2": total_lot_area_m2,
     }
 
 
