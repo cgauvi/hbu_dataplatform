@@ -10,41 +10,72 @@ Currently enabled: **VSMPE** (Villeray–Saint-Michel–Parc-Extension, 24 table
 
 | Asset | Partitions | Output |
 | --- | --- | --- |
-| `spectrum_table_catalog` | date | The service's full table list for that day (577 tables across 19 namespaces), held by the IO manager |
-| `neighborhood_features` | date × neighborhood | One parquet file per source table, written directly to `data/spectrum/` |
+| `spectrum_table_catalog` | date | The service's full table list for that day (577 tables across 19 namespaces), as one `tables.parquet` |
+| `neighborhood_features` | date × neighborhood | One parquet file per source table |
+| `reference_neighborhoods` | date | Montreal's 91 housing reference neighborhoods from donnees.montreal.ca, with their dwelling counts |
+| `neighborhood_lots` | date × neighborhood | Every cadastral lot inside that borough, from Quebec's Infolot service, as one `lots.parquet` |
+| `vacancy_rates` | date × neighborhood | CMHC Rental Market Survey vacancy rates for that borough, averaged over the survey's own neighborhoods |
 | `linked_documents` | date × neighborhood | The PDFs those tables link to, fetched and flattened to text |
 | `document_chunks` | date × neighborhood | Those documents cut into retrieval-sized chunks |
 | `document_embeddings` | date × neighborhood | A bge-m3 vector per chunk |
+| `document_index` | date × neighborhood | Those vectors upserted into the Postgres/pgvector store the query side reads |
 
-The last three build the retrieval corpus and are described under [The document
-corpus](#the-document-corpus).
+The last four build the retrieval corpus and are described under [The document
+corpus](#the-document-corpus) and [The shared vector
+store](#the-shared-vector-store).
 
 The catalog is a separate asset because the published table list drifts —
 boroughs add and retire layers without notice, and a scrape is only
 reproducible if you know what existed on that date. `neighborhood_features`
-reads it through a `MultiToSingleDimensionPartitionMapping`, so the
-`2026-08-18|VSMPE` partition consumes exactly the `2026-08-18` catalog.
+reads that day's `tables.parquet` through a
+`MultiToSingleDimensionPartitionMapping`, so the `2026-08-18|VSMPE` partition
+consumes exactly the `2026-08-18` catalog.
 
 ## Output layout
 
+Every asset owns one prefix, keyed by scrape date and then by borough:
+
 ```
-data/spectrum/
-└── neighborhood=VSMPE/
-    └── scrape_date=2026-08-18/
-        ├── Apaisement__VSP_TRA_AFFICHEUR.parquet
-        ├── Reglement_urbanisme__VSP_REG_ZONE.parquet
-        └── ...
+<root>/<asset>/<YYYY-MM-DD>[/<neighborhood>]/
 ```
 
-Hive-style directories, so the whole history reads back as one dataset:
+```
+data/
+├── spectrum_table_catalog/2026-08-18/
+│   └── tables.parquet
+├── neighborhood_features/2026-08-18/VSMPE/
+│   ├── Apaisement__VSP_TRA_AFFICHEUR.parquet
+│   ├── Reglement_urbanisme__VSP_REG_ZONE.parquet
+│   └── ...
+├── reference_neighborhoods/2026-08-18/
+│   └── ...
+├── neighborhood_lots/2026-08-18/VSMPE/
+│   └── lots.parquet
+└── vacancy_rates/2026-08-18/VSMPE/
+    ├── vacancy_rates.parquet
+    └── quartier_vacancy_rates.parquet
+```
+
+`<root>` is `data/` by default and `s3://$S3_BUCKET/` when that is set — see
+[S3 output](#s3-output). One prefix per asset means a partition can be listed,
+copied or dropped without touching what another asset wrote for the same day.
+
+The keys are bare values, not hive `key=value` pairs, so `neighborhood` and
+`scrape_date` are written as **columns** instead of being recovered from the
+path. A file that is copied out of the tree still knows which snapshot it
+belongs to:
 
 ```python
 import geopandas as gpd
 
-zones = gpd.read_parquet("data/spectrum/neighborhood=VSMPE/scrape_date=2026-08-18/Reglement_urbanisme__VSP_REG_ZONE.parquet")
+zones = gpd.read_parquet("data/neighborhood_features/2026-08-18/VSMPE/Reglement_urbanisme__VSP_REG_ZONE.parquet")
 zones.crs        # EPSG:4326
-zones.columns    # source table attributes + source_table + scraped_at
+zones.columns    # source table attributes + source_table + neighborhood
+                 #   + scrape_date + scraped_at
 ```
+
+The whole history still reads back as one dataset — `read_parquet` over
+`data/neighborhood_features/**/*.parquet`, then group by those two columns.
 
 Geometry is reprojected to EPSG:4326 **server side** (`MI_Transform`) — the
 service stores it in `epsg:42104`, an MTM-zone-8 variant, and exposes no
@@ -60,42 +91,233 @@ the first VSMPE snapshot). They are counted in the `num_invalid_geometries`
 materialization metadata and logged per table; repair with
 `gdf.geometry.make_valid()` downstream if a consumer needs it.
 
+## The reference neighborhoods
+
+The Spectrum layers are borough-scoped. The city's housing division also
+publishes an island-wide division into 91 *quartiers de référence en
+habitation* — historical, socio-economically homogeneous units used for
+housing analysis — through the open-data portal rather than through Spectrum:
+
+- [donnees.montreal.ca/dataset/quartiers](https://donnees.montreal.ca/dataset/quartiers),
+  CC BY 4.0, updated irregularly.
+
+`reference_neighborhoods` snapshots it per scrape date. There is no borough
+axis to partition on, so this asset is partitioned by **date only**:
+
+```
+<root>/reference_neighborhoods/2026-08-20/
+├── quartiers.parquet          # the layer, EPSG:4326, one row per quartier
+└── nombre_logements.parquet   # dwellings per quartier, 2017 assessment roll
+```
+
+The two join on `no_qr`. Column names are lower-cased on the way in, because
+the portal spells the same field `No_QR` in one file and `no_qr` in the other,
+and identifiers stay text so the zero padding (`01`..`91`) survives; `nb_log`
+is the one column cast to an integer. `source_file`, `scrape_date` and
+`scraped_at` are added to both.
+
+The dataset publishes the layer as SHP and CSV too, but those are the same rows
+with the geometry zipped or dropped, so only the GeoJSON is read. Resources are
+looked up by the filename their download URL ends in, not by resource id or
+title: CKAN mints a new id whenever the city replaces a file, and both files
+are published under the same French title.
+
+A failure on the layer fails the partition; a failure on the dwelling counts
+only skips that file and lands in the `dwellings_error` metadata, the same way
+one unreadable Spectrum layer does not cost a whole borough.
+
+## The cadastral lots
+
+Boroughs publish zoning; the *lots* those rules apply to are provincial data,
+from the Registre foncier's **Infolot** service. `neighborhood_lots` snapshots
+every lot intersecting one borough per scrape date:
+
+```
+<root>/neighborhood_lots/2026-08-20/VSMPE/
+└── lots.parquet     # 24 953 lots, EPSG:4326, 1 730 ha
+```
+
+Useful columns: `NO_LOT` (the lot number, `"2 170 935"`), `VA_SUPRF_LOT_CALCL`
+(area in m², computed from the geometry) next to `VA_SUPRF_LOT` (as declared),
+`CO_STATT_LOT` with `DA_STATT_LOT` (status and since when), and
+`DH_DERNR_MODFC_GEOMT` (last edit to the geometry — the column to diff two
+scrape dates on). The two epoch-millisecond columns are converted to UTC
+timestamps on the way in; everything else is written as the service returned
+it.
+
+Lots have no borough of their own, so the boundary comes from Montreal's side:
+the asset dissolves that borough's quartiers out of `reference_neighborhoods`
+and hands the outline to Infolot as the query geometry. That makes it the one
+asset that joins the two sources, and it is why it depends on the open-data
+snapshot for the same date. A lot straddling a border is returned for **both**
+boroughs — the query keeps whatever intersects, rather than cutting geometry.
+
+### Why it is read the way it is
+
+Infolot is an ArcGIS `MapServer` behind a GeoCortex security module, and three
+things about it decide the shape of `urban_rag.infolot`:
+
+- **Not every service answers.** `Infolot` is open; its sibling
+  `Infolot_Anonyme` returns HTTP 500 from the security module to everything,
+  `?f=json` included. There is no token to obtain — the open one is the one to
+  use.
+- **Paging is advertised but broken.** The layer reports
+  `supportsPagination: true`, yet the same window asked for in pages of 200
+  returns 124, 836 or 47 rows depending on the offset, with
+  `exceededTransferLimit` unset. A paged read truncates silently.
+- **So reads are two-phase.** `returnIdsOnly` ignores `maxRecordCount` and
+  returns every matching id in one response; those ids are then fetched in
+  batches of 250 by `objectIds`. A batch that comes back short is an error,
+  not a warning — that is the whole point of fetching by id. Batches are
+  POSTed, because a borough outline alone runs to ~100 KB of ring coordinates.
+
+The layer's `minScale` only stops the lots from *drawing* on a zoomed-out map;
+`/query` ignores it.
+
+> The MERN WMS at `geoegl.msp.gouv.qc.ca/apis/mern/cadastre` renders the same
+> lots, and is what a map viewer uses. It is not usable as a source here: it
+> answers 403 to any request without a `Referer` from the one origin its
+> gateway allows, its WFS `GetFeature` is blocked, and `GetFeatureInfo` — the
+> only vector way out — is capped at 1:20 000, so it needs thousands of tiled
+> requests and still returns a different set at each scale (a 500 m tile
+> returned 80 lots where its four 250 m sub-tiles returned 122).
+
+## The vacancy rates
+
+`vacancy_rates` reads CMHC's [Rental Market
+Survey](https://www.cmhc-schl.gc.ca/professionals/housing-markets-data-and-research/housing-data/data-tables/rental-market/urban-rental-market-survey-data-vacancy-rates)
+— one workbook a year, every Canadian centre in it — and keeps the slice where
+`Province == "Qc"` and `Centre == "Montréal"`:
+
+```
+<root>/vacancy_rates/2026-08-20/VSMPE/
+├── vacancy_rates.parquet             # 15 rows: the borough average
+└── quartier_vacancy_rates.parquet    # 45 rows: what it averaged
+```
+
+CMHC surveys the Montreal **census metropolitan area** and cuts it into its own
+neighborhoods, which do not line up with the boroughs everything else here is
+partitioned on. `VSMPE` is three of them, `Outremont` is one, and `PR` is the
+borough *plus* Senneville, which CMHC will not split out. The crosswalk is
+`CMHC_QUARTIERS` in [partitions.py](src/urban_rag/partitions.py), a third map
+alongside the Spectrum namespaces and the borough codes.
+
+It holds one canonical name per quartier, not one per publication: CMHC
+*respells* names between survey years — 2022 prints `South West ~ Sud-Ouest`
+where 2023 prints `Sud-Ouest`, and swaps a slash for a hyphen in Pierrefonds'
+— so names are matched with case, accents and punctuation collapsed, and the
+bilingual half dropped. That is deliberately not fuzzy: two names differing by
+a letter still differ, a sheet where two quartiers collapse to the same key is
+refused, and a quartier the map names but the workbook does not publish **fails
+the partition** rather than quietly shortening the average.
+
+Unlike the lots and the buildings, the cut is a **name lookup, not a spatial
+join** — the survey publishes rates, not geometry — which makes this the one
+borough-partitioned asset with no dependency on `reference_neighborhoods`.
+
+The `Quartier` sheet is a cross-tab: five bedroom classes, each two columns
+wide (the rate, then a letter grading its reliability). It is unpivoted to one
+row per `dwelling_type` × `bedroom_type`, keyed to stable snake_case
+(`apartment_other` × `2_bedroom`, `all` × `all`, …) rather than to the French
+labels, because the same survey is published in an English workbook whose
+headers read differently.
+
+A rate is stored in **percent as published** — `0.2%` is `0.2`, not `0.002` —
+and is null wherever there is none. The two reasons for that are kept apart in
+`status`, because they mean different things and neither is an average-able
+zero:
+
+| `status` | Sheet | Meaning |
+| --- | --- | --- |
+| `published` | `1.6%` | A rate, with `reliability` in `a`..`d` |
+| `suppressed` | `**` | Measured, withheld for confidentiality or reliability |
+| `no_units` | `--` | No dwelling of that class exists in the quartier |
+
+The borough figure is the **unweighted mean** of its quartiers' published
+rates. Unweighted because this table publishes rates and nothing to weight them
+by — the universe counts live in a different CMHC table — so `num_quartiers`
+sits on every row next to `num_quartiers_mapped`, and the two rarely match:
+suppression is heavy at this geography. For VSMPE in the 2023 survey, 31 of 45
+cells are suppressed and the borough's overall rate is Parc-Extension's alone:
+
+```python
+import pandas as pd
+
+rates = pd.read_parquet("data/vacancy_rates/2026-08-20/VSMPE/vacancy_rates.parquet")
+rates.loc[
+    (rates.dwelling_type == "all") & (rates.bedroom_type == "all"),
+    ["vacancy_rate_pct", "num_quartiers", "num_quartiers_mapped", "averaged_quartiers"],
+]
+#    vacancy_rate_pct  num_quartiers  num_quartiers_mapped  averaged_quartiers
+# 14              0.3              1                     3      Parc-Extension
+```
+
+Every `dwelling_type` × `bedroom_type` is written whether or not anything was
+published for it, so the grid is the same 15 rows for every borough and a
+suppressed cell is visible as a row rather than as an absence.
+
+The survey year is **resource config, not a partition dimension** — the survey
+is annual and this pipeline's date axis is the scrape date. `survey_year` and
+`survey_period` (`octobre 2023`) are written as columns, and the field defaults
+to `URBAN_RAG_CMHC_SURVEY_YEAR`, so pointing a run at another year takes:
+
+```powershell
+$env:URBAN_RAG_CMHC_SURVEY_YEAR = "2022"
+uv run dagster asset materialize --select vacancy_rates --partition "2026-08-20|VSMPE" -m urban_rag.definitions
+```
+
+An env var rather than config alone because `--config-json` replaces a
+resource's config *wholesale* — set `survey_year` that way and `cache_dir`,
+which the code location is what knows, has to be restated with it.
+
+2022 and 2023 are published under the French slug as of this writing; 2024 and
+anything before 2022 answer 404. The workbook is cached under
+`data/cache/cmhc/`, keyed by filename and shared across every scrape date —
+the same posture as the PDF and BDOI caches, since a published survey year is
+final.
+
 ## The document corpus
 
-The regulation tables carry no prose of their own. `EN_SAVOIR_PLUS` holds a
+The regulation tables carry no prose of their own. `LIEN_GRILLE` holds a
 link, not a description:
 
 ```
-Reglement_urbanisme__VSP_REG_PPCMOI.EN_SAVOIR_PLUS
-  http://www1.ville.montreal.qc.ca/CartesInteractives/villeray/doc/pp_pv/PP_CA11140080.pdf
+Reglement_urbanisme__VSP_REG_ZONE.LIEN_GRILLE
+  http://www1.ville.montreal.qc.ca/CartesInteractives/villeray/doc/zone/C01-001.pdf
 ```
 
-So the retrievable text lives in the linked PDFs — 229 rows pointing at 227
-distinct resolutions — and three assets turn them into an embedded corpus:
+So the retrievable text lives in the linked PDFs — one per zone, 633 rows
+pointing at 632 distinct "grille des spécifications" documents for VSMPE —
+and three assets turn them into an embedded corpus:
 
 | Asset | Output |
 | --- | --- |
-| `linked_documents` | One row per distinct link: the PDF fetched and flattened to text (200 of 227 for VSMPE) |
-| `document_chunks` | Paragraph-aligned, overlapping chunks, sized in the encoder's tokens (518 for VSMPE) |
+| `linked_documents` | One row per distinct link: the PDF fetched and flattened to text |
+| `document_chunks` | Paragraph-aligned, overlapping chunks, sized in the encoder's tokens |
 | `document_embeddings` | One 1024-wide float32 [BAAI/bge-m3](https://huggingface.co/BAAI/bge-m3) vector per chunk |
 
 ```
 data/
 ├── cache/pdf/<sha256(url)>.pdf          # outside the partitions on purpose
-└── rag/neighborhood=VSMPE/scrape_date=2026-08-18/
-    ├── documents.parquet
-    ├── chunks.parquet
-    └── embeddings.parquet
+├── linked_documents/2026-08-18/VSMPE/documents.parquet
+├── document_chunks/2026-08-18/VSMPE/chunks.parquet
+└── document_embeddings/2026-08-18/VSMPE/embeddings.parquet
 ```
 
-A published resolution never changes, so the download cache sits outside the
-partition tree and every later scrape date reads it from disk instead of from
-the city's web server.
+Each step owns its own prefix, so re-chunking replaces `document_chunks/` and
+leaves the downloads and the vectors where they are.
 
-There is no OCR step. 200 of the 227 links are born-digital and carry a text
-layer; the other 27 are scans — all of them older `doc/pe/` exemption files —
-and each fails its own row with `no text layer`, leaving the rest of the
-partition alone, exactly as a dead link does. They are counted in
+A fourth asset, `document_index`, publishes the result into Postgres — it owns
+no prefix, because it writes to a database rather than to the tree. See [The
+shared vector store](#the-shared-vector-store).
+
+A published zoning grid never changes once issued, so the download cache sits
+outside the partition tree and every later scrape date reads it from disk
+instead of from the city's web server.
+
+There is no OCR step: a link that answers with a scan instead of a
+born-digital PDF fails its own row with `no text layer`, leaving the rest of
+the partition alone, exactly as a dead link does. Both are counted in
 `num_failed` and listed by URL in the `failures` metadata, so adding an OCR
 fallback later is a matter of reading that list.
 
@@ -127,7 +349,7 @@ when each earns an extractor.
 HNSW index over it, driven by a `urban-rag` CLI.
 
 ```powershell
-uv run urban-rag index                      # load data/rag/**/embeddings.parquet
+uv run urban-rag index                      # load document_embeddings/**/embeddings.parquet
 uv run urban-rag status                     # what is in the store
 uv run urban-rag search "..." -k 5          # retrieval only, no generation
 uv run urban-rag ask "..." -k 5             # retrieval, then a local LLM answers
@@ -182,6 +404,158 @@ Two things that bite on this machine specifically:
   another process`. Disconnect it there, or reload the window. The lock is taken
   *before* any work rather than after, so this is reported in the first second.
 
+## The shared vector store
+
+The DuckDB file is *one process's* store: it takes an exclusive write lock, it
+lives on whatever disk that process happens to have, and it is rebuilt in full
+to change. That is the right trade on a laptop and the wrong one for a
+deployment, where the pipeline runs in one place and a map, an API or a second
+Dagster run reads the vectors from another — while a load is in flight.
+
+The same corpus therefore also goes into **Postgres with the `pgvector`
+extension**, on RDS. Same commands, one flag:
+
+```bash
+uv run urban-rag status --backend postgres
+uv run urban-rag search "hauteur maximale en mètres" -k 5 --backend postgres
+uv run urban-rag index  --backend postgres            # full reload from parquet
+```
+
+`URBAN_RAG_BACKEND=postgres` makes it the default; `make status BACKEND=postgres`
+does the same through the Makefile. Both stores return the same `Hit`, so
+[retriever.py](src/urban_rag/rag/retriever.py) and the chain neither know nor
+care which one answered.
+
+### Loading is an asset, not a command
+
+`urban-rag index --backend postgres` is the *reload*: it drops the table and
+replays every partition, which is what changing encoder needs and what leaves
+the corpus unqueryable while it runs. The steady state is the `document_index`
+asset, one partition at a time:
+
+```bash
+make publish DATE=2026-08-18 NEIGHBORHOOD=VSMPE
+# or
+uv run dagster asset materialize --select document_index --partition "2026-08-18|VSMPE" -m urban_rag.definitions
+```
+
+It is a load, not a computation — no encoder, no PDF, no model weights — so it
+runs in the slim image and finishes in seconds. One partition is one
+transaction: a reader sees it either as it was or as it now is.
+
+It sits in its own job (`document_index_job`) rather than in `rag_corpus_job`,
+because the corpus is built from the city's servers and this step publishes to a
+database that has to be reachable — the second failing should not cost the
+first.
+
+### What the first load creates
+
+```
+rag.chunks                   one row per chunk, embedding vector(1024)
+rag.chunks_meta              schema_version, embedding_model, dimension, source
+rag.chunks_embedding_hnsw    HNSW, vector_cosine_ops, m=16, ef_construction=64
+rag.chunks_partition         btree (neighborhood, scrape_date)
+```
+
+Two things it cannot create, both needing a role this pipeline should not have:
+the **database**, and the **extension** — `CREATE EXTENSION vector` requires
+`rds_superuser`. Those, the `urban_rag` role and the schema it owns all come
+from **hbu_infra**, which is where the master credentials live:
+
+```bash
+cd ../hbu_infra
+make db-bootstrap ENV=dev    # urban_rag + grants, password → Secrets Manager
+make db-init      ENV=dev    # extensions, and the spatial half of the schema
+```
+
+For any other Postgres — a local container, a scratch database — where you
+have a superuser DSN and pick the password yourself, this repo keeps a manual
+escape hatch that applies the same file from an hbu_infra checkout:
+
+```bash
+make pg-bootstrap PG_ADMIN_DSN="host=<endpoint> dbname=urban_rag user=<master>" \
+                  PG_APP_PASSWORD='...' [INFRA=../hbu_infra]
+```
+
+`feature_ids` lands as `jsonb` rather than the JSON string the parquet carries:
+in a shared database "which zones cite this document" is a query someone will
+want. It reads back as text either way.
+
+### Snapshot semantics, in a table people are reading
+
+The DuckDB store gets its snapshot semantics for free — it is rebuilt from
+scratch, so a document that stopped being cited stops being retrievable. A live
+table cannot be emptied that way, so the same guarantee is two rules instead:
+
+- **newest wins.** A chunk is keyed by `chunk_id`, which is derived from the
+  document's URL, so the same resolution re-embedded on a later scrape date
+  collides with itself. The upsert overwrites only when
+  `EXCLUDED.scrape_date >= chunks.scrape_date`.
+- **superseded rows are pruned.** After a partition lands, that borough's older
+  scrape dates are deleted. What kept an old date is exactly what today's
+  snapshot no longer links to. Set `prune_superseded=False` on the resource to
+  keep the history instead.
+
+`chunk_id` can also arrive twice inside *one* partition — two source tables
+occasionally link the same PDF — and `ON CONFLICT` refuses to touch a row twice
+in one statement, so the load de-duplicates before inserting.
+
+### Connecting
+
+Configuration is environment-first, so the code location, the CLI and anything
+else that opens the store agree without an endpoint being committed:
+
+| Variable | |
+| --- | --- |
+| `URBAN_RAG_PG_HOST` | RDS endpoint. Unset means libpq's own `PGHOST` |
+| `URBAN_RAG_PG_PORT`, `_DATABASE`, `_USER` | default `5432`, `urban_rag`, `urban_rag` |
+| `URBAN_RAG_PG_PASSWORD` | a literal password; prefer either of the next two |
+| `URBAN_RAG_PG_SECRET_ID` | Secrets Manager secret holding `{"username", "password"}` |
+| `URBAN_RAG_PG_IAM_AUTH` | `1` to sign each connection with an RDS IAM auth token |
+| `URBAN_RAG_PG_SSLMODE` | default `verify-full` |
+| `URBAN_RAG_PG_SSLROOTCERT` | the RDS CA bundle `verify-full` needs |
+| `URBAN_RAG_PG_SCHEMA`, `_TABLE` | default `rag`, `chunks` |
+| `URBAN_RAG_PG_DSN` | full libpq string, overriding all of the above |
+| `URBAN_RAG_BACKEND` | `postgres` to make it the CLI default |
+
+Credentials are resolved **per connection**, in that order, because an IAM auth
+token is signed for fifteen minutes — a long-lived resource that cached one
+would hand out an expired token on its second run. IAM authentication needs
+`GRANT rds_iam` in the database *and* `rds-db:connect` in the task role's IAM
+policy; it is the option with nothing long-lived to leak.
+
+TLS defaults to `verify-full`, which is the only mode that authenticates the
+server it is talking to, and it needs Amazon's CA on disk:
+
+```bash
+curl -o ~/.postgresql/root.crt --create-dirs \
+     https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
+```
+
+That is checked *before* connecting, since libpq's own message for a missing
+one names a file most people have never heard of. `URBAN_RAG_PG_SSLMODE=require`
+encrypts without authenticating the server; `disable` is for a local
+`pgvector/pgvector` container, which is also the easiest thing to point
+`URBAN_RAG_PG_DSN` at.
+
+An RDS instance is only reachable from inside its VPC, so a run from a laptop
+needs the VPN or a tunnel; the connection failure says so rather than repeating
+libpq's one-liner.
+
+### Sizing
+
+HNSW lives or dies by whether the index fits in memory: roughly
+`rows × dimension × 4 bytes` plus the graph. bge-m3's 1024-wide vectors are ~4
+KB apiece, so 100k chunks is ~400 MB before the graph — comfortable on a
+`db.t4g.medium`, not on a `db.t4g.micro`. A rebuild raises
+`maintenance_work_mem` for its own session; raise it on the parameter group if
+the index build still spills to disk.
+
+Search widens pgvector's candidate list (`hnsw.ef_search`, 40 by default) to
+`max(100, 4k)`: the index returns its candidates and the `WHERE` clause is
+applied to them *afterwards*, so filtering by neighborhood or scrape date is a
+reason to ask for more of them, not fewer.
+
 ## Setup
 
 ```powershell
@@ -232,9 +606,9 @@ overwritten. uv's download cache and the Hugging Face cache are named volumes,
 so a rebuild does not re-download bge-m3; the venv is not, so a rebuilt image
 is never shadowed by a stale copy of itself.
 
-The retrieval stack is in the devcontainer image because the corpus, search,
-and ask paths use it. The Dagster code location itself only needs
-`langchain-core`, so it can load without the heavy `rag` extra.
+The retrieval stack is in the devcontainer image, which is why it is several
+gigabytes: the Dagster code location does not load without it — see [The rag
+extra is not optional](#the-rag-extra-is-not-optional).
 
 ### WSL
 
@@ -257,8 +631,31 @@ overridable:
 
 | Path | Holds | Env |
 | --- | --- | --- |
-| `/data` | parquet snapshots, PDF cache, `vect_db.duckdb` | `URBAN_RAG_DATA_DIR` |
+| `/data` | PDF cache, `vect_db.duckdb`, and parquet snapshots when `S3_BUCKET` is unset | `URBAN_RAG_DATA_DIR` |
 | `/dagster_home` | run and event storage, schedule state | `DAGSTER_HOME` |
+
+### S3 output
+
+Set `S3_BUCKET` (in `.env` or the environment) to write every (geo)parquet
+output — the catalog, the Spectrum scrape, the open-data snapshot and the RAG
+corpus — under `s3://$S3_BUCKET/` instead of `/data`. The prefixes are the same
+[output layout](#output-layout) the local tree uses, one per asset:
+
+```
+s3://$S3_BUCKET/spectrum_table_catalog/2026-08-20/tables.parquet
+s3://$S3_BUCKET/neighborhood_features/2026-08-20/VSMPE/*.parquet
+s3://$S3_BUCKET/reference_neighborhoods/2026-08-20/*.parquet
+s3://$S3_BUCKET/neighborhood_lots/2026-08-20/VSMPE/lots.parquet
+s3://$S3_BUCKET/linked_documents/2026-08-20/VSMPE/documents.parquet
+s3://$S3_BUCKET/document_chunks/2026-08-20/VSMPE/chunks.parquet
+s3://$S3_BUCKET/document_embeddings/2026-08-20/VSMPE/embeddings.parquet
+```
+
+Credentials come from the named profile in `AWS_PROFILE` (default
+`charles_gauvin_east_1`), resolved from `~/.aws/credentials`; in
+`docker-compose.yml` that file is bind-mounted read-only into the container.
+The PDF cache, the Dagster IO manager, and `vect_db.duckdb` always stay on
+local disk - only asset output moves.
 
 The image is several gigabytes, and on Linux most of that is the CUDA runtime
 the locked torch pulls in — which the Windows resolution never did. If the
@@ -287,22 +684,21 @@ gunzip vss.duckdb_extension.gz
 then mount it and point `URBAN_RAG_VSS_EXTENSION` at it — the escape hatch
 `vss.py` already provides for exactly this.
 
-#### Slim scrape image
+#### The rag extra costs several gigabytes for five assets that never load it
 
-The expensive retrieval packages are optional for loading the Dagster code
-location. `resources.py` imports `rag.embeddings`, whose
-`SentenceTransformerEmbeddings` class subclasses
-`langchain_core.embeddings.Embeddings` at module scope, so `langchain-core`
-stays in the base dependencies. The model stack itself remains lazy and stays
-behind the `rag` extra.
+`pyproject.toml` says the retrieval stack "stays out of the base install that
+the Dagster scrape only needs", and it does: `resources.py` imports
+`rag.embeddings` at module scope, but that module only reaches for
+sentence-transformers/torch lazily, inside methods, so the code location loads
+fine with `uv sync --extra dev` alone.
 
 ```bash
 make docker-build-slim
 ```
 
-builds a ~510 MB image whose code location loads. Use the regular
-`make docker-build` image for corpus materialization, vector search, and local
-answers.
+builds a ~510 MB image whose code location loads and lists all five assets -
+`ask`/`search`/`index` just are not available without the `rag` extra to run
+the encoder they need.
 
 ### Compose
 
@@ -317,10 +713,12 @@ make logs
 make down
 ```
 
-That stack still uses the default SQLite and filesystem storage under
-`/dagster_home`. Before AWS, point `DAGSTER_HOME` at a `dagster.yaml` with
-Postgres run and event storage: two containers sharing one SQLite file is the
-first thing to break once the schedules are actually running.
+That stack uses the default SQLite and filesystem storage under `/dagster_home`
+until Postgres connection settings are present. With `URBAN_RAG_PG_HOST` plus a
+password or secret (or an explicit `DAGSTER_POSTGRES_URL`), the image
+entrypoint writes a `dagster.yaml` that stores Dagster run/event/schedule
+metadata in the same database under the `dagster` schema. Run
+`hbu_infra`'s `make db-bootstrap`/`make db-init` first so that schema exists.
 
 ## Running
 
@@ -338,14 +736,30 @@ uv run dagster dev
 uv run dagster asset materialize --select spectrum_table_catalog --partition 2026-08-18 -m urban_rag.definitions
 uv run dagster asset materialize --select neighborhood_features --partition "2026-08-18|VSMPE" -m urban_rag.definitions
 
+# the open-data neighborhoods, date-partitioned only
+uv run dagster asset materialize --select reference_neighborhoods --partition 2026-08-18 -m urban_rag.definitions
+
+# the cadastral lots for that borough, which read the snapshot above
+uv run dagster asset materialize --select neighborhood_lots --partition "2026-08-18|VSMPE" -m urban_rag.definitions
+
+# the CMHC vacancy rates for that borough, which depend on nothing upstream
+uv run dagster asset materialize --select vacancy_rates --partition "2026-08-18|VSMPE" -m urban_rag.definitions
+
 # then the corpus over that snapshot's linked PDFs
 uv run dagster asset materialize --select "linked_documents,document_chunks,document_embeddings" --partition "2026-08-18|VSMPE" -m urban_rag.definitions
+
+# and publish those vectors to the Postgres/pgvector store
+uv run dagster asset materialize --select document_index --partition "2026-08-18|VSMPE" -m urban_rag.definitions
 ```
 
-Two schedules run daily in `America/Toronto`: the catalog at 04:00, the
-features at 04:20. Both target *today's* partition — `end_offset=1` on the
-daily partitions exists for that reason, since "scrape date" means the day the
-fetch happened, not a closed event window.
+Schedules run daily in `America/Toronto`: the catalog at 04:00, the features
+at 04:20, the reference neighborhoods at 04:40 and the vacancy rates at 04:45
+(both independent of the Spectrum assets — the minute only keeps them from
+overlapping), then the lots at 05:40, the buildings at 05:50 and the building ×
+lot join at 07:00 behind them. All target *today's*
+partition — `end_offset=1` on the daily partitions exists for that reason,
+since "scrape date" means the day the fetch happened, not a closed event
+window.
 
 ## Adding neighborhoods
 

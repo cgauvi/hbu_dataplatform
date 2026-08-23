@@ -6,15 +6,14 @@
 #   docker build --target runtime --build-arg EXTRAS="" -t urban-rag:slim .
 #   docker build --target dev -t urban-rag:dev .        # what .devcontainer/ uses
 #
-# EXTRAS defaults to `--extra rag` for the deployable image because the corpus,
-# search, and ask paths need pypdf, sentence-transformers, transformers, and
-# torch. On Linux, the locked torch wheel brings the CUDA runtime behind it -
-# several gigabytes against the ~510 MB scrape-only image.
+# EXTRAS defaults to `--extra rag` so the image built by `make docker-build`
+# behaves like a full checkout. Dropping it (EXTRAS="") also works - the code
+# location loads fine without it, since `rag.embeddings` (imported by
+# `resources.py` at module scope) only pulls in sentence-transformers/torch
+# lazily, inside methods - but the image then can't run `ask`/`search`/`index`.
 #
-# EXTRAS="" builds that ~510 MB image. The Dagster code location still loads
-# because `langchain-core` is in the base dependencies; the heavy retrieval
-# packages are imported lazily by the assets and CLI commands that actually use
-# them.
+# EXTRAS="" builds a ~510 MB image instead of several gigabytes: torch and, on
+# Linux, the CUDA runtime behind it are what the `rag` extra actually costs.
 #
 # The virtualenv lives at /opt/venv, deliberately outside the project directory:
 # a bind-mounted workspace (devcontainer, `docker run -v $PWD:/app`) would
@@ -87,6 +86,7 @@ USER app
 RUN python -c "import duckdb; from urban_rag.rag.vss import load_vss; load_vss(duckdb.connect())" \
  || echo "vss not baked in; it will be installed on first use"
 
+ENTRYPOINT ["python", "-m", "urban_rag.dagster_home"]
 VOLUME ["/data", "/dagster_home"]
 EXPOSE 2500
 

@@ -9,75 +9,19 @@ loaded, no PDF re-fetched, seconds rather than minutes.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
 from pathlib import Path
 
 import duckdb
 
+from urban_rag.rag.results import COLUMNS as _COLUMNS, SCHEMA_VERSION, Hit, IndexMismatch
 from urban_rag.rag.vss import connect
+from urban_rag.storage import configure_duckdb_s3, is_s3_uri
 
-#: Bumped when the schema changes in a way an existing file cannot satisfy.
-SCHEMA_VERSION = "2"
+#: Re-exported so `from urban_rag.rag.store import Hit, IndexMismatch` keeps
+#: working: both are shared with the Postgres store, see `rag.results`.
+__all__ = ["Hit", "IndexMismatch", "SCHEMA_VERSION", "VectorStore"]
 
 _HNSW_INDEX = "chunks_embedding_hnsw"
-
-#: Selected in this order by both the load and the search, so `Hit` can be
-#: built positionally from a result row.
-_COLUMNS = (
-    "chunk_id",
-    "doc_id",
-    "url",
-    "title",
-    "source_table",
-    "neighborhood",
-    "scrape_date",
-    "chunk_index",
-    "num_tokens",
-    "feature_ids",
-    "model",
-    "text",
-)
-
-
-class IndexMismatch(RuntimeError):
-    """The store, or the parquet behind it, is not internally consistent."""
-
-
-@dataclass(frozen=True)
-class Hit:
-    """One retrieved passage and how close it was to the query."""
-
-    chunk_id: str
-    doc_id: str
-    url: str
-    title: str | None
-    source_table: str
-    neighborhood: str
-    scrape_date: str
-    chunk_index: int
-    num_tokens: int
-    feature_ids: str
-    model: str
-    text: str
-    similarity: float
-
-    @property
-    def metadata(self) -> dict:
-        """Provenance, shaped for a LangChain ``Document``."""
-        return {
-            "chunk_id": self.chunk_id,
-            "doc_id": self.doc_id,
-            "url": self.url,
-            "title": self.title,
-            "source_table": self.source_table,
-            "neighborhood": self.neighborhood,
-            "scrape_date": self.scrape_date,
-            "chunk_index": self.chunk_index,
-            "num_tokens": self.num_tokens,
-            "feature_ids": self.feature_ids,
-            "model": self.model,
-            "similarity": self.similarity,
-        }
 
 
 class VectorStore:
@@ -90,6 +34,11 @@ class VectorStore:
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
+
+    @property
+    def location(self) -> str:
+        """Where this store is, for messages that name it. See `PgVectorStore`."""
+        return str(self.path)
 
     def exists(self) -> bool:
         return self.path.exists()
@@ -120,10 +69,16 @@ class VectorStore:
         """
         clauses, parameters = _filters(neighborhood, scrape_date)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        source = "read_parquet(?, hive_partitioning = true)"
+        # No `hive_partitioning`: `neighborhood` and `scrape_date` are real
+        # columns in the parquet, so a file still carries its own provenance
+        # when it is copied out of the tree that named it.
+        source = "read_parquet(?)"
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with connect(self.path) as connection:
+            if is_s3_uri(pattern):
+                configure_duckdb_s3(connection)
+
             dimension, model = _describe_source(
                 connection, source, where, [pattern, *parameters]
             )

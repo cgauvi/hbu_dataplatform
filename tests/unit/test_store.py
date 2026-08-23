@@ -30,8 +30,12 @@ def write_embeddings(
     scrape_date="2026-08-18",
     model="BAAI/bge-m3",
 ):
-    """Write one `embeddings.parquet` under the hive layout the loader expects."""
-    directory = root / f"neighborhood={neighborhood}" / f"scrape_date={scrape_date}"
+    """Write one `embeddings.parquet` under the layout the loader expects.
+
+    ``<root>/<date>/<neighborhood>/embeddings.parquet``, with the two keys as
+    columns as well: nothing recovers them from the path any more.
+    """
+    directory = root / scrape_date / neighborhood
     directory.mkdir(parents=True, exist_ok=True)
     frame = pd.DataFrame(
         [
@@ -42,6 +46,8 @@ def write_embeddings(
                 "num_tokens": tokens,
                 "text": text,
                 "source_table": "Reglement_urbanisme__VSP_REG_PPCMOI",
+                "neighborhood": neighborhood,
+                "scrape_date": scrape_date,
                 "url": f"http://x/{chunk_id.split(':')[0]}.pdf",
                 "title": "Resolution",
                 "feature_ids": "[1]",
@@ -63,7 +69,7 @@ def store(tmp_path):
 @pytest.fixture
 def source(tmp_path):
     return write_embeddings(
-        tmp_path / "rag",
+        tmp_path / "document_embeddings",
         [
             ("doc0:0000", "premier extrait", 100, unit(1, 0, 0)),
             ("doc1:0000", "deuxieme extrait", 101, unit(0, 1, 0)),
@@ -91,7 +97,7 @@ def test_search_returns_the_nearest_chunk_first(store, source):
     assert hits[0].num_tokens == 100
 
 
-def test_search_carries_provenance_into_langchain_metadata(store, source):
+def test_search_carries_provenance_into_metadata(store, source):
     store.build(source)
 
     metadata = store.search(unit(1, 0, 0), k=1)[0].metadata
@@ -104,7 +110,7 @@ def test_search_carries_provenance_into_langchain_metadata(store, source):
     assert metadata["chunk_index"] == 0
 
 
-def test_hive_keys_become_columns(store, source):
+def test_partition_keys_reach_the_store(store, source):
     store.build(source)
 
     stats = store.stats()
@@ -129,7 +135,7 @@ def test_search_filters_narrow_the_candidates(store, source, filters, expected):
 
 
 def test_build_can_load_a_single_partition(store, tmp_path):
-    root = tmp_path / "rag"
+    root = tmp_path / "document_embeddings"
     write_embeddings(root, [("doc0:0000", "a", 10, unit(1, 0, 0))])
     pattern = write_embeddings(
         root, [("doc1:0000", "b", 10, unit(0, 1, 0))], neighborhood="PMR"
@@ -140,7 +146,7 @@ def test_build_can_load_a_single_partition(store, tmp_path):
 
 
 def test_the_newest_scrape_date_wins_for_a_repeated_chunk(store, tmp_path):
-    root = tmp_path / "rag"
+    root = tmp_path / "document_embeddings"
     write_embeddings(
         root, [("doc0:0000", "ancienne version", 10, unit(1, 0, 0))],
         scrape_date="2026-08-01",
@@ -170,7 +176,7 @@ def test_rebuilding_replaces_rather_than_appends(store, source, tmp_path):
 
 
 def test_mixing_two_embedding_models_is_refused(store, tmp_path):
-    root = tmp_path / "rag"
+    root = tmp_path / "document_embeddings"
     write_embeddings(root, [("doc0:0000", "a", 10, unit(1, 0, 0))], model="bge-m3")
     pattern = write_embeddings(
         root, [("doc1:0000", "b", 10, unit(0, 1, 0))],

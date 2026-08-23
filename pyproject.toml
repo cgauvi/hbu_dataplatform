@@ -1,31 +1,39 @@
 [project]
 name = "urban-rag"
 version = "0.1.0"
-description = "Dagster pipeline that scrapes Montreal's Spectrum Spatial Feature Service into local (geo)parquet, plus a DuckDB/VSS question-answering layer over the result."
+description = "Dagster pipeline that scrapes Montreal's Spectrum Spatial Feature Service into local (geo)parquet, plus a question-answering layer over the result: DuckDB/VSS on a laptop, Postgres/pgvector on RDS."
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "boto3>=1.34",
     "dagster>=1.11",
+    "dagster-postgres>=0.29",
     "dagster-webserver>=1.11",
     "duckdb>=1.4",
     "geopandas>=1.0",
-    "langchain-core>=0.3",
+    # Reads the CMHC survey workbook (urban_rag.cmhc); pandas needs it as the
+    # xlsx engine and does not pull it in itself.
+    "openpyxl>=3.1",
     "pandas>=2.2",
+    # The Postgres/pgvector store (rag/pgvector.py) and its type adapter. In the
+    # base install rather than the `rag` extra: loading a partition into the
+    # store is an asset, so the code location needs the driver even in the slim
+    # image that has no encoder. Both are small; neither pulls torch.
+    "pgvector>=0.3",
+    "psycopg[binary]>=3.2",
     "pyarrow>=17",
+    "python-dotenv>=1.0",
     "requests>=2.32",
+    "s3fs>=2024.6",
     "shapely>=2.0",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "dagster-dg-cli>=1.13"]
+dev = ["pytest>=8", "dagster-dg-cli>=1.13", "moto[s3]>=5.0"]
 # The retrieval stack. sentence-transformers pulls torch and transformers, which
 # together dominate the size of the environment, so it stays out of the base
-# install that the Dagster scrape only needs. langchain-core stays in the base
-# install because the Dagster code location imports its lightweight Embeddings
-# ABC at module load time.
+# install that the Dagster scrape only needs.
 rag = [
     "accelerate>=0.34",
-    "langchain>=0.3",
-    "langchain-huggingface>=0.1",
     "pypdf>=6.16.1",
     "sentence-transformers>=3.0",
     "torch>=2.4",
