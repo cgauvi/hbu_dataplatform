@@ -232,9 +232,9 @@ overwritten. uv's download cache and the Hugging Face cache are named volumes,
 so a rebuild does not re-download bge-m3; the venv is not, so a rebuilt image
 is never shadowed by a stale copy of itself.
 
-The retrieval stack is in the devcontainer image, which is why it is several
-gigabytes: the Dagster code location does not load without it — see [The rag
-extra is not optional](#the-rag-extra-is-not-optional).
+The retrieval stack is in the devcontainer image because the corpus, search,
+and ask paths use it. The Dagster code location itself only needs
+`langchain-core`, so it can load without the heavy `rag` extra.
 
 ### WSL
 
@@ -287,25 +287,22 @@ gunzip vss.duckdb_extension.gz
 then mount it and point `URBAN_RAG_VSS_EXTENSION` at it — the escape hatch
 `vss.py` already provides for exactly this.
 
-#### The rag extra is not optional
+#### Slim scrape image
 
-It should be. `pyproject.toml` says the retrieval stack "stays out of the base
-install that the Dagster scrape only needs", and everything expensive in it is
-already imported lazily — but `resources.py` imports `rag.embeddings`, which
-subclasses `langchain_core.embeddings.Embeddings` at module scope. So
-`uv sync --extra dev` alone produces a code location that fails to import, and
-the image has to carry torch to load five assets that never call it.
-
-One pure-Python package is the whole difference. Move `langchain-core` from the
-`rag` extra into the base dependencies, re-lock, and
+The expensive retrieval packages are optional for loading the Dagster code
+location. `resources.py` imports `rag.embeddings`, whose
+`SentenceTransformerEmbeddings` class subclasses
+`langchain_core.embeddings.Embeddings` at module scope, so `langchain-core`
+stays in the base dependencies. The model stack itself remains lazy and stays
+behind the `rag` extra.
 
 ```bash
 make docker-build-slim
 ```
 
-builds a ~510 MB image whose code location loads. Verified by installing
-`langchain-core` into that image by hand: `dagster asset list` goes from
-`ModuleNotFoundError` to all five assets.
+builds a ~510 MB image whose code location loads. Use the regular
+`make docker-build` image for corpus materialization, vector search, and local
+answers.
 
 ### Compose
 

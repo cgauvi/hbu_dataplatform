@@ -6,17 +6,15 @@
 #   docker build --target runtime --build-arg EXTRAS="" -t urban-rag:slim .
 #   docker build --target dev -t urban-rag:dev .        # what .devcontainer/ uses
 #
-# EXTRAS defaults to `--extra rag` because the code location does not currently
-# load without it: `resources.py` imports `rag.embeddings`, which subclasses
-# `langchain_core.embeddings.Embeddings` at module scope. That drags in torch
-# and, on Linux, the CUDA runtime behind it - several gigabytes against the
-# ~510 MB of the scrape alone.
+# EXTRAS defaults to `--extra rag` for the deployable image because the corpus,
+# search, and ask paths need pypdf, sentence-transformers, transformers, and
+# torch. On Linux, the locked torch wheel brings the CUDA runtime behind it -
+# several gigabytes against the ~510 MB scrape-only image.
 #
-# EXTRAS="" builds that ~510 MB image. It needs one change first: move
-# `langchain-core` out of the `rag` extra and into the base dependencies in
-# pyproject.toml, then re-lock. Nothing else in the import chain is heavy -
-# sentence-transformers and torch are already loaded lazily - so that single
-# pure-Python package is the whole difference.
+# EXTRAS="" builds that ~510 MB image. The Dagster code location still loads
+# because `langchain-core` is in the base dependencies; the heavy retrieval
+# packages are imported lazily by the assets and CLI commands that actually use
+# them.
 #
 # The virtualenv lives at /opt/venv, deliberately outside the project directory:
 # a bind-mounted workspace (devcontainer, `docker run -v $PWD:/app`) would

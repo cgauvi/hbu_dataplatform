@@ -8,6 +8,7 @@ dependencies = [
     "dagster-webserver>=1.11",
     "duckdb>=1.4",
     "geopandas>=1.0",
+    "langchain-core>=0.3",
     "pandas>=2.2",
     "pyarrow>=17",
     "requests>=2.32",
@@ -18,11 +19,12 @@ dependencies = [
 dev = ["pytest>=8", "dagster-dg-cli>=1.13"]
 # The retrieval stack. sentence-transformers pulls torch and transformers, which
 # together dominate the size of the environment, so it stays out of the base
-# install that the Dagster scrape only needs.
+# install that the Dagster scrape only needs. langchain-core stays in the base
+# install because the Dagster code location imports its lightweight Embeddings
+# ABC at module load time.
 rag = [
     "accelerate>=0.34",
     "langchain>=0.3",
-    "langchain-core>=0.3",
     "langchain-huggingface>=0.1",
     "pypdf>=6.16.1",
     "sentence-transformers>=3.0",

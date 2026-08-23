@@ -41,10 +41,11 @@ help: ## Show this help
 
 # -- environment -----------------------------------------------------------
 
-# `rag` is not optional in practice: resources.py imports rag.embeddings, which
-# subclasses a langchain_core type at module scope, so the code location does
-# not load without it. The unset works around SSL_CERT_FILE breaking uv's
-# resolver on a managed laptop; it is a no-op everywhere else.
+# Local development installs the retrieval stack because the corpus/search
+# targets need it; Dagster's code location itself only needs the lightweight
+# langchain-core package in the base install. The unset works around
+# SSL_CERT_FILE breaking uv's resolver on a managed laptop; it is a no-op
+# everywhere else.
 sync: ## Install deps, including the retrieval stack
 	unset SSL_CERT_FILE; UV_SYSTEM_CERTS=1 uv sync --python 3.12 --extra dev --extra rag
 
@@ -99,9 +100,8 @@ status: ## What is in the vector store
 docker-build: ## Build the deployable image
 	docker build --target runtime -t $(IMAGE):$(TAG) .
 
-# ~510 MB against several GB, and it loads every asset - but only once
-# langchain-core moves from the `rag` extra into the base dependencies. See the
-# header of the Dockerfile.
+# ~510 MB against several GB, and it can load the Dagster code location because
+# langchain-core is in the base dependencies. See the header of the Dockerfile.
 docker-build-slim: ## Build without the retrieval stack (see Dockerfile header)
 	docker build --target runtime --build-arg EXTRAS="" -t $(IMAGE):slim .
 
