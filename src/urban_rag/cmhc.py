@@ -1,4 +1,4 @@
-"""Client for CMHC's Rental Market Survey vacancy-rate tables.
+"""Client for CMHC's Rental Market Survey tables.
 
 CMHC publishes one workbook per survey year, covering every Canadian centre
 at once, with no per-borough download to ask for - the same posture as the
@@ -18,6 +18,8 @@ Deliberately free of Dagster imports, mirroring `urban_rag.open_data`,
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from html.parser import HTMLParser
 import os
 import re
 import time
@@ -39,6 +41,21 @@ DEFAULT_BASE_URL = (
     "housing-markets-data-and-research/housing-data-tables/rental-market/"
     "urban-rental-market-survey-data-vacancy-rates"
 )
+
+#: HMIP's accessible/table rendering of the current Montreal CMA average-rent
+#: table. The page defaults to the latest reference period and carries the
+#: neighborhood rows directly in the HTML, so this is deliberately fetched as
+#: a scrape snapshot rather than cached as a final annual workbook.
+AVERAGE_RENTS_READING_MODE_URL = (
+    "https://www03.cmhc-schl.gc.ca/hmip-pimh/en/TableMapChart/"
+    "TableMatchingCriteria?CategoryLevel1=Primary+Rental+Market"
+    "&CategoryLevel2=Average+Rent+%28%24%29&ColumnField=2"
+    "&GeographyId=1060&GeographyType=MetropolitanMajorArea&RowField=24"
+)
+
+#: The HMIP table is the annual Rental Market Survey, whose reference month is
+#: October even though the reading-mode selector lists every month.
+AVERAGE_RENTS_SURVEY_MONTH = "October"
 
 #: Latest survey year published under the French slug. The workbook is
 #: reissued once a year; bump this (and check the sheet still parses) rather
@@ -108,6 +125,29 @@ TOTAL_LABEL = "Total"
 #: half after the separator is the name it means.
 BILINGUAL_SEPARATOR = " ~ "
 
+#: Names that the English HMIP reading-mode page translates without keeping
+#: the French half. Values are already normalized keys, not display labels.
+QUARTIER_ALIASES: dict[str, str] = {
+    "south west": "sud ouest",
+    "east ville marie": "ville marie est",
+}
+
+READING_MODE_BEDROOM_TYPES: dict[str, str] = {
+    "Studio": "studio",
+    "Bachelor": "studio",
+    "1 Bedroom": "1_bedroom",
+    "2 Bedroom": "2_bedroom",
+    "3 Bedroom +": "3_bedroom_plus",
+    "Total": "all",
+}
+
+
+@dataclass(frozen=True)
+class ReadingModeRentTable:
+    frame: pd.DataFrame
+    survey_year: int
+    survey_period: str
+
 
 class CmhcError(RuntimeError):
     """The workbook could not be fetched, or is not shaped as expected."""
@@ -129,7 +169,8 @@ def normalize_quartier(name: str) -> str:
     """
     stripped = unicodedata.normalize("NFKD", strip_bilingual(name))
     without_accents = "".join(c for c in stripped if not unicodedata.combining(c))
-    return re.sub(r"[^a-z0-9]+", " ", without_accents.casefold()).strip()
+    key = re.sub(r"[^a-z0-9]+", " ", without_accents.casefold()).strip()
+    return QUARTIER_ALIASES.get(key, key)
 
 
 def strip_bilingual(name: str) -> str:
@@ -235,6 +276,41 @@ class CmhcFetcher:
         return cached
 
 
+class CmhcReadingModeFetcher:
+    """Fetches HMIP's readable HTML tables."""
+
+    def __init__(
+        self,
+        *,
+        average_rents_url: str = AVERAGE_RENTS_READING_MODE_URL,
+        timeout_seconds: float = 120.0,
+        request_delay_seconds: float = 0.25,
+        max_retries: int = 3,
+        ca_bundle: str | None = None,
+        session: requests.Session | None = None,
+    ) -> None:
+        self.average_rents_url = average_rents_url
+        self.timeout_seconds = timeout_seconds
+        self.request_delay_seconds = request_delay_seconds
+        self._session = session or CmhcFetcher._build_session(max_retries, ca_bundle)
+
+    def fetch_average_rents(self) -> str:
+        if self.request_delay_seconds:
+            time.sleep(self.request_delay_seconds)
+        try:
+            response = self._session.get(
+                self.average_rents_url, timeout=self.timeout_seconds
+            )
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            raise CmhcError(f"{self.average_rents_url}: {exc}") from exc
+
+        html = response.text
+        if "Average Rent" not in html:
+            raise CmhcError(f"{self.average_rents_url}: response is not the rent table")
+        return html
+
+
 def read_quartier_sheet(path: Path | str) -> pd.DataFrame:
     """The `Quartier` sheet, unpivoted to one row per bedroom class.
 
@@ -292,6 +368,61 @@ def read_quartier_sheet(path: Path | str) -> pd.DataFrame:
     frame["vacancy_rate_pct"] = frame["vacancy_rate_pct"].astype("Float64")
     _reject_colliding_quartiers(frame, path)
     return frame
+
+
+def read_average_rents_reading_mode(html: str) -> ReadingModeRentTable:
+    """HMIP reading-mode average rents, unpivoted by bedroom type.
+
+    Columns: `centre`, `quartier`, `bedroom_type`, `average_rent_cad`,
+    `reliability` and `status`. Rents are in dollars as published and null
+    wherever CMHC suppresses a cell.
+    """
+    rows = _html_table_rows(html) or _pipe_table_rows(html)
+    table = _average_rent_table(rows)
+    survey_year = _reading_mode_year(html)
+    survey_period = f"{AVERAGE_RENTS_SURVEY_MONTH} {survey_year}"
+
+    header = table[0]
+    bedrooms = _reading_mode_bedrooms(header)
+    records: list[dict] = []
+    for row in table[1:]:
+        if len(row) < 2:
+            continue
+        quartier = _clean(row[0])
+        if not quartier or quartier.casefold() == "notes":
+            continue
+        for index, bedroom_type in enumerate(bedrooms):
+            rate_column = 1 + index * 2
+            reliability_column = rate_column + 1
+            if rate_column >= len(row):
+                raise CmhcError(
+                    "Average-rent reading-mode table ended before "
+                    f"{bedroom_type!r}"
+                )
+            rent, status = _parse_rent(row[rate_column])
+            reliability = (
+                _parse_reliability(row[reliability_column])
+                if reliability_column < len(row)
+                else None
+            )
+            records.append(
+                {
+                    "centre": "Montr\u00e9al",
+                    "quartier": strip_bilingual(quartier),
+                    "bedroom_type": bedroom_type,
+                    "average_rent_cad": rent,
+                    "reliability": reliability,
+                    "status": status,
+                }
+            )
+
+    if not records:
+        raise CmhcError("Average-rent reading-mode table has no data rows")
+    frame = pd.DataFrame.from_records(records)
+    frame["average_rent_cad"] = frame["average_rent_cad"].astype("Float64")
+    return ReadingModeRentTable(
+        frame=frame, survey_year=survey_year, survey_period=survey_period
+    )
 
 
 def _reject_colliding_quartiers(frame: pd.DataFrame, path: Path | str) -> None:
@@ -400,6 +531,19 @@ def _parse_rate(value) -> tuple[float | None, str]:
         raise CmhcError(f"Unparseable vacancy rate {text!r}") from None
 
 
+def _parse_rent(value) -> tuple[float | None, str]:
+    text = _clean(value)
+    if text == SUPPRESSED or not text:
+        return None, STATUS_SUPPRESSED
+    try:
+        return (
+            float(text.replace("$", "").replace(",", "").replace(" ", "")),
+            STATUS_PUBLISHED,
+        )
+    except ValueError:
+        raise CmhcError(f"Unparseable average rent {text!r}") from None
+
+
 def _parse_reliability(value) -> str | None:
     """The letter grading a rate: ``a``..``d``, or None where there is none.
 
@@ -408,3 +552,111 @@ def _parse_reliability(value) -> str | None:
     """
     text = _clean(value)
     return text if text in ("a", "b", "c", "d") else None
+
+
+class _TableParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.tables: list[list[list[str]]] = []
+        self._table: list[list[str]] | None = None
+        self._row: list[str] | None = None
+        self._cell: list[str] | None = None
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag in {"script", "style"}:
+            self._skip_depth += 1
+            return
+        if self._skip_depth:
+            return
+        if tag == "table":
+            self._table = []
+        elif tag == "tr" and self._table is not None:
+            self._row = []
+        elif tag in {"td", "th"} and self._row is not None:
+            self._cell = []
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth or self._cell is None:
+            return
+        self._cell.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"script", "style"} and self._skip_depth:
+            self._skip_depth -= 1
+            return
+        if self._skip_depth:
+            return
+        if tag in {"td", "th"} and self._cell is not None and self._row is not None:
+            self._row.append(_clean(" ".join(self._cell)))
+            self._cell = None
+        elif tag == "tr" and self._row is not None and self._table is not None:
+            if any(cell for cell in self._row):
+                self._table.append(self._row)
+            self._row = None
+        elif tag == "table" and self._table is not None:
+            if self._table:
+                self.tables.append(self._table)
+            self._table = None
+
+
+def _html_table_rows(html: str) -> list[list[str]]:
+    parser = _TableParser()
+    parser.feed(html)
+    for table in parser.tables:
+        if _looks_like_average_rent_table(table):
+            return table
+    return []
+
+
+def _pipe_table_rows(text: str) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for line in text.splitlines():
+        if " | " not in line:
+            continue
+        rows.append([_clean(cell) for cell in line.split("|")])
+    return rows
+
+
+def _looks_like_average_rent_table(rows: list[list[str]]) -> bool:
+    return any(_reading_mode_bedrooms(row, require_all=False) for row in rows)
+
+
+def _average_rent_table(rows: list[list[str]]) -> list[list[str]]:
+    for index, row in enumerate(rows):
+        bedrooms = _reading_mode_bedrooms(row, require_all=False)
+        if bedrooms and {"studio", "1_bedroom", "2_bedroom", "all"}.issubset(
+            bedrooms
+        ):
+            return rows[index:]
+    raise CmhcError("No average-rent reading-mode table found")
+
+
+def _reading_mode_bedrooms(
+    row: list[str], *, require_all: bool = True
+) -> list[str]:
+    bedrooms: list[str] = []
+    for cells in (row[1:], row):
+        labels = [_clean(cell) for cell in cells if _clean(cell)]
+        bedrooms = [
+            bedroom_type
+            for label in labels
+            if (bedroom_type := READING_MODE_BEDROOM_TYPES.get(label)) is not None
+        ]
+        if bedrooms:
+            break
+    expected = list(READING_MODE_BEDROOM_TYPES.values())
+    if require_all:
+        missing = [key for key in dict.fromkeys(expected) if key not in bedrooms]
+        if missing:
+            raise CmhcError(
+                "Average-rent bedroom column(s) missing: " + ", ".join(missing)
+            )
+    return bedrooms
+
+
+def _reading_mode_year(html: str) -> int:
+    years = [int(value) for value in re.findall(r"\b(20\d{2})\b", html)]
+    if not years:
+        raise CmhcError("Average-rent reading-mode page has no reference year")
+    return max(years)

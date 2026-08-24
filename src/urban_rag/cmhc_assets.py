@@ -28,12 +28,14 @@ from dagster import (
 from urban_rag.cmhc import (
     BEDROOM_TYPES,
     DWELLING_TYPES,
+    AVERAGE_RENTS_READING_MODE_URL,
     STATUS_NO_UNITS,
     STATUS_PUBLISHED,
     STATUS_SUPPRESSED,
     TOTAL_LABEL,
     CmhcError,
     normalize_quartier,
+    read_average_rents_reading_mode,
     read_quartier_sheet,
     survey_period,
 )
@@ -47,10 +49,16 @@ GROUP = "cmhc"
 #: The borough averages, one row per dwelling type x bedroom class.
 VACANCY_FILE = "vacancy_rates.parquet"
 
+#: The borough average rents, one row per bedroom class.
+AVERAGE_RENTS_FILE = "average_rents.parquet"
+
 #: The per-quartier rows those averages were taken over, kept alongside them:
 #: with three quartiers behind a borough figure and most cells suppressed, the
 #: average is only readable next to what went into it.
 QUARTIERS_FILE = "quartier_vacancy_rates.parquet"
+
+#: The per-quartier rows behind `AVERAGE_RENTS_FILE`.
+QUARTIER_AVERAGE_RENTS_FILE = "quartier_average_rents.parquet"
 
 #: The slice of the survey this pipeline reads.
 PROVINCE = "Qc"
@@ -61,6 +69,8 @@ SOURCE_URL = (
     "https://www.cmhc-schl.gc.ca/professionals/housing-markets-data-and-research/"
     "housing-data/data-tables/rental-market/urban-rental-market-survey-data-vacancy-rates"
 )
+
+AVERAGE_RENTS_SOURCE_URL = AVERAGE_RENTS_READING_MODE_URL
 
 
 @asset(
@@ -166,6 +176,98 @@ def vacancy_rates(
     )
 
 
+@asset(
+    partitions_def=scrape_partitions,
+    group_name=GROUP,
+    description=(
+        "CMHC HMIP reading-mode average rents for one borough, as "
+        "average_rents/<YYYY-MM-DD>/<neighborhood>/average_rents.parquet: "
+        "the survey's Montreal-CMA neighborhoods that make up the borough "
+        "(see partitions.CMHC_QUARTIERS), averaged into one rent per bedroom "
+        "class, with the per-quartier rows kept alongside in "
+        f"{QUARTIER_AVERAGE_RENTS_FILE}. Source: {AVERAGE_RENTS_SOURCE_URL}"
+    ),
+)
+def average_rents(
+    context: AssetExecutionContext,
+    cmhc: CmhcResource,
+    store: ParquetStore,
+) -> MaterializeResult:
+    dimensions = context.partition_key.keys_by_dimension
+    neighborhood = dimensions["neighborhood"]
+    scrape_date = dimensions["date"][:10]
+
+    quartiers = quartiers_for(neighborhood)
+    fetcher = cmhc.reading_mode_fetcher()
+    try:
+        table = read_average_rents_reading_mode(fetcher.fetch_average_rents())
+    except CmhcError as exc:
+        raise Failure(f"CMHC average-rent reading-mode page read failed: {exc}")
+
+    borough = _rent_borough_rows(table.frame, neighborhood, quartiers)
+
+    output_dir = store.partition_dir(
+        context.asset_key.path[-1], scrape_date, neighborhood
+    )
+    removed = clear_parquet(output_dir)
+    if removed:
+        context.log.info("Removed %d file(s) from a previous run", len(removed))
+
+    scraped_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    provenance = {
+        "neighborhood": neighborhood,
+        "survey_year": table.survey_year,
+        "survey_period": table.survey_period,
+        "scrape_date": scrape_date,
+        "scraped_at": scraped_at,
+    }
+
+    averages = _average_rents_over_quartiers(borough, quartiers)
+    for name, value in provenance.items():
+        averages[name] = value
+        borough[name] = value
+
+    write_frame(borough, join(output_dir, QUARTIER_AVERAGE_RENTS_FILE))
+    path = write_frame(averages, join(output_dir, AVERAGE_RENTS_FILE))
+
+    published = averages[averages["num_quartiers"] > 0]
+    context.log.info(
+        "%s: %d quartier(s) -> %d averaged rent cell(s), "
+        "%d with a published rent -> %s",
+        neighborhood,
+        len(quartiers),
+        len(averages),
+        len(published),
+        path,
+    )
+    if published.empty:
+        context.log.warning(
+            "%s: every average-rent cell is suppressed in the %d survey",
+            neighborhood,
+            table.survey_year,
+        )
+
+    overall = published[published["bedroom_type"] == "all"]["average_rent_cad"]
+
+    return MaterializeResult(
+        metadata={
+            "dagster/row_count": len(averages),
+            "num_quartiers": len(quartiers),
+            "quartiers": MetadataValue.text(", ".join(quartiers)),
+            "num_quartier_rows": len(borough),
+            "num_published_cells": len(published),
+            "num_suppressed_cells": int((borough["status"] == STATUS_SUPPRESSED).sum()),
+            "overall_average_rent_cad": MetadataValue.float(float(overall.iloc[0]))
+            if not overall.empty
+            else MetadataValue.text("suppressed"),
+            "survey_year": table.survey_year,
+            "survey_period": table.survey_period,
+            "output_path": MetadataValue.path(str(path)),
+            "source_url": MetadataValue.url(AVERAGE_RENTS_SOURCE_URL),
+        }
+    )
+
+
 def _borough_rows(
     survey: pd.DataFrame, neighborhood: str, quartiers: tuple[str, ...]
 ) -> pd.DataFrame:
@@ -245,6 +347,61 @@ def _average_over_quartiers(
     grid = pd.MultiIndex.from_product(
         [list(DWELLING_TYPES.values()), list(BEDROOM_TYPES.values())],
         names=["dwelling_type", "bedroom_type"],
+    )
+    frame = stats.reindex(grid).reset_index()
+    frame["num_quartiers"] = frame["num_quartiers"].fillna(0).astype("int64")
+    frame["averaged_quartiers"] = frame["averaged_quartiers"].fillna("")
+    frame["num_quartiers_mapped"] = len(quartiers)
+    return frame
+
+
+def _rent_borough_rows(
+    survey: pd.DataFrame, neighborhood: str, quartiers: tuple[str, ...]
+) -> pd.DataFrame:
+    montreal = survey[survey["centre"] == CENTRE]
+    if montreal.empty:
+        raise Failure(
+            f"The average-rent page publishes no rows for Centre={CENTRE!r}; "
+            "the page geography may have changed."
+        )
+
+    keys = {normalize_quartier(q): q for q in quartiers}
+    published_keys = montreal["quartier"].map(normalize_quartier)
+    missing = [name for key, name in keys.items() if key not in set(published_keys)]
+    if missing:
+        published = sorted(set(montreal["quartier"]))
+        raise Failure(
+            f"{neighborhood}: the average-rent page publishes no quartier named "
+            f"{', '.join(repr(q) for q in missing)}. It has: "
+            f"{', '.join(published)}"
+        )
+
+    rows = montreal[published_keys.isin(keys)].copy()
+    rows["quartier"] = pd.Categorical(
+        rows["quartier"].map(lambda name: keys[normalize_quartier(name)]),
+        categories=quartiers,
+    )
+    return rows.sort_values(["quartier", "bedroom_type"], ignore_index=True).astype(
+        {"quartier": "string"}
+    )
+
+
+def _average_rents_over_quartiers(
+    borough: pd.DataFrame, quartiers: tuple[str, ...]
+) -> pd.DataFrame:
+    published = borough[borough["status"] == STATUS_PUBLISHED]
+    grouped = published.groupby("bedroom_type", observed=True)
+    stats = grouped.agg(
+        average_rent_cad=("average_rent_cad", "mean"),
+        min_average_rent_cad=("average_rent_cad", "min"),
+        max_average_rent_cad=("average_rent_cad", "max"),
+        num_quartiers=("average_rent_cad", "count"),
+        averaged_quartiers=("quartier", lambda values: ", ".join(values)),
+    )
+
+    grid = pd.Index(
+        list(dict.fromkeys(BEDROOM_TYPES.values())),
+        name="bedroom_type",
     )
     frame = stats.reindex(grid).reset_index()
     frame["num_quartiers"] = frame["num_quartiers"].fillna(0).astype("int64")

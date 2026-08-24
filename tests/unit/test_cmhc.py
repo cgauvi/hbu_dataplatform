@@ -16,16 +16,26 @@ from dagster import Failure, MultiPartitionKey, materialize
 from openpyxl import Workbook
 
 from urban_rag.cmhc import (
+    AVERAGE_RENTS_READING_MODE_URL,
     QUARTIER_SHEET,
     CmhcError,
     CmhcFetcher,
+    CmhcReadingModeFetcher,
     filename_for,
     normalize_quartier,
+    read_average_rents_reading_mode,
     read_quartier_sheet,
     strip_bilingual,
     survey_period,
 )
-from urban_rag.cmhc_assets import QUARTIERS_FILE, VACANCY_FILE, vacancy_rates
+from urban_rag.cmhc_assets import (
+    AVERAGE_RENTS_FILE,
+    QUARTIER_AVERAGE_RENTS_FILE,
+    QUARTIERS_FILE,
+    VACANCY_FILE,
+    average_rents,
+    vacancy_rates,
+)
 from urban_rag.partitions import CMHC_QUARTIERS, quartiers_for
 from urban_rag.resources import CmhcResource, ParquetStore
 from urban_rag.storage import join
@@ -74,6 +84,51 @@ ROWS = [
     (ZONE, "Total", "Total", "**", "0.1%", "0.4%", "**", "0.5%"),
 ]
 
+AVERAGE_RENTS_HTML = """
+<html>
+  <body>
+    <h1>Montr\u00e9al \u2014 Average Rent by Bedroom Type by Neighbourhood</h1>
+    <section>
+      <h2>Reference Period</h2>
+      <button>previous</button><button>next</button>
+      <span>2023</span><span>2024</span><span>2025</span>
+      <button>Apply</button>
+    </section>
+    <table>
+      <tr>
+        <th></th>
+        <th>Studio</th><th>1 Bedroom</th><th>2 Bedroom</th>
+        <th>3 Bedroom +</th><th>Total</th>
+      </tr>
+      <tr>
+        <td>Montr\u00e9al</td>
+        <td>1,005</td><td>a</td><td>1,131</td><td>a</td>
+        <td>1,346</td><td>a</td><td>1,625</td><td>a</td>
+        <td>1,291</td><td>a</td>
+      </tr>
+      <tr>
+        <td>Parc-Extension</td>
+        <td>737</td><td>c</td><td>941</td><td>c</td>
+        <td>**</td><td></td><td>**</td><td></td>
+        <td>1,028</td><td>d</td>
+      </tr>
+      <tr>
+        <td>Saint-Michel</td>
+        <td>**</td><td></td><td>**</td><td></td>
+        <td>1,184</td><td>d</td><td>**</td><td></td>
+        <td>1,121</td><td>d</td>
+      </tr>
+      <tr>
+        <td>Villeray</td>
+        <td>906</td><td>c</td><td>1,019</td><td>b</td>
+        <td>1,504</td><td>d</td><td>**</td><td></td>
+        <td>1,439</td><td>c</td>
+      </tr>
+    </table>
+  </body>
+</html>
+"""
+
 
 def write_workbook(
     path: Path, *, rows=ROWS, header=HEADER, period="octobre 2023"
@@ -108,6 +163,7 @@ def workbook(tmp_path) -> Path:
 class FakeResponse:
     def __init__(self, content: bytes, *, content_type: str = "application/xlsx"):
         self.content = content
+        self.text = content.decode("utf-8", errors="replace")
         self.headers = {"Content-Type": content_type}
         self.status_code = 200
 
@@ -130,6 +186,14 @@ class FakeSession:
         return FakeResponse(self.files[filename])
 
 
+class FakeReadingModeFetcher:
+    def __init__(self, html: str = AVERAGE_RENTS_HTML):
+        self.html = html
+
+    def fetch_average_rents(self) -> str:
+        return self.html
+
+
 # -- client -----------------------------------------------------------------
 
 
@@ -150,6 +214,19 @@ def test_fetch_downloads_and_caches_by_survey_year(tmp_path, workbook):
     # A second fetch reuses the cache instead of downloading again.
     fetcher.fetch(SURVEY_YEAR)
     assert len(session.calls) == 1
+
+
+def test_reading_mode_fetches_the_average_rent_page():
+    key = AVERAGE_RENTS_READING_MODE_URL.rsplit("/", 1)[-1]
+    session = FakeSession({key: AVERAGE_RENTS_HTML.encode("utf-8")})
+    fetcher = CmhcReadingModeFetcher(
+        average_rents_url=AVERAGE_RENTS_READING_MODE_URL,
+        request_delay_seconds=0,
+        session=session,
+    )
+
+    assert "Average Rent by Bedroom Type" in fetcher.fetch_average_rents()
+    assert session.calls == [AVERAGE_RENTS_READING_MODE_URL]
 
 
 def test_a_non_xlsx_response_is_rejected(tmp_path):
@@ -187,6 +264,37 @@ def test_the_sheet_is_unpivoted_to_one_row_per_bedroom_class(workbook):
     # Percent as published, not a fraction.
     assert rate["vacancy_rate_pct"].iloc[0] == pytest.approx(0.3)
     assert rate["reliability"].iloc[0] == "b"
+
+
+def test_reading_mode_average_rents_are_unpivoted_by_bedroom_type():
+    table = read_average_rents_reading_mode(AVERAGE_RENTS_HTML)
+    rents = table.frame
+
+    assert table.survey_year == 2025
+    assert table.survey_period == "October 2025"
+    assert len(rents) == 20
+    assert set(rents["quartier"]) == {
+        "Montr\u00e9al",
+        "Parc-Extension",
+        "Saint-Michel",
+        "Villeray",
+    }
+
+    parc = rents[
+        (rents["quartier"] == "Parc-Extension")
+        & (rents["bedroom_type"] == "studio")
+    ].iloc[0]
+    assert parc["average_rent_cad"] == pytest.approx(737)
+    assert parc["reliability"] == "c"
+    assert parc["status"] == "published"
+
+    suppressed = rents[
+        (rents["quartier"] == "Parc-Extension")
+        & (rents["bedroom_type"] == "2_bedroom")
+    ].iloc[0]
+    assert pd.isna(suppressed["average_rent_cad"])
+    assert suppressed["status"] == "suppressed"
+    assert pd.isna(suppressed["reliability"])
 
 
 def test_the_two_kinds_of_missing_rate_stay_distinct(workbook):
@@ -242,8 +350,10 @@ def test_a_bilingual_label_keeps_its_french_half(tmp_path):
     [
         # Both respellings the 2022 workbook uses against the 2023 names.
         ("South West ~ Sud-Ouest", "Sud-Ouest"),
+        ("South West", "Sud-Ouest"),
         ("Senneville/Roxboro-Pierrefonds", "Senneville-Roxboro-Pierrefonds"),
         ("East Ville-Marie ~ Ville-Marie Est", "Ville-Marie Est"),
+        ("East Ville-Marie", "Ville-Marie Est"),
         ("Cote-des-Neiges", "Côte-des-Neiges"),
     ],
 )
@@ -331,6 +441,31 @@ def read_output(store, filename, *, neighborhood=NEIGHBORHOOD):
     return pd.read_parquet(
         join(
             store.partition_dir(vacancy_rates.key.path[-1], DATE, neighborhood),
+            filename,
+        )
+    )
+
+
+def run_rents(store, cache, monkeypatch, *, neighborhood=NEIGHBORHOOD):
+    monkeypatch.setattr(
+        CmhcResource,
+        "reading_mode_fetcher",
+        lambda self: FakeReadingModeFetcher(),
+    )
+    return materialize(
+        [average_rents],
+        partition_key=MultiPartitionKey({"date": DATE, "neighborhood": neighborhood}),
+        resources={
+            "cmhc": CmhcResource(cache_dir=cache),
+            "store": store,
+        },
+    )
+
+
+def read_rent_output(store, filename, *, neighborhood=NEIGHBORHOOD):
+    return pd.read_parquet(
+        join(
+            store.partition_dir(average_rents.key.path[-1], DATE, neighborhood),
             filename,
         )
     )
@@ -438,5 +573,69 @@ def test_a_rerun_replaces_the_partition(store, cache):
     pd.DataFrame({"a": [1]}).to_parquet(stale)
 
     run(store, cache)
+
+    assert not Path(stale).exists()
+
+
+def test_average_rents_land_under_date_then_neighborhood(store, cache, monkeypatch):
+    assert run_rents(store, cache, monkeypatch).success
+
+    averages = read_rent_output(store, AVERAGE_RENTS_FILE)
+    assert len(averages) == 5
+    assert set(averages["neighborhood"]) == {NEIGHBORHOOD}
+    assert set(averages["scrape_date"]) == {DATE}
+    assert set(averages["survey_year"]) == {2025}
+    assert set(averages["survey_period"]) == {"October 2025"}
+
+
+def test_average_rent_is_the_mean_of_its_quartiers(store, cache, monkeypatch):
+    run_rents(store, cache, monkeypatch)
+    averages = read_rent_output(store, AVERAGE_RENTS_FILE)
+
+    overall = averages[averages["bedroom_type"] == "all"].iloc[0]
+
+    # (1028 + 1121 + 1439) / 3; all three quartiers publish a total rent.
+    assert overall["average_rent_cad"] == pytest.approx(1196)
+    assert overall["min_average_rent_cad"] == pytest.approx(1028)
+    assert overall["max_average_rent_cad"] == pytest.approx(1439)
+    assert overall["num_quartiers"] == 3
+    assert overall["averaged_quartiers"] == "Parc-Extension, Saint-Michel, Villeray"
+    assert overall["num_quartiers_mapped"] == 3
+
+    two_bedroom = averages[averages["bedroom_type"] == "2_bedroom"].iloc[0]
+    assert two_bedroom["average_rent_cad"] == pytest.approx(1344)
+    assert two_bedroom["averaged_quartiers"] == "Saint-Michel, Villeray"
+
+
+def test_average_rent_quartier_rows_are_kept(store, cache, monkeypatch):
+    run_rents(store, cache, monkeypatch)
+    quartiers = read_rent_output(store, QUARTIER_AVERAGE_RENTS_FILE)
+
+    # 3 quartiers x 5 bedroom classes.
+    assert len(quartiers) == 15
+    assert set(quartiers["centre"]) == {"Montr\u00e9al"}
+    assert set(quartiers["neighborhood"]) == {NEIGHBORHOOD}
+    assert set(quartiers["quartier"]) == set(quartiers_for(NEIGHBORHOOD))
+
+
+def test_a_fully_suppressed_rent_cell_is_a_row(store, cache, monkeypatch):
+    run_rents(store, cache, monkeypatch)
+    averages = read_rent_output(store, AVERAGE_RENTS_FILE)
+
+    three_bedroom = averages[averages["bedroom_type"] == "3_bedroom_plus"].iloc[0]
+    assert pd.isna(three_bedroom["average_rent_cad"])
+    assert three_bedroom["num_quartiers"] == 0
+    assert three_bedroom["averaged_quartiers"] == ""
+
+
+def test_an_average_rent_rerun_replaces_the_partition(store, cache, monkeypatch):
+    run_rents(store, cache, monkeypatch)
+    stale = join(
+        store.partition_dir(average_rents.key.path[-1], DATE, NEIGHBORHOOD),
+        "leftover.parquet",
+    )
+    pd.DataFrame({"a": [1]}).to_parquet(stale)
+
+    run_rents(store, cache, monkeypatch)
 
     assert not Path(stale).exists()

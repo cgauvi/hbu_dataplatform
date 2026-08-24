@@ -32,9 +32,8 @@ DOCKER_RUN := docker run --rm -it \
 	-p $(PORT):2500
 
 .PHONY: help sync dagster_run daemon test materialize catalog features \
-	quartiers vacancy corpus publish index search ask status require-q clean clean-data \
-	pg-bootstrap docker-build docker-build-slim docker-run docker-shell \
-	docker-test up down logs
+	quartiers vacancy rents lot-vacancy corpus publish index search ask status require-q clean clean-data \
+	docker-build docker-build-slim docker-run docker-shell docker-test up down logs
 
 help: ## Show this help
 	@echo "Targets:"
@@ -83,6 +82,12 @@ quartiers: | $(DAGSTER_HOME) ## Materialize reference_neighborhoods for DATE
 vacancy: | $(DAGSTER_HOME) ## Materialize vacancy_rates for DATE x NEIGHBORHOOD
 	uv run dagster asset materialize --select vacancy_rates --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
 
+rents: | $(DAGSTER_HOME) ## Materialize average_rents for DATE x NEIGHBORHOOD
+	uv run dagster asset materialize --select average_rents --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
+
+lot-vacancy: | $(DAGSTER_HOME) ## Materialize lots_with_vacancy_rates for DATE x NEIGHBORHOOD
+	uv run dagster asset materialize --select lots_with_vacancy_rates --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
+
 corpus: | $(DAGSTER_HOME) ## Fetch, chunk and embed the PDFs linked from DATE x NEIGHBORHOOD
 	uv run dagster asset materialize --select "linked_documents,document_chunks,document_embeddings" --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
 
@@ -112,29 +117,6 @@ ask: require-q ## Retrieve then answer with a local LLM: make ask Q="..."
 
 status: ## What is in the vector store
 	uv run urban-rag status --backend $(BACKEND)
-
-# Run once per database, as the master user - it creates what the pipeline's own
-# role may not (the role, the schema, the extension). Everything else the first
-# load creates for itself. Needs psql on PATH.
-#
-# The file itself lives in hbu_infra, which is where the master credentials are
-# and which owns the rest of the schema. For the shared RDS instance use that
-# repo's `make db-bootstrap ENV=<env>`: it resolves the credentials from Secrets
-# Manager and writes the generated password back there. This target is the
-# manual escape hatch for any other Postgres - a local container, a scratch
-# database - where you have a superuser DSN and a password you picked yourself.
-#
-#   make pg-bootstrap PG_ADMIN_DSN="host=... dbname=urban_rag user=postgres" \
-#                     PG_APP_PASSWORD='...'
-INFRA ?= ../hbu_infra
-pg-bootstrap: ## Create the role, schema and extension (master user; see hbu_infra)
-	@[ -n "$(PG_ADMIN_DSN)" ] || { echo 'usage: make pg-bootstrap PG_ADMIN_DSN="host=... dbname=urban_rag user=<master>" PG_APP_PASSWORD=...' >&2; exit 2; }
-	@[ -n "$(PG_APP_PASSWORD)" ] || { echo 'PG_APP_PASSWORD is required - the role is created without one otherwise' >&2; exit 2; }
-	@[ -f "$(INFRA)/sql/000_roles.sql" ] || { echo '$(INFRA)/sql/000_roles.sql not found - set INFRA to your hbu_infra checkout' >&2; exit 2; }
-	psql "$(PG_ADMIN_DSN)" -v ON_ERROR_STOP=1 \
-		-c "CREATE EXTENSION IF NOT EXISTS vector" \
-		-f $(INFRA)/sql/000_roles.sql \
-		-c "ALTER ROLE urban_rag WITH PASSWORD '$(PG_APP_PASSWORD)'"
 
 # -- docker ----------------------------------------------------------------
 
@@ -179,5 +161,5 @@ clean: ## Remove Python and pytest caches
 # left. One directory per asset - see "Output layout" in the README.
 clean-data: ## Delete every parquet snapshot under data/
 	rm -rf data/spectrum_table_catalog data/neighborhood_features \
-		data/reference_neighborhoods data/vacancy_rates data/linked_documents \
-		data/document_chunks data/document_embeddings
+		data/reference_neighborhoods data/vacancy_rates data/average_rents data/linked_documents \
+		data/lots_with_vacancy_rates data/document_chunks data/document_embeddings

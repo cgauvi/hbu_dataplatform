@@ -19,7 +19,7 @@ pipeline should not have:
   every entry point here connects to something that already exists.
 - **the extension.** `CREATE EXTENSION vector` requires `rds_superuser`, so an
   admin runs hbu_infra's `make db-bootstrap` and `make db-init` once per
-  database - the role, the schema and the extensions all come from there.
+  database - the role, the schemas and the extensions all come from there.
   `ensure_schema` attempts it anyway (harmless, and it is what makes a local
   dev container work unattended), and reports the privilege failure for what
   it is.

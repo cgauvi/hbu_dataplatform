@@ -2331,6 +2331,7 @@ dependencies = [
     { name = "pgvector" },
     { name = "psycopg", extra = ["binary"] },
     { name = "pyarrow" },
+    { name = "pypdf" },
     { name = "python-dotenv" },
     { name = "requests" },
     { name = "s3fs" },
@@ -2345,7 +2346,6 @@ dev = [
 ]
 rag = [
     { name = "accelerate" },
-    { name = "pypdf" },
     { name = "sentence-transformers" },
     { name = "torch" },
     { name = "transformers" },
@@ -2367,7 +2367,7 @@ requires-dist = [
     { name = "pgvector", specifier = ">=0.3" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
     { name = "pyarrow", specifier = ">=17" },
-    { name = "pypdf", marker = "extra == 'rag'", specifier = ">=6.16.1" },
+    { name = "pypdf", specifier = ">=6.16.1" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
     { name = "python-dotenv", specifier = ">=1.0" },
     { name = "requests", specifier = ">=2.32" },

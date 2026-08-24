@@ -16,8 +16,9 @@ from dagster import (
 from urban_rag.assets import neighborhood_features, spectrum_table_catalog
 from urban_rag.bdoi_assets import neighborhood_buildings
 from urban_rag.building_lots_assets import building_lot_intersections
-from urban_rag.cmhc_assets import vacancy_rates
+from urban_rag.cmhc_assets import average_rents, vacancy_rates
 from urban_rag.infolot_assets import neighborhood_lots
+from urban_rag.lot_vacancy_assets import lots_with_vacancy_rates
 from urban_rag.open_data_assets import reference_neighborhoods
 from urban_rag.partitions import (
     ENABLED_NEIGHBORHOODS,
@@ -86,6 +87,18 @@ building_lots_job = define_asset_job(
 vacancy_rates_job = define_asset_job(
     "vacancy_rates_job",
     selection=AssetSelection.assets(vacancy_rates),
+    partitions_def=scrape_partitions,
+)
+
+average_rents_job = define_asset_job(
+    "average_rents_job",
+    selection=AssetSelection.assets(average_rents),
+    partitions_def=scrape_partitions,
+)
+
+lots_with_vacancy_rates_job = define_asset_job(
+    "lots_with_vacancy_rates_job",
+    selection=AssetSelection.assets(lots_with_vacancy_rates),
     partitions_def=scrape_partitions,
 )
 
@@ -231,6 +244,43 @@ def daily_vacancy_rates_schedule(context: ScheduleEvaluationContext):
         )
 
 
+@schedule(
+    job=average_rents_job,
+    # Same source and no pipeline upstream, but kept at a different minute so
+    # a live CMHC hiccup affects one small run at a time.
+    cron_schedule="50 4 * * *",
+    execution_timezone=TIMEZONE,
+    description="Snapshot the CMHC average rents of every enabled neighborhood.",
+)
+def daily_average_rents_schedule(context: ScheduleEvaluationContext):
+    scrape_date = context.scheduled_execution_time.strftime("%Y-%m-%d")
+    for neighborhood in ENABLED_NEIGHBORHOODS:
+        yield RunRequest(
+            run_key=f"average-rents-{neighborhood}-{scrape_date}",
+            partition_key=MultiPartitionKey(
+                {"date": scrape_date, "neighborhood": neighborhood}
+            ),
+        )
+
+
+@schedule(
+    job=lots_with_vacancy_rates_job,
+    # After lots and vacancy_rates, before the building x lot spatial join.
+    cron_schedule="10 6 * * *",
+    execution_timezone=TIMEZONE,
+    description="Join cadastral lots to CMHC vacancy rates by neighborhood.",
+)
+def daily_lots_with_vacancy_rates_schedule(context: ScheduleEvaluationContext):
+    scrape_date = context.scheduled_execution_time.strftime("%Y-%m-%d")
+    for neighborhood in ENABLED_NEIGHBORHOODS:
+        yield RunRequest(
+            run_key=f"lots-with-vacancy-rates-{neighborhood}-{scrape_date}",
+            partition_key=MultiPartitionKey(
+                {"date": scrape_date, "neighborhood": neighborhood}
+            ),
+        )
+
+
 defs = Definitions(
     assets=[
         spectrum_table_catalog,
@@ -238,8 +288,10 @@ defs = Definitions(
         reference_neighborhoods,
         neighborhood_lots,
         neighborhood_buildings,
-        building_lot_intersections,
         vacancy_rates,
+        average_rents,
+        lots_with_vacancy_rates,
+        building_lot_intersections,
         linked_documents,
         document_chunks,
         document_embeddings,
@@ -253,6 +305,8 @@ defs = Definitions(
         buildings_job,
         building_lots_job,
         vacancy_rates_job,
+        average_rents_job,
+        lots_with_vacancy_rates_job,
         rag_corpus_job,
         document_index_job,
     ],
@@ -264,6 +318,8 @@ defs = Definitions(
         daily_buildings_schedule,
         daily_building_lots_schedule,
         daily_vacancy_rates_schedule,
+        daily_average_rents_schedule,
+        daily_lots_with_vacancy_rates_schedule,
     ],
     resources={
         "spectrum": SpectrumResource(),

@@ -3,7 +3,7 @@
 `urban_rag.postgis`'s load/compute functions are Postgres-only in substance -
 they issue COPY and INSERT ... ST_Intersection statements - so nothing here
 touches a real database. What is worth testing without one is the asset's own
-logic: which partition's parquet it reads, what it hands to
+logic: which partition's enriched lot parquet it reads, what it hands to
 `postgis.load_lots`/`load_buildings`/`compute_intersections`, and how their
 return values turn into `MaterializeResult` metadata. `postgis.py` itself has
 no unit test for the same reason `rag/pgvector.py`'s `load_partition` does
@@ -23,7 +23,10 @@ from urban_rag import building_lots_assets
 from urban_rag.bdoi_assets import BUILDINGS_FILE, neighborhood_buildings
 from urban_rag.building_lots_assets import building_lot_intersections
 from urban_rag.frames import write_frame
-from urban_rag.infolot_assets import LOTS_FILE, neighborhood_lots
+from urban_rag.lot_vacancy_assets import (
+    LOTS_WITH_VACANCY_FILE,
+    lots_with_vacancy_rates,
+)
 from urban_rag.resources import ParquetStore, PostgisResource
 from urban_rag.storage import join
 
@@ -38,8 +41,10 @@ def store(tmp_path):
 
 def write_lots(store, *, lot_numbers=("1", "2"), geometries=None):
     path = join(
-        store.partition_dir(neighborhood_lots.key.path[-1], DATE, NEIGHBORHOOD),
-        LOTS_FILE,
+        store.partition_dir(
+            lots_with_vacancy_rates.key.path[-1], DATE, NEIGHBORHOOD
+        ),
+        LOTS_WITH_VACANCY_FILE,
     )
     frame = gpd.GeoDataFrame(
         {"NO_LOT": list(lot_numbers)},

@@ -14,6 +14,9 @@ dependencies = [
     # xlsx engine and does not pull it in itself.
     "openpyxl>=3.1",
     "pandas>=2.2",
+    # Reads linked zoning PDFs for the document corpus. Kept in the base install
+    # because it is small and the asset can fetch PDFs without the encoder stack.
+    "pypdf>=6.16.1",
     # The Postgres/pgvector store (rag/pgvector.py) and its type adapter. In the
     # base install rather than the `rag` extra: loading a partition into the
     # store is an asset, so the code location needs the driver even in the slim
@@ -34,7 +37,6 @@ dev = ["pytest>=8", "dagster-dg-cli>=1.13", "moto[s3]>=5.0"]
 # install that the Dagster scrape only needs.
 rag = [
     "accelerate>=0.34",
-    "pypdf>=6.16.1",
     "sentence-transformers>=3.0",
     "torch>=2.4",
     "transformers>=4.44",

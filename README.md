@@ -15,6 +15,8 @@ Currently enabled: **VSMPE** (Villeray–Saint-Michel–Parc-Extension, 24 table
 | `reference_neighborhoods` | date | Montreal's 91 housing reference neighborhoods from donnees.montreal.ca, with their dwelling counts |
 | `neighborhood_lots` | date × neighborhood | Every cadastral lot inside that borough, from Quebec's Infolot service, as one `lots.parquet` |
 | `vacancy_rates` | date × neighborhood | CMHC Rental Market Survey vacancy rates for that borough, averaged over the survey's own neighborhoods |
+| `average_rents` | date × neighborhood | CMHC HMIP average rents for that borough, averaged by bedroom type over the survey's own neighborhoods |
+| `lots_with_vacancy_rates` | date × neighborhood | Cadastral lots with the CMHC vacancy-rate grid joined by neighborhood name, before spatial joins |
 | `linked_documents` | date × neighborhood | The PDFs those tables link to, fetched and flattened to text |
 | `document_chunks` | date × neighborhood | Those documents cut into retrieval-sized chunks |
 | `document_embeddings` | date × neighborhood | A bge-m3 vector per chunk |
@@ -51,9 +53,14 @@ data/
 │   └── ...
 ├── neighborhood_lots/2026-08-18/VSMPE/
 │   └── lots.parquet
-└── vacancy_rates/2026-08-18/VSMPE/
-    ├── vacancy_rates.parquet
-    └── quartier_vacancy_rates.parquet
+├── vacancy_rates/2026-08-18/VSMPE/
+│   ├── vacancy_rates.parquet
+│   └── quartier_vacancy_rates.parquet
+├── average_rents/2026-08-18/VSMPE/
+│   ├── average_rents.parquet
+│   └── quartier_average_rents.parquet
+└── lots_with_vacancy_rates/2026-08-18/VSMPE/
+    └── lots_with_vacancy_rates.parquet
 ```
 
 `<root>` is `data/` by default and `s3://$S3_BUCKET/` when that is set — see
@@ -276,6 +283,45 @@ anything before 2022 answer 404. The workbook is cached under
 the same posture as the PDF and BDOI caches, since a published survey year is
 final.
 
+## The average rents
+
+`average_rents` reads CMHC's HMIP reading-mode page for
+`Montreal - Average Rent by Bedroom Type by Neighbourhood`, then applies the
+same `CMHC_QUARTIERS` crosswalk as `vacancy_rates`:
+
+```powershell
+uv run dagster asset materialize --select average_rents --partition "2026-08-20|VSMPE" -m urban_rag.definitions
+```
+
+It writes five borough rows, one per `bedroom_type`, plus the quartier cells
+behind the mean:
+
+```
+<root>/average_rents/2026-08-20/VSMPE/
+├── average_rents.parquet
+└── quartier_average_rents.parquet
+```
+
+The rent is an unweighted mean of published quartier rents, in dollars as
+published. Suppressed `**` cells stay null and drop out of the mean.
+
+## Lots with CMHC vacancy rates
+
+`lots_with_vacancy_rates` is the early, non-spatial join between
+`neighborhood_lots` and `vacancy_rates` for the same date × neighborhood
+partition:
+
+```
+<root>/lots_with_vacancy_rates/2026-08-20/VSMPE/
+└── lots_with_vacancy_rates.parquet
+```
+
+The join key is the partition's `neighborhood` column. CMHC's 15-row
+`dwelling_type` × `bedroom_type` grid is widened into `cmhc_*` columns before
+the merge, so the output remains one row per lot. That keeps
+`building_lot_intersections` working against true lot geometries while loading
+the CMHC context into `rag.lots.attributes` ahead of the spatial join.
+
 ## The document corpus
 
 The regulation tables carry no prose of their own. `LIEN_GRILLE` holds a
@@ -459,23 +505,19 @@ rag.chunks_partition         btree (neighborhood, scrape_date)
 
 Two things it cannot create, both needing a role this pipeline should not have:
 the **database**, and the **extension** — `CREATE EXTENSION vector` requires
-`rds_superuser`. Those, the `urban_rag` role and the schema it owns all come
-from **hbu_infra**, which is where the master credentials live:
+`rds_superuser`. Those, the `urban_rag` role, and the `rag` and `dagster`
+schemas it owns all come from **hbu_infra**, which is where the master
+credentials live:
 
 ```bash
 cd ../hbu_infra
 make db-bootstrap ENV=dev    # urban_rag + grants, password → Secrets Manager
-make db-init      ENV=dev    # extensions, and the spatial half of the schema
+make db-init      ENV=dev    # extensions, rag/dagster schemas, and spatial tables
 ```
 
-For any other Postgres — a local container, a scratch database — where you
-have a superuser DSN and pick the password yourself, this repo keeps a manual
-escape hatch that applies the same file from an hbu_infra checkout:
-
-```bash
-make pg-bootstrap PG_ADMIN_DSN="host=<endpoint> dbname=urban_rag user=<master>" \
-                  PG_APP_PASSWORD='...' [INFRA=../hbu_infra]
-```
+For any other Postgres — a local container, a scratch database — use the same
+`hbu_infra` SQL rather than a dataplatform target. Set `DATABASE_URL` for the
+superuser connection in that repo and run its `db-bootstrap`/`db-init` path.
 
 `feature_ids` lands as `jsonb` rather than the JSON string the parquet carries:
 in a shared database "which zones cite this document" is a query someone will
@@ -646,6 +688,9 @@ s3://$S3_BUCKET/spectrum_table_catalog/2026-08-20/tables.parquet
 s3://$S3_BUCKET/neighborhood_features/2026-08-20/VSMPE/*.parquet
 s3://$S3_BUCKET/reference_neighborhoods/2026-08-20/*.parquet
 s3://$S3_BUCKET/neighborhood_lots/2026-08-20/VSMPE/lots.parquet
+s3://$S3_BUCKET/vacancy_rates/2026-08-20/VSMPE/vacancy_rates.parquet
+s3://$S3_BUCKET/average_rents/2026-08-20/VSMPE/average_rents.parquet
+s3://$S3_BUCKET/lots_with_vacancy_rates/2026-08-20/VSMPE/lots_with_vacancy_rates.parquet
 s3://$S3_BUCKET/linked_documents/2026-08-20/VSMPE/documents.parquet
 s3://$S3_BUCKET/document_chunks/2026-08-20/VSMPE/chunks.parquet
 s3://$S3_BUCKET/document_embeddings/2026-08-20/VSMPE/embeddings.parquet
@@ -745,6 +790,12 @@ uv run dagster asset materialize --select neighborhood_lots --partition "2026-08
 # the CMHC vacancy rates for that borough, which depend on nothing upstream
 uv run dagster asset materialize --select vacancy_rates --partition "2026-08-18|VSMPE" -m urban_rag.definitions
 
+# the CMHC average rents for that borough, also independent
+uv run dagster asset materialize --select average_rents --partition "2026-08-18|VSMPE" -m urban_rag.definitions
+
+# lots enriched with CMHC rates by neighborhood name, before spatial joins
+uv run dagster asset materialize --select lots_with_vacancy_rates --partition "2026-08-18|VSMPE" -m urban_rag.definitions
+
 # then the corpus over that snapshot's linked PDFs
 uv run dagster asset materialize --select "linked_documents,document_chunks,document_embeddings" --partition "2026-08-18|VSMPE" -m urban_rag.definitions
 
@@ -753,9 +804,10 @@ uv run dagster asset materialize --select document_index --partition "2026-08-18
 ```
 
 Schedules run daily in `America/Toronto`: the catalog at 04:00, the features
-at 04:20, the reference neighborhoods at 04:40 and the vacancy rates at 04:45
-(both independent of the Spectrum assets — the minute only keeps them from
-overlapping), then the lots at 05:40, the buildings at 05:50 and the building ×
+at 04:20, the reference neighborhoods at 04:40, the vacancy rates at 04:45 and
+the average rents at 04:50 (the CMHC assets are independent of the Spectrum
+assets — the minutes only keep them from overlapping), then the lots at 05:40,
+the buildings at 05:50, the lot × CMHC name join at 06:10 and the building ×
 lot join at 07:00 behind them. All target *today's*
 partition — `end_offset=1` on the daily partitions exists for that reason,
 since "scrape date" means the day the fetch happened, not a closed event

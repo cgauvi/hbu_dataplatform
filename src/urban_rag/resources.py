@@ -20,9 +20,11 @@ from urban_rag.rag.pgvector import PgSettings, PgVectorStore
 from urban_rag.postgis import connect as postgis_connect
 from urban_rag.bdoi import DEFAULT_BASE_URL as BDOI_BASE_URL, BdoiFetcher
 from urban_rag.cmhc import (
+    AVERAGE_RENTS_READING_MODE_URL,
     DEFAULT_BASE_URL as CMHC_BASE_URL,
     SURVEY_YEAR_VAR,
     CmhcFetcher,
+    CmhcReadingModeFetcher,
     default_survey_year,
 )
 from urban_rag.open_data import (
@@ -232,6 +234,7 @@ class CmhcResource(ConfigurableResource):
         ),
     )
     base_url: str = CMHC_BASE_URL
+    average_rents_url: str = AVERAGE_RENTS_READING_MODE_URL
     timeout_seconds: float = 120.0
     request_delay_seconds: float = Field(
         default=0.25, description="Pause before every download, in seconds."
@@ -254,6 +257,16 @@ class CmhcResource(ConfigurableResource):
             max_retries=self.max_retries,
             ca_bundle=self.ca_bundle,
         )
+
+    def reading_mode_fetcher(self) -> CmhcReadingModeFetcher:
+        return CmhcReadingModeFetcher(
+            average_rents_url=self.average_rents_url,
+            timeout_seconds=self.timeout_seconds,
+            request_delay_seconds=self.request_delay_seconds,
+            max_retries=self.max_retries,
+            ca_bundle=self.ca_bundle,
+        )
+
 
 class PdfCache(ConfigurableResource):
     """Where the linked PDFs are downloaded to, and how politely.

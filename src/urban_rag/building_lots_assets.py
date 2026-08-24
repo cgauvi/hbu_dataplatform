@@ -1,13 +1,13 @@
 """Which buildings sit on which lots, computed in Postgres from the latest
 snapshot of each.
 
-`neighborhood_lots` and `neighborhood_buildings` each write one borough's
-snapshot to S3 as geoparquet; this asset is the join between them, and it
-answers something neither carries on its own. A building's footprint does not
-respect a cadastral boundary - a school, a warehouse, an apartment tower can
-each span two or three lots - so "which lot is this building on" is not a
-column either layer has. It is computed here, once both snapshots land, and
-it lands in Postgres rather than another geoparquet: PostGIS already holds
+`lots_with_vacancy_rates` and `neighborhood_buildings` each write one
+borough's snapshot to S3 as geoparquet; this asset is the join between them,
+and it answers something neither carries on its own. A building's footprint
+does not respect a cadastral boundary - a school, a warehouse, an apartment
+tower can each span two or three lots - so "which lot is this building on" is
+not a column either layer has. It is computed here, once both snapshots land,
+and it lands in Postgres rather than another geoparquet: PostGIS already holds
 both layers loaded and GiST-indexed by the time this asset runs, and
 `ST_Intersection` over an index is the tool for exactly this join.
 
@@ -26,7 +26,10 @@ from dagster import (
 )
 
 from urban_rag.bdoi_assets import BUILDINGS_FILE, neighborhood_buildings
-from urban_rag.infolot_assets import LOTS_FILE, neighborhood_lots
+from urban_rag.lot_vacancy_assets import (
+    LOTS_WITH_VACANCY_FILE,
+    lots_with_vacancy_rates,
+)
 from urban_rag.partitions import scrape_partitions
 from urban_rag.postgis import compute_intersections, load_buildings, load_lots
 from urban_rag.rag.pgvector import PostgresUnavailable
@@ -38,7 +41,7 @@ GROUP = "building_lots"
 
 @asset(
     partitions_def=scrape_partitions,
-    deps=[neighborhood_lots, neighborhood_buildings],
+    deps=[lots_with_vacancy_rates, neighborhood_buildings],
     group_name=GROUP,
     description=(
         "Building footprints clipped to the lot(s) they intersect, as rows in "
@@ -47,8 +50,8 @@ GROUP = "building_lots"
         "A building spanning several lots gets one row per lot, in proportion "
         "to the footprint actually inside it - not assigned wholesale to "
         "whichever lot its centroid falls in. Loads this borough's latest "
-        "neighborhood_lots/neighborhood_buildings snapshot into rag.lots/"
-        "rag.buildings first, replacing that partition's prior rows."
+        "lots_with_vacancy_rates/neighborhood_buildings snapshot into "
+        "rag.lots/rag.buildings first, replacing that partition's prior rows."
     ),
 )
 def building_lot_intersections(
@@ -62,9 +65,9 @@ def building_lot_intersections(
 
     lots_path = join(
         store.partition_dir(
-            neighborhood_lots.key.path[-1], scrape_date, neighborhood
+            lots_with_vacancy_rates.key.path[-1], scrape_date, neighborhood
         ),
-        LOTS_FILE,
+        LOTS_WITH_VACANCY_FILE,
     )
     buildings_path = join(
         store.partition_dir(
