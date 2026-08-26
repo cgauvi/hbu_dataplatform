@@ -20,6 +20,7 @@ from urban_rag.frames import (
     table_slug,
     write_frame,
 )
+from urban_rag.layers import key_prefix
 from urban_rag.partitions import date_partitions, namespace_for, scrape_partitions
 from urban_rag.resources import ParquetStore, SpectrumResource
 from urban_rag.spectrum import SpectrumError
@@ -31,18 +32,20 @@ from urban_rag.storage import (
     storage_options,
 )
 
-GROUP = "spectrum"
+GROUP = "bronze_spectrum"
 
-#: The catalog's one file, under `<root>/spectrum_table_catalog/<date>/`.
+#: The catalog's one file, under `<root>/bronze/spectrum_table_catalog/<date>/`.
 CATALOG_FILE = "tables.parquet"
 
 
 @asset(
+    key_prefix=key_prefix("spectrum_table_catalog"),
     partitions_def=date_partitions,
     group_name=GROUP,
+    kinds={"parquet"},
     description=(
         "Every named table published by the Feature Service on a given day, "
-        "as `spectrum_table_catalog/<YYYY-MM-DD>/tables.parquet`. Kept as its "
+        "as `bronze/spectrum_table_catalog/<YYYY-MM-DD>/tables.parquet`. Kept as its "
         "own asset because the catalog drifts: boroughs add and retire layers "
         "without notice."
     ),
@@ -83,6 +86,7 @@ def spectrum_table_catalog(
 
 
 @asset(
+    key_prefix=key_prefix("neighborhood_features"),
     partitions_def=scrape_partitions,
     deps=[
         AssetDep(
@@ -93,9 +97,10 @@ def spectrum_table_catalog(
         )
     ],
     group_name=GROUP,
+    kinds={"geoparquet", "parquet"},
     description=(
         "One (geo)parquet file per source table, under "
-        "neighborhood_features/<YYYY-MM-DD>/<neighborhood>/. Geometry is "
+        "bronze/neighborhood_features/<YYYY-MM-DD>/<neighborhood>/. Geometry is "
         "reprojected to EPSG:4326 by the service; tables without geometry land "
         "as plain parquet."
     ),

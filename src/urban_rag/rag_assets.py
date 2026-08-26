@@ -1,4 +1,4 @@
-"""Assets that turn the scraped tables' linked PDFs into an embedded corpus.
+"""Assets that turn the zoning grids linked from a scraped table into a corpus.
 
 Three steps, kept apart so each can be re-run on its own: fetch and flatten
 the PDFs, cut them into chunks, embed the chunks. Re-chunking is cheap;
@@ -6,17 +6,24 @@ re-embedding is not, and neither should force a re-download.
 
 Each lands under its own asset prefix, keyed the same way as the scrape::
 
-    data/linked_documents/2026-08-18/VSMPE/documents.parquet
-    data/document_chunks/2026-08-18/VSMPE/chunks.parquet
-    data/document_embeddings/2026-08-18/VSMPE/embeddings.parquet
+    data/bronze/linked_documents/2026-08-18/VSMPE/documents.parquet
+    data/silver/document_chunks/2026-08-18/VSMPE/chunks.parquet
+    data/silver/document_embeddings/2026-08-18/VSMPE/embeddings.parquet
 
 so re-running one step replaces one prefix and leaves the other two alone.
 
-A fourth, `document_index`, publishes the result: it loads that partition's
-vectors into the Postgres/pgvector store the query side reads. It writes to a
-database rather than to the tree, so it is the one asset here that needs
-something outside the account's own storage to exist first - see
-`urban_rag.rag.pgvector`.
+The layer boundary falls after the fetch. `linked_documents` is bronze: it is
+the publisher's PDF, flattened to text and otherwise untouched, and a dead link
+costs its own row rather than the partition. Chunking and embedding are silver -
+the same documents cut to this platform's own retrieval grain, measured with
+this platform's own tokenizer, which is a choice about how the corpus is used
+rather than a property of what was published.
+
+A fourth, `document_index`, is gold: it publishes that partition's vectors into
+the Postgres/pgvector store the query side reads. It is the one asset in the
+platform that writes no parquet of its own, and deliberately - it is a *load*,
+not a computation, and what it loads is `document_embeddings`, which is already
+in the tree. Its record is that file.
 """
 
 import json
@@ -42,6 +49,7 @@ from urban_rag.rag.documents import (
     read_pdf,
 )
 from urban_rag.frames import write_vectors
+from urban_rag.layers import key_prefix
 from urban_rag.partitions import scrape_partitions
 from urban_rag.rag.pgvector import PostgresUnavailable
 from urban_rag.rag.results import IndexMismatch
@@ -53,26 +61,36 @@ from urban_rag.resources import (
 )
 from urban_rag.storage import dirname, filesystem, join, storage_options
 
-GROUP = "rag"
+BRONZE_GROUP = "bronze_documents"
+SILVER_GROUP = "silver_corpus"
+GOLD_GROUP = "gold_corpus"
 
 DOCUMENTS_FILE = "documents.parquet"
 CHUNKS_FILE = "chunks.parquet"
 EMBEDDINGS_FILE = "embeddings.parquet"
 
-#: Attribute columns worth carrying alongside a document, when the source
-#: table has them: whichever citation number a user would actually reference
-#: (a resolution's ``ID``, or a zone's ``NUMERO_COMPLET``).
-_ID_COLUMNS = ("ID", "NUMERO_COMPLET")
-_TITLE_COLUMNS = ("DESCRIPTION", "NOM_CAT", "USAGE")
+#: Attribute columns worth carrying alongside a document, first match wins.
+#: The id is whichever citation number a user would actually reference - for
+#: ``VSP_REG_ZONE`` that is ``NUMERO_COMPLET``, the zone number printed on the
+#: grid itself ("C01-001"), which is also what `neighborhood_features` joins a
+#: parcel to. ``ID`` and the other titles are kept for tables added to
+#: `DOCUMENT_SOURCES` later; the zone table carries neither.
+_ID_COLUMNS = ("NUMERO_COMPLET", "ID")
+_TITLE_COLUMNS = ("USAGE", "DESCRIPTION", "NOM_CAT")
 
 
 @asset(
+    key_prefix=key_prefix("linked_documents"),
     partitions_def=scrape_partitions,
     deps=[neighborhood_features],
-    group_name=GROUP,
+    group_name=BRONZE_GROUP,
+    kinds={"parquet"},
     description=(
-        "The PDFs linked from a scraped table's URL column (EN_SAVOIR_PLUS and "
-        "friends), downloaded and flattened to text. One row per distinct link."
+        "The zoning grids linked from a scraped table's URL column - today "
+        "Reglement_urbanisme__VSP_REG_ZONE.LIEN_GRILLE, one 'grille des "
+        "usages et des normes' PDF per zone - downloaded and flattened to "
+        "text. One row per distinct link, so two zones sharing a grid cost "
+        "one document."
     ),
 )
 def linked_documents(
@@ -102,7 +120,15 @@ def linked_documents(
             columns=_wanted_columns(path, url_column),
             storage_options=storage_options(path),
         )
-        links = document_urls(frame, url_column)
+        try:
+            links = document_urls(frame, url_column)
+        except DocumentError as exc:
+            # The registry names a column this table no longer has. That is a
+            # registry bug, so it belongs in `failures` where the metadata
+            # shows it - not as a traceback that costs the whole partition.
+            failures[f"{slug}.{url_column}"] = str(exc)
+            context.log.warning("%s: %s", slug, exc)
+            continue
         context.log.info("%s: %d distinct link(s) in %s", slug, len(links), url_column)
         features = _features_by_url(frame, url_column)
 
@@ -162,9 +188,11 @@ def linked_documents(
 
 
 @asset(
+    key_prefix=key_prefix("document_chunks"),
     partitions_def=scrape_partitions,
     deps=[linked_documents],
-    group_name=GROUP,
+    group_name=SILVER_GROUP,
+    kinds={"parquet"},
     description=(
         "Documents cut into overlapping, paragraph-aligned chunks, measured "
         "with the embedding model's own tokenizer."
@@ -235,9 +263,11 @@ def document_chunks(
 
 
 @asset(
+    key_prefix=key_prefix("document_embeddings"),
     partitions_def=scrape_partitions,
     deps=[document_chunks],
-    group_name=GROUP,
+    group_name=SILVER_GROUP,
+    kinds={"parquet"},
     description=(
         "Dense BAAI/bge-m3 vectors, one per chunk, L2-normalised so retrieval "
         "can score with a dot product. Written as a fixed-size float32 column."
@@ -282,12 +312,16 @@ def document_embeddings(
 
 
 @asset(
+    key_prefix=key_prefix("document_index"),
     partitions_def=scrape_partitions,
     deps=[document_embeddings],
-    group_name=GROUP,
+    group_name=GOLD_GROUP,
+    kinds={"postgres"},
     description=(
         "This partition's vectors published to the Postgres/pgvector store the "
-        "query side reads: upserted on chunk_id, newest scrape date wins."
+        "query side reads: upserted on chunk_id, newest scrape date wins. "
+        "Writes no parquet - it is a load of document_embeddings, which is "
+        "already in the tree."
     ),
 )
 def document_index(
@@ -358,7 +392,12 @@ def _partition(context: AssetExecutionContext) -> tuple[str, str]:
 
 
 def _partition_dir(context: AssetExecutionContext, store: ParquetStore) -> str:
-    """Where the running asset writes: `<root>/<asset>/<date>/<neighborhood>/`."""
+    """Where the running asset writes.
+
+    `<root>/<layer>/<asset>/<date>/<neighborhood>/` - the layer comes from
+    `urban_rag.layers`, so this is the same call whichever layer the asset is
+    in.
+    """
     neighborhood, scrape_date = _partition(context)
     return store.partition_dir(
         context.asset_key.path[-1], scrape_date, neighborhood

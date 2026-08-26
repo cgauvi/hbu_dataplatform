@@ -11,6 +11,7 @@ import pandas as pd
 import pytest
 
 from urban_rag.rag.documents import (
+    DOCUMENT_SOURCES,
     DocumentError,
     PdfFetcher,
     chunk_text,
@@ -62,19 +63,24 @@ def make_fetcher(tmp_path, response):
     return fetcher, session
 
 
+def test_the_corpus_is_built_from_the_zoning_grids():
+    """The registry is the whole definition of what gets indexed."""
+    assert DOCUMENT_SOURCES == {"Reglement_urbanisme__VSP_REG_ZONE": "LIEN_GRILLE"}
+
+
 def test_document_urls_are_distinct_and_keep_their_first_seen_order():
     frame = pd.DataFrame(
-        {"EN_SAVOIR_PLUS": ["http://x/b.pdf", "http://x/a.pdf", "http://x/b.pdf", None]}
+        {"LIEN_GRILLE": ["http://x/b.pdf", "http://x/a.pdf", "http://x/b.pdf", None]}
     )
 
-    links = document_urls(frame, "EN_SAVOIR_PLUS")
+    links = document_urls(frame, "LIEN_GRILLE")
 
     assert links == ["http://x/b.pdf", "http://x/a.pdf"]
 
 
 def test_document_urls_rejects_a_missing_column():
     with pytest.raises(DocumentError):
-        document_urls(pd.DataFrame({"OTHER": ["http://x"]}), "EN_SAVOIR_PLUS")
+        document_urls(pd.DataFrame({"OTHER": ["http://x"]}), "LIEN_GRILLE")
 
 
 def test_document_id_is_stable_for_a_url():

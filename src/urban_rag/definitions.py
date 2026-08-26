@@ -1,4 +1,12 @@
-"""Code location for the urban_rag Spectrum scraper."""
+"""Code location for the urban_rag pipeline.
+
+Assets are grouped and keyed by medallion layer - `bronze/`, `silver/`,
+`gold/` - declared once in `urban_rag.layers` and used for both the Dagster
+asset key and the prefix each asset writes under. `_assert_layers_declared`
+below checks the two sets against each other at import time, so an asset
+registered without a layer is a code-location load error rather than a
+`KeyError` on its first materialization.
+"""
 
 from __future__ import annotations
 
@@ -16,10 +24,22 @@ from dagster import (
 from urban_rag.assets import neighborhood_features, spectrum_table_catalog
 from urban_rag.bdoi_assets import neighborhood_buildings
 from urban_rag.building_lots_assets import building_lot_intersections
-from urban_rag.cmhc_assets import average_rents, vacancy_rates
+from urban_rag.cmhc_assets import (
+    average_rents,
+    cmhc_rent_survey,
+    cmhc_vacancy_survey,
+    vacancy_rates,
+)
+from urban_rag.envelope_assets import lot_zoning_envelopes, zoning_grid_columns
+from urban_rag.estimator_assets import (
+    montreal_nonresidential_costs,
+    montreal_residential_costs,
+)
+from urban_rag.frontage_assets import lot_frontage
 from urban_rag.infolot_assets import neighborhood_lots
-from urban_rag.lot_vacancy_assets import lots_with_vacancy_rates
-from urban_rag.open_data_assets import reference_neighborhoods
+from urban_rag.layers import ASSET_LAYERS
+from urban_rag.lot_profiles_assets import lot_profiles
+from urban_rag.open_data_assets import reference_neighborhoods, street_network
 from urban_rag.partitions import (
     ENABLED_NEIGHBORHOODS,
     date_partitions,
@@ -35,6 +55,7 @@ from urban_rag.resources import (
     BdoiResource,
     CmhcResource,
     EmbeddingModel,
+    EstimatorResource,
     InfolotResource,
     OpenDataResource,
     ParquetStore,
@@ -44,8 +65,64 @@ from urban_rag.resources import (
     SpectrumResource,
 )
 from urban_rag.storage import DATA_ROOT, output_root
+from urban_rag.street_assets import neighborhood_streets
 
 TIMEZONE = "America/Toronto"
+
+#: Every asset this code location registers. Named once so `Definitions` and
+#: the layer check below cannot disagree about what is in it.
+ASSETS = [
+    # bronze
+    spectrum_table_catalog,
+    neighborhood_features,
+    reference_neighborhoods,
+    neighborhood_lots,
+    neighborhood_buildings,
+    cmhc_vacancy_survey,
+    cmhc_rent_survey,
+    street_network,
+    linked_documents,
+    montreal_residential_costs,
+    montreal_nonresidential_costs,
+    # silver
+    vacancy_rates,
+    average_rents,
+    building_lot_intersections,
+    neighborhood_streets,
+    lot_frontage,
+    document_chunks,
+    document_embeddings,
+    zoning_grid_columns,
+    lot_zoning_envelopes,
+    # gold
+    lot_profiles,
+    document_index,
+]
+
+
+def _assert_layers_declared() -> None:
+    """Every registered asset has a layer, and every declared layer an asset.
+
+    Both halves matter. An asset missing from `ASSET_LAYERS` has no prefix to
+    write under and would fail on its first materialization rather than here;
+    a name left in `ASSET_LAYERS` after its asset was renamed is a row nothing
+    reads, which is how the table starts lying about the tree.
+    """
+    registered = {definition.key.path[-1] for definition in ASSETS}
+    declared = set(ASSET_LAYERS)
+    if undeclared := sorted(registered - declared):
+        raise ValueError(
+            f"Registered asset(s) with no layer in urban_rag.layers: "
+            f"{', '.join(undeclared)}"
+        )
+    if unregistered := sorted(declared - registered):
+        raise ValueError(
+            f"urban_rag.layers declares layer(s) for asset(s) this code "
+            f"location does not register: {', '.join(unregistered)}"
+        )
+
+
+_assert_layers_declared()
 
 catalog_job = define_asset_job(
     "spectrum_catalog_job",
@@ -84,6 +161,54 @@ building_lots_job = define_asset_job(
     partitions_def=scrape_partitions,
 )
 
+lot_profiles_job = define_asset_job(
+    "lot_profiles_job",
+    selection=AssetSelection.assets(lot_profiles),
+    partitions_def=scrape_partitions,
+)
+
+# The geobase double is one 91 MB download for the whole island, so DATE only -
+# same posture as reference_neighborhoods and the two CMHC surveys. The borough
+# axis appears one asset later, in neighborhood_streets.
+street_network_job = define_asset_job(
+    "street_network_job",
+    selection=AssetSelection.assets(street_network),
+    partitions_def=date_partitions,
+)
+
+neighborhood_streets_job = define_asset_job(
+    "neighborhood_streets_job",
+    selection=AssetSelection.assets(neighborhood_streets),
+    partitions_def=scrape_partitions,
+)
+
+lot_frontage_job = define_asset_job(
+    "lot_frontage_job",
+    selection=AssetSelection.assets(lot_frontage),
+    partitions_def=scrape_partitions,
+)
+
+# The two CMHC surveys are read once per scrape date, not once per borough:
+# there is nothing borough-shaped about either publication, and the crosswalk
+# that cuts them into boroughs runs in the silver assets below.
+cmhc_survey_job = define_asset_job(
+    "cmhc_survey_job",
+    selection=AssetSelection.assets(cmhc_vacancy_survey, cmhc_rent_survey),
+    partitions_def=date_partitions,
+)
+
+# Both cost assets in one run, for the same reason the two CMHC surveys share
+# one: they read the same publication, neither has a borough axis, and a day
+# where one snapshot lands and the other does not is a day whose residential
+# and non-residential rates came from different revisions of the guide.
+construction_costs_job = define_asset_job(
+    "construction_costs_job",
+    selection=AssetSelection.assets(
+        montreal_residential_costs, montreal_nonresidential_costs
+    ),
+    partitions_def=date_partitions,
+)
+
 vacancy_rates_job = define_asset_job(
     "vacancy_rates_job",
     selection=AssetSelection.assets(vacancy_rates),
@@ -96,9 +221,13 @@ average_rents_job = define_asset_job(
     partitions_def=scrape_partitions,
 )
 
-lots_with_vacancy_rates_job = define_asset_job(
-    "lots_with_vacancy_rates_job",
-    selection=AssetSelection.assets(lots_with_vacancy_rates),
+# The envelope pair, kept off the corpus job: the grids are parsed from the
+# PDFs that job already downloaded, and re-reading them as tables is cheap
+# enough to re-run on its own whenever the parser changes - which it will, for
+# as long as the boroughs keep publishing their own templates.
+zoning_envelopes_job = define_asset_job(
+    "zoning_envelopes_job",
+    selection=AssetSelection.assets(zoning_grid_columns, lot_zoning_envelopes),
     partitions_def=scrape_partitions,
 )
 
@@ -168,6 +297,20 @@ def daily_reference_neighborhoods_schedule(
     )
 
 @schedule(
+    job=street_network_job,
+    # Alongside reference_neighborhoods and the CMHC surveys rather than behind
+    # them: the geobase double has no upstream in this pipeline. One run for the
+    # whole island; the boroughs are cut out of it an hour and a half later.
+    cron_schedule="50 4 * * *",
+    execution_timezone=TIMEZONE,
+    description="Snapshot the island-wide geobase double for today.",
+)
+def daily_street_network_schedule(context: ScheduleEvaluationContext) -> RunRequest:
+    scrape_date = context.scheduled_execution_time.strftime("%Y-%m-%d")
+    return RunRequest(run_key=f"street-network-{scrape_date}", partition_key=scrape_date)
+
+
+@schedule(
     job=lots_job,
     # An hour behind reference_neighborhoods, which supplies the borough
     # boundary each partition is cut with.
@@ -207,11 +350,14 @@ def daily_buildings_schedule(context: ScheduleEvaluationContext):
 
 @schedule(
     job=building_lots_job,
-    # An hour behind lots/buildings, which it depends on for the same
-    # partition - long enough for both to clear a borough's worth of rows.
+    # An hour behind lots/buildings/features, which it depends on for the same
+    # partition - long enough for all three to clear a borough's worth of rows.
     cron_schedule="0 7 * * *",
     execution_timezone=TIMEZONE,
-    description="Recompute the building x lot join for every enabled neighborhood.",
+    description=(
+        "Recompute the building x lot and lot x feature joins for every "
+        "enabled neighborhood."
+    ),
 )
 def daily_building_lots_schedule(context: ScheduleEvaluationContext):
     scrape_date = context.scheduled_execution_time.strftime("%Y-%m-%d")
@@ -225,13 +371,44 @@ def daily_building_lots_schedule(context: ScheduleEvaluationContext):
 
 
 @schedule(
-    job=vacancy_rates_job,
-    # Alongside reference_neighborhoods rather than behind it: the survey has
-    # no upstream in this pipeline, since the borough is picked by name rather
-    # than cut out of a boundary.
+    job=cmhc_survey_job,
+    # Alongside reference_neighborhoods rather than behind it: the surveys have
+    # no upstream in this pipeline. One run for both, and one for the whole
+    # island - the boroughs are cut out of the result an hour later.
     cron_schedule="45 4 * * *",
     execution_timezone=TIMEZONE,
-    description="Snapshot the CMHC vacancy rates of every enabled neighborhood.",
+    description="Snapshot both CMHC surveys for today's scrape date.",
+)
+def daily_cmhc_survey_schedule(context: ScheduleEvaluationContext) -> RunRequest:
+    scrape_date = context.scheduled_execution_time.strftime("%Y-%m-%d")
+    return RunRequest(run_key=f"cmhc-survey-{scrape_date}", partition_key=scrape_date)
+
+
+@schedule(
+    job=construction_costs_job,
+    # Alongside the CMHC surveys and reference_neighborhoods rather than behind
+    # anything: the cost guide has no upstream in this pipeline, and no borough
+    # axis to wait for one. Kept at its own minute so a publisher that has
+    # moved the file fails one small run rather than sharing a run with the
+    # city's servers.
+    cron_schedule="47 4 * * *",
+    execution_timezone=TIMEZONE,
+    description="Snapshot the Montreal construction cost rates for today.",
+)
+def daily_construction_costs_schedule(context: ScheduleEvaluationContext) -> RunRequest:
+    scrape_date = context.scheduled_execution_time.strftime("%Y-%m-%d")
+    return RunRequest(
+        run_key=f"construction-costs-{scrape_date}", partition_key=scrape_date
+    )
+
+
+@schedule(
+    job=vacancy_rates_job,
+    # Behind cmhc_survey_job, which is now its upstream: the crosswalk is
+    # applied to that day's snapshot rather than to a fresh download.
+    cron_schedule="55 5 * * *",
+    execution_timezone=TIMEZONE,
+    description="Cut today's CMHC vacancy survey into every enabled borough.",
 )
 def daily_vacancy_rates_schedule(context: ScheduleEvaluationContext):
     scrape_date = context.scheduled_execution_time.strftime("%Y-%m-%d")
@@ -246,11 +423,11 @@ def daily_vacancy_rates_schedule(context: ScheduleEvaluationContext):
 
 @schedule(
     job=average_rents_job,
-    # Same source and no pipeline upstream, but kept at a different minute so
-    # a live CMHC hiccup affects one small run at a time.
-    cron_schedule="50 4 * * *",
+    # Same upstream, kept at a different minute so one borough's crosswalk
+    # failure is one small run at a time.
+    cron_schedule="58 5 * * *",
     execution_timezone=TIMEZONE,
-    description="Snapshot the CMHC average rents of every enabled neighborhood.",
+    description="Cut today's CMHC rent survey into every enabled borough.",
 )
 def daily_average_rents_schedule(context: ScheduleEvaluationContext):
     scrape_date = context.scheduled_execution_time.strftime("%Y-%m-%d")
@@ -264,39 +441,58 @@ def daily_average_rents_schedule(context: ScheduleEvaluationContext):
 
 
 @schedule(
-    job=lots_with_vacancy_rates_job,
-    # After lots and vacancy_rates, before the building x lot spatial join.
-    cron_schedule="10 6 * * *",
+    job=neighborhood_streets_job,
+    # After street_network (50 4) and reference_neighborhoods (40 4), which
+    # supply the island-wide layer and the boundary it is cut with. Ahead of
+    # daily_building_lots_schedule rather than behind the cadastre: the two
+    # share no input.
+    cron_schedule="20 6 * * *",
     execution_timezone=TIMEZONE,
-    description="Join cadastral lots to CMHC vacancy rates by neighborhood.",
+    description="Cut today's geobase double into every enabled borough.",
 )
-def daily_lots_with_vacancy_rates_schedule(context: ScheduleEvaluationContext):
+def daily_neighborhood_streets_schedule(context: ScheduleEvaluationContext):
     scrape_date = context.scheduled_execution_time.strftime("%Y-%m-%d")
     for neighborhood in ENABLED_NEIGHBORHOODS:
         yield RunRequest(
-            run_key=f"lots-with-vacancy-rates-{neighborhood}-{scrape_date}",
+            run_key=f"neighborhood-streets-{neighborhood}-{scrape_date}",
             partition_key=MultiPartitionKey(
                 {"date": scrape_date, "neighborhood": neighborhood}
             ),
         )
 
 
+# No schedule for `lot_frontage` either, and for the same reason as
+# `lot_profiles` below: `rag.streets` and `rag.lot_frontage` are hbu_infra's to
+# create, and until sql/007_streets.sql and sql/008_lot_frontage.sql have been
+# applied to the database a nightly run fails on `relation "rag.streets" does
+# not exist` every morning. Both files exist in that repo; what is outstanding
+# is `db.py init` against the target database. It is registered and has a job,
+# so it appears in the lineage and can be run by hand the moment the tables
+# land - see `lot_frontage_job` and `make frontage`. Add the schedule then, at
+# 30 7, behind daily_building_lots_schedule which loads the cadastre it reads.
+
+# No schedule for `lot_profiles`, unlike every other asset here, and not an
+# oversight: it reads two relations hbu_infra has to create first.
+# sql/009_lot_profiles.sql creates the table it writes into, and
+# sql/006_lot_documents.sql creates the `rag.lot_documents` view it takes the
+# document columns from - and that second file carries a `-- requires:
+# rag.chunks` header, so `db.py init` skips it on a database that has never
+# held a corpus and it only lands on the *next* init after `document_index` has
+# run. Both files exist in that repo; what is outstanding is `db.py init`
+# against the target database, twice. `compute_lot_profiles` checks for both up
+# front and names the file to apply, so the failure says what to do rather than
+# `relation "rag.lot_profiles" does not exist`. It is registered and has a job,
+# so it appears in the lineage and can be run by hand the moment the relations
+# land - see `lot_profiles_job` and `make lot-profiles`. Add the schedule then,
+# at 40 7, behind lot_frontage which supplies the frontage it pivots - and
+# behind `zoning_envelopes_job`, which has no schedule of its own either. Three
+# of this asset's inputs come from the tree rather than from Postgres
+# (lot_zoning_envelopes, vacancy_rates, average_rents), and it fails naming the
+# one that is missing rather than writing a partition without it.
+
+
 defs = Definitions(
-    assets=[
-        spectrum_table_catalog,
-        neighborhood_features,
-        reference_neighborhoods,
-        neighborhood_lots,
-        neighborhood_buildings,
-        vacancy_rates,
-        average_rents,
-        lots_with_vacancy_rates,
-        building_lot_intersections,
-        linked_documents,
-        document_chunks,
-        document_embeddings,
-        document_index,
-    ],
+    assets=ASSETS,
     jobs=[
         catalog_job,
         features_job,
@@ -304,9 +500,15 @@ defs = Definitions(
         lots_job,
         buildings_job,
         building_lots_job,
+        lot_profiles_job,
+        street_network_job,
+        neighborhood_streets_job,
+        lot_frontage_job,
+        zoning_envelopes_job,
+        cmhc_survey_job,
+        construction_costs_job,
         vacancy_rates_job,
         average_rents_job,
-        lots_with_vacancy_rates_job,
         rag_corpus_job,
         document_index_job,
     ],
@@ -314,12 +516,15 @@ defs = Definitions(
         daily_catalog_schedule,
         daily_features_schedule,
         daily_reference_neighborhoods_schedule,
+        daily_street_network_schedule,
         daily_lots_schedule,
         daily_buildings_schedule,
         daily_building_lots_schedule,
+        daily_cmhc_survey_schedule,
+        daily_construction_costs_schedule,
         daily_vacancy_rates_schedule,
         daily_average_rents_schedule,
-        daily_lots_with_vacancy_rates_schedule,
+        daily_neighborhood_streets_schedule,
     ],
     resources={
         "spectrum": SpectrumResource(),
@@ -341,6 +546,10 @@ defs = Definitions(
             # always local.
             cache_dir=str(DATA_ROOT / "cache" / "bdoi"),
         ),
+        # No cache_dir, unlike bdoi/cmhc/pdf_cache below: the cost guide is one
+        # 16 kB script that its publisher can revise on any day, so each scrape
+        # date fetches it again rather than reusing a copy.
+        "estimator": EstimatorResource(),
         "cmhc": CmhcResource(
             # Same posture as bdoi/pdf_cache: a published survey year is
             # final, so the workbook is cached once, outside the partition
@@ -353,7 +562,8 @@ defs = Definitions(
         # (or in .env) rather than here - and `urban-rag --backend postgres`
         # reads the same ones.
         "pgvector": PgVectorResource(),
-        # The plain PostGIS tables (rag.lots/rag.buildings/rag.building_lots),
+        # The plain PostGIS tables (rag.lots/rag.buildings/rag.features and
+        # the joins between them),
         # same database as "pgvector" and configured the same way - every
         # field defaults to its URBAN_RAG_PG_* variable.
         "postgis": PostgisResource(),

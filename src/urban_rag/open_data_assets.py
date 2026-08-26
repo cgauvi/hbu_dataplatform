@@ -19,12 +19,13 @@ from dagster import (
 )
 
 from urban_rag.frames import count_invalid_geometries, features_to_frame, write_frame
+from urban_rag.layers import key_prefix
 from urban_rag.open_data import OpenDataError, decode_csv
 from urban_rag.partitions import borough_code_for, date_partitions
 from urban_rag.resources import OpenDataResource, ParquetStore
 from urban_rag.storage import clear_parquet, filesystem, join
 
-GROUP = "open_data"
+GROUP = "bronze_open_data"
 
 #: Portal slug of https://donnees.montreal.ca/dataset/quartiers
 QUARTIERS_DATASET = "quartiers"
@@ -33,7 +34,7 @@ QUARTIERS_DATASET = "quartiers"
 QUARTIERS_GEOJSON = "quartierreferencehabitation.geojson"
 
 #: The one file the geographic layer is written to, under
-#: `reference_neighborhoods/<YYYY-MM-DD>/`. Read back by
+#: `bronze/reference_neighborhoods/<YYYY-MM-DD>/`. Read back by
 #: `urban_rag.infolot_assets` to bound each borough's cadastre query.
 QUARTIERS_FILE = "quartiers.parquet"
 
@@ -50,13 +51,39 @@ DWELLINGS_COUNT_COLUMN = "nb_log"
 #: on - see `urban_rag.partitions.NEIGHBORHOOD_BOROUGH_CODES`.
 BOROUGH_CODE_COLUMN = "no_arr"
 
+#: Portal slug of https://donnees.montreal.ca/dataset/geobase-double
+STREETS_DATASET = "geobase-double"
+
+#: The *géobase double*: one line per side of street, drawn along the curb and
+#: sidewalk limits, rather than the single centre line the plain géobase
+#: publishes. Sides are what a frontage question needs - a lot faces one side
+#: of a street, not the axis of the roadway - which is why this dataset and not
+#: `geobase`. 91,546 features island-wide, ~91 MB of GeoJSON.
+STREETS_GEOJSON = "gbdouble.json"
+
+#: The one file the street network is written to, under
+#: `bronze/street_network/<YYYY-MM-DD>/`. Read back by
+#: `urban_rag.street_assets` to cut each borough's slice out of it.
+STREETS_FILE = "street_sides.parquet"
+
+#: The geobase double's own key for a street side, unique island-wide (91,546
+#: of 91,546 in the first snapshot). Carried through silver and into
+#: `rag.streets.cote_rue_id` as the id that survives a reload.
+STREET_ID_COLUMN = "COTE_RUE_ID"
+
+#: The street's name, kept as its own column all the way to `rag.streets`
+#: because it is what a frontage row is read for.
+STREET_NAME_COLUMN = "NOM_VOIE"
+
 
 @asset(
+    key_prefix=key_prefix("reference_neighborhoods"),
     partitions_def=date_partitions,
     group_name=GROUP,
+    kinds={"geoparquet", "parquet"},
     description=(
         "Montreal's 91 reference neighborhoods for housing analysis, snapshot "
-        "per scrape date under reference_neighborhoods/<YYYY-MM-DD>/: the "
+        "per scrape date under bronze/reference_neighborhoods/<YYYY-MM-DD>/: the "
         "geographic layer as geoparquet, plus the dwelling counts published "
         "alongside it. Source: https://donnees.montreal.ca/dataset/quartiers"
     ),
@@ -131,15 +158,104 @@ def reference_neighborhoods(
     return MaterializeResult(metadata=metadata)
 
 
+@asset(
+    key_prefix=key_prefix("street_network"),
+    partitions_def=date_partitions,
+    group_name=GROUP,
+    kinds={"geoparquet"},
+    description=(
+        "Montreal's geobase double - one line per side of street, drawn along "
+        "the curb and sidewalk limits - snapshot per scrape date under "
+        f"bronze/street_network/<YYYY-MM-DD>/{STREETS_FILE}. Island-wide and "
+        "as published: the borough slice is cut in silver. Source: "
+        "https://donnees.montreal.ca/dataset/geobase-double"
+    ),
+)
+def street_network(
+    context: AssetExecutionContext,
+    open_data: OpenDataResource,
+    store: ParquetStore,
+) -> MaterializeResult:
+    scrape_date = context.partition_key
+    output_dir = store.partition_dir(context.asset_key.path[-1], scrape_date)
+
+    client = open_data.client()
+    package = client.package(STREETS_DATASET)
+    geojson = package.resource(STREETS_GEOJSON)
+    scraped_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    removed = clear_parquet(output_dir)
+    if removed:
+        context.log.info("Removed %d file(s) from a previous run", len(removed))
+
+    # Column names are left exactly as the city spells them, unlike
+    # `reference_neighborhoods` above: that asset lower-cases because its two
+    # files disagree with each other (`No_QR` against `no_qr`) about a column
+    # they have to join on. This is one file with one spelling, and the rest of
+    # the lot lineage carries its publishers' names through bronze untouched -
+    # `NO_LOT` from Infolot, `NUMERO_COMPLET` from Spectrum, `COTE_RUE_ID` here.
+    frame = _geojson_to_frame(
+        client.download(geojson),
+        source_file=geojson.filename,
+        scrape_date=scrape_date,
+        scraped_at=scraped_at,
+        normalize_columns=False,
+    )
+    if STREET_ID_COLUMN not in frame.columns:
+        raise Failure(
+            f"{geojson.filename} has no {STREET_ID_COLUMN} column; it publishes "
+            f"{', '.join(sorted(frame.columns))}."
+        )
+
+    path = write_frame(frame, join(output_dir, STREETS_FILE))
+    invalid = count_invalid_geometries(frame)
+    if invalid:
+        # Reported, not repaired, so the snapshot stays a faithful copy.
+        context.log.warning("%s: %d invalid geometr(ies)", STREETS_FILE, invalid)
+    context.log.info("%s: %d street side(s) -> %s", geojson.filename, len(frame), path)
+
+    return MaterializeResult(
+        metadata={
+            "dagster/row_count": len(frame),
+            "num_street_sides": len(frame),
+            # The key silver declares its grain on. Reported rather than
+            # enforced: bronze keeps whatever the publisher sent, and a
+            # duplicate here is the publisher's fact, not this asset's failure.
+            "num_street_ids": int(frame[STREET_ID_COLUMN].nunique()),
+            "num_street_names": int(frame[STREET_NAME_COLUMN].nunique())
+            if STREET_NAME_COLUMN in frame.columns
+            else 0,
+            "num_invalid_geometries": invalid,
+            "output_path": MetadataValue.path(str(path)),
+            "source_url": MetadataValue.url(
+                f"https://donnees.montreal.ca/dataset/{STREETS_DATASET}"
+            ),
+            "license": package.license_title or "unknown",
+            "streets_last_modified": geojson.last_modified or "unknown",
+        }
+    )
+
+
 def _geojson_to_frame(
-    content: bytes, *, source_file: str, scrape_date: str, scraped_at: str
+    content: bytes,
+    *,
+    source_file: str,
+    scrape_date: str,
+    scraped_at: str,
+    normalize_columns: bool = True,
 ):
     """GeoJSON bytes -> GeoDataFrame, with the provenance columns attached.
 
     Parsed rather than handed to ``gpd.read_file`` so the same normalization
     the Spectrum scrape applies (nested values JSON-encoded, style dropped)
-    applies here too. The portal publishes this layer in EPSG:4326 already,
-    which is the CRS `features_to_frame` asserts.
+    applies here too. Both layers this reads are published in EPSG:4326 - the
+    quartiers layer says so, and the geobase double names no `crs` member at
+    all, which in GeoJSON *means* WGS 84 - and that is the CRS
+    `features_to_frame` asserts.
+
+    ``normalize_columns`` lower-cases the column names. On by default for the
+    quartiers pair, which needs it to join; off for the street network, which
+    keeps its publisher's spelling - see `street_network`.
     """
     try:
         payload = json.loads(content)
@@ -160,7 +276,8 @@ def _geojson_to_frame(
             "scraped_at": scraped_at,
         },
     )
-    frame.columns = [_normalize(name, frame) for name in frame.columns]
+    if normalize_columns:
+        frame.columns = [_normalize(name, frame) for name in frame.columns]
     return frame
 
 

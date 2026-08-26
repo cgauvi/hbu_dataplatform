@@ -20,6 +20,7 @@ import textwrap
 import time
 from pathlib import Path
 
+from urban_rag.layers import layer_of
 from urban_rag.rag.pgvector import PgSettings, PgVectorStore, PostgresUnavailable
 from urban_rag.rag.store import IndexMismatch, VectorStore
 from urban_rag.rag.vss import StoreLocked, VSSUnavailable
@@ -29,8 +30,17 @@ from urban_rag.storage import DATA_ROOT, join, output_root
 #: `<date>/<neighborhood>/`, and each file carries those two as columns.
 #: `output_root()` is an `s3://` URI when `S3_BUCKET` is set - DuckDB's httpfs
 #: reads that glob directly, authenticated through `AWS_PROFILE`.
+#:
+#: The layer comes from `urban_rag.layers` rather than being spelled `silver`
+#: here, for the same reason `ParquetStore.partition_dir` looks it up: this is
+#: a reader of an asset's output, and a reader that hard-codes the layer is
+#: the thing that breaks when the asset moves between them.
 DEFAULT_SOURCE = join(
-    output_root(), "document_embeddings", "**", "embeddings.parquet"
+    output_root(),
+    str(layer_of("document_embeddings")),
+    "document_embeddings",
+    "**",
+    "embeddings.parquet",
 )
 #: Matches the database registered in `.vscode/settings.json`, so the editor's
 #: DuckDB panel opens the same file the CLI writes. Always local: DuckDB opens

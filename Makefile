@@ -14,6 +14,10 @@ endif
 
 export DAGSTER_HOME := $(CURDIR)/.dagster_home
 
+# Assets are selected by their full `<layer>/<asset>` key, which is what
+# `key_prefix` in urban_rag.layers gives them. A bare name resolves to no
+# AssetsDefinition and dagster answers DagsterInvalidSubsetError, so adding a
+# target means looking the asset's layer up rather than copying its name.
 MODULE := urban_rag.definitions
 DATE ?= $(shell date +%F)
 NEIGHBORHOOD ?= VSMPE
@@ -23,6 +27,9 @@ K ?= 5
 # the shared Postgres/pgvector one (configured from URBAN_RAG_PG_*, see the
 # README). `make index BACKEND=postgres` reloads the latter from parquet.
 BACKEND ?= duckdb
+# How far behind the curb line a lot boundary still counts as facing it, for
+# `make frontage`. See silver/lot_frontage in the README.
+BUFFER_M ?= 3.0
 
 IMAGE ?= urban-rag
 TAG ?= latest
@@ -32,7 +39,9 @@ DOCKER_RUN := docker run --rm -it \
 	-p $(PORT):2500
 
 .PHONY: help sync dagster_run daemon test materialize catalog features \
-	quartiers vacancy rents lot-vacancy corpus publish index search ask status require-q clean clean-data \
+	quartiers cmhc costs vacancy rents envelopes lot-profiles \
+	streets borough-streets frontage corpus publish index search ask status \
+	require-q clean clean-data clean-silver \
 	docker-build docker-build-slim docker-run docker-shell docker-test up down logs
 
 help: ## Show this help
@@ -40,7 +49,7 @@ help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  %-18s %s\n", $$1, $$2}'
 	@echo ""
 	@echo "Vars: DATE=$(DATE) NEIGHBORHOOD=$(NEIGHBORHOOD) PORT=$(PORT) K=$(K)"
-	@echo "      BACKEND=$(BACKEND)"
+	@echo "      BACKEND=$(BACKEND) BUFFER_M=$(BUFFER_M)"
 	@echo "      IMAGE=$(IMAGE):$(TAG)"
 	@echo "      DAGSTER_HOME=$(DAGSTER_HOME)"
 
@@ -71,25 +80,57 @@ daemon: | $(DAGSTER_HOME) ## Run the daemon alone (what the schedules need)
 	uv run dagster-daemon run -m $(MODULE)
 
 catalog: | $(DAGSTER_HOME) ## Materialize spectrum_table_catalog for DATE
-	uv run dagster asset materialize --select spectrum_table_catalog --partition $(DATE) -m $(MODULE)
+	uv run dagster asset materialize --select bronze/spectrum_table_catalog --partition $(DATE) -m $(MODULE)
 
 features: | $(DAGSTER_HOME) ## Materialize neighborhood_features for DATE x NEIGHBORHOOD
-	uv run dagster asset materialize --select neighborhood_features --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
+	uv run dagster asset materialize --select bronze/neighborhood_features --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
 
 quartiers: | $(DAGSTER_HOME) ## Materialize reference_neighborhoods for DATE
-	uv run dagster asset materialize --select reference_neighborhoods --partition $(DATE) -m $(MODULE)
+	uv run dagster asset materialize --select bronze/reference_neighborhoods --partition $(DATE) -m $(MODULE)
+
+# Bronze: one workbook read for the whole island, so DATE only.
+cmhc: | $(DAGSTER_HOME) ## Snapshot both CMHC surveys for DATE
+	uv run dagster asset materialize --select bronze/cmhc_vacancy_survey,bronze/cmhc_rent_survey --partition $(DATE) -m $(MODULE)
+
+# Bronze: one script read for the whole guide, so DATE only.
+costs: | $(DAGSTER_HOME) ## Snapshot the Montreal construction cost rates for DATE
+	uv run dagster asset materialize --select bronze/montreal_residential_costs,bronze/montreal_nonresidential_costs --partition $(DATE) -m $(MODULE)
 
 vacancy: | $(DAGSTER_HOME) ## Materialize vacancy_rates for DATE x NEIGHBORHOOD
-	uv run dagster asset materialize --select vacancy_rates --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
+	uv run dagster asset materialize --select silver/vacancy_rates --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
 
 rents: | $(DAGSTER_HOME) ## Materialize average_rents for DATE x NEIGHBORHOOD
-	uv run dagster asset materialize --select average_rents --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
+	uv run dagster asset materialize --select silver/average_rents --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
 
-lot-vacancy: | $(DAGSTER_HOME) ## Materialize lots_with_vacancy_rates for DATE x NEIGHBORHOOD
-	uv run dagster asset materialize --select lots_with_vacancy_rates --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
+# The two envelope assets, which lot_profiles now reads: the grids are
+# parsed from the PDFs the corpus already downloaded.
+envelopes: | $(DAGSTER_HOME) ## Materialize the zoning envelopes for DATE x NEIGHBORHOOD
+	uv run dagster asset materialize --select silver/zoning_grid_columns,silver/lot_zoning_envelopes --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
+
+# Needs rag.lot_profiles and the rag.lot_documents view (hbu_infra sql/009,
+# sql/006) applied, and 006 only lands on a db.py init run *after* a corpus has
+# been indexed - see urban_rag.lot_profiles_assets. Also reads three silver
+# parquet partitions the database knows nothing about: `envelopes`, `vacancy`
+# and `rents` for the same DATE x NEIGHBORHOOD.
+lot-profiles: | $(DAGSTER_HOME) ## Materialize lot_profiles for DATE x NEIGHBORHOOD
+	uv run dagster asset materialize --select gold/lot_profiles --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
+
+# Bronze: one 91 MB download for the whole island, so DATE only.
+streets: | $(DAGSTER_HOME) ## Snapshot the island-wide geobase double for DATE
+	uv run dagster asset materialize --select bronze/street_network --partition $(DATE) -m $(MODULE)
+
+borough-streets: | $(DAGSTER_HOME) ## Materialize neighborhood_streets for DATE x NEIGHBORHOOD
+	uv run dagster asset materialize --select silver/neighborhood_streets --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
+
+# Needs rag.streets and rag.lot_frontage (hbu_infra sql/007, sql/008) applied,
+# and building_lot_intersections run first for the same partition - that is what
+# puts this borough's cadastre in rag.lots. BUFFER_M overrides the 3 m default.
+frontage: | $(DAGSTER_HOME) ## Materialize lot_frontage for DATE x NEIGHBORHOOD
+	uv run dagster asset materialize --select silver/lot_frontage --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE) \
+		--config-json '{"ops":{"silver__lot_frontage":{"config":{"buffer_m":$(BUFFER_M)}}}}'
 
 corpus: | $(DAGSTER_HOME) ## Fetch, chunk and embed the PDFs linked from DATE x NEIGHBORHOOD
-	uv run dagster asset materialize --select "linked_documents,document_chunks,document_embeddings" --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
+	uv run dagster asset materialize --select "bronze/linked_documents,silver/document_chunks,silver/document_embeddings" --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
 
 materialize: catalog features ## Full scrape for DATE x NEIGHBORHOOD
 
@@ -99,7 +140,7 @@ materialize: catalog features ## Full scrape for DATE x NEIGHBORHOOD
 # without touching the others. `make index BACKEND=postgres` is the other half -
 # a full reload of every partition, which is what a new encoder needs.
 publish: | $(DAGSTER_HOME) ## Load DATE x NEIGHBORHOOD into Postgres/pgvector
-	uv run dagster asset materialize --select document_index --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
+	uv run dagster asset materialize --select gold/document_index --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
 
 index: ## (Re)build the vector store from the latest snapshot (BACKEND=...)
 	uv run urban-rag index --backend $(BACKEND) --neighborhood $(NEIGHBORHOOD)
@@ -156,10 +197,14 @@ clean: ## Remove Python and pytest caches
 	rm -rf .pytest_cache
 	find . -path ./.venv -prune -o -name __pycache__ -type d -print0 | xargs -0 -r rm -rf
 
-# The PDF cache and vect_db.duckdb stay: the cache is keyed by URL rather than
-# by scrape date, and the store is rebuilt by `make index` from whatever is
-# left. One directory per asset - see "Output layout" in the README.
+# The PDF/BDOI/CMHC caches and vect_db.duckdb stay: they are keyed by URL or
+# filename rather than by scrape date, and the store is rebuilt by `make index`
+# from whatever is left. Three directories, one per medallion layer, each
+# holding one directory per asset - see "Output layout" in the README. Naming
+# the layers rather than the assets is the point: an asset added later is
+# covered without editing this line.
 clean-data: ## Delete every parquet snapshot under data/
-	rm -rf data/spectrum_table_catalog data/neighborhood_features \
-		data/reference_neighborhoods data/vacancy_rates data/average_rents data/linked_documents \
-		data/lots_with_vacancy_rates data/document_chunks data/document_embeddings
+	rm -rf data/bronze data/silver data/gold
+
+clean-silver: ## Delete silver and gold, keeping the bronze snapshots
+	rm -rf data/silver data/gold

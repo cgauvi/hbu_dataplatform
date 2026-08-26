@@ -13,6 +13,8 @@ import pandas as pd
 import pytest
 from dagster import materialize
 
+from asset_helpers import materialization_metadata
+
 from urban_rag.open_data import CkanClient, OpenDataError, Resource, decode_csv
 from urban_rag.open_data_assets import (
     DWELLINGS_CSV,
@@ -265,7 +267,7 @@ def materialize_partition(
 def test_asset_writes_both_files_under_the_date_partition(tmp_path, monkeypatch):
     materialize_partition(tmp_path, monkeypatch, scrape_date="2026-08-05")
 
-    partition = tmp_path / "reference_neighborhoods" / "2026-08-05"
+    partition = tmp_path / "bronze" / "reference_neighborhoods" / "2026-08-05"
     assert sorted(p.name for p in partition.glob("*.parquet")) == [
         "nombre_logements.parquet",
         "quartiers.parquet",
@@ -289,9 +291,7 @@ def test_asset_writes_both_files_under_the_date_partition(tmp_path, monkeypatch)
 def test_metadata_reports_the_counts_and_the_licence(tmp_path, monkeypatch):
     result = materialize_partition(tmp_path, monkeypatch)
 
-    metadata = result.asset_materializations_for_node("reference_neighborhoods")[
-        0
-    ].metadata
+    metadata = materialization_metadata(result, reference_neighborhoods)
     assert metadata["dagster/row_count"].value == 2
     assert metadata["num_neighborhoods"].value == 2
     assert metadata["total_dwellings"].value == 23546
@@ -300,7 +300,7 @@ def test_metadata_reports_the_counts_and_the_licence(tmp_path, monkeypatch):
 
 
 def test_a_rerun_replaces_the_previous_snapshot(tmp_path, monkeypatch):
-    partition = tmp_path / "reference_neighborhoods" / "2026-08-05"
+    partition = tmp_path / "bronze" / "reference_neighborhoods" / "2026-08-05"
     partition.mkdir(parents=True)
     stale = partition / "quartiers_retired.parquet"
     pd.DataFrame({"a": [1]}).to_parquet(stale)
@@ -315,10 +315,8 @@ def test_a_broken_dwellings_file_does_not_cost_the_layer(tmp_path, monkeypatch):
 
     result = materialize_partition(tmp_path, monkeypatch, session=session)
 
-    partition = tmp_path / "reference_neighborhoods" / "2026-08-05"
+    partition = tmp_path / "bronze" / "reference_neighborhoods" / "2026-08-05"
     assert (partition / "quartiers.parquet").exists()
     assert not (partition / "nombre_logements.parquet").exists()
-    metadata = result.asset_materializations_for_node("reference_neighborhoods")[
-        0
-    ].metadata
+    metadata = materialization_metadata(result, reference_neighborhoods)
     assert "dwellings_error" in metadata

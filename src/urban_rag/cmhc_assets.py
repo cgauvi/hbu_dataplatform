@@ -1,27 +1,45 @@
-"""Asset sourced from CMHC's Rental Market Survey, rather than from Spectrum
-or donnees.montreal.ca.
+"""CMHC's Rental Market Survey, in two layers.
 
 CMHC surveys the Montreal *census metropolitan area* and cuts it into its own
 neighborhoods, which do not line up with the boroughs this pipeline is
 partitioned on: `VSMPE` is three CMHC quartiers, `Outremont` is one, and `PR`
 is the borough plus a neighbouring municipality CMHC will not split out. The
-crosswalk is `urban_rag.partitions.CMHC_QUARTIERS`, and this asset averages
-each borough's quartiers into one set of rates per bedroom class.
+crosswalk is `urban_rag.partitions.CMHC_QUARTIERS`.
 
-Unlike the lots and the buildings, the cut is a name lookup rather than a
-spatial join: the survey publishes rates, not geometry, so there is nothing to
-intersect a borough boundary with. That also makes this the one
-borough-partitioned asset with no dependency on `reference_neighborhoods`.
+That crosswalk is exactly where the bronze/silver line falls here.
+
+**Bronze** - `cmhc_vacancy_survey` and `cmhc_rent_survey` - snapshot the
+Montreal slice as published: every quartier the survey prints for this centre,
+under whatever names it prints them, subtotal rows included. Neither knows the
+crosswalk exists, so neither can be broken by it. They are partitioned by
+scrape date *alone*, because there is nothing borough-shaped about them: one
+workbook read per day rather than the same workbook re-read and re-parsed once
+per enabled borough.
+
+**Silver** - `vacancy_rates` and `average_rents` - apply the crosswalk to that
+snapshot and average each borough's quartiers into one figure. These are the
+assets that are allowed to refuse: a quartier the crosswalk names but the
+survey does not publish fails a *silver* partition, and the bronze snapshot it
+was computed from is still on disk to diagnose it with. Before the split, a
+CMHC respelling cost the day's scrape; now it costs a re-run of one silver
+asset against parquet already landed.
+
+Unlike the lots and the buildings, the borough cut is a name lookup rather than
+a spatial join: the survey publishes rates, not geometry, so there is nothing
+to intersect a boundary with. That also makes these the one borough-partitioned
+assets with no dependency on `reference_neighborhoods`.
 """
 
 from datetime import datetime, timezone
 
 import pandas as pd
 from dagster import (
+    AssetDep,
     AssetExecutionContext,
     Failure,
     MaterializeResult,
     MetadataValue,
+    MultiToSingleDimensionPartitionMapping,
     asset,
 )
 
@@ -40,11 +58,13 @@ from urban_rag.cmhc import (
     survey_period,
 )
 from urban_rag.frames import write_frame
-from urban_rag.partitions import quartiers_for, scrape_partitions
+from urban_rag.layers import key_prefix
+from urban_rag.partitions import date_partitions, quartiers_for, scrape_partitions
 from urban_rag.resources import CmhcResource, ParquetStore
-from urban_rag.storage import clear_parquet, join
+from urban_rag.storage import clear_parquet, filesystem, join, storage_options
 
-GROUP = "cmhc"
+BRONZE_GROUP = "bronze_cmhc"
+SILVER_GROUP = "silver_cmhc"
 
 #: The borough averages, one row per dwelling type x bedroom class.
 VACANCY_FILE = "vacancy_rates.parquet"
@@ -52,15 +72,20 @@ VACANCY_FILE = "vacancy_rates.parquet"
 #: The borough average rents, one row per bedroom class.
 AVERAGE_RENTS_FILE = "average_rents.parquet"
 
-#: The per-quartier rows those averages were taken over, kept alongside them:
-#: with three quartiers behind a borough figure and most cells suppressed, the
-#: average is only readable next to what went into it.
+#: The per-quartier rows those averages were taken over. Written by *both*
+#: layers, and they are not the same file: bronze holds every quartier the
+#: survey publishes for Montreal under the survey's own spelling, silver holds
+#: only this borough's, relabelled to the crosswalk's canonical name. Silver
+#: keeps its copy because with three quartiers behind a borough figure and most
+#: cells suppressed, the average is only readable next to what went into it.
 QUARTIERS_FILE = "quartier_vacancy_rates.parquet"
 
-#: The per-quartier rows behind `AVERAGE_RENTS_FILE`.
+#: The per-quartier rows behind `AVERAGE_RENTS_FILE`, same split as above.
 QUARTIER_AVERAGE_RENTS_FILE = "quartier_average_rents.parquet"
 
-#: The slice of the survey this pipeline reads.
+#: The slice of the survey this pipeline reads. A scope on what is asked for,
+#: not an interpretation of what came back, so it is applied in bronze - the
+#: same posture as bounding the Infolot query with a borough outline.
 PROVINCE = "Qc"
 CENTRE = "Montréal"
 
@@ -72,64 +97,213 @@ SOURCE_URL = (
 
 AVERAGE_RENTS_SOURCE_URL = AVERAGE_RENTS_READING_MODE_URL
 
+# --------------------------------------------------------------------------
+# bronze
+# --------------------------------------------------------------------------
+
 
 @asset(
-    partitions_def=scrape_partitions,
-    group_name=GROUP,
+    key_prefix=key_prefix("cmhc_vacancy_survey"),
+    partitions_def=date_partitions,
+    group_name=BRONZE_GROUP,
+    kinds={"parquet"},
     description=(
-        "CMHC Rental Market Survey vacancy rates for one borough, as "
-        "vacancy_rates/<YYYY-MM-DD>/<neighborhood>/vacancy_rates.parquet: the "
-        "survey's Montreal-CMA neighborhoods that make up the borough "
-        "(see partitions.CMHC_QUARTIERS), averaged into one rate per dwelling "
-        "type x bedroom class, with the per-quartier rows kept alongside in "
-        f"{QUARTIERS_FILE}. Source: {SOURCE_URL}"
+        "CMHC Rental Market Survey vacancy rates for the Montreal CMA as "
+        "published, as bronze/cmhc_vacancy_survey/<YYYY-MM-DD>/"
+        f"{QUARTIERS_FILE}: every quartier the survey prints for "
+        f"Province={PROVINCE}/Centre={CENTRE}, under the survey's own "
+        "spellings, subtotal rows included. Partitioned by date alone - there "
+        "is nothing borough-shaped about the workbook, and the crosswalk that "
+        f"cuts it into boroughs is applied in silver. Source: {SOURCE_URL}"
     ),
 )
-def vacancy_rates(
+def cmhc_vacancy_survey(
     context: AssetExecutionContext,
     cmhc: CmhcResource,
     store: ParquetStore,
 ) -> MaterializeResult:
-    dimensions = context.partition_key.keys_by_dimension
-    neighborhood = dimensions["neighborhood"]
-    scrape_date = dimensions["date"][:10]
-
-    quartiers = quartiers_for(neighborhood)
+    scrape_date = context.partition_key
     survey_year = cmhc.survey_year
-    fetcher = cmhc.fetcher()
     try:
-        workbook = fetcher.fetch(survey_year)
+        workbook = cmhc.fetcher().fetch(survey_year)
         survey = read_quartier_sheet(workbook)
         period = survey_period(workbook)
     except CmhcError as exc:
         raise Failure(f"CMHC {survey_year} survey read failed: {exc}")
 
-    borough = _borough_rows(survey, neighborhood, quartiers)
+    montreal = survey[
+        (survey["province"] == PROVINCE) & (survey["centre"] == CENTRE)
+    ].copy()
+    if montreal.empty:
+        raise Failure(
+            f"The survey publishes no rows for Province={PROVINCE!r}, "
+            f"Centre={CENTRE!r}; the workbook's geography labels may have changed."
+        )
 
-    output_dir = store.partition_dir(
-        context.asset_key.path[-1], scrape_date, neighborhood
+    montreal = _with_provenance(
+        montreal, survey_year=survey_year, period=period, scrape_date=scrape_date
     )
-    removed = clear_parquet(output_dir)
-    if removed:
-        context.log.info("Removed %d file(s) from a previous run", len(removed))
+    output_dir = _partition_dir(context, store, scrape_date)
+    _clear(context, output_dir)
+    path = write_frame(montreal, join(output_dir, QUARTIERS_FILE))
 
-    scraped_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    # Written as columns because the output path holds bare keys rather than
-    # hive `key=value` pairs, so a reader that opens one file still knows
-    # which snapshot it belongs to.
+    quartiers = sorted(set(montreal["quartier"]) - {TOTAL_LABEL})
+    context.log.info(
+        "%d row(s) across %d quartier(s) -> %s", len(montreal), len(quartiers), path
+    )
+
+    return MaterializeResult(
+        metadata={
+            "dagster/row_count": len(montreal),
+            "num_quartiers": len(quartiers),
+            "quartiers": MetadataValue.text(", ".join(quartiers)),
+            "num_published_cells": int(
+                (montreal["status"] == STATUS_PUBLISHED).sum()
+            ),
+            "num_suppressed_cells": int(
+                (montreal["status"] == STATUS_SUPPRESSED).sum()
+            ),
+            "num_no_unit_cells": int((montreal["status"] == STATUS_NO_UNITS).sum()),
+            "survey_year": survey_year,
+            "survey_period": period or "unknown",
+            "output_path": MetadataValue.path(str(path)),
+            "source_url": MetadataValue.url(SOURCE_URL),
+        }
+    )
+
+
+@asset(
+    key_prefix=key_prefix("cmhc_rent_survey"),
+    partitions_def=date_partitions,
+    group_name=BRONZE_GROUP,
+    kinds={"parquet"},
+    description=(
+        "CMHC HMIP reading-mode average rents for the Montreal CMA as "
+        "published, as bronze/cmhc_rent_survey/<YYYY-MM-DD>/"
+        f"{QUARTIER_AVERAGE_RENTS_FILE}: every quartier the page prints for "
+        f"Centre={CENTRE}, under the page's own spellings. Partitioned by "
+        "date alone, same as cmhc_vacancy_survey. Source: "
+        f"{AVERAGE_RENTS_SOURCE_URL}"
+    ),
+)
+def cmhc_rent_survey(
+    context: AssetExecutionContext,
+    cmhc: CmhcResource,
+    store: ParquetStore,
+) -> MaterializeResult:
+    scrape_date = context.partition_key
+    try:
+        table = read_average_rents_reading_mode(
+            cmhc.reading_mode_fetcher().fetch_average_rents()
+        )
+    except CmhcError as exc:
+        raise Failure(f"CMHC average-rent reading-mode page read failed: {exc}")
+
+    montreal = table.frame[table.frame["centre"] == CENTRE].copy()
+    if montreal.empty:
+        raise Failure(
+            f"The average-rent page publishes no rows for Centre={CENTRE!r}; "
+            "the page geography may have changed."
+        )
+
+    montreal = _with_provenance(
+        montreal,
+        survey_year=table.survey_year,
+        period=table.survey_period,
+        scrape_date=scrape_date,
+    )
+    output_dir = _partition_dir(context, store, scrape_date)
+    _clear(context, output_dir)
+    path = write_frame(montreal, join(output_dir, QUARTIER_AVERAGE_RENTS_FILE))
+
+    quartiers = sorted(set(montreal["quartier"]) - {TOTAL_LABEL})
+    context.log.info(
+        "%d rent row(s) across %d quartier(s) -> %s",
+        len(montreal),
+        len(quartiers),
+        path,
+    )
+
+    return MaterializeResult(
+        metadata={
+            "dagster/row_count": len(montreal),
+            "num_quartiers": len(quartiers),
+            "quartiers": MetadataValue.text(", ".join(quartiers)),
+            "num_published_cells": int(
+                (montreal["status"] == STATUS_PUBLISHED).sum()
+            ),
+            "num_suppressed_cells": int(
+                (montreal["status"] == STATUS_SUPPRESSED).sum()
+            ),
+            "survey_year": table.survey_year,
+            "survey_period": table.survey_period,
+            "output_path": MetadataValue.path(str(path)),
+            "source_url": MetadataValue.url(AVERAGE_RENTS_SOURCE_URL),
+        }
+    )
+
+
+# --------------------------------------------------------------------------
+# silver
+# --------------------------------------------------------------------------
+
+
+@asset(
+    key_prefix=key_prefix("vacancy_rates"),
+    partitions_def=scrape_partitions,
+    deps=[
+        AssetDep(
+            cmhc_vacancy_survey,
+            partition_mapping=MultiToSingleDimensionPartitionMapping(
+                partition_dimension_name="date"
+            ),
+        )
+    ],
+    group_name=SILVER_GROUP,
+    kinds={"parquet"},
+    description=(
+        "One borough's CMHC vacancy rates, as silver/vacancy_rates/"
+        "<YYYY-MM-DD>/<neighborhood>/vacancy_rates.parquet: the survey's "
+        "Montreal-CMA quartiers that make up the borough (see "
+        "partitions.CMHC_QUARTIERS) taken out of that day's "
+        "cmhc_vacancy_survey snapshot, relabelled to the crosswalk's "
+        "spelling and averaged into one rate per dwelling type x bedroom "
+        f"class, with the borough's own rows kept alongside in {QUARTIERS_FILE}. "
+        "Reads parquet, not CMHC: a respelling upstream fails this asset and "
+        "leaves the bronze snapshot intact."
+    ),
+)
+def vacancy_rates(
+    context: AssetExecutionContext,
+    store: ParquetStore,
+) -> MaterializeResult:
+    neighborhood, scrape_date = _borough_partition(context)
+    quartiers = quartiers_for(neighborhood)
+
+    survey = _read_bronze(
+        store, cmhc_vacancy_survey.key.path[-1], scrape_date, QUARTIERS_FILE
+    )
+    borough = _borough_rows(
+        survey,
+        neighborhood,
+        quartiers,
+        sort_by=["quartier", "dwelling_type", "bedroom_type"],
+    )
+    averages = _average_over_quartiers(borough, quartiers)
+
     provenance = {
         "neighborhood": neighborhood,
-        "survey_year": survey_year,
-        "survey_period": period,
+        "survey_year": _only_value(borough, "survey_year"),
+        "survey_period": _only_value(borough, "survey_period"),
         "scrape_date": scrape_date,
-        "scraped_at": scraped_at,
+        "conformed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
-
-    averages = _average_over_quartiers(borough, quartiers)
     for name, value in provenance.items():
         averages[name] = value
         borough[name] = value
 
+    output_dir = _partition_dir(context, store, scrape_date, neighborhood)
+    _clear(context, output_dir)
     write_frame(borough, join(output_dir, QUARTIERS_FILE))
     path = write_frame(averages, join(output_dir, VACANCY_FILE))
 
@@ -147,9 +321,9 @@ def vacancy_rates(
         # boroughs, and an empty-but-correct partition should not block the
         # ones around it.
         context.log.warning(
-            "%s: every rate is suppressed or has no units in the %d survey",
+            "%s: every rate is suppressed or has no units in the %s survey",
             neighborhood,
-            survey_year,
+            provenance["survey_year"],
         )
 
     overall = published[
@@ -168,8 +342,8 @@ def vacancy_rates(
             "overall_vacancy_rate_pct": MetadataValue.float(float(overall.iloc[0]))
             if not overall.empty
             else MetadataValue.text("suppressed"),
-            "survey_year": survey_year,
-            "survey_period": period or "unknown",
+            "survey_year": provenance["survey_year"],
+            "survey_period": provenance["survey_period"] or "unknown",
             "output_path": MetadataValue.path(str(path)),
             "source_url": MetadataValue.url(SOURCE_URL),
         }
@@ -177,56 +351,57 @@ def vacancy_rates(
 
 
 @asset(
+    key_prefix=key_prefix("average_rents"),
     partitions_def=scrape_partitions,
-    group_name=GROUP,
+    deps=[
+        AssetDep(
+            cmhc_rent_survey,
+            partition_mapping=MultiToSingleDimensionPartitionMapping(
+                partition_dimension_name="date"
+            ),
+        )
+    ],
+    group_name=SILVER_GROUP,
+    kinds={"parquet"},
     description=(
-        "CMHC HMIP reading-mode average rents for one borough, as "
-        "average_rents/<YYYY-MM-DD>/<neighborhood>/average_rents.parquet: "
-        "the survey's Montreal-CMA neighborhoods that make up the borough "
-        "(see partitions.CMHC_QUARTIERS), averaged into one rent per bedroom "
-        "class, with the per-quartier rows kept alongside in "
-        f"{QUARTIER_AVERAGE_RENTS_FILE}. Source: {AVERAGE_RENTS_SOURCE_URL}"
+        "One borough's CMHC average rents, as silver/average_rents/"
+        "<YYYY-MM-DD>/<neighborhood>/average_rents.parquet: the crosswalk "
+        "applied to that day's cmhc_rent_survey snapshot and averaged into "
+        "one rent per bedroom class, with the borough's own rows kept "
+        f"alongside in {QUARTIER_AVERAGE_RENTS_FILE}."
     ),
 )
 def average_rents(
     context: AssetExecutionContext,
-    cmhc: CmhcResource,
     store: ParquetStore,
 ) -> MaterializeResult:
-    dimensions = context.partition_key.keys_by_dimension
-    neighborhood = dimensions["neighborhood"]
-    scrape_date = dimensions["date"][:10]
-
+    neighborhood, scrape_date = _borough_partition(context)
     quartiers = quartiers_for(neighborhood)
-    fetcher = cmhc.reading_mode_fetcher()
-    try:
-        table = read_average_rents_reading_mode(fetcher.fetch_average_rents())
-    except CmhcError as exc:
-        raise Failure(f"CMHC average-rent reading-mode page read failed: {exc}")
 
-    borough = _rent_borough_rows(table.frame, neighborhood, quartiers)
-
-    output_dir = store.partition_dir(
-        context.asset_key.path[-1], scrape_date, neighborhood
+    survey = _read_bronze(
+        store,
+        cmhc_rent_survey.key.path[-1],
+        scrape_date,
+        QUARTIER_AVERAGE_RENTS_FILE,
     )
-    removed = clear_parquet(output_dir)
-    if removed:
-        context.log.info("Removed %d file(s) from a previous run", len(removed))
+    borough = _borough_rows(
+        survey, neighborhood, quartiers, sort_by=["quartier", "bedroom_type"]
+    )
+    averages = _average_rents_over_quartiers(borough, quartiers)
 
-    scraped_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     provenance = {
         "neighborhood": neighborhood,
-        "survey_year": table.survey_year,
-        "survey_period": table.survey_period,
+        "survey_year": _only_value(borough, "survey_year"),
+        "survey_period": _only_value(borough, "survey_period"),
         "scrape_date": scrape_date,
-        "scraped_at": scraped_at,
+        "conformed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
-
-    averages = _average_rents_over_quartiers(borough, quartiers)
     for name, value in provenance.items():
         averages[name] = value
         borough[name] = value
 
+    output_dir = _partition_dir(context, store, scrape_date, neighborhood)
+    _clear(context, output_dir)
     write_frame(borough, join(output_dir, QUARTIER_AVERAGE_RENTS_FILE))
     path = write_frame(averages, join(output_dir, AVERAGE_RENTS_FILE))
 
@@ -242,9 +417,9 @@ def average_rents(
     )
     if published.empty:
         context.log.warning(
-            "%s: every average-rent cell is suppressed in the %d survey",
+            "%s: every average-rent cell is suppressed in the %s survey",
             neighborhood,
-            table.survey_year,
+            provenance["survey_year"],
         )
 
     overall = published[published["bedroom_type"] == "all"]["average_rent_cad"]
@@ -260,62 +435,109 @@ def average_rents(
             "overall_average_rent_cad": MetadataValue.float(float(overall.iloc[0]))
             if not overall.empty
             else MetadataValue.text("suppressed"),
-            "survey_year": table.survey_year,
-            "survey_period": table.survey_period,
+            "survey_year": provenance["survey_year"],
+            "survey_period": provenance["survey_period"],
             "output_path": MetadataValue.path(str(path)),
             "source_url": MetadataValue.url(AVERAGE_RENTS_SOURCE_URL),
         }
     )
 
 
-def _borough_rows(
-    survey: pd.DataFrame, neighborhood: str, quartiers: tuple[str, ...]
+# --------------------------------------------------------------------------
+# shared
+# --------------------------------------------------------------------------
+
+
+def _borough_partition(context: AssetExecutionContext) -> tuple[str, str]:
+    dimensions = context.partition_key.keys_by_dimension
+    return dimensions["neighborhood"], dimensions["date"][:10]
+
+
+def _partition_dir(
+    context: AssetExecutionContext,
+    store: ParquetStore,
+    scrape_date: str,
+    neighborhood: str | None = None,
+) -> str:
+    return store.partition_dir(
+        context.asset_key.path[-1], scrape_date, neighborhood
+    )
+
+
+def _clear(context: AssetExecutionContext, output_dir: str) -> None:
+    removed = clear_parquet(output_dir)
+    if removed:
+        context.log.info("Removed %d file(s) from a previous run", len(removed))
+
+
+def _with_provenance(
+    frame: pd.DataFrame, *, survey_year, period, scrape_date: str
 ) -> pd.DataFrame:
-    """The survey rows for one borough's quartiers, in the map's own order.
+    frame["survey_year"] = survey_year
+    frame["survey_period"] = period
+    frame["scrape_date"] = scrape_date
+    frame["scraped_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return frame
+
+
+def _read_bronze(
+    store: ParquetStore, asset_name: str, scrape_date: str, filename: str
+) -> pd.DataFrame:
+    """That day's bronze survey snapshot, or a `Failure` naming what to run."""
+    path = join(store.partition_dir(asset_name, scrape_date), filename)
+    if not filesystem(path).exists(path):
+        raise Failure(
+            f"{path} is missing; materialize {asset_name} for {scrape_date} first."
+        )
+    frame = pd.read_parquet(path, storage_options=storage_options(path))
+    if frame.empty:
+        raise Failure(f"{path} holds no survey row to conform.")
+    return frame
+
+
+def _borough_rows(
+    survey: pd.DataFrame,
+    neighborhood: str,
+    quartiers: tuple[str, ...],
+    *,
+    sort_by: list[str],
+) -> pd.DataFrame:
+    """The bronze rows for one borough's quartiers, in the crosswalk's order.
 
     Matched through `normalize_quartier`, so the crosswalk survives the
-    respellings CMHC varies between publications; the `quartier` column keeps
-    the sheet's own label either way.
+    respellings CMHC varies between publications; the `quartier` column is
+    then relabelled to the crosswalk's own spelling, so two survey years of
+    this asset stack into one frame without the punctuation drifting.
 
-    A quartier the map names but the workbook does not publish is a `Failure`
-    rather than a silently shorter average: a rename that went unnoticed would
-    quietly change what the borough figure means.
+    A quartier the crosswalk names but the snapshot does not publish is a
+    `Failure` rather than a silently shorter average: a rename that went
+    unnoticed would quietly change what the borough figure means. It fails
+    here, in silver, so the bronze snapshot it was read from survives the
+    failure and can be looked at.
     """
-    montreal = survey[
-        (survey["province"] == PROVINCE)
-        & (survey["centre"] == CENTRE)
-        # The zone subtotals repeat their quartiers' rows and would
-        # double-count; none of the mapped names is "Total" anyway, so this
-        # only guards against a future one that is.
-        & (survey["quartier"] != TOTAL_LABEL)
-    ]
-    if montreal.empty:
-        raise Failure(
-            f"The survey publishes no rows for Province={PROVINCE!r}, "
-            f"Centre={CENTRE!r}; the workbook's geography labels may have changed."
-        )
+    # The zone subtotals repeat their quartiers' rows and would double-count.
+    # Bronze keeps them because the survey prints them; the guard belongs
+    # here. None of the mapped names is "Total" anyway, so this only guards
+    # against a future one that is.
+    published_rows = survey[survey["quartier"] != TOTAL_LABEL]
 
     keys = {normalize_quartier(q): q for q in quartiers}
-    published_keys = montreal["quartier"].map(normalize_quartier)
+    published_keys = published_rows["quartier"].map(normalize_quartier)
     missing = [name for key, name in keys.items() if key not in set(published_keys)]
     if missing:
-        published = sorted(set(montreal["quartier"]))
+        available = sorted(set(published_rows["quartier"]))
         raise Failure(
-            f"{neighborhood}: the {CENTRE} survey publishes no quartier named "
-            f"{', '.join(repr(q) for q in missing)}. It has: "
-            f"{', '.join(published)}"
+            f"{neighborhood}: the {CENTRE} survey snapshot publishes no quartier "
+            f"named {', '.join(repr(q) for q in missing)}. It has: "
+            f"{', '.join(available)}"
         )
 
-    rows = montreal[published_keys.isin(keys)].copy()
-    # Relabelled to the crosswalk's spelling and ordering, so two survey years
-    # of this asset stack into one frame without the punctuation drifting.
+    rows = published_rows[published_keys.isin(keys)].copy()
     rows["quartier"] = pd.Categorical(
         rows["quartier"].map(lambda name: keys[normalize_quartier(name)]),
         categories=quartiers,
     )
-    return rows.sort_values(
-        ["quartier", "dwelling_type", "bedroom_type"], ignore_index=True
-    ).astype({"quartier": "string"})
+    return rows.sort_values(sort_by, ignore_index=True).astype({"quartier": "string"})
 
 
 def _average_over_quartiers(
@@ -355,37 +577,6 @@ def _average_over_quartiers(
     return frame
 
 
-def _rent_borough_rows(
-    survey: pd.DataFrame, neighborhood: str, quartiers: tuple[str, ...]
-) -> pd.DataFrame:
-    montreal = survey[survey["centre"] == CENTRE]
-    if montreal.empty:
-        raise Failure(
-            f"The average-rent page publishes no rows for Centre={CENTRE!r}; "
-            "the page geography may have changed."
-        )
-
-    keys = {normalize_quartier(q): q for q in quartiers}
-    published_keys = montreal["quartier"].map(normalize_quartier)
-    missing = [name for key, name in keys.items() if key not in set(published_keys)]
-    if missing:
-        published = sorted(set(montreal["quartier"]))
-        raise Failure(
-            f"{neighborhood}: the average-rent page publishes no quartier named "
-            f"{', '.join(repr(q) for q in missing)}. It has: "
-            f"{', '.join(published)}"
-        )
-
-    rows = montreal[published_keys.isin(keys)].copy()
-    rows["quartier"] = pd.Categorical(
-        rows["quartier"].map(lambda name: keys[normalize_quartier(name)]),
-        categories=quartiers,
-    )
-    return rows.sort_values(["quartier", "bedroom_type"], ignore_index=True).astype(
-        {"quartier": "string"}
-    )
-
-
 def _average_rents_over_quartiers(
     borough: pd.DataFrame, quartiers: tuple[str, ...]
 ) -> pd.DataFrame:
@@ -408,3 +599,20 @@ def _average_rents_over_quartiers(
     frame["averaged_quartiers"] = frame["averaged_quartiers"].fillna("")
     frame["num_quartiers_mapped"] = len(quartiers)
     return frame
+
+
+def _only_value(frame: pd.DataFrame, column: str):
+    """The one value ``column`` carries, or a `Failure` if it carries several.
+
+    The survey year and period travel down from bronze as columns rather than
+    from `CmhcResource`, because a silver partition describes the snapshot it
+    actually read - which may not be the year the resource is configured for
+    today.
+    """
+    values = frame[column].dropna().unique()
+    if len(values) == 0:
+        return None
+    if len(values) > 1:
+        raise Failure(f"The survey snapshot carries multiple {column}: {values!r}")
+    value = values[0]
+    return value.item() if hasattr(value, "item") else value

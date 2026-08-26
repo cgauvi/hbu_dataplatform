@@ -25,15 +25,16 @@ from dagster import (
 
 from urban_rag.bdoi import BdoiError, QUEBEC_FILES, read_shapefile_zip
 from urban_rag.frames import count_invalid_geometries, write_frame
+from urban_rag.layers import key_prefix
 from urban_rag.open_data_assets import borough_boundary, reference_neighborhoods
 from urban_rag.partitions import scrape_partitions
 from urban_rag.resources import BdoiResource, ParquetStore
 from urban_rag.storage import clear_parquet, join
 
-GROUP = "bdoi"
+GROUP = "bronze_bdoi"
 
 #: The one file a partition is written to, under
-#: `neighborhood_buildings/<YYYY-MM-DD>/<neighborhood>/`.
+#: `bronze/neighborhood_buildings/<YYYY-MM-DD>/<neighborhood>/`.
 BUILDINGS_FILE = "buildings.parquet"
 
 #: https://www150.statcan.gc.ca/n1/en/catalogue/34260001
@@ -41,6 +42,7 @@ SOURCE_URL = "https://www150.statcan.gc.ca/n1/en/catalogue/34260001"
 
 
 @asset(
+    key_prefix=key_prefix("neighborhood_buildings"),
     partitions_def=scrape_partitions,
     deps=[
         AssetDep(
@@ -51,8 +53,9 @@ SOURCE_URL = "https://www150.statcan.gc.ca/n1/en/catalogue/34260001"
         )
     ],
     group_name=GROUP,
+    kinds={"geoparquet"},
     description=(
-        "Building footprints intersecting one borough, as "
+        "Building footprints intersecting one borough, as bronze/"
         "neighborhood_buildings/<YYYY-MM-DD>/<neighborhood>/buildings.parquet. "
         "Both of Quebec's BDOI extracts are downloaded once (cached on disk, "
         "keyed by filename), concatenated into a single layer, then cut down "

@@ -13,6 +13,11 @@ dependencies = [
     # Reads the CMHC survey workbook (urban_rag.cmhc); pandas needs it as the
     # xlsx engine and does not pull it in itself.
     "openpyxl>=3.1",
+    # CP-SAT, for the development program in urban_rag.program. Gross floor
+    # area is a footprint the model chooses times a storey count it also
+    # chooses, so the one constraint that matters is a product of two decision
+    # variables and an LP cannot express it. ~30 MB, no transitive weight.
+    "ortools>=9.10",
     "pandas>=2.2",
     # Reads linked zoning PDFs for the document corpus. Kept in the base install
     # because it is small and the asset can fetch PDFs without the encoder stack.
@@ -31,7 +36,32 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "dagster-dg-cli>=1.13", "moto[s3]>=5.0"]
+dev = [
+    "pytest>=8",
+    "dagster-dg-cli>=1.13",
+    "moto[s3]>=5.0",
+    # DuckDB's `vss` extension, as a wheel instead of a runtime download.
+    # `INSTALL vss` fetches ~11 MB from extensions.duckdb.org, which the
+    # TLS-inspecting proxy this project already accommodates elsewhere
+    # truncates at ~0.5 MB - for curl, requests and DuckDB alike - while
+    # answering `403` to the Range request that would let a client resume.
+    # PyPI is not inspected the same way, so this is the one route to the
+    # extension that works from behind it, and without it every test in
+    # tests/unit/test_store.py fails on a machine that cannot reach the
+    # extension repository.
+    #
+    # In `dev` rather than the base install: it is the *test suite* that needs
+    # vss present without a network, and `urban_rag.rag.vss` still installs it
+    # by its own routes at runtime when this is absent.
+    #
+    # Both packages come from https://github.com/santosh-d3vpl3x/duckdb_extensions,
+    # a third party repackaging DuckDB's own published binaries - not DuckDB
+    # Labs. `duckdb-extension-vss` pins `duckdb==` its own version exactly, so
+    # the two move in lockstep and a duckdb upgrade waits on a matching
+    # extension release.
+    "duckdb-extensions>=1.5.5",
+    "duckdb-extension-vss>=1.5.5",
+]
 # The retrieval stack. sentence-transformers pulls torch and transformers, which
 # together dominate the size of the environment, so it stays out of the base
 # install that the Dagster scrape only needs.

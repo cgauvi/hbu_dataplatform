@@ -1,9 +1,11 @@
 """Fetch the PDFs a scraped table links to, and cut them into chunks.
 
-The regulation tables carry no prose of their own: a column such as
-``EN_SAVOIR_PLUS`` holds an ``http://www1.ville.montreal.qc.ca/...`` link to
-the borough resolution PDF. The RAG corpus is therefore built from those
-linked files, not from the parquet cells.
+The regulation tables carry no prose of their own: ``VSP_REG_ZONE`` holds one
+``LIEN_GRILLE`` per zone, an ``http://www1.ville.montreal.qc.ca/.../zone/
+C01-001.pdf`` link to that zone's *grille des usages et des normes* - the PDF
+stating its authorised usages, heights, densities, implantation and margins.
+The RAG corpus is therefore built from those linked grids, not from the
+parquet cells.
 
 Kept free of Dagster and of the embedding stack: chunking takes a
 :class:`TokenRuler`, so tests exercise it with a trivial counter instead of
@@ -28,11 +30,17 @@ from urllib3.util.retry import Retry
 from urban_rag.spectrum import default_ca_bundle
 
 #: Tables whose URL column points at a document worth indexing, keyed by the
-#: file slug written by ``neighborhood_features``. Other tables carry links
-#: too, but to web pages (``Education__*``), photos (``Ruelle_verte__*``) or a
-#: single shared modality page (``Stationnement__*``, ``VSP_REG_PIIA``,
-#: ``VSP_REG_PPCMOI``), so they stay out until each is worth its own
-#: extractor.
+#: file slug written by ``neighborhood_features``. The zoning grids are the
+#: corpus: one PDF per zone, so a retrieved passage is already scoped to the
+#: parcel the map is asking about.
+#:
+#: Other tables carry links too, but to web pages (``Education__*``,
+#: ``VSP_REG_BATIMENT_*``), photos (``Ruelle_verte__*``) or a single shared
+#: modality page (``Stationnement__*``, ``VSP_REG_PIIA``). ``VSP_REG_PPCMOI``
+#: is the one genuine second corpus - 227 per-resolution PDFs behind
+#: ``EN_SAVOIR_PLUS`` - and is left out only because a project-specific
+#: resolution answers a different question than a zone's standing rules; add
+#: it here when that question is worth indexing.
 DOCUMENT_SOURCES: dict[str, str] = {
     "Reglement_urbanisme__VSP_REG_ZONE": "LIEN_GRILLE",
 }
@@ -107,9 +115,10 @@ def document_urls(frame, url_column: str) -> list[str]:
 class PdfFetcher:
     """Downloads linked PDFs, with an on-disk cache keyed by the URL.
 
-    These are municipal resolutions: once published they do not change, so a
-    cached copy is reused across scrape dates rather than pulled from the
-    city's web server again on every run.
+    A published zoning grid is reissued under a new file when the zone is
+    amended rather than edited in place, so a cached copy is reused across
+    scrape dates rather than pulled from the city's web server again on every
+    run.
     """
 
     def __init__(

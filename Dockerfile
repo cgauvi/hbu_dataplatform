@@ -122,10 +122,14 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 USER app
 
-# Same bake-in as the runtime stage, minus the project's own downloader, which
-# is not installed here. Non-fatal: the extension is fetched on first use if
-# this could not get it, and `make docker-test` is what needs it.
-RUN python -c "import duckdb; duckdb.connect().execute('INSTALL vss')" \
+# Same bake-in as the runtime stage, but from the wheel rather than over the
+# network: `--extra dev` above installs duckdb-extension-vss, so the binary is
+# already in the image and `INSTALL vss` - which some TLS-inspecting proxies
+# truncate mid-body - is not needed. The project's own downloader is not an
+# option here anyway, since `--no-install-project` means urban_rag is absent.
+# Non-fatal, and `make docker-test` is what needs it: every test in
+# tests/unit/test_store.py does.
+RUN python -c "from duckdb_extensions import import_extension; import_extension('vss')" \
  || echo "vss not baked in; it will be installed on first use"
 
 CMD ["sleep", "infinity"]

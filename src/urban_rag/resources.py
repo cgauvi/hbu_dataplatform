@@ -27,6 +27,11 @@ from urban_rag.cmhc import (
     CmhcReadingModeFetcher,
     default_survey_year,
 )
+from urban_rag.estimator import (
+    DEFAULT_BASE_URL as ESTIMATOR_BASE_URL,
+    MONTREAL_CITY_ID,
+    EstimatorClient,
+)
 from urban_rag.open_data import (
     DEFAULT_BASE_URL as OPEN_DATA_BASE_URL,
     CkanClient,
@@ -37,6 +42,7 @@ from urban_rag.infolot import (
     LOT_LAYER,
     InfolotClient,
 )
+from urban_rag.layers import Layer, layer_of
 from urban_rag.spectrum import DEFAULT_BASE_URL, SpectrumClient
 from urban_rag.storage import join
 
@@ -76,20 +82,30 @@ class SpectrumResource(ConfigurableResource):
 
 
 class ParquetStore(ConfigurableResource):
-    """The output tree: one prefix per asset, then scrape date, then borough.
+    """The output tree: medallion layer, then asset, then scrape date, then
+    borough.
 
-        <root>/spectrum_table_catalog/2026-08-20/
-        <root>/neighborhood_features/2026-08-20/VSMPE/
-        <root>/reference_neighborhoods/2026-08-20/
+        <root>/bronze/spectrum_table_catalog/2026-08-20/
+        <root>/bronze/neighborhood_features/2026-08-20/VSMPE/
+        <root>/silver/building_lot_intersections/2026-08-20/VSMPE/
+        <root>/gold/lot_profiles/2026-08-20/VSMPE/
 
     ``root_dir`` is `output_root()` in the real code location, so the same
     keys address a directory on disk or an ``s3://<S3_BUCKET>/`` prefix.
 
-    Keyed by asset name rather than by source system so that every asset owns
-    one prefix: a partition can be listed, copied or dropped without touching
-    what another asset wrote for the same day. The keys are bare values rather
-    than hive ``key=value`` pairs, so `neighborhood` and `scrape_date` are
-    written as columns instead of being recovered from the path.
+    The layer is looked up from `urban_rag.layers` rather than passed in, so a
+    caller reading an upstream asset's output does not have to know which layer
+    that asset lives in: `partition_dir(neighborhood_lots...)` finds `bronze/`
+    on its own, and moving an asset between layers is one edit in one table.
+    That table also supplies the asset's Dagster key prefix, which is what
+    keeps the key and the path from drifting apart.
+
+    Below the layer, keyed by asset name rather than by source system so that
+    every asset owns one prefix: a partition can be listed, copied or dropped
+    without touching what another asset wrote for the same day. The keys are
+    bare values rather than hive ``key=value`` pairs, so `neighborhood` and
+    `scrape_date` are written as columns instead of being recovered from the
+    path.
     """
 
     root_dir: str
@@ -97,10 +113,14 @@ class ParquetStore(ConfigurableResource):
     def partition_dir(
         self, asset: str, scrape_date: str, neighborhood: str | None = None
     ) -> str:
-        parts = [asset, scrape_date]
+        parts = [str(layer_of(asset)), asset, scrape_date]
         if neighborhood is not None:
             parts.append(neighborhood)
         return join(self.root_dir, *parts)
+
+    def layer_dir(self, layer: Layer) -> str:
+        """Everything one layer holds - the prefix to list, copy or drop."""
+        return join(self.root_dir, str(layer))
 
 
 class OpenDataResource(ConfigurableResource):
@@ -171,6 +191,52 @@ class InfolotResource(ConfigurableResource):
             request_delay_seconds=self.request_delay_seconds,
             max_retries=self.max_retries,
             batch_size=self.batch_size,
+            ca_bundle=self.ca_bundle,
+        )
+
+
+class EstimatorResource(ConfigurableResource):
+    """Connection settings for the ZEF construction cost estimator.
+
+    Same posture as `SpectrumResource`: paced and patient rather than fast.
+    Nothing here needs the speed - the cost table is one 16 kB script on
+    GitHub Pages, which is also why it has no download cache of its own the
+    way `BdoiResource` and `CmhcResource` do. Their sources are a published
+    extract and a published survey year, both final; this one is a live page
+    that its publisher can revise on any day, so every scrape date fetches it
+    again and keeps what it got.
+
+    `city` is config rather than a partition dimension because the guide's
+    city axis is not this pipeline's: nine markets are priced and one island
+    is modelled. Both assets that read this are named for Montreal, so
+    pointing it elsewhere is a thing to do deliberately - to diff Montreal
+    against Toronto in a notebook - and not a thing to leave set.
+    """
+
+    base_url: str = ESTIMATOR_BASE_URL
+    city: str = Field(
+        default=MONTREAL_CITY_ID,
+        description="`CITIES` id to take the rate column from: mtl, tor, van, ...",
+    )
+    timeout_seconds: float = 60.0
+    request_delay_seconds: float = Field(
+        default=0.25, description="Pause before every request, in seconds."
+    )
+    max_retries: int = 3
+    ca_bundle: str | None = Field(
+        default=None,
+        description=(
+            "PEM bundle to verify TLS against. Defaults to REQUESTS_CA_BUNDLE, "
+            "CURL_CA_BUNDLE or SSL_CERT_FILE, whichever is set."
+        ),
+    )
+
+    def client(self) -> EstimatorClient:
+        return EstimatorClient(
+            self.base_url,
+            timeout_seconds=self.timeout_seconds,
+            request_delay_seconds=self.request_delay_seconds,
+            max_retries=self.max_retries,
             ca_bundle=self.ca_bundle,
         )
 

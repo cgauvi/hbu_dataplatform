@@ -1,11 +1,28 @@
 """Opening a DuckDB connection with the `vss` extension available.
 
 `INSTALL vss` normally just works. Behind the TLS-inspecting proxy this project
-already accommodates elsewhere, it does not: DuckDB's own extension downloader
-is answered with `HTTP 403`, while `curl` and `requests` fetch the identical URL
-fine. So the fallback path downloads the extension binary through `requests`
-(which honours the corporate CA bundle, see `spectrum.default_ca_bundle`) and
-hands DuckDB a local file to install instead.
+already accommodates elsewhere, it does not, and not the way this module's
+first version assumed: `extensions.duckdb.org` answers `200` and then truncates
+the body at a few hundred KB of ~11 MB - for DuckDB's own downloader, `curl`
+and `requests` alike - while answering `403` to the Range request that would
+let a client resume. There is no client-side route around that.
+
+So there are three routes, tried in this order:
+
+1. **The wheel.** `duckdb-extension-vss` ships the extension binary that
+   DuckDB publishes, and PyPI is not inspected the way the extension
+   repository is, so this is the one route that works from behind that proxy.
+   It is in the `dev` extra (see `pyproject.toml`) because it is the test
+   suite that needs vss present without a network.
+2. **`INSTALL vss`**, DuckDB's own downloader, for a machine with clean egress
+   and no dev extra.
+3. **A download through `requests`**, which honours the corporate CA bundle
+   (see `spectrum.default_ca_bundle`), cached on disk and handed to DuckDB as a
+   local file. This is what covers a proxy that inspects TLS but does *not*
+   truncate.
+
+`URBAN_RAG_VSS_EXTENSION` short-circuits the third for a machine with no egress
+at all.
 """
 
 from __future__ import annotations
@@ -63,19 +80,27 @@ def connect(database: str | Path, *, read_only: bool = False) -> duckdb.DuckDBPy
 
 
 def load_vss(connection: duckdb.DuckDBPyConnection) -> None:
-    """Make `vss` available on `connection`, downloading it ourselves if needed."""
+    """Make `vss` available on `connection`, by whichever of the three routes works."""
     try:
         connection.execute("LOAD vss")
         return
     except duckdb.Error:
         pass  # not installed yet
 
+    # The wheel first: it is already on disk, so it costs no network at all.
+    try:
+        _install_packaged(connection)
+        connection.execute("LOAD vss")
+        return
+    except Exception as exc:
+        packaged_failure = exc
+
     try:
         connection.execute("INSTALL vss")
         connection.execute("LOAD vss")
         return
     except duckdb.Error as exc:
-        first_failure = exc
+        install_failure = exc
 
     try:
         path = _local_extension(connection)
@@ -84,12 +109,33 @@ def load_vss(connection: duckdb.DuckDBPyConnection) -> None:
     except Exception as exc:
         raise VSSUnavailable(
             "Could not install DuckDB's vss extension.\n"
-            f"  INSTALL vss    -> {_first_line(first_failure)}\n"
+            f"  packaged wheel -> {_first_line(packaged_failure)}\n"
+            f"  INSTALL vss    -> {_first_line(install_failure)}\n"
             f"  local install  -> {_first_line(exc)}\n"
-            "On a machine with no egress, download "
+            "`uv sync --extra dev` installs the wheel, which is the route that "
+            "works from behind a proxy that truncates the extension "
+            "repository.\n"
+            "On a machine with no egress at all, download "
             f"{_extension_url(_platform(connection))} elsewhere, gunzip it, and "
             f"set {EXTENSION_PATH_ENV} to the resulting .duckdb_extension file."
         ) from exc
+
+
+def _install_packaged(connection: duckdb.DuckDBPyConnection) -> None:
+    """Install the binary shipped by `duckdb-extension-vss`, if it is installed.
+
+    `import_extension` picks the build matching this connection's DuckDB
+    version and runs `INSTALL '<path>'` against the connection, so a plain
+    `LOAD vss` works afterwards - and keeps working for every later connection,
+    since installing writes into DuckDB's own extension directory.
+
+    Imported here rather than at module scope: both packages live in the `dev`
+    extra, and a base install has to fall through to the two download routes
+    rather than fail to import.
+    """
+    from duckdb_extensions import import_extension
+
+    import_extension("vss", con=connection)
 
 
 def _local_extension(connection: duckdb.DuckDBPyConnection) -> Path:

@@ -104,7 +104,7 @@ def test_catalog_lands_under_its_own_asset_prefix(tmp_path, store, spectrum):
     materialize_catalog(store)
 
     frame = pd.read_parquet(
-        tmp_path / "spectrum_table_catalog" / DATE / CATALOG_FILE
+        tmp_path / "bronze" / "spectrum_table_catalog" / DATE / CATALOG_FILE
     )
     assert frame["table"].tolist() == TABLES
     assert frame["namespace"].tolist() == ["19_VSMPE", "18_VM"]
@@ -116,7 +116,7 @@ def test_features_land_under_asset_date_and_neighborhood(tmp_path, store, spectr
 
     assert materialize_features(store).success
 
-    partition = tmp_path / "neighborhood_features" / DATE / NEIGHBORHOOD
+    partition = tmp_path / "bronze" / "neighborhood_features" / DATE / NEIGHBORHOOD
     assert [p.name for p in partition.glob("*.parquet")] == [f"{ZONE_SLUG}.parquet"]
 
     frame = gpd.read_parquet(partition / f"{ZONE_SLUG}.parquet")
@@ -139,7 +139,7 @@ def test_features_read_the_catalog_written_for_their_own_date(
 
 def test_a_rerun_replaces_the_previous_snapshot(tmp_path, store, spectrum):
     materialize_catalog(store)
-    partition = tmp_path / "neighborhood_features" / DATE / NEIGHBORHOOD
+    partition = tmp_path / "bronze" / "neighborhood_features" / DATE / NEIGHBORHOOD
     partition.mkdir(parents=True)
     stale = partition / "Reglement_urbanisme__VSP_REG_RETIRED.parquet"
     pd.DataFrame({"a": [1]}).to_parquet(stale)

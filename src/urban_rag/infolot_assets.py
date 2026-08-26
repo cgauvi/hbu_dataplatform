@@ -25,15 +25,16 @@ from urban_rag.infolot import (
     esri_polygon,
     normalize_dates,
 )
+from urban_rag.layers import key_prefix
 from urban_rag.open_data_assets import borough_boundary, reference_neighborhoods
 from urban_rag.partitions import scrape_partitions
 from urban_rag.resources import InfolotResource, ParquetStore
 from urban_rag.storage import clear_parquet, join
 
-GROUP = "infolot"
+GROUP = "bronze_infolot"
 
 #: The one file a partition is written to, under
-#: `neighborhood_lots/<YYYY-MM-DD>/<neighborhood>/`.
+#: `bronze/neighborhood_lots/<YYYY-MM-DD>/<neighborhood>/`.
 LOTS_FILE = "lots.parquet"
 
 #: Lot area in square metres, as computed by the service from the geometry.
@@ -42,6 +43,7 @@ AREA_COLUMN = "VA_SUPRF_LOT_CALCL"
 
 
 @asset(
+    key_prefix=key_prefix("neighborhood_lots"),
     partitions_def=scrape_partitions,
     deps=[
         AssetDep(
@@ -52,13 +54,15 @@ AREA_COLUMN = "VA_SUPRF_LOT_CALCL"
         )
     ],
     group_name=GROUP,
+    kinds={"geoparquet"},
     description=(
         "Every cadastral lot intersecting one borough, as "
-        "neighborhood_lots/<YYYY-MM-DD>/<neighborhood>/lots.parquet. Bounded "
-        "by that borough's boundary from reference_neighborhoods, so a lot "
-        "straddling a border belongs to both. Geometry is reprojected to "
-        "EPSG:4326 by the service. Source: Infolot, Registre foncier du "
-        "Quebec."
+        "bronze/neighborhood_lots/<YYYY-MM-DD>/<neighborhood>/lots.parquet. "
+        "Bounded by that borough's boundary from reference_neighborhoods, so a "
+        "lot straddling a border belongs to both - a bound on what is asked "
+        "for, not an interpretation of what comes back, which is why this "
+        "stays bronze. Geometry is reprojected to EPSG:4326 by the service. "
+        "Source: Infolot, Registre foncier du Quebec."
     ),
 )
 def neighborhood_lots(

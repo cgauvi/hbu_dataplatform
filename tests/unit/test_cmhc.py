@@ -1,9 +1,15 @@
-"""Offline tests for the CMHC survey client and the vacancy-rate asset.
+"""Offline tests for the CMHC survey client and the four assets over it.
 
 Nothing here touches the network: the workbook is built cell by cell with
 openpyxl in the shape the real `Quartier` sheet has - a title, a reference
-month, then a header row over five (rate, reliability) pairs - and the asset
-runs against a temp directory through `dagster.materialize`.
+month, then a header row over five (rate, reliability) pairs - and the assets
+run against a temp directory through `dagster.materialize`.
+
+The asset half is in two sections, because the pipeline is: bronze snapshots
+the Montreal slice as published, silver applies the `CMHC_QUARTIERS` crosswalk
+to that snapshot. The tests that matter most for the split are the ones that
+run only one of the two - `test_a_renamed_quartier_does_not_cost_the_bronze_
+snapshot` and `test_silver_without_its_bronze_snapshot_says_what_to_run`.
 """
 
 from __future__ import annotations
@@ -34,6 +40,8 @@ from urban_rag.cmhc_assets import (
     QUARTIERS_FILE,
     VACANCY_FILE,
     average_rents,
+    cmhc_rent_survey,
+    cmhc_vacancy_survey,
     vacancy_rates,
 )
 from urban_rag.partitions import CMHC_QUARTIERS, quartiers_for
@@ -409,7 +417,7 @@ def test_an_unmapped_borough_names_the_keys_it_knows():
         quartiers_for("Nowhere")
 
 
-# -- asset ------------------------------------------------------------------
+# -- assets: bronze snapshot, then the silver borough cut -------------------
 
 
 @pytest.fixture
@@ -426,14 +434,46 @@ def cache(tmp_path, workbook) -> str:
     return str(cache_dir)
 
 
-def run(store, cache, *, neighborhood=NEIGHBORHOOD):
+def run_vacancy_survey(store, cache):
+    """The bronze half: the Montreal slice of the workbook, no crosswalk."""
     return materialize(
-        [vacancy_rates],
-        partition_key=MultiPartitionKey({"date": DATE, "neighborhood": neighborhood}),
+        [cmhc_vacancy_survey],
+        partition_key=DATE,
         resources={
             "cmhc": CmhcResource(cache_dir=cache, survey_year=SURVEY_YEAR),
             "store": store,
         },
+    )
+
+
+def run(store, cache, *, neighborhood=NEIGHBORHOOD):
+    """Bronze then silver, which is the order the schedules run them in.
+
+    Silver reads the snapshot rather than CMHC, so the bronze run has to have
+    landed first. Running them in two calls rather than one is what the
+    pipeline actually does, and it is what makes a crosswalk failure visibly
+    cost only the second.
+    """
+    assert run_vacancy_survey(store, cache).success
+    return materialize(
+        [vacancy_rates],
+        partition_key=MultiPartitionKey({"date": DATE, "neighborhood": neighborhood}),
+        resources={"store": store},
+    )
+
+
+def materialize_silver_vacancy(store, *, neighborhood=NEIGHBORHOOD):
+    """Silver alone, for the cases where bronze is meant to already be there."""
+    return materialize(
+        [vacancy_rates],
+        partition_key=MultiPartitionKey({"date": DATE, "neighborhood": neighborhood}),
+        resources={"store": store},
+    )
+
+
+def read_bronze(store, asset_def, filename):
+    return pd.read_parquet(
+        join(store.partition_dir(asset_def.key.path[-1], DATE), filename)
     )
 
 
@@ -446,19 +486,25 @@ def read_output(store, filename, *, neighborhood=NEIGHBORHOOD):
     )
 
 
-def run_rents(store, cache, monkeypatch, *, neighborhood=NEIGHBORHOOD):
+def run_rent_survey(store, cache, monkeypatch):
     monkeypatch.setattr(
         CmhcResource,
         "reading_mode_fetcher",
         lambda self: FakeReadingModeFetcher(),
     )
     return materialize(
+        [cmhc_rent_survey],
+        partition_key=DATE,
+        resources={"cmhc": CmhcResource(cache_dir=cache), "store": store},
+    )
+
+
+def run_rents(store, cache, monkeypatch, *, neighborhood=NEIGHBORHOOD):
+    assert run_rent_survey(store, cache, monkeypatch).success
+    return materialize(
         [average_rents],
         partition_key=MultiPartitionKey({"date": DATE, "neighborhood": neighborhood}),
-        resources={
-            "cmhc": CmhcResource(cache_dir=cache),
-            "store": store,
-        },
+        resources={"store": store},
     )
 
 
@@ -471,14 +517,99 @@ def read_rent_output(store, filename, *, neighborhood=NEIGHBORHOOD):
     )
 
 
+# -- bronze -----------------------------------------------------------------
+
+
+def test_the_survey_snapshot_lands_under_bronze_by_date_alone(store, cache):
+    assert run_vacancy_survey(store, cache).success
+
+    path = store.partition_dir(cmhc_vacancy_survey.key.path[-1], DATE)
+    assert "/bronze/cmhc_vacancy_survey/" in path
+    # No neighborhood dimension: one workbook read serves every borough.
+    assert not path.endswith(NEIGHBORHOOD)
+
+    snapshot = read_bronze(store, cmhc_vacancy_survey, QUARTIERS_FILE)
+    assert set(snapshot["scrape_date"]) == {DATE}
+    assert set(snapshot["survey_year"]) == {SURVEY_YEAR}
+    assert set(snapshot["survey_period"]) == {"octobre 2023"}
+
+
+def test_bronze_keeps_every_montreal_quartier_and_the_subtotal(store, cache):
+    """Bronze is the survey as published - the crosswalk is not its business.
+
+    It holds quartiers no borough in `CMHC_QUARTIERS` claims, and the `Total`
+    subtotal rows the average must not double-count. Both are silver's to
+    filter; keeping them here is what lets a crosswalk fix be re-run against a
+    snapshot instead of a re-download.
+    """
+    run_vacancy_survey(store, cache)
+    snapshot = read_bronze(store, cmhc_vacancy_survey, QUARTIERS_FILE)
+
+    assert "Total" in set(snapshot["quartier"])
+    assert set(snapshot["province"]) == {"Qc"}
+    assert set(snapshot["centre"]) == {"Montréal"}
+    # Wider than the one borough the silver asset cuts out of it.
+    assert set(quartiers_for(NEIGHBORHOOD)) < set(snapshot["quartier"])
+    # And it says nothing about boroughs at all.
+    assert "neighborhood" not in snapshot.columns
+
+
+def test_a_renamed_quartier_does_not_cost_the_bronze_snapshot(store, cache):
+    """The split's whole point: a respelling upstream is a silver failure.
+
+    Before it, the same rename failed the day's scrape and left nothing on
+    disk to diagnose it with.
+    """
+    renamed = [
+        (zone, "Parc-Ext." if q == "Parc-Extension" else q, *rest)
+        for zone, q, *rest in ROWS
+    ]
+    path = Path(cache) / filename_for(SURVEY_YEAR)
+    path.unlink()
+    write_workbook(path, rows=renamed)
+
+    assert run_vacancy_survey(store, cache).success
+    snapshot = read_bronze(store, cmhc_vacancy_survey, QUARTIERS_FILE)
+    assert "Parc-Ext." in set(snapshot["quartier"])
+
+    with pytest.raises(Failure, match="publishes no quartier named"):
+        materialize_silver_vacancy(store)
+
+
+def test_silver_without_its_bronze_snapshot_says_what_to_run(store):
+    with pytest.raises(Failure, match="materialize cmhc_vacancy_survey"):
+        materialize_silver_vacancy(store)
+
+
+def test_the_rent_snapshot_lands_under_bronze_by_date_alone(store, cache, monkeypatch):
+    assert run_rent_survey(store, cache, monkeypatch).success
+
+    path = store.partition_dir(cmhc_rent_survey.key.path[-1], DATE)
+    assert "/bronze/cmhc_rent_survey/" in path
+
+    snapshot = read_bronze(store, cmhc_rent_survey, QUARTIER_AVERAGE_RENTS_FILE)
+    assert set(snapshot["centre"]) == {"Montréal"}
+    assert set(snapshot["survey_year"]) == {2025}
+    assert "neighborhood" not in snapshot.columns
+
+
+# -- silver -----------------------------------------------------------------
+
+
 def test_rates_land_under_date_then_neighborhood(store, cache):
     assert run(store, cache).success
+
+    assert "/silver/vacancy_rates/" in store.partition_dir(
+        vacancy_rates.key.path[-1], DATE, NEIGHBORHOOD
+    )
 
     averages = read_output(store, VACANCY_FILE)
     # The full grid, published or not: 3 dwelling types x 5 bedroom classes.
     assert len(averages) == 15
     assert set(averages["neighborhood"]) == {NEIGHBORHOOD}
     assert set(averages["scrape_date"]) == {DATE}
+    # Carried down from the snapshot's own columns rather than from the
+    # resource: a silver partition describes the snapshot it actually read.
     assert set(averages["survey_year"]) == {SURVEY_YEAR}
     assert set(averages["survey_period"]) == {"octobre 2023"}
 
@@ -524,7 +655,8 @@ def test_the_quartier_rows_behind_the_average_are_kept(store, cache):
     run(store, cache)
     quartiers = read_output(store, QUARTIERS_FILE)
 
-    # 3 quartiers x 3 dwelling types x 5 bedroom classes.
+    # 3 quartiers x 3 dwelling types x 5 bedroom classes - this borough's
+    # slice of the snapshot, not the snapshot.
     assert len(quartiers) == 45
     assert set(quartiers["centre"]) == {"Montréal"}
     assert set(quartiers["province"]) == {"Qc"}
@@ -549,19 +681,6 @@ def test_a_respelled_quartier_is_averaged_and_relabelled(store, cache, tmp_path)
     # Still both quartiers, under the crosswalk's own spelling.
     assert overall["num_quartiers"] == 2
     assert overall["averaged_quartiers"] == "Parc-Extension, Villeray"
-
-
-def test_a_renamed_quartier_fails_the_partition(store, cache, tmp_path, monkeypatch):
-    renamed = [
-        (zone, "Parc-Ext." if q == "Parc-Extension" else q, *rest)
-        for zone, q, *rest in ROWS
-    ]
-    path = Path(cache) / filename_for(SURVEY_YEAR)
-    path.unlink()
-    write_workbook(path, rows=renamed)
-
-    with pytest.raises(Failure, match="publishes no quartier named"):
-        run(store, cache)
 
 
 def test_a_rerun_replaces_the_partition(store, cache):
@@ -613,7 +732,7 @@ def test_average_rent_quartier_rows_are_kept(store, cache, monkeypatch):
 
     # 3 quartiers x 5 bedroom classes.
     assert len(quartiers) == 15
-    assert set(quartiers["centre"]) == {"Montr\u00e9al"}
+    assert set(quartiers["centre"]) == {"Montréal"}
     assert set(quartiers["neighborhood"]) == {NEIGHBORHOOD}
     assert set(quartiers["quartier"]) == set(quartiers_for(NEIGHBORHOOD))
 
