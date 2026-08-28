@@ -1,21 +1,28 @@
 """Loading the latest lots, buildings and map features into Postgres/PostGIS,
 the spatial joins between them, and the per-lot profile they collapse into.
 
-`rag.lots` and `rag.buildings` are owned by hbu_infra (see its README and
-sql/002_spatial.sql) - this module only ever DELETEs/INSERTs into tables it
-assumes already exist, the same ownership split `rag.chunks`/`rag_assets.py`
-draws the other way: hbu_infra creates the tables, this repo fills them.
+Every table named here is owned by hbu_infra (see its README and sql/) - this
+module only ever writes into tables it assumes already exist, the same
+ownership split `rag.chunks`/`rag_assets.py` draws the other way: hbu_infra
+creates the tables, this repo fills them.
 
-`rag.building_lots` is the derived join: for each (building, lot) pair whose
-footprints intersect, one row holding the *clipped* intersection geometry and
-its share of the building's area - so a warehouse straddling three lots is
-assigned to each of them in proportion to the footprint actually inside it,
-rather than to whichever lot its centroid happens to land on. Computed with
-`ST_Intersection` in Postgres rather than in GeoPandas: by the time this runs,
-PostGIS already holds both layers loaded and GiST-indexed, and the join is
-exactly the kind of thing that index is for.
+**Two schemas, and the line between them is the medallion layer.** `rag` holds
+the working set the joins below are computed *over*: `rag.lots`,
+`rag.buildings` and `rag.features`, loaded from the bronze snapshots by
+`load_lots`/`load_buildings`/`load_features`. `silver` and `gold` hold what the
+joins *produce*, one table per asset, and every write to them goes through
+`urban_rag.warehouse` - see that module for the partitioning and the upsert.
 
-`rag.lot_features` is the other derived join, and the one the corpus hangs
+`silver.building_lot_intersections` is the first derived join: for each
+(building, lot) pair whose footprints intersect, one row holding the *clipped*
+intersection geometry and its share of the building's area - so a warehouse
+straddling three lots is assigned to each of them in proportion to the
+footprint actually inside it, rather than to whichever lot its centroid happens
+to land on. Computed with `ST_Intersection` in Postgres rather than in
+GeoPandas: by the time this runs, PostGIS already holds both layers loaded and
+GiST-indexed, and the join is exactly the kind of thing that index is for.
+
+`silver.lot_features` is the other derived join, and the one the corpus hangs
 off. `rag.chunks.feature_ids` records which map features cite each indexed
 PDF, so a lot's documents are whatever the features covering it cite - but
 there is no id that gets from a lot to a feature. The lots come from Infolot,
@@ -23,50 +30,55 @@ Quebec's cadastre, keyed by `NO_LOT`; the features come from Montreal's
 Spectrum service, keyed by `NUMERO_COMPLET`, and neither publisher carries the
 other's key. Geometry is the only thing the two share, so the join is spatial
 by necessity rather than by choice - see `compute_lot_features`, and
-hbu_infra's sql/005_lot_features.sql for the table.
+hbu_infra's sql/005_silver_lot_features.sql for the table.
 
-`rag.lot_frontage` is the third derived join, and the one that answers "how
-much of this lot faces a street". Its right-hand side is `rag.streets`, the
-city's *geobase double* - one line per side of street, drawn along the curb -
-and the measure is taken on the lot's `ST_Boundary`, not on the lot itself: a
-lot is a polygon, and `ST_Length` of a polygon is zero, so intersecting the
-two solids and measuring the result would report nothing at all. See
-`compute_lot_frontage` for the buffer this hangs on, and hbu_infra's
-sql/007_streets.sql and sql/008_lot_frontage.sql for the two tables.
+`silver.lot_frontage` is the third derived join, and the one that answers "how
+much of this lot faces a street". Its right-hand side is
+`silver.neighborhood_streets`, the city's *geobase double* - one line per side
+of street, drawn along the curb - and the measure is taken on the lot's
+`ST_Boundary`, not on the lot itself: a lot is a polygon, and `ST_Length` of a
+polygon is zero, so intersecting the two solids and measuring the result would
+report nothing at all. See `compute_lot_frontage` for the buffer this hangs on,
+and hbu_infra's sql/007_silver_streets.sql and sql/008_silver_lot_frontage.sql
+for the two tables.
 
-`rag.lot_profiles` is where the three joins above come back together, at the
+`gold.lot_profiles` is where the three joins above come back together, at the
 grain they are all about: one row per lot, carrying how many buildings stand on
 it, the two street edges it fronts on, and the document that governs it -
-alongside three jsonb columns its caller hands in from the geoparquet tree,
-since `silver/lot_zoning_envelopes`, `silver/vacancy_rates` and
-`silver/average_rents` are never loaded into Postgres at all. It
-replaces an earlier `rag.vacant_lots`, which read the building join the other
-way round and kept only the parcels it found nothing on - a table that could
-answer "where is the empty land" and nothing else, because the lots its WHERE
-clause dropped were the ones a reader could no longer see. Keeping every lot
-and carrying `has_building` costs one boolean and makes that question a filter;
-see `compute_lot_profiles`.
+alongside four jsonb columns its caller hands in from the geoparquet tree at a
+grain no table here holds. It replaces an earlier `rag.vacant_lots`, which read
+the building join the other way round and kept only the parcels it found
+nothing on - a table that could answer "where is the empty land" and nothing
+else, because the lots its WHERE clause dropped were the ones a reader could no
+longer see. Keeping every lot and carrying `has_building` costs one boolean and
+makes that question a filter; see `compute_lot_profiles`.
 
-None of this is a live view. A partition is refreshed by deleting and
-reinserting its (neighborhood, scrape_date) rows, the same snapshot semantics
-the geoparquet tree already has - not by upserting row by row, because BDOI's
-buildings carry no key that survives a re-scrape the way Infolot's lot number
-does. "Latest" therefore falls out for free: whatever is in Postgres for a
-neighborhood *is* its latest scrape, because a new load always deletes the old
-one for that same neighborhood and date first, and the Dagster asset that
-calls this only ever loads the partition it was just handed.
+None of this is a live view, and a partition is still a snapshot - but it is
+now refreshed by an upsert followed by a prune rather than by a delete followed
+by an insert. The difference is what a reader querying mid-load sees: with the
+old order, a borough's rows were simply gone for the length of the recompute.
+`urban_rag.warehouse` documents the trade in full; the part that matters here
+is that a key which does not survive a re-scrape - BDOI publishes no building
+id, unlike Infolot's lot number - degrades to exactly the delete-and-insert it
+always was, because every old row is pruned and every new one inserted.
+"Latest" still falls out for free: whatever is in the table for a neighborhood
+*is* its latest scrape, and the Dagster asset that calls this only ever writes
+the partition it was just handed.
 """
 
 from __future__ import annotations
 
 import json
 from contextlib import contextmanager
+from datetime import date
 from typing import TYPE_CHECKING, Any, Iterator, Sequence
 
 import geopandas as gpd
 import pandas as pd
 
+from urban_rag import warehouse
 from urban_rag.rag.pgvector import PgSettings, PostgresUnavailable
+from urban_rag.warehouse import MissingRelation  # noqa: F401  (re-exported)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, psycopg is imported lazily
     from psycopg import Connection
@@ -104,6 +116,40 @@ def connect(settings: PgSettings) -> Iterator["Connection"]:
         ) from exc
     with connection:
         yield connection
+
+
+#: The `rag` working set, and the hbu_infra file that creates all three.
+#:
+#: The only relations this module touches that nothing else already checks:
+#: every silver and gold write goes through `urban_rag.warehouse`, which calls
+#: `require_table` on its own target before it writes, while these three are
+#: loaded by the raw DELETE/COPY/INSERT in `_replace_partition` and
+#: `load_features` below. One source file for all three, because they are one
+#: file's worth of DDL - a database missing `rag.lots` is missing the other two,
+#: and naming them one failed run at a time is two runs too many.
+WORKING_SET_RELATIONS: tuple[tuple[str, str], ...] = (
+    ("rag.lots", "sql/002_spatial.sql"),
+    ("rag.buildings", "sql/002_spatial.sql"),
+    ("rag.features", "sql/002_spatial.sql"),
+)
+
+
+def require_working_set(connection: "Connection") -> None:
+    """Raise `MissingRelation` unless the `rag` working set is there.
+
+    Called once, before the first load, rather than from inside each loader:
+    the three tables come from one file, so reporting them together is
+    reporting the one thing that is actually wrong. Without it the first
+    `DELETE FROM rag.lots` fails as a bare `psycopg.errors.UndefinedTable` -
+    the identifier that failed to resolve, and nothing about which repo owns it
+    or what to apply - and it fails only after the partition's parquet has been
+    read, repaired and checked, so the run pays for all of that first.
+
+    The same check `compute_lot_profiles` makes with `_LOT_PROFILE_RELATIONS`,
+    moved ahead of the loads that have to land before any of those relations
+    can be read.
+    """
+    _require_relations(connection.cursor(), WORKING_SET_RELATIONS)
 
 
 def load_lots(
@@ -160,34 +206,77 @@ def load_streets(
     *,
     neighborhood: str,
     scrape_date: str,
-    street_id_column: str = "COTE_RUE_ID",
-    street_name_column: str = "NOM_VOIE",
-) -> int:
-    """Replace this borough's rows in `rag.streets` with ``frame``.
+) -> dict[str, int]:
+    """Publish this borough's street sides to `silver.neighborhood_streets`.
 
     ``frame`` is one borough's slice of the geobase double, so the rows are
     street *sides* rather than centre lines: `COTE_RUE_ID` is unique across the
     island (91,546 of 91,546 in the first snapshot), which makes it as real a
-    natural key as Infolot's lot number, and the same `ON CONFLICT ... DO
-    NOTHING` applies for the same reason.
+    natural key as Infolot's lot number - and it is what the upsert conflicts
+    on, inside the (scrape_date, neighborhood) partition.
 
-    ``street_name_column`` gets a column of its own rather than a slot in
-    `attributes` because it is what a frontage row is read *for* - "22 m on
-    Rue Jarry" is the answer, and digging it back out of jsonb at every read
-    would be work done in the wrong place. The measure is `ST_Length` rather
-    than `ST_Area`: these are lines, and a line has no area to record.
+    The one loader here that is a plain `urban_rag.warehouse` call and nothing
+    else, because it is the one whose rows arrive as a frame rather than out of
+    a join computed in the database. `NOM_VOIE` becomes `street_name` and
+    `COTE_RUE_ID` becomes `cote_rue_id` through the table's own column map;
+    `length_m` is measured in SQL below rather than in the frame, since the
+    frame's `length_in_borough_m` is computed in a projected CRS by the asset
+    and this column is the geography measure every other table here uses.
+    Everything else the layer publishes lands in `attributes`.
+
+    The geometry is forced to `MultiLineString` on the way, because the column
+    is typed one and a typmod rejects a bare `LineString`. `_replace_partition`
+    used to do this with `ST_Multi` in its INSERT; `urban_rag.warehouse` has no
+    such step, on purpose - it writes what it is given and a cast per table
+    would be a special case in the one place that has none. The knowledge that
+    this column is Multi lives here, where the table is known.
     """
-    return _replace_partition(
+    frame = frame.assign(**{"length_m": _length_m(frame)}).set_geometry(
+        frame.geometry.map(_as_multi_line)
+    )
+    return warehouse.upsert_frame(
         connection,
-        "rag.streets",
+        "neighborhood_streets",
         frame,
         neighborhood=neighborhood,
         scrape_date=scrape_date,
-        natural_key_column=street_id_column,
-        natural_key_target="cote_rue_id",
-        extra_text_columns=(("street_name", street_name_column),),
-        measure_column="length_m",
-        measure_function="ST_Length",
+    )
+
+
+def _as_multi_line(geometry: Any):
+    """One street side as the `MultiLineString` its column is typed as.
+
+    A side clipped at a borough line comes back as either shape - one piece or
+    two - and `geometry(MultiLineString, 4326)` rejects the single one by
+    typmod rather than promoting it.
+    """
+    from shapely.geometry import MultiLineString
+
+    if geometry is None or geometry.is_empty:
+        return geometry
+    return (
+        geometry
+        if geometry.geom_type == "MultiLineString"
+        else MultiLineString([geometry])
+    )
+
+
+def _length_m(frame: gpd.GeoDataFrame) -> pd.Series:
+    """Each row's length in metres, measured the way PostGIS would.
+
+    `GeoSeries.length` on a 4326 frame is in *degrees*, which is not a length.
+    The geodesic measure is what `ST_Length(geography(...))` returns and what
+    every measure in this module is stated in, so the two agree whichever side
+    computed them - and pyproj's `Geod` is what geopandas itself reprojects
+    with, so it is already installed wherever this runs.
+    """
+    from pyproj import Geod
+
+    geod = Geod(ellps="WGS84")
+    return frame.geometry.map(
+        lambda geometry: None
+        if geometry is None or geometry.is_empty
+        else abs(geod.geometry_length(geometry))
     )
 
 
@@ -262,6 +351,7 @@ def load_features(
     )
 
     inserted = 0
+    partition_date = _as_date(scrape_date)
     statement = (
         f"COPY {staging} (feature_id, source_table, neighborhood, scrape_date, "
         "attributes, geom) FROM STDIN (FORMAT BINARY)"
@@ -280,7 +370,7 @@ def load_features(
                     str(feature_id),
                     source_table,
                     neighborhood,
-                    scrape_date,
+                    partition_date,
                     Jsonb(attrs[index]),
                     shapely.wkb.dumps(geometry),
                 ]
@@ -310,29 +400,43 @@ def compute_intersections(
     neighborhood: str,
     scrape_date: str,
 ) -> dict[str, object]:
-    """(Re)compute `rag.building_lots` for one (neighborhood, scrape_date).
+    """(Re)compute `silver.building_lot_intersections` for one partition.
 
     Assumes `load_lots`/`load_buildings` already landed this partition's rows
     in `rag.lots`/`rag.buildings` - the join is `ON l.neighborhood =
     b.neighborhood AND l.scrape_date = b.scrape_date`, so a stale lot from a
     different date simply cannot match.
+
+    Published through `urban_rag.warehouse.upsert_select` rather than inserted
+    directly: the rows are produced in the database and never pass through
+    Python, but the write still has to be the upsert-then-prune every other
+    table here gets. `building_uid` is a bigserial `load_buildings` mints
+    again on each load, so in practice a re-run of a partition prunes all of
+    it and inserts all of it - which is what this table has always done, now
+    said once in one place instead of here.
     """
     cursor = connection.cursor()
-    cursor.execute(
-        "DELETE FROM rag.building_lots WHERE neighborhood = %s AND scrape_date = %s::date",
-        [neighborhood, scrape_date],
-    )
-    cursor.execute(
+    result = warehouse.upsert_select(
+        cursor,
+        "building_lot_intersections",
+        (
+            "scrape_date",
+            "neighborhood",
+            "building_uid",
+            "lot_uid",
+            "lot_number",
+            "building_area_m2",
+            "intersection_area_m2",
+            "pct_of_building",
+            "geom",
+        ),
         """
-        INSERT INTO rag.building_lots (
-            building_uid, lot_uid, neighborhood, scrape_date,
-            building_area_m2, intersection_area_m2, pct_of_building, geom
-        )
         SELECT
+            b.scrape_date,
+            b.neighborhood,
             b.building_uid,
             l.lot_uid,
-            b.neighborhood,
-            b.scrape_date,
+            l.lot_number,
             ST_Area(geography(b.geom)),
             ST_Area(geography(clipped.geom)),
             CASE WHEN ST_Area(geography(b.geom)) > 0
@@ -356,20 +460,22 @@ def compute_intersections(
           AND ST_Dimension(clipped.geom) = 2
         """,
         {"neighborhood": neighborhood, "scrape_date": scrape_date},
+        neighborhood=neighborhood,
+        scrape_date=scrape_date,
     )
-    inserted = max(cursor.rowcount, 0)
 
     cursor.execute(
         """
         SELECT count(DISTINCT building_uid), COALESCE(sum(intersection_area_m2), 0)
-        FROM rag.building_lots
+        FROM silver.building_lot_intersections
         WHERE neighborhood = %s AND scrape_date = %s::date
         """,
         [neighborhood, scrape_date],
     )
     buildings_matched, total_area_m2 = cursor.fetchone()
     return {
-        "intersections": inserted,
+        "intersections": result["upserted"],
+        "pruned": result["pruned"],
         "buildings_matched": int(buildings_matched),
         "total_area_m2": float(total_area_m2),
     }
@@ -381,7 +487,7 @@ def compute_lot_features(
     neighborhood: str,
     scrape_date: str,
 ) -> dict[str, object]:
-    """(Re)compute `rag.lot_features` for one (neighborhood, scrape_date).
+    """(Re)compute `silver.lot_features` for one (neighborhood, scrape_date).
 
     The join that gives a lot its documents, and the reason it has to be a
     spatial one: the lots come from Infolot, Quebec's cadastre, keyed by
@@ -403,23 +509,31 @@ def compute_lot_features(
     to an area and excluding it would mean excluding those layers entirely.
     """
     cursor = connection.cursor()
-    cursor.execute(
-        "DELETE FROM rag.lot_features WHERE neighborhood = %s AND scrape_date = %s::date",
-        [neighborhood, scrape_date],
-    )
-    cursor.execute(
+    result = warehouse.upsert_select(
+        cursor,
+        "lot_features",
+        (
+            "scrape_date",
+            "neighborhood",
+            "lot_uid",
+            "source_table",
+            "feature_id",
+            "lot_number",
+            "feature_uid",
+            "lot_area_m2",
+            "overlap_area_m2",
+            "pct_of_lot",
+            "geom",
+        ),
         """
-        INSERT INTO rag.lot_features (
-            lot_uid, feature_uid, source_table, feature_id, neighborhood,
-            scrape_date, lot_area_m2, overlap_area_m2, pct_of_lot, geom
-        )
         SELECT
+            l.scrape_date,
+            l.neighborhood,
             l.lot_uid,
-            f.feature_uid,
             f.source_table,
             f.feature_id,
-            l.neighborhood,
-            l.scrape_date,
+            l.lot_number,
+            f.feature_uid,
             ST_Area(geography(l.geom)),
             ST_Area(geography(clipped.geom)),
             CASE WHEN ST_Area(geography(l.geom)) > 0
@@ -443,14 +557,15 @@ def compute_lot_features(
           AND (ST_Dimension(clipped.geom) = 2 OR ST_Dimension(f.geom) < 2)
         """,
         {"neighborhood": neighborhood, "scrape_date": scrape_date},
+        neighborhood=neighborhood,
+        scrape_date=scrape_date,
     )
-    inserted = max(cursor.rowcount, 0)
 
     cursor.execute(
         """
         SELECT count(DISTINCT lot_uid), count(DISTINCT feature_uid),
                count(DISTINCT source_table)
-        FROM rag.lot_features
+        FROM silver.lot_features
         WHERE neighborhood = %s AND scrape_date = %s::date
         """,
         [neighborhood, scrape_date],
@@ -467,7 +582,8 @@ def compute_lot_features(
     (num_lots,) = cursor.fetchone()
 
     return {
-        "lot_features": inserted,
+        "lot_features": result["upserted"],
+        "pruned": result["pruned"],
         "lots_matched": int(lots_matched),
         "features_matched": int(features_matched),
         "layers": int(layers),
@@ -485,6 +601,17 @@ def compute_lot_features(
 DEFAULT_FRONTAGE_BUFFER_M = 3.0
 
 
+#: The relations `compute_lot_frontage` *reads*, and the hbu_infra file that
+#: creates each. `silver.lot_frontage` is deliberately not among them: it is
+#: the target, and `warehouse.upsert_select` checks that one for itself. These
+#: two are the ones it cannot see, and the SELECT would otherwise fail on
+#: whichever the planner resolved first.
+_FRONTAGE_RELATIONS: tuple[tuple[str, str], ...] = (
+    ("rag.lots", "sql/002_spatial.sql"),
+    ("silver.neighborhood_streets", "sql/007_silver_streets.sql"),
+)
+
+
 def compute_lot_frontage(
     connection: "Connection",
     *,
@@ -492,7 +619,7 @@ def compute_lot_frontage(
     scrape_date: str,
     buffer_m: float = DEFAULT_FRONTAGE_BUFFER_M,
 ) -> dict[str, object]:
-    """(Re)compute `rag.lot_frontage` for one (neighborhood, scrape_date).
+    """(Re)compute `silver.lot_frontage` for one (neighborhood, scrape_date).
 
     How much of a lot faces a street, and which street. A lot with 30 m on a
     boulevard is a different development site from the one behind it with 6 m
@@ -531,29 +658,38 @@ def compute_lot_frontage(
     the race that asset's docstring exists to describe.
     """
     cursor = connection.cursor()
-    cursor.execute(
-        "DELETE FROM rag.lot_frontage WHERE neighborhood = %s AND scrape_date = %s::date",
-        [neighborhood, scrape_date],
-    )
-    cursor.execute(
+    _require_relations(cursor, _FRONTAGE_RELATIONS)
+    result = warehouse.upsert_select(
+        cursor,
+        "lot_frontage",
+        (
+            "scrape_date",
+            "neighborhood",
+            "lot_uid",
+            "cote_rue_id",
+            "lot_number",
+            "street_name",
+            "buffer_m",
+            "frontage_m",
+            "lot_perimeter_m",
+            "pct_of_perimeter",
+            "frontage_rank",
+            "geom",
+        ),
         """
         WITH buffered AS (
             -- Buffered once per street side rather than once per candidate
             -- pair, and in metres through `geography` - see the docstring.
-            SELECT street_uid, cote_rue_id, street_name,
+            SELECT cote_rue_id, street_name,
                    ST_Buffer(geography(geom), %(buffer_m)s::double precision)::geometry AS geom
-            FROM rag.streets
+            FROM silver.neighborhood_streets
             WHERE neighborhood = %(neighborhood)s
               AND scrape_date = %(scrape_date)s::date
         )
-        INSERT INTO rag.lot_frontage (
-            lot_uid, street_uid, cote_rue_id, street_name, neighborhood,
-            scrape_date, buffer_m, frontage_m, lot_perimeter_m,
-            pct_of_perimeter, frontage_rank, geom
-        )
         SELECT
-            lot_uid, street_uid, cote_rue_id, street_name, neighborhood,
-            scrape_date, %(buffer_m)s::double precision, frontage_m, lot_perimeter_m,
+            scrape_date, neighborhood, lot_uid, cote_rue_id, lot_number,
+            street_name,
+            %(buffer_m)s::double precision, frontage_m, lot_perimeter_m,
             CASE WHEN lot_perimeter_m > 0
                  THEN 100.0 * frontage_m / lot_perimeter_m
                  ELSE 0.0
@@ -562,19 +698,19 @@ def compute_lot_frontage(
             geom
         FROM (
             SELECT
+                l.scrape_date,
+                l.neighborhood,
                 l.lot_uid,
-                s.street_uid,
+                l.lot_number,
                 s.cote_rue_id,
                 s.street_name,
-                l.neighborhood,
-                l.scrape_date,
                 ST_Length(geography(faces.geom)) AS frontage_m,
                 ST_Length(geography(ST_Boundary(l.geom))) AS lot_perimeter_m,
                 row_number() OVER (
                     PARTITION BY l.lot_uid
-                    -- street_uid only to make the order total, so a re-run
+                    -- cote_rue_id only to make the order total, so a re-run
                     -- ranks two exactly equal frontages the same way twice.
-                    ORDER BY ST_Length(geography(faces.geom)) DESC, s.street_uid
+                    ORDER BY ST_Length(geography(faces.geom)) DESC, s.cote_rue_id
                 ) AS frontage_rank,
                 faces.geom
             FROM rag.lots l
@@ -602,14 +738,15 @@ def compute_lot_frontage(
             "scrape_date": scrape_date,
             "buffer_m": float(buffer_m),
         },
+        neighborhood=neighborhood,
+        scrape_date=scrape_date,
     )
-    inserted = max(cursor.rowcount, 0)
 
     cursor.execute(
         """
-        SELECT count(DISTINCT lot_uid), count(DISTINCT street_uid),
+        SELECT count(DISTINCT lot_uid), count(DISTINCT cote_rue_id),
                COALESCE(sum(frontage_m), 0), COALESCE(max(frontage_m), 0)
-        FROM rag.lot_frontage
+        FROM silver.lot_frontage
         WHERE neighborhood = %s AND scrape_date = %s::date
         """,
         [neighborhood, scrape_date],
@@ -625,13 +762,15 @@ def compute_lot_frontage(
     )
     (num_lots,) = cursor.fetchone()
     cursor.execute(
-        "SELECT count(*) FROM rag.streets WHERE neighborhood = %s AND scrape_date = %s::date",
+        "SELECT count(*) FROM silver.neighborhood_streets "
+        "WHERE neighborhood = %s AND scrape_date = %s::date",
         [neighborhood, scrape_date],
     )
     (num_streets,) = cursor.fetchone()
 
     return {
-        "frontages": inserted,
+        "frontages": result["upserted"],
+        "pruned": result["pruned"],
         "lots_matched": int(lots_matched),
         "streets_matched": int(streets_matched),
         "total_frontage_m": float(total_frontage_m),
@@ -640,15 +779,6 @@ def compute_lot_frontage(
         "num_streets": int(num_streets),
         "buffer_m": float(buffer_m),
     }
-
-
-class MissingRelation(RuntimeError):
-    """A table or view a computation here reads has not been created yet.
-
-    Distinct from letting psycopg raise `relation "x" does not exist`: every
-    table this module touches belongs to hbu_infra, so the useful message names
-    the .sql file to apply rather than the identifier that failed to resolve.
-    """
 
 
 #: The categories `compute_lot_profiles` sorts a lot into. Kept here rather
@@ -675,14 +805,14 @@ DEFAULT_MAX_BUILT_AREA_M2 = 30.0
 #: rather than on whichever identifier the planner happened to resolve first.
 _LOT_PROFILE_RELATIONS: tuple[tuple[str, str], ...] = (
     ("rag.lots", "sql/002_spatial.sql"),
-    ("rag.building_lots", "sql/004_building_lots.sql"),
-    ("rag.lot_frontage", "sql/008_lot_frontage.sql"),
+    ("silver.building_lot_intersections", "sql/004_silver_building_lots.sql"),
+    ("silver.lot_frontage", "sql/008_silver_lot_frontage.sql"),
     # A view, and the one most likely to be missing: 006 carries a
     # `-- requires: rag.chunks` header, so `db.py init` skips it on a database
     # that has never held a corpus and it only lands on the *next* init after
     # document_index has run.
     ("rag.lot_documents", "sql/006_lot_documents.sql"),
-    ("rag.lot_profiles", "sql/009_lot_profiles.sql"),
+    ("gold.lot_profiles", "sql/009_gold_lot_profiles.sql"),
 )
 
 
@@ -747,14 +877,14 @@ def compute_lot_profiles(
     construction_costs: dict | None = None,
     zoning_envelopes: "Sequence[tuple[str, dict]]" = (),
 ) -> dict[str, object]:
-    """(Re)compute `rag.lot_profiles` for one (neighborhood, scrape_date).
+    """(Re)compute `gold.lot_profiles` for one (neighborhood, scrape_date).
 
     One row per lot in the borough - every lot, not a selection of them. Three
     joins that each hold one row per (lot x something) are collapsed onto that
     grain and land side by side:
 
-    * `rag.building_lots` -> `num_buildings`, `built_area_m2`, `category`
-    * `rag.lot_frontage`  -> `primary_*` and `secondary_*`, `num_frontages`
+    * `silver.building_lot_intersections` -> `num_buildings`, `built_area_m2`, `category`
+    * `silver.lot_frontage`  -> `primary_*` and `secondary_*`, `num_frontages`
     * `rag.lot_documents` -> `doc_*` and the `documents` array
 
     All three arrive by LEFT JOIN, which is the whole design: a lot no building
@@ -834,35 +964,33 @@ def compute_lot_profiles(
     cursor = connection.cursor()
     _require_relations(cursor, _LOT_PROFILE_RELATIONS)
 
-    # Ahead of the DELETE so a malformed envelope costs nothing: the partition
-    # is only torn down once there is something to rebuild it from.
+    # Ahead of the write so a malformed envelope costs nothing: the partition
+    # is only rebuilt once there is something to rebuild it from.
     num_envelopes_staged = _stage_lot_envelopes(cursor, zoning_envelopes)
 
-    cursor.execute(
-        "DELETE FROM rag.lot_profiles WHERE neighborhood = %s AND scrape_date = %s::date",
-        [neighborhood, scrape_date],
-    )
-    cursor.execute(
+    result = warehouse.upsert_select(
+        cursor,
+        "lot_profiles",
+        (
+            "scrape_date", "neighborhood", "lot_number", "lot_uid", "lot_area_m2",
+            "has_building", "num_buildings", "built_area_m2", "built_pct_of_lot",
+            "largest_building_area_m2", "category", "max_built_area_m2",
+            "num_frontages", "total_frontage_m",
+            "primary_frontage_m", "primary_street_name", "primary_cote_rue_id",
+            "secondary_frontage_m", "secondary_street_name", "secondary_cote_rue_id",
+            "frontage_buffer_m",
+            "num_documents", "doc_id", "doc_url", "doc_title", "doc_source_table",
+            "doc_pct_of_lot", "documents",
+            "num_zoning_envelopes", "zoning_envelopes",
+            "vacancy_rates", "overall_vacancy_rate_pct",
+            "average_rents", "overall_average_rent_cad",
+            "construction_costs",
+            "underground_stall_cost_low_cad", "underground_stall_cost_high_cad",
+            "above_grade_stall_cost_low_cad", "above_grade_stall_cost_high_cad",
+            "condo_cost_low_cad_sqft", "condo_cost_high_cad_sqft",
+            "geom",
+        ),
         """
-        INSERT INTO rag.lot_profiles (
-            lot_uid, lot_number, neighborhood, scrape_date, lot_area_m2,
-            has_building, num_buildings, built_area_m2, built_pct_of_lot,
-            largest_building_area_m2, category, max_built_area_m2,
-            num_frontages, total_frontage_m,
-            primary_frontage_m, primary_street_name, primary_cote_rue_id,
-            secondary_frontage_m, secondary_street_name, secondary_cote_rue_id,
-            frontage_buffer_m,
-            num_documents, doc_id, doc_url, doc_title, doc_source_table,
-            doc_pct_of_lot, documents,
-            num_zoning_envelopes, zoning_envelopes,
-            vacancy_rates, overall_vacancy_rate_pct,
-            average_rents, overall_average_rent_cad,
-            construction_costs,
-            underground_stall_cost_low_cad, underground_stall_cost_high_cad,
-            above_grade_stall_cost_low_cad, above_grade_stall_cost_high_cad,
-            condo_cost_low_cad_sqft, condo_cost_high_cad_sqft,
-            geom
-        )
         -- Each CTE scans its join once for the whole partition and groups it
         -- to one row per lot. Written this way rather than as three LATERALs
         -- because `rag.lot_documents` is a view over a DISTINCT across every
@@ -873,7 +1001,7 @@ def compute_lot_profiles(
                    count(*) AS num_buildings,
                    sum(bl.intersection_area_m2) AS built_area_m2,
                    max(bl.building_area_m2) AS largest_building_area_m2
-              FROM rag.building_lots bl
+              FROM silver.building_lot_intersections bl
              WHERE bl.neighborhood = %(neighborhood)s
                AND bl.scrape_date = %(scrape_date)s::date
              GROUP BY bl.lot_uid
@@ -903,7 +1031,7 @@ def compute_lot_profiles(
                         ORDER BY f.frontage_rank, f.cote_rue_id))[2] AS secondary_street_name,
                    (array_agg(f.cote_rue_id
                         ORDER BY f.frontage_rank, f.cote_rue_id))[2] AS secondary_cote_rue_id
-              FROM rag.lot_frontage f
+              FROM silver.lot_frontage f
              WHERE f.neighborhood = %(neighborhood)s
                AND f.scrape_date = %(scrape_date)s::date
              GROUP BY f.lot_uid
@@ -969,10 +1097,10 @@ def compute_lot_profiles(
              GROUP BY e.lot_number
         )
         SELECT
-            l.lot_uid,
-            l.lot_number,
-            l.neighborhood,
             l.scrape_date,
+            l.neighborhood,
+            l.lot_number,
+            l.lot_uid,
             l.area_m2,
             COALESCE(built.num_buildings, 0) > 0,
             COALESCE(built.num_buildings, 0),
@@ -1053,13 +1181,14 @@ def compute_lot_profiles(
             "average_rents": Jsonb(average_rents or {}),
             "construction_costs": Jsonb(construction_costs or {}),
         },
+        neighborhood=neighborhood,
+        scrape_date=scrape_date,
     )
-    inserted = max(cursor.rowcount, 0)
 
     cursor.execute(
         """
         SELECT category, count(*), COALESCE(sum(lot_area_m2), 0)
-        FROM rag.lot_profiles
+        FROM gold.lot_profiles
         WHERE neighborhood = %s AND scrape_date = %s::date
         GROUP BY category
         """,
@@ -1100,7 +1229,7 @@ def compute_lot_profiles(
                max(above_grade_stall_cost_high_cad),
                max(condo_cost_low_cad_sqft),
                max(condo_cost_high_cad_sqft)
-        FROM rag.lot_profiles
+        FROM gold.lot_profiles
         WHERE neighborhood = %s AND scrape_date = %s::date
         """,
         [neighborhood, scrape_date],
@@ -1137,7 +1266,8 @@ def compute_lot_profiles(
     (num_lots,) = cursor.fetchone()
 
     return {
-        "profiles": inserted,
+        "profiles": result["upserted"],
+        "pruned": result["pruned"],
         "num_lots": int(num_lots),
         "num_profiles": int(num_profiles),
         "by_category": {name: counted.get(name, 0) for name in LOT_CATEGORIES},
@@ -1238,63 +1368,66 @@ def _require_relations(
 # have left behind afterwards.
 
 
-#: `rag.building_lots`, minus its geometry, qualified by the alias each column
-#: comes from. `lot_number` is joined in from `rag.lots` because the `*_uid`
-#: columns are bigserials a reload mints again - on its own the parquet would
-#: carry no key that survives one.
+#: `silver.building_lot_intersections`, minus its geometry.
+#:
+#: No `building_lot_uid`: the surrogate went with the move to a partitioned
+#: table, where a primary key has to contain the partition keys and a serial
+#: nothing cites was the wrong half to keep. `lot_number` is a column of the
+#: table now rather than something joined in from `rag.lots` - the `*_uid`
+#: columns are bigserials a reload mints again, so on its own a row would carry
+#: no key that survives one, and the parquet has carried the number for exactly
+#: that reason since before the table did.
 _BUILDING_LOT_COLUMNS = (
-    "bl.building_lot_uid",
-    "bl.building_uid",
-    "bl.lot_uid",
-    "l.lot_number",
-    "bl.neighborhood",
-    "bl.scrape_date",
-    "bl.building_area_m2",
-    "bl.intersection_area_m2",
-    "bl.pct_of_building",
+    "building_uid",
+    "lot_uid",
+    "lot_number",
+    "neighborhood",
+    "scrape_date",
+    "building_area_m2",
+    "intersection_area_m2",
+    "pct_of_building",
 )
 
-#: `rag.lot_features`, minus its geometry. `source_table` and `feature_id` are
-#: the pair `rag.chunks` cites, so the *feature* side already carries a durable
-#: key; `lot_number` is joined in from `rag.lots` to give the lot side one too,
-#: for the same reason it is in `_BUILDING_LOT_COLUMNS` - `lot_uid` is a
-#: bigserial a reload mints again, so on its own the parquet would carry no lot
-#: key that survives one, and `lot_zoning_envelopes` joins on exactly that.
+#: `silver.lot_features`, minus its geometry. `source_table` and `feature_id`
+#: are the pair `rag.chunks` cites, so the *feature* side carries a durable key
+#: of its own; `lot_number` gives the lot side one, for the reason
+#: `_BUILDING_LOT_COLUMNS` gives - and `lot_zoning_envelopes` joins on exactly
+#: that.
 _LOT_FEATURE_COLUMNS = (
-    "lf.lot_feature_uid",
-    "lf.lot_uid",
-    "l.lot_number",
-    "lf.feature_uid",
-    "lf.source_table",
-    "lf.feature_id",
-    "lf.neighborhood",
-    "lf.scrape_date",
-    "lf.lot_area_m2",
-    "lf.overlap_area_m2",
-    "lf.pct_of_lot",
+    "lot_uid",
+    "lot_number",
+    "feature_uid",
+    "source_table",
+    "feature_id",
+    "neighborhood",
+    "scrape_date",
+    "lot_area_m2",
+    "overlap_area_m2",
+    "pct_of_lot",
 )
 
-#: `rag.lot_frontage`, minus its geometry. `lot_number` is joined in from
-#: `rag.lots` for the same reason it is in `_BUILDING_LOT_COLUMNS` - the
-#: `*_uid` columns are bigserials a reload mints again; `cote_rue_id` is the
-#: street side's own durable key and needs no such join.
+#: `silver.lot_frontage`, minus its geometry. Same reading as the two above:
+#: `cote_rue_id` is the street side's own durable key and `lot_number` the
+#: lot's, while `lot_uid` is a bigserial worth keeping only for a join back
+#: inside the same partition. There is no `street_uid`: the street side's
+#: surrogate went with the move to a partitioned
+#: `silver.neighborhood_streets`, where a primary key has to contain the
+#: partition keys - and `cote_rue_id` was always the key that meant anything.
 _LOT_FRONTAGE_COLUMNS = (
-    "f.lot_frontage_uid",
-    "f.lot_uid",
-    "l.lot_number",
-    "f.street_uid",
-    "f.cote_rue_id",
-    "f.street_name",
-    "f.neighborhood",
-    "f.scrape_date",
-    "f.buffer_m",
-    "f.frontage_m",
-    "f.lot_perimeter_m",
-    "f.pct_of_perimeter",
-    "f.frontage_rank",
+    "lot_uid",
+    "lot_number",
+    "cote_rue_id",
+    "street_name",
+    "neighborhood",
+    "scrape_date",
+    "buffer_m",
+    "frontage_m",
+    "lot_perimeter_m",
+    "pct_of_perimeter",
+    "frontage_rank",
 )
 
-#: `rag.lot_profiles`, minus its geometry, in the order a reader scans them:
+#: `gold.lot_profiles`, minus its geometry, in the order a reader scans them:
 #: which lot, what stands on it, what it faces, what governs it.
 #:
 #: The four jsonb columns are selected as ``jsonb::text`` rather than as jsonb,
@@ -1357,45 +1490,44 @@ _LOT_PROFILE_COLUMNS = (
 def fetch_building_lots(
     connection: "Connection", *, neighborhood: str, scrape_date: str
 ) -> gpd.GeoDataFrame:
-    """This partition's `rag.building_lots` rows, as a GeoDataFrame."""
+    """This partition's `silver.building_lot_intersections` rows, as a frame.
+
+    No join to `rag.lots` any more: the lot number is the table's own column
+    since the move to `silver`, which is one less relation this read depends
+    on still holding the partition it is about.
+    """
     return _fetch_partition(
         connection,
         _BUILDING_LOT_COLUMNS,
         """
-        FROM rag.building_lots bl
-        JOIN rag.lots l ON l.lot_uid = bl.lot_uid
-        WHERE bl.neighborhood = %s AND bl.scrape_date = %s::date
-        ORDER BY bl.building_uid, bl.lot_uid
+        FROM silver.building_lot_intersections
+        WHERE neighborhood = %s AND scrape_date = %s::date
+        ORDER BY building_uid, lot_uid
         """,
         [neighborhood, scrape_date],
-        date_column="bl.scrape_date",
-        geometry_column="bl.geom",
     )
 
 
 def fetch_lot_features(
     connection: "Connection", *, neighborhood: str, scrape_date: str
 ) -> gpd.GeoDataFrame:
-    """This partition's `rag.lot_features` rows, as a GeoDataFrame."""
+    """This partition's `silver.lot_features` rows, as a GeoDataFrame."""
     return _fetch_partition(
         connection,
         _LOT_FEATURE_COLUMNS,
         """
-        FROM rag.lot_features lf
-        JOIN rag.lots l ON l.lot_uid = lf.lot_uid
-        WHERE lf.neighborhood = %s AND lf.scrape_date = %s::date
-        ORDER BY lf.lot_uid, lf.feature_uid
+        FROM silver.lot_features
+        WHERE neighborhood = %s AND scrape_date = %s::date
+        ORDER BY lot_uid, source_table, feature_id
         """,
         [neighborhood, scrape_date],
-        date_column="lf.scrape_date",
-        geometry_column="lf.geom",
     )
 
 
 def fetch_lot_frontage(
     connection: "Connection", *, neighborhood: str, scrape_date: str
 ) -> gpd.GeoDataFrame:
-    """This partition's `rag.lot_frontage` rows, longest frontage first.
+    """This partition's `silver.lot_frontage` rows, longest frontage first.
 
     Ordered in SQL rather than left to the reader, so the parquet itself
     answers "which lots have the most street" by being read from the top.
@@ -1404,32 +1536,29 @@ def fetch_lot_frontage(
         connection,
         _LOT_FRONTAGE_COLUMNS,
         """
-        FROM rag.lot_frontage f
-        JOIN rag.lots l ON l.lot_uid = f.lot_uid
-        WHERE f.neighborhood = %s AND f.scrape_date = %s::date
-        ORDER BY f.frontage_m DESC, l.lot_number, f.street_uid
+        FROM silver.lot_frontage
+        WHERE neighborhood = %s AND scrape_date = %s::date
+        ORDER BY frontage_m DESC, lot_number, cote_rue_id
         """,
         [neighborhood, scrape_date],
-        date_column="f.scrape_date",
-        geometry_column="f.geom",
     )
 
 
 def fetch_lot_profiles(
     connection: "Connection", *, neighborhood: str, scrape_date: str
 ) -> gpd.GeoDataFrame:
-    """This partition's `rag.lot_profiles` rows, as a GeoDataFrame.
+    """This partition's `gold.lot_profiles` rows, as a GeoDataFrame.
 
     Ordered by lot number rather than by any of the measures: this one is the
     borough's whole inventory, so the order a reader wants is the cadastre's
-    own. `rag.lot_frontage` sorts by frontage because it is read for the top of
+    own. `silver.lot_frontage` sorts by frontage because it is read for the top of
     that list; this is read for a named parcel.
     """
     return _fetch_partition(
         connection,
         _LOT_PROFILE_COLUMNS,
         """
-        FROM rag.lot_profiles
+        FROM gold.lot_profiles
         WHERE neighborhood = %s AND scrape_date = %s::date
         ORDER BY lot_number
         """,
@@ -1498,13 +1627,30 @@ def _selected_as(column: str) -> str:
 def _as_text(value: Any) -> str | None:
     """A staging cell as text, with a missing value left missing.
 
-    `str(nan)` is `"nan"`, which would land in `rag.streets.street_name` as a
-    street called "nan" rather than as the absent name it is - and in a NOT
-    NULL key column, as a row that looks loaded and joins to nothing.
+    `str(nan)` is `"nan"`, which would land in `rag.lots.lot_number` as a lot
+    numbered "nan" rather than as the absent number it is - and in a NOT NULL
+    key column, as a row that looks loaded and joins to nothing.
+    `urban_rag.warehouse._as_text` is the same rule for the silver and gold
+    write path, which does not share this one's binary COPY.
     """
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return None
     return str(value)
+
+
+def _as_date(value: str | date) -> date:
+    """A partition's scrape date as a `datetime.date`.
+
+    Every caller in this module types `scrape_date` as `str`, because that is
+    what a partition key is. The staging tables type the column as `date`, and
+    the COPYs that fill them run `FORMAT BINARY` - where psycopg dumps each
+    value by its Python type rather than letting Postgres parse a literal. A
+    `str` there reaches `DateBinaryDumper` and fails with `descriptor
+    'toordinal' ... doesn't apply to a 'str' object`, naming neither the column
+    nor the partition. Text COPY would have parsed it; binary will not, so the
+    conversion has to happen here.
+    """
+    return date.fromisoformat(value) if isinstance(value, str) else value
 
 
 def _replace_partition(
@@ -1516,11 +1662,15 @@ def _replace_partition(
     scrape_date: str,
     natural_key_column: str | None,
     natural_key_target: str | None,
-    extra_text_columns: tuple[tuple[str, str], ...] = (),
-    measure_column: str = "area_m2",
-    measure_function: str = "ST_Area",
 ) -> int:
     """Delete ``table``'s rows for this partition, then COPY ``frame`` in.
+
+    The loader for the `rag` working set - `rag.lots` and `rag.buildings` -
+    and nothing else. The silver and gold tables are written by
+    `urban_rag.warehouse` instead, which upserts rather than replaces; these
+    two keep the older shape on purpose, because they are not published
+    datasets but the inputs the joins below are computed over, rebuilt from
+    bronze on every run of the partition.
 
     Geometry travels as plain WKB bytes rather than through a registered
     PostGIS type - psycopg has no built-in adapter for `geometry`, and
@@ -1529,20 +1679,16 @@ def _replace_partition(
     `geometry(MultiPolygon, 4326)` rejects a bare Polygon by typmod; `ST_Multi`
     in the INSERT is what normalizes that, not the COPY itself.
 
-    ``extra_text_columns`` are ``(target column, frame column)`` pairs lifted
-    out of `attributes` into columns of their own - `rag.streets.street_name`
-    is the one caller that needs it. ``measure_function``/``measure_column``
-    are what a row's one derived number is: `ST_Area` into `area_m2` for the
-    polygon tables, `ST_Length` into `length_m` for the line one, since a
-    street side has no area and a lot no length worth recording.
+    ``natural_key_column``/``natural_key_target`` name the frame column that
+    is a real key and the column it lands in - `NO_LOT` into `lot_number` for
+    the cadastre. Given, a repeated key inside one load is resolved with `ON
+    CONFLICT ... DO NOTHING`; omitted, as for BDOI's buildings, there is no key
+    to conflict on and every row is simply inserted.
     """
     if (natural_key_column is None) != (natural_key_target is None):
         raise ValueError(
             "natural_key_column and natural_key_target must be given together"
         )
-    missing = [source for _, source in extra_text_columns if source not in frame.columns]
-    if missing:
-        raise ValueError(f"{table}: no {', '.join(missing)} column(s) in the frame")
 
     cursor = connection.cursor()
     cursor.execute(
@@ -1557,24 +1703,17 @@ def _replace_partition(
     import shapely.wkb
 
     staging = f"{table.replace('.', '_')}_load"
-    # The natural key and the lifted columns are all text, and all travel
-    # ahead of the partition keys, so one list covers the DDL, the COPY header
-    # and the INSERT's select list below.
-    text_targets = ([natural_key_target] if natural_key_target else []) + [
-        target for target, _ in extra_text_columns
-    ]
-    text_sources = ([natural_key_column] if natural_key_column else []) + [
-        source for _, source in extra_text_columns
-    ]
-    text_ddl = "".join(f"{target} text, " for target in text_targets)
+    key_ddl = f"{natural_key_target} text, " if natural_key_target else ""
     cursor.execute(
         f"CREATE TEMP TABLE {staging} "
-        f"({text_ddl}neighborhood text, scrape_date date, "
+        f"({key_ddl}neighborhood text, scrape_date date, "
         "attributes jsonb, geom bytea) ON COMMIT DROP"
     )
 
     geometry_name = frame.geometry.name
-    exclude = set(_ALWAYS_EXCLUDED) | {geometry_name} | set(text_sources)
+    exclude = set(_ALWAYS_EXCLUDED) | {geometry_name}
+    if natural_key_column:
+        exclude.add(natural_key_column)
     attribute_columns = [c for c in frame.columns if c not in exclude]
     attrs = (
         json.loads(frame[attribute_columns].to_json(orient="records", date_format="iso"))
@@ -1582,10 +1721,12 @@ def _replace_partition(
         else [{}] * len(frame)
     )
 
-    columns = text_targets + ["neighborhood", "scrape_date", "attributes", "geom"]
-    types = ["text"] * len(text_targets) + ["text", "date", "jsonb", "bytea"]
+    key_targets = [natural_key_target] if natural_key_target else []
+    columns = key_targets + ["neighborhood", "scrape_date", "attributes", "geom"]
+    types = ["text"] * len(key_targets) + ["text", "date", "jsonb", "bytea"]
 
     inserted = 0
+    partition_date = _as_date(scrape_date)
     statement = f"COPY {staging} ({', '.join(columns)}) FROM STDIN (FORMAT BINARY)"
     with cursor.copy(statement) as copy:
         copy.set_types(types)
@@ -1593,19 +1734,21 @@ def _replace_partition(
             geometry = getattr(row, geometry_name)
             if geometry is None or geometry.is_empty:
                 continue
-            values: list[Any] = [
-                _as_text(getattr(row, source)) for source in text_sources
-            ]
+            values: list[Any] = (
+                [_as_text(getattr(row, natural_key_column))]
+                if natural_key_column
+                else []
+            )
             values += [
                 neighborhood,
-                scrape_date,
+                partition_date,
                 Jsonb(attrs[index]),
                 shapely.wkb.dumps(geometry),
             ]
             copy.write_row(values)
             inserted += 1
 
-    key_list = "".join(f"{target}, " for target in text_targets)
+    key_list = f"{natural_key_target}, " if natural_key_target else ""
     conflict = (
         f"ON CONFLICT ({natural_key_target}, scrape_date) DO NOTHING"
         if natural_key_target
@@ -1614,12 +1757,12 @@ def _replace_partition(
     cursor.execute(
         f"""
         INSERT INTO {table} (
-            {key_list}neighborhood, scrape_date, {measure_column}, attributes, geom
+            {key_list}neighborhood, scrape_date, area_m2, attributes, geom
         )
         SELECT
             {key_list}neighborhood,
             scrape_date,
-            {measure_function}(geography(ST_Multi(ST_SetSRID(ST_GeomFromWKB(geom), 4326)))),
+            ST_Area(geography(ST_Multi(ST_SetSRID(ST_GeomFromWKB(geom), 4326)))),
             attributes,
             ST_Multi(ST_SetSRID(ST_GeomFromWKB(geom), 4326))
         FROM {staging}

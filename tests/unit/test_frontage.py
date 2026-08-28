@@ -78,6 +78,7 @@ def stub_postgis(
     lots_matched=2,
     streets_matched=2,
     num_lots=4,
+    num_streets=2,
     total_frontage_m=60.0,
     max_frontage_m=30.0,
 ):
@@ -88,19 +89,6 @@ def stub_postgis(
     def connect(self):
         yield object()
 
-    def load_streets(
-        connection, frame, *, neighborhood, scrape_date, street_id_column,
-        street_name_column,
-    ):
-        calls["load_streets"] = (
-            neighborhood,
-            scrape_date,
-            street_id_column,
-            street_name_column,
-            len(frame),
-        )
-        return len(frame)
-
     def compute_lot_frontage(connection, *, neighborhood, scrape_date, buffer_m):
         calls["compute"] = (neighborhood, scrape_date, buffer_m)
         return {
@@ -110,8 +98,9 @@ def stub_postgis(
             "total_frontage_m": total_frontage_m,
             "max_frontage_m": max_frontage_m,
             "num_lots": num_lots,
-            "num_streets": 2,
+            "num_streets": num_streets,
             "buffer_m": buffer_m,
+            "pruned": 0,
         }
 
     def fetch_lot_frontage(connection, *, neighborhood, scrape_date):
@@ -141,7 +130,6 @@ def stub_postgis(
 
     monkeypatch.setattr(PostgisResource, "connect", connect)
     for name, value in {
-        "load_streets": load_streets,
         "compute_lot_frontage": compute_lot_frontage,
         "fetch_lot_frontage": fetch_lot_frontage,
     }.items():
@@ -170,9 +158,6 @@ def test_the_partition_is_loaded_measured_and_written(store, monkeypatch, tmp_pa
 
     assert materialize_partition(store).success
 
-    assert calls["load_streets"] == (
-        NEIGHBORHOOD, DATE, "COTE_RUE_ID", "NOM_VOIE", 2
-    )
     assert calls["compute"][:2] == (NEIGHBORHOOD, DATE)
     assert calls["fetch"] == (NEIGHBORHOOD, DATE)
 
@@ -185,9 +170,12 @@ def test_the_partition_is_loaded_measured_and_written(store, monkeypatch, tmp_pa
     assert frame.crs.to_string() == "EPSG:4326"
 
 
-def test_only_the_streets_are_loaded(store, monkeypatch):
-    """`rag.lots` belongs to `building_lot_intersections`. Two assets loading
-    the cadastre from the same file in two transactions is a race, not a
+def test_nothing_is_loaded_here(store, monkeypatch):
+    """Both sides of the join are already in Postgres when this runs.
+
+    `rag.lots` belongs to `building_lot_intersections` and
+    `silver.neighborhood_streets` to `neighborhood_streets`. Two assets loading
+    the same table from the same file in two transactions is a race, not a
     redundancy - whoever commits second replaces the rows the first computed
     against."""
     calls = stub_postgis(monkeypatch)
@@ -195,7 +183,7 @@ def test_only_the_streets_are_loaded(store, monkeypatch):
 
     materialize_partition(store)
 
-    assert set(calls) == {"load_streets", "compute", "fetch"}
+    assert set(calls) == {"compute", "fetch"}
 
 
 def test_the_written_rows_are_ordered_longest_frontage_first(

@@ -75,19 +75,27 @@ class FakeCursor:
         if "to_regclass" in text:
             (name,) = params
             self._result = (None if name in self.missing else name,)
-        elif text.startswith("CREATE TEMP TABLE"):
+        elif "warehouse.ensure_partition" in text:
+            # The partition is created on demand before every write - see
+            # hbu_infra's sql/003_warehouse.sql. Nothing to answer here.
+            self._result = ("gold.lot_profiles_vsmpe_202608",)
+        elif text.startswith("CREATE TEMP TABLE") or text.startswith("DROP TABLE"):
             pass
-        elif text.startswith("DELETE FROM rag.lot_profiles"):
-            self.rowcount = 3
-        elif "INSERT INTO rag.lot_profiles" in text:
+        elif "INSERT INTO gold_lot_profiles_load" in text:
+            # The staging table `urban_rag.warehouse.upsert_select` lands the
+            # computed rows in, before the upsert and the prune below.
             self.rowcount = 10
+        elif "INSERT INTO gold.lot_profiles" in text:
+            self.rowcount = 10
+        elif text.startswith("DELETE FROM gold.lot_profiles"):
+            self.rowcount = 3
         elif "GROUP BY category" in text:
             self._result = [
                 ("built", 6, 2_400.0),
                 ("no_building", 3, 15_000.0),
                 ("shed_only", 1, 5_000.0),
             ]
-        elif "FILTER" in text:
+        elif "FROM gold.lot_profiles" in text and "FILTER" in text:
             #  profiles, built, fronted, corner, documented, buildings,
             #  area, max primary, mean primary, enveloped, envelopes,
             #  overall vacancy, overall rent, then the six cost rates:
@@ -100,6 +108,8 @@ class FakeCursor:
             )
         elif "FROM rag.lots" in text:
             self._result = (10,)
+        elif "FROM pg_attribute" in text:
+            self._result = []
         else:  # pragma: no cover - a statement this stub does not know about
             raise AssertionError(f"unexpected statement: {text[:80]}")
         return self
@@ -196,7 +206,7 @@ def test_the_threshold_reaches_the_statement():
     insert = next(
         params
         for statement, params in cursor.statements
-        if "INSERT INTO rag.lot_profiles" in statement
+        if "INSERT INTO gold_lot_profiles_load" in statement
     )
     assert insert["threshold"] == 60.0
     assert insert["neighborhood"] == NEIGHBORHOOD
@@ -221,7 +231,7 @@ def test_zero_selects_only_the_lots_no_building_touches():
     insert = next(
         params
         for statement, params in cursor.statements
-        if "INSERT INTO rag.lot_profiles" in statement
+        if "INSERT INTO gold_lot_profiles_load" in statement
     )
     assert insert["threshold"] == 0.0
 
@@ -249,14 +259,14 @@ def test_a_missing_relation_names_the_hbu_infra_file_to_apply():
 def test_every_missing_relation_is_reported_at_once():
     """On a fresh database several are absent, and finding that out one failed
     run per file is three runs too many."""
-    cursor = FakeCursor(missing=("rag.lot_frontage", "rag.lot_profiles"))
+    cursor = FakeCursor(missing=("silver.lot_frontage", "gold.lot_profiles"))
 
     with pytest.raises(MissingRelation) as caught:
         compute(cursor)
 
     message = str(caught.value)
-    assert "sql/008_lot_frontage.sql" in message
-    assert "sql/009_lot_profiles.sql" in message
+    assert "sql/008_silver_lot_frontage.sql" in message
+    assert "sql/009_gold_lot_profiles.sql" in message
 
 
 def test_the_default_threshold_keeps_a_shed_and_drops_a_garage():
@@ -267,8 +277,8 @@ def test_the_default_threshold_keeps_a_shed_and_drops_a_garage():
 def test_the_envelopes_are_staged_before_the_partition_is_touched():
     """A malformed envelope should cost nothing.
 
-    The COPY runs ahead of the DELETE, so a partition is only torn down once
-    there is something to rebuild it from.
+    The COPY runs ahead of every statement that writes gold.lot_profiles, so a
+    partition is only rebuilt once there is something to rebuild it from.
     """
     cursor = FakeCursor()
 
@@ -278,13 +288,16 @@ def test_the_envelopes_are_staged_before_the_partition_is_touched():
     )
 
     issued = [" ".join(statement.split()) for statement, _ in cursor.statements]
-    create = next(i for i, text in enumerate(issued) if "CREATE TEMP TABLE" in text)
-    delete = next(
-        i
-        for i, text in enumerate(issued)
-        if text.startswith("DELETE FROM rag.lot_profiles")
+    staged = next(
+        i for i, text in enumerate(issued)
+        if "CREATE TEMP TABLE lot_profiles_envelopes_load" in text
     )
-    assert create < delete
+    written = next(
+        i for i, text in enumerate(issued)
+        if "INSERT INTO gold.lot_profiles" in text
+        or text.startswith("DELETE FROM gold.lot_profiles")
+    )
+    assert staged < written
 
 
 def test_an_envelope_is_staged_with_its_lot_number_and_its_place_in_the_array():
@@ -363,7 +376,7 @@ def test_the_cmhc_objects_reach_the_statement_as_jsonb_parameters():
     insert = next(
         params
         for statement, params in cursor.statements
-        if "INSERT INTO rag.lot_profiles" in statement
+        if "INSERT INTO gold_lot_profiles_load" in statement
     )
     assert insert["vacancy_rates"].obj["survey_year"] == 2023
     assert insert["average_rents"].obj["overall_average_rent_cad"] == 1_275.0
@@ -397,7 +410,7 @@ def test_the_cost_guide_reaches_the_statement_as_one_jsonb_parameter():
     insert = next(
         params
         for statement, params in cursor.statements
-        if "INSERT INTO rag.lot_profiles" in statement
+        if "INSERT INTO gold_lot_profiles_load" in statement
     )
     assert insert["construction_costs"].obj["condo_band"] == "condo_wood"
     assert insert["construction_costs"].obj["city"] == "mtl"
@@ -436,7 +449,7 @@ def test_the_flattened_rates_are_cast_out_of_the_object_not_passed_beside_it():
     statement, params = next(
         (statement, params)
         for statement, params in cursor.statements
-        if "INSERT INTO rag.lot_profiles" in statement
+        if "INSERT INTO gold_lot_profiles_load" in statement
     )
     assert [key for key in params if "construction" in key] == ["construction_costs"]
     for column in (
@@ -460,14 +473,14 @@ def test_a_partition_with_no_cost_guide_writes_an_empty_object_not_null():
     insert = next(
         params
         for statement, params in cursor.statements
-        if "INSERT INTO rag.lot_profiles" in statement
+        if "INSERT INTO gold_lot_profiles_load" in statement
     )
     assert insert["construction_costs"].obj == {}
     assert result["has_construction_costs"] is False
 
 
 def test_a_partition_with_no_cmhc_figures_writes_an_empty_object_not_null():
-    """`vacancy_rates` is NOT NULL in 009_lot_profiles.sql, and '{}' is a
+    """`vacancy_rates` is NOT NULL in 009_gold_lot_profiles.sql, and '{}' is a
     different answer from a suppressed grid."""
     cursor = FakeCursor()
 
@@ -476,7 +489,7 @@ def test_a_partition_with_no_cmhc_figures_writes_an_empty_object_not_null():
     insert = next(
         params
         for statement, params in cursor.statements
-        if "INSERT INTO rag.lot_profiles" in statement
+        if "INSERT INTO gold_lot_profiles_load" in statement
     )
     assert insert["vacancy_rates"].obj == {}
     assert insert["average_rents"].obj == {}

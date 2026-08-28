@@ -25,10 +25,20 @@ What each layer promises a reader:
 | **silver** | EPSG:4326, geometry valid, the crosswalks in `partitions.py` applied, one row per declared grain. | a crosswalk names something the snapshot does not publish; a declared grain is breached |
 | **gold** | Named for the question, at the grain whoever asks it reads. | its upstream partition was never loaded |
 
-Postgres is a **serving copy** of silver and gold, never the only copy.
-`rag.lots`, `rag.buildings` and `rag.features` are silver tables that happen to
-live in the serving database; `rag.lot_profiles` and `rag.chunks` are gold. The
-tree is the record — losing the database costs a reload rather than a
+Postgres is a **serving copy** of silver and gold, never the only copy, and
+**the schema a table is in is the layer its asset is in**: `silver/vacancy_rates`
+in the tree is `silver.vacancy_rates` in the database, and `gold/lot_profiles`
+is `gold.lot_profiles`. Every one of those tables is partitioned by
+`(neighborhood, scrape_date)` and written by one upsert — see [The silver and
+gold tables](#the-silver-and-gold-tables).
+
+Two things in Postgres sit outside that rule and are not exceptions to it.
+`rag.lots`, `rag.buildings` and `rag.features` are *bronze* snapshots loaded
+into PostGIS because the silver joins are computed over them there; `rag.chunks`
+is the pgvector index `document_index` publishes. Neither is a silver or gold
+dataset's own table.
+
+The tree is the record — losing the database costs a reload rather than a
 re-scrape, which for a live municipal source no later run can undo.
 
 ## Assets
@@ -45,17 +55,20 @@ re-scrape, which for a live municipal source no later run can undo.
 | bronze | `street_network` | date | Montreal's *géobase double* — one line per side of street — as published, island-wide |
 | bronze | `montreal_residential_costs` | date | The Montreal column of the Altus construction cost guide's residential types — condo/apartment by storey band, townhouses, single family, seniors, student residences — in $/sf |
 | bronze | `montreal_nonresidential_costs` | date | The same column's commercial and industrial types in $/sf, plus the three parking types in **$/stall** |
+| bronze | `property_assessment_roll` | date | Quebec's *rôle d'évaluation foncière* — one point per assessment unit and the characteristics table describing it, out of a province-wide GeoPackage, scoped to Ville de Montréal |
 | bronze | `linked_documents` | date × neighborhood | The PDFs those tables link to, fetched and flattened to text |
-| silver | `vacancy_rates` | date × neighborhood | That borough's quartiers taken out of the snapshot and averaged into one rate per dwelling type × bedroom class |
-| silver | `average_rents` | date × neighborhood | The same, per bedroom class, for rents |
-| silver | `building_lot_intersections` | date × neighborhood | Both spatial joins, computed against one load of the cadastre — repaired on the way in, which is where `make_valid` runs: building footprints clipped to the lots they intersect (`rag.building_lots`) and map features clipped to the lots they cover (`rag.lot_features`, the hop from a lot to its documents), as two geoparquet files |
-| silver | `neighborhood_streets` | date × neighborhood | That day's street sides clipped to one borough, with the published length, the length inside it, and the share that survived the cut |
-| silver | `lot_frontage` | date × neighborhood | How much of each lot's boundary faces each street side, in metres, longest first — as geoparquet and as `rag.lot_frontage`. **Blocked**, see below |
-| silver | `zoning_grid_columns` | date × neighborhood | Those PDFs read as the tables they are — one row per column of each *grille des usages et des normes*, with its usages, authorised levels and every norm of its CADRE BÂTI block as columns |
-| silver | `lot_zoning_envelopes` | date × neighborhood | Every lot's zoning envelope, denormalised to the grain `urban_rag.program` reads — one row per (lot, grid column), with the lot's area, its primary and secondary frontage, and the norms that bound what may be built on it |
-| silver | `document_chunks` | date × neighborhood | Those documents cut into retrieval-sized chunks |
-| silver | `document_embeddings` | date × neighborhood | A bge-m3 vector per chunk |
-| gold | `lot_profiles` | date × neighborhood | Every lot in the borough, one row each — whether a building stands on it and how many, its primary and secondary street frontage in metres, the zoning PDF that covers most of it, the zoning envelopes that govern it, and the borough's CMHC vacancy and rent grids — as geoparquet and as `rag.lot_profiles`. **Blocked**, see below |
+| silver | `vacancy_rates` | date × neighborhood | That borough's quartiers taken out of the snapshot and averaged into one rate per dwelling type × bedroom class — as parquet and as `silver.vacancy_rates`, with the quartier rows behind it in `silver.quartier_vacancy_rates` |
+| silver | `average_rents` | date × neighborhood | The same, per bedroom class, for rents — `silver.average_rents` and `silver.quartier_average_rents` |
+| silver | `building_lot_intersections` | date × neighborhood | Both spatial joins, computed against one load of the cadastre — repaired on the way in, which is where `make_valid` runs: building footprints clipped to the lots they intersect (`silver.building_lot_intersections`) and map features clipped to the lots they cover (`silver.lot_features`, the hop from a lot to its documents), as two geoparquet files |
+| silver | `assessment_units` | date | The roll's two layers put back together on `id_provinc` — one row per assessment unit, its point and everything the roll says about it. The one silver asset with **no table**: it has no borough axis to partition one by |
+| silver | `lot_assessed_values` | date × neighborhood | What every lot in the borough is assessed at: the units whose point falls inside it, summed on `rl0404a`, with the count beside the total — as geoparquet and as `silver.lot_assessed_values` |
+| silver | `neighborhood_streets` | date × neighborhood | That day's street sides clipped to one borough, with the published length, the length inside it, and the share that survived the cut — as geoparquet and as `silver.neighborhood_streets` |
+| silver | `lot_frontage` | date × neighborhood | How much of each lot's boundary faces each street side, in metres, longest first — as geoparquet and as `silver.lot_frontage`. **Blocked**, see below |
+| silver | `zoning_grid_columns` | date × neighborhood | Those PDFs read as the tables they are — one row per column of each *grille des usages et des normes*, with its usages, authorised levels and every norm of its CADRE BÂTI block as columns — as parquet and as `silver.zoning_grid_columns` |
+| silver | `lot_zoning_envelopes` | date × neighborhood | Every lot's zoning envelope, denormalised to the grain `urban_rag.program` reads — one row per (lot, grid column), with the lot's area, its primary and secondary frontage, and the norms that bound what may be built on it — as parquet and as `silver.lot_zoning_envelopes` |
+| silver | `document_chunks` | date × neighborhood | Those documents cut into retrieval-sized chunks — as parquet and as `silver.document_chunks` |
+| silver | `document_embeddings` | date × neighborhood | A bge-m3 vector per chunk. The one silver asset with no table of its own: its vectors' home is the pgvector index `document_index` writes |
+| gold | `lot_profiles` | date × neighborhood | Every lot in the borough, one row each — whether a building stands on it and how many, its primary and secondary street frontage in metres, the zoning PDF that covers most of it, the zoning envelopes that govern it, and the borough's CMHC vacancy and rent grids — as geoparquet and as `gold.lot_profiles`. **Blocked**, see below |
 | gold | `document_index` | date × neighborhood | Those vectors upserted into the Postgres/pgvector store the query side reads |
 
 The corpus assets are described under [The document
@@ -74,7 +87,7 @@ deliberately: it is a *load* of `document_embeddings`, which is already in the
 tree. Its record is that file.
 
 `lot_profiles` is registered and has a job, but **no schedule**, because it
-reads two relations hbu_infra has to create first. `sql/009_lot_profiles.sql`
+reads two relations hbu_infra has to create first. `sql/009_gold_lot_profiles.sql`
 creates the table it writes into, and `sql/006_lot_documents.sql` creates the
 `rag.lot_documents` view it takes the document columns from — and that second
 file carries a `-- requires: rag.chunks` header, so `db.py init` skips it on a
@@ -82,7 +95,7 @@ database that has never held a corpus and it only lands on the *next* init,
 after `document_index` has run. Both files exist; what is outstanding is
 `db.py init` against the target database, twice. `compute_lot_profiles` checks
 for both up front and fails naming the file to apply rather than letting
-psycopg raise `relation "rag.lot_profiles" does not exist`. Add the schedule
+psycopg raise `relation "gold.lot_profiles" does not exist`. Add the schedule
 then. Run it by hand with `make lot-profiles`.
 
 Five of its inputs come from the tree rather than from Postgres —
@@ -96,12 +109,95 @@ are partitioned by date alone, so one run of them serves every borough of that
 day.
 
 `lot_frontage` is blocked the same way, one step further along: hbu_infra
-*has* `sql/007_streets.sql` and `sql/008_lot_frontage.sql`, but a database
-they have not been applied to yet answers `relation "rag.streets" does not
+*has* `sql/007_silver_streets.sql` and `sql/008_silver_lot_frontage.sql`, but a database
+they have not been applied to yet answers `relation "silver.neighborhood_streets" does not
 exist`. So it too is registered, given a job, and left off the schedules
 until `db.py init` has run against the target database. Run it by hand with
-`make frontage`. Its upstream `neighborhood_streets` writes only parquet and
-is scheduled normally.
+`make frontage`. Its upstream `neighborhood_streets` now owns
+`silver.neighborhood_streets` itself rather than being loaded by this asset on
+the way past, so it needs `sql/007_silver_streets.sql` applied too — and it is
+still scheduled normally, since that file has no `-- requires:` header and lands
+on the first `db.py init`.
+
+## The silver and gold tables
+
+Every silver and gold dataset has one table, in the schema its layer is named
+for, and one way of being written to it — `urban_rag.warehouse`, which is the
+single writer. Before it, four assets reached Postgres through a loader each,
+all of them writing into `rag`, all of them deleting a partition and
+re-inserting it; the seven that did not reach Postgres at all had no table to
+reach.
+
+Three rules hold for every one of those tables.
+
+**The schema is the layer.** Looked up from `urban_rag.layers` rather than
+written down twice, so moving an asset between layers moves its table with it
+instead of leaving the two disagreeing.
+
+**The grain is `(neighborhood, scrape_date, natural key)`.** Each table is
+partitioned `PARTITION BY LIST (neighborhood)` and then `PARTITION BY RANGE
+(scrape_date)` by month, so a borough's month is a leaf a reader's `WHERE`
+prunes to. Postgres requires a partitioned table's unique constraint to contain
+its partition keys, which is not a tax here but the grain restated — and it is
+exactly what a write conflicts on:
+
+```sql
+INSERT INTO silver.neighborhood_streets (...)
+VALUES (...)
+ON CONFLICT (scrape_date, neighborhood, cote_rue_id)
+DO UPDATE SET ...
+```
+
+| Table | Conflicts on, beyond the partition |
+| --- | --- |
+| `silver.vacancy_rates` | `dwelling_type`, `bedroom_type` |
+| `silver.quartier_vacancy_rates` | `quartier`, `dwelling_type`, `bedroom_type` |
+| `silver.average_rents` | `bedroom_type` |
+| `silver.quartier_average_rents` | `quartier`, `bedroom_type` |
+| `silver.building_lot_intersections` | `building_uid`, `lot_uid` |
+| `silver.lot_features` | `lot_uid`, `source_table`, `feature_id` |
+| `silver.neighborhood_streets` | `cote_rue_id` |
+| `silver.lot_frontage` | `lot_uid`, `cote_rue_id` |
+| `silver.document_chunks` | `chunk_id` |
+| `silver.zoning_grid_columns` | `source_table`, `feature_id`, `column_index` |
+| `silver.lot_zoning_envelopes` | `lot_uid`, `feature_id`, `column_index` |
+| `silver.lot_assessed_values` | `lot_number` |
+| `gold.lot_profiles` | `lot_number` |
+
+**A write is an upsert, and a partition is still a snapshot.** The frame is
+COPYed into a staging table shaped `LIKE` the target, upserted in one
+statement, and the partition's rows the staging table does not have are then
+deleted. The upsert is what lets a re-run land while readers are querying —
+nothing is ever missing mid-load, the way a delete-then-insert leaves it — and
+the prune is what keeps snapshot semantics, which the upsert alone cannot: a lot
+that disappears from the cadastre has no row to conflict with and would
+otherwise sit there forever.
+
+That last half also settles what to do about a key that does not survive a
+re-scrape. `silver.building_lot_intersections` conflicts on `building_uid`, a
+bigserial `load_buildings` mints again on every load, so a re-run upserts
+nothing and prunes everything — which is precisely the delete-then-insert that
+table needs. The mechanism is one; what changes per table is only which columns
+are the key.
+
+Partitions are created on demand by hbu_infra's `warehouse.ensure_partition`,
+called with the partition about to be written, so a borough enabled for the
+first time and the first load of a new month both just work. It is deliberately
+not a `DEFAULT` partition: rows that land in a default cannot be moved by
+attaching the partition they belong in.
+
+Every asset reports what it published in its run metadata: the parquet-first
+ones as `<dataset>_rows_upserted` (and `<dataset>_rows_pruned` when the prune
+found anything), the PostGIS ones alongside the counts they already report —
+`num_building_lot_rows_pruned`, `num_profiles_pruned`. A prune of zero is the
+steady state; a prune of four thousand on a re-run is the borough's cadastre
+having moved under the partition.
+
+Those PostGIS joins take the same road by a different door. Their rows are
+computed in the database and never pass through Python, so they go through
+`warehouse.upsert_select` instead: the statement lands in the same staging
+table, and the same upsert and prune run over it. See
+[`src/urban_rag/warehouse.py`](src/urban_rag/warehouse.py).
 
 ## Output layout
 
@@ -138,9 +234,16 @@ data/
 │   │   └── residential_costs.parquet
 │   ├── montreal_nonresidential_costs/2026-08-18/
 │   │   └── non_residential_costs.parquet
+│   ├── property_assessment_roll/2026-08-18/
+│   │   ├── rol_unite_p.parquet       # one point per assessment unit
+│   │   └── unite_evaln.parquet       # what the roll says about each
 │   └── linked_documents/2026-08-18/VSMPE/
 │       └── documents.parquet
 ├── silver/
+│   ├── assessment_units/2026-08-18/
+│   │   └── assessment_units.parquet
+│   ├── lot_assessed_values/2026-08-18/VSMPE/
+│   │   └── lot_assessed_values.parquet
 │   ├── vacancy_rates/2026-08-18/VSMPE/
 │   │   ├── vacancy_rates.parquet
 │   │   └── quartier_vacancy_rates.parquet
@@ -300,6 +403,170 @@ The layer's `minScale` only stops the lots from *drawing* on a zoomed-out map;
 > requests and still returns a different set at each scale (a 500 m tile
 > returned 80 lots where its four 250 m sub-tiles returned 122).
 
+## What a lot is assessed at
+
+Infolot draws the lot. It does not say what stands on it, who owns it, or what
+it is worth — those are the *rôle d'évaluation foncière*, the assessment roll
+every Quebec municipality files and the MAMH republishes as open data:
+
+- [donneesouvertes.affmunqc.net/role/ROLE2026_GEOPACKAGE.zip](https://donneesouvertes.affmunqc.net/role/ROLE2026_GEOPACKAGE.zip),
+  572 MB zipped, one 2.8 GB GeoPackage for the province.
+
+Three assets over it. `property_assessment_roll` snapshots it,
+`assessment_units` makes it readable, and `lot_assessed_values` carries it onto
+the cadastre.
+
+### Five layers, two of them read
+
+The GeoPackage holds one feature class and four tables, all keyed on
+`id_provinc` — the municipality's five-digit code followed by the unit's
+18-character matricule:
+
+| Layer | Rows (province) | What it is | Read |
+| --- | --- | --- | --- |
+| `rol_unite_p_2026` | 3 747 008 | One point per *unité d'évaluation*, at the unit's visual centre. EPSG:4269 | ✅ |
+| `b05v_unite_evaln_2026` | 3 747 176 | The characteristics: values, area, storeys, year built, dwellings, use code | ✅ |
+| `b05v_adr_unite_evaln_2026` | 3 819 572 | Civic addresses, one to many | — |
+| `b05v_lot_cadst_2026` | 5 595 995 | The cadastral lot numbers the unit covers, one to many | — |
+| `b05v_repar_fisc_2026` | 1 626 132 | Fiscal breakdowns and exemptions, one to many | — |
+
+The three that are not read are one-to-many against the unit, so keeping them
+would mean four grains in one partition. `UNREAD_LAYERS` names them and the
+asset reports them in its `layers_not_read` metadata, so what was dropped is on
+the record rather than inferred from what is absent.
+
+The layer names carry the roll year, so they are resolved by prefix rather than
+written out: next year's archive is the same five layers ending `_2027`, and a
+hard-coded name would fail on the one line guaranteed to change. The year
+itself is `RoleResource.roll_year`, defaulting to `$URBAN_RAG_ROLL_YEAR`.
+
+### Two things the archive forces
+
+**It is unpacked to disk.** `urban_rag.bdoi` hands its zipped shapefiles
+straight to GDAL through `zip://` and never writes them out. That cannot work
+here: a GeoPackage is a SQLite database, and SQLite reads it by *seeking* —
+inside a deflate stream, every seek means decompressing from the start of the
+member again. The unpacked 2.8 GB copy lands beside the archive in
+`data/cache/role/`, and both are keyed by filename and shared across every
+scrape date, the same posture as the BDOI extracts and the CMHC workbook. A
+published roll year is final; only the first run of a year pays for it.
+
+**It is filtered in OGR, not in memory.** The province is 3.7 million
+assessment units against Montreal's 437 thousand. `municipality_codes` becomes
+an OGR attribute filter (`code_mun IN ('66023')`) rather than a mask applied to
+a frame afterwards, so the rows outside it are never built — the difference
+between ~300 MB of memory and a few gigabytes. Scoping a province-wide source
+to the territory being modelled is a bound on what was asked for rather than an
+interpretation of what came back, which is what keeps this in bronze; it is the
+same move `cmhc_vacancy_survey` makes when it keeps the Montreal CMA out of a
+national survey.
+
+Set it to `[]` for the whole province, or add codes for the other on-island
+municipalities — Westmount, Mont-Royal, Côte-Saint-Luc and the rest file their
+own rolls and are not boroughs:
+
+```bash
+make roll DATE=2026-08-26                    # Ville de Montréal, the default
+make roll DATE=2026-08-26 CODE_MUN='[]'      # the province
+```
+
+Geometry is reprojected to EPSG:4326 on the way in, the way BDOI's is. NAD83 is
+close enough to WGS 84 to look right on a map and about a metre and a half
+away — enough to move a point across a lot line, which is exactly what the
+third asset joins on.
+
+### Putting the two layers back together
+
+`assessment_units` merges them on `id_provinc`, which is 1:1 on both sides
+(437 192 rows each for Montreal in the 2026 roll). The grain is checked rather
+than assumed on both files, because a duplicate would multiply the merge and
+then double a lot's total downstream — the kind of error that reads as a
+plausible number rather than as a crash.
+
+`code_mun` and `mat18` are published in *both* layers — `id_provinc` taken
+apart — so they are dropped from the characteristics side rather than suffixed.
+Checked first: two spellings of one municipality code is a thing for silver to
+refuse, not to pick a winner for. `identifiant` is in both and the two do *not*
+agree, so it is kept as `identifiant_unite`; `arrond` and its characteristics-
+side name `rl0102a` both survive, since bronze vocabulary is not reconciled
+away.
+
+The result is as wide as the bronze snapshot — the roll has no borough axis, so
+this asset is partitioned by **date alone**, like `street_network` and the two
+CMHC surveys. The borough cut happens one asset later, against the cadastre.
+
+### The lot join is spatial, and that is a choice
+
+`lot_assessed_values` puts each unit on the lot its point falls inside, then
+groups by `NO_LOT` and sums `rl0404a` (VALEUR IMMEUBLE — land plus buildings,
+which the roll also splits as `rl0402a` and `rl0403a`).
+
+The roll *does* publish the exact mapping, in `b05v_lot_cadst`. Not reading it
+trades a known error for a different one, and both are worth naming:
+
+- An assessment point sits at the **visual centre of the unit**, so a unit
+  spanning three lots lands entirely on whichever of the three holds its
+  centre. Its full value goes there and the other two get none of it.
+- A point falling in a lane, a park, or a lot the cadastre draws slightly
+  differently matches nothing, and its value is attributed nowhere.
+
+Neither is assumed. `num_units_unmatched_in_snapshot` counts the second, and
+the first is why `num_assessment_units` travels beside every total. Reading
+`b05v_lot_cadst` and joining on the lot number is the refinement this asset is
+shaped to accept.
+
+**The sum is over units, not over buildings.** A divided-co-ownership building
+is one unit per apartment, all on the one `PC-*` common-parts lot. On the first
+VSMPE snapshot:
+
+```
+NO_LOT     num_assessment_units  total_assessed_value
+PC-29987                    402           257 660 500
+PC-36627                    323           202 657 400
+3 801 513                     1           150 476 700
+```
+
+That is the number a highest-and-best-use question wants — what the ground is
+currently worth in aggregate — and it is only readable as such because the
+count sits next to it.
+
+A lot nothing is assessed on **keeps its row**, with `num_assessment_units = 0`
+and a **null** total: a sum over nothing is not a value of zero. On that same
+snapshot 26 484 of the borough's units fell inside 21 676 of its 24 952 lots,
+$27.36 B in total; the 3 276 unvalued lots are mostly lanes, parks and city
+parcels. A few percent is the honest reading of `num_lots_unvalued`; a third of
+the borough would mean the cadastre and the roll disagree about where the
+ground is.
+
+The cadastre's self-intersecting rings are repaired here with `make_valid`
+before the point-in-polygon join, and the count reported as
+`num_geometries_repaired` — the same repair `building_lot_intersections` makes
+on the way into PostGIS, for the same reason and made visible the same way.
+
+> `rl0404a` is an **assessed value for taxation**, not a market appraisal, and
+> Montreal's roll is triennial: every unit in a 2026 roll is valued as of the
+> same reference date. The totals compare across lots; they do not track a
+> market between rolls.
+
+### Only one of the two has a table
+
+`lot_assessed_values` owns `silver.lot_assessed_values`
+(`sql/013_silver_lot_assessed_values.sql`), like every other borough-scoped
+silver asset — one row per `(scrape_date, neighborhood, lot_number)`, the
+cadastre's other columns in the jsonb catch-all, upserted then pruned by
+`urban_rag.warehouse` like all the rest. That file has no `-- requires:`
+header, so it lands on the first `db.py init` and the asset is scheduled
+normally.
+
+`assessment_units` is a **documented absence** in `warehouse.TABLES`, alongside
+`document_embeddings` and `document_index`. Every warehouse table is
+`PARTITION BY LIST (neighborhood)` and keyed `(scrape_date, neighborhood, …)`;
+this is the one silver asset with no borough axis to supply one, and inventing
+a neighborhood — a literal, or a borough read off `arrond` — would be a
+partition key meaning something different from every other table's. Its record
+is the tree, which is where the record lives anyway. `test_warehouse.py` asserts
+those three and only those three, so a fourth absence cannot arrive quietly.
+
 ## The vacancy rates
 
 Two assets, and the seam between them is where this pipeline's bronze/silver
@@ -449,7 +716,7 @@ Both surveys are borough figures, so the denormalisation has to happen
 somewhere — CMHC publishes no geometry and there is nothing to join on but the
 name. It now happens at [the grain that asks the
 question](#every-lot-profiled), as `vacancy_rates` and `average_rents` jsonb on
-`rag.lot_profiles`. What was left of that asset was the geometry repair, and it
+`gold.lot_profiles`. What was left of that asset was the geometry repair, and it
 moved into `building_lot_intersections`, next to the `ST_Intersection` calls it
 exists for.
 
@@ -560,7 +827,7 @@ than by preference.
 date × neighborhood partition it loads the borough's map features into
 `rag.features` — which nothing filled before, so `rag.chunk_features`,
 `rag.search_near` and `rag.search_at_lot` had all been reading an empty table —
-loads its lots into `rag.lots`, and intersects the two into `rag.lot_features`,
+loads its lots into `rag.lots`, and intersects the two into `silver.lot_features`,
 one row per (lot, feature) pair holding the clipped slice and `pct_of_lot`, the
 share of the lot that feature covers.
 
@@ -632,7 +899,7 @@ database.
 The chain then runs end to end in SQL:
 
 ```
-rag.lots  ──ST_Intersection──▶  rag.lot_features  ──feature_id──▶  rag.chunks
+rag.lots  ──ST_Intersection──▶  silver.lot_features  ──feature_id──▶  rag.chunks
  NO_LOT                          pct_of_lot                        url, text
 ```
 
@@ -648,7 +915,7 @@ SELECT lot_number, feature_id, pct_of_lot, url
 
 `rag.search_at_lot_number(embedding, '1425926')` is the retrieval version:
 `rag.search_at_lot` entered from a lot number rather than a point, reading the
-join back out of `rag.lot_features` instead of recomputing it per query.
+join back out of `silver.lot_features` instead of recomputing it per query.
 
 ### Two things the geometry makes true
 
@@ -656,7 +923,7 @@ join back out of `rag.lot_features` instead of recomputing it per query.
 cadastral boundary and a zoning boundary are drawn by different offices from
 different surveys, so they miss each other by centimetres all along a street
 and every lot picks up a sliver of its neighbour's zone. Nothing is thresholded
-away at load time — the same posture `rag.building_lots` takes toward the
+away at load time — the same posture `silver.building_lot_intersections` takes toward the
 corner of a triplex crossing a lot line — because the cutoff belongs to the
 question, not to the geometry. `pct_of_lot` is the column to filter on, and
 `coverage_rank = 1` takes the zone that actually governs the lot. A lot
@@ -672,7 +939,7 @@ loading a layer under the path would fail nothing and match nothing.
 
 The slug also drops the borough namespace, and zone numbers restart at
 `C01-001` in every borough — so the borough is part of the match too, not just
-of the partition filter, both in `rag.lot_features` and in
+of the partition filter, both in `silver.lot_features` and in
 `rag.chunk_features`.
 
 ## The street network, and what a lot fronts on
@@ -682,7 +949,7 @@ area. Two 400 m² lots side by side are not the same development site if one has
 30 m on a boulevard and the other 6 m on a lane: the width of the street edge
 decides what can be built, how it is entered, and what it is worth. Neither
 publisher records it. Infolot draws the parcel; Montreal draws the roadway; the
-relation between them is geometry — the same situation `rag.lot_features` is
+relation between them is geometry — the same situation `silver.lot_features` is
 in, and it is answered the same way.
 
 The street layer is the *géobase double*, not the plain géobase:
@@ -694,7 +961,7 @@ The plain géobase draws one centre line per segment. The double projects that
 onto the curb and sidewalk limits and draws **one line per side of street**,
 which is what a frontage question needs: a lot faces one side of a street, not
 the axis of the roadway. `COTE_RUE_ID` is the publisher's key for a side and is
-unique island-wide, which is what lets `rag.streets` upsert against a real
+unique island-wide, which is what lets `silver.neighborhood_streets` upsert against a real
 natural key rather than replace a partition wholesale.
 
 Three assets, and the borough axis appears in the middle one:
@@ -789,7 +1056,7 @@ on when a question wants *the* street a lot fronts on:
 
 ```sql
 SELECT lot_number, street_name, round(frontage_m::numeric, 1) AS frontage_m
-FROM rag.lot_frontage
+FROM silver.lot_frontage
 WHERE neighborhood = 'VSMPE' AND scrape_date = '2026-08-18'
   AND frontage_rank = 1
 ORDER BY frontage_m DESC
@@ -798,20 +1065,25 @@ LIMIT 20;
 
 A corner lot legitimately has two rows; a lot clipping a side street by 40 cm
 has a second one that is a survey artifact. Nothing is thresholded away at load
-time, for the same reason `rag.lot_features` keeps its slivers — the cutoff
+time, for the same reason `silver.lot_features` keeps its slivers — the cutoff
 belongs to the question. `num_lots_without_frontage` in the run's metadata is
 the number to watch: a few percent are true interior parcels, a third of the
 borough is a street snapshot that stopped short.
 
 ### What this asset does *not* load
 
-`rag.lots`. It is already holding this partition when `lot_frontage` runs,
-because `building_lot_intersections` put it there, and that asset's docstring
-explains why loading the cadastre from two places is a race rather than a
-redundancy: whoever commits second replaces the rows the first just computed
-against. So `lot_frontage` depends on it, loads only `rag.streets`, and fails
-with a message naming it if `rag.lots` comes back empty — the same guard
-`lot_profiles` carries for the same reason.
+Anything. Both sides of the join are already in Postgres when `lot_frontage`
+runs: `rag.lots` because `building_lot_intersections` put it there, and
+`silver.neighborhood_streets` because that asset owns its own table. Each of
+those is loaded in exactly one place, which is not tidiness but the fix for a
+real race — `building_lot_intersections`'s docstring has the long version:
+whoever commits second replaces the rows the first just computed against.
+
+So `lot_frontage` depends on both assets, guards on both partitions being
+populated, and fails with a message naming the one that came back empty — the
+same guard `lot_profiles` carries for the same reason. It used to load the
+streets itself, which left `silver.neighborhood_streets` with a writer that was
+not the asset it is named for.
 
 ## Every lot, profiled
 
@@ -821,8 +1093,8 @@ question a person actually asks:
 
 | upstream | grain | what it contributes |
 |---|---|---|
-| `rag.building_lots` | (building, lot) | `num_buildings`, `built_area_m2`, `category` |
-| `rag.lot_frontage` | (lot, street side) | `primary_*` and `secondary_*`, `num_frontages` |
+| `silver.building_lot_intersections` | (building, lot) | `num_buildings`, `built_area_m2`, `category` |
+| `silver.lot_frontage` | (lot, street side) | `primary_*` and `secondary_*`, `num_frontages` |
 | `rag.lot_documents` | (lot, feature, document) | `doc_*` and the `documents` array |
 | `silver/lot_zoning_envelopes` | (lot, grid column) | `num_zoning_envelopes` and the `zoning_envelopes` array |
 
@@ -868,7 +1140,7 @@ column and turns the old question into a filter over an inventory:
 
 ```sql
 SELECT lot_number, primary_street_name, round(primary_frontage_m::numeric, 1)
-FROM rag.lot_profiles
+FROM gold.lot_profiles
 WHERE neighborhood = 'VSMPE' AND scrape_date = '2026-08-18'
   AND NOT has_building
 ORDER BY primary_frontage_m DESC NULLS LAST
@@ -887,7 +1159,7 @@ a 12 m² shed satisfies. Whether a lot is *usably* empty depends on a threshold,
 a threshold is a judgement about the built form rather than a property of the
 data, and a boolean cannot carry one. So that lives in `category`, computed
 against `LotProfilesConfig.max_built_area_m2`, which every row records the way
-`rag.lot_frontage` records its `buffer_m`:
+`silver.lot_frontage` records its `buffer_m`:
 
 ```
 make lot-profiles DATE=2026-08-18 NEIGHBORHOOD=VSMPE
@@ -899,7 +1171,7 @@ applied to them.
 
 ### The two frontages
 
-`rag.lot_frontage` is one row per (lot, street side), ranked longest first;
+`silver.lot_frontage` is one row per (lot, street side), ranked longest first;
 these are its top two, pivoted. Ranks beyond the second are counted in
 `num_frontages` and summed into `total_frontage_m` rather than given a third
 pair of columns every other row would leave empty. Which edge is primary is
@@ -914,7 +1186,7 @@ snapshot that stopped short.
 
 ### The linked PDF
 
-The last hop of the chain `rag.lot_features` opens up. `rag.chunks.feature_ids`
+The last hop of the chain `silver.lot_features` opens up. `rag.chunks.feature_ids`
 records which map features cite each indexed PDF, and `rag.lot_documents` puts
 that together with the features covering a lot. The highest-coverage document
 **across every layer** is flattened into `doc_url`/`doc_title` so the common
@@ -1080,8 +1352,8 @@ corpus:
 | Asset | Output |
 | --- | --- |
 | `linked_documents` | One row per distinct link: the PDF fetched and flattened to text |
-| `document_chunks` | Paragraph-aligned, overlapping chunks, sized in the encoder's tokens |
-| `document_embeddings` | One 1024-wide float32 [BAAI/bge-m3](https://huggingface.co/BAAI/bge-m3) vector per chunk |
+| `document_chunks` | Paragraph-aligned, overlapping chunks, sized in the encoder's tokens — and the one of the three with a table of its own, `silver.document_chunks`, which keeps every scrape date rather than only the current one |
+| `document_embeddings` | One 1024-wide float32 [BAAI/bge-m3](https://huggingface.co/BAAI/bge-m3) vector per chunk. No table: its vectors' home is `rag.chunks`, the pgvector index `document_index` writes, and a `silver.document_embeddings` would be a second copy of the only thing here measured in gigabytes |
 
 ```
 data/
@@ -1368,11 +1640,21 @@ Two environment gotchas on a managed laptop:
   `REQUESTS_CA_BUNDLE` / `CURL_CA_BUNDLE`) explicitly. Keep `SSL_CERT_FILE`
   pointed at the corporate root at run time, or set `ca_bundle` on the
   `SpectrumResource`.
-- **The model download needs the opposite again.** huggingface.co is *not*
-  behind the inspecting proxy, so verifying it against the corporate root fails
-  with `CERTIFICATE_VERIFY_FAILED`. `rag.embeddings.trusted_ca` swaps the three
-  CA variables for `certifi` while the weights download and restores them after;
-  override with `URBAN_RAG_HF_CA_BUNDLE` if your machine needs something else.
+- **The model download needs both halves at once.** huggingface.co itself is
+  *not* behind the inspecting proxy, so verifying it against the corporate root
+  fails with `CERTIFICATE_VERIFY_FAILED` — but the file CDN it redirects the
+  weights to, `us.aws.cdn.hf.co`, *is* intercepted, and verifying that against
+  `certifi` fails the same way. `rag.embeddings.trusted_ca` swaps the three CA
+  variables for `certifi` while the weights download and restores them after,
+  which resolves the metadata and then dies at the transfer's TLS handshake.
+  Point `URBAN_RAG_HF_CA_BUNDLE` at the concatenated bundle — a superset of
+  `certifi`, so it satisfies both hosts.
+
+  The failure is worth recognising because the message names the wrong problem:
+  `huggingface_hub` 1.x is `httpx`-based, `httpx` errors are not `OSError`
+  subclasses, and `transformers` wraps anything that is not an `OSError` in
+  `Can't load the model for 'BAAI/bge-m3' … a file named pytorch_model.bin`.
+  The real `httpx.ConnectError` is the `__cause__`, further down the chain.
 
 ## Containers
 
@@ -1404,7 +1686,9 @@ extra is not optional](#the-rag-extra-is-not-optional).
 checkout on the WSL filesystem (`~/urban_rag`), not under `/mnt/c`. Dagster's
 default run and event storage is SQLite, and SQLite's locking over the 9p mount
 that backs `/mnt/c` is where this goes wrong first — as does the DuckDB write
-lock the vector store takes.
+lock the vector store takes. Pointing Dagster at Postgres
+([Dagster's own storage](#dagsters-own-storage)) removes the first of those two
+but not the second.
 
 ### Image
 
@@ -1420,7 +1704,7 @@ overridable:
 | Path | Holds | Env |
 | --- | --- | --- |
 | `/data` | PDF cache, `vect_db.duckdb`, and parquet snapshots when `S3_BUCKET` is unset | `URBAN_RAG_DATA_DIR` |
-| `/dagster_home` | run and event storage, schedule state | `DAGSTER_HOME` |
+| `/dagster_home` | `dagster.yaml`, plus run and event storage when it is not on Postgres | `DAGSTER_HOME` |
 
 ### S3 output
 
@@ -1531,11 +1815,56 @@ make down
 ```
 
 That stack uses the default SQLite and filesystem storage under `/dagster_home`
-until Postgres connection settings are present. With `URBAN_RAG_PG_HOST` plus a
-password or secret (or an explicit `DAGSTER_POSTGRES_URL`), the image
-entrypoint writes a `dagster.yaml` that stores Dagster run/event/schedule
-metadata in the same database under the `dagster` schema. Run
-`hbu_infra`'s `make db-bootstrap`/`make db-init` first so that schema exists.
+until Postgres connection settings are present — see
+[Dagster's own storage](#dagsters-own-storage) below, which is the same
+mechanism.
+
+### Dagster's own storage
+
+Two different databases are in play and they are easy to confuse. The
+Postgres/pgvector one holds the *corpus* — `rag.chunks` and the spatial tables,
+which `make publish` and `make index BACKEND=postgres` write. This section is
+about the other one: Dagster's own bookkeeping — run history, the event log,
+schedule and sensor state, the tick records the daemon reads.
+
+By default that bookkeeping is SQLite plus loose files under `DAGSTER_HOME`,
+which is fine for one laptop and wrong for anything with two processes: the
+webserver and the daemon in [docker-compose.yml](docker-compose.yml) are peers
+contending for the same SQLite writer lock, and a Fargate task's local disk
+does not survive a redeploy at all.
+
+Set `URBAN_RAG_PG_HOST` plus a password or secret — or an explicit
+`DAGSTER_POSTGRES_URL` — and that bookkeeping moves to Postgres instead, into a
+`dagster` schema kept separate from `rag`:
+
+```bash
+cd ../hbu_infra
+make db-bootstrap ENV=dev     # creates the urban_rag role and both schemas
+make db-init      ENV=dev
+eval "$(./scripts/db.py env --app)"   # or plain `env` for the master user
+
+cd ../hbu_dataplatform
+make dagster_run
+```
+
+[src/urban_rag/dagster_home.py](src/urban_rag/dagster_home.py) is what reads
+those variables: it writes `$DAGSTER_HOME/dagster.yaml` and then execs the
+dagster command it was handed. Both entry points go through it — the image's
+`ENTRYPOINT`, and every dagster target in the Makefile — so a laptop run and a
+container run configure the instance the same way. With no Postgres settings in
+the environment it leaves the local SQLite default alone, and will not clobber a
+`dagster.yaml` you wrote by hand.
+
+`DAGSTER_POSTGRES_SCHEMA` overrides the schema name; it reaches libpq as a
+`search_path` in the connection URL rather than as anything Dagster is told
+about, which is why the schema has to exist first. `db.py check` lists what
+lands there.
+
+One constraint worth knowing: `URBAN_RAG_PG_IAM_AUTH=1` works for the corpus
+but not for this. RDS IAM tokens expire after fifteen minutes and Dagster holds
+its instance-storage connections open indefinitely, so a durable password or a
+Secrets Manager id is required here — `dagster_home.py` says so rather than
+failing later.
 
 ## Running
 
@@ -1546,6 +1875,11 @@ the variables they read. Raw:
 `--select` takes an asset's full `<layer>/<asset>` key — the prefix
 `urban_rag.layers` gives it. A bare name selects nothing and dagster answers
 `DagsterInvalidSubsetError`, naming the prefixed key it meant.
+
+Raw invocations skip the `urban_rag.dagster_home` entrypoint the Makefile and
+the image both go through, so they read whatever `dagster.yaml` is already in
+`DAGSTER_HOME` — prefix them with `python -m urban_rag.dagster_home` to get the
+Postgres config generated from the environment instead.
 
 ```powershell
 $env:DAGSTER_HOME = "$PWD\.dagster_home"
@@ -1577,6 +1911,15 @@ uv run dagster asset materialize --select bronze/montreal_residential_costs,bron
 
 # that borough's sides of street, cut out of it
 uv run dagster asset materialize --select silver/neighborhood_streets --partition "2026-08-18|VSMPE" -m urban_rag.definitions
+
+# the province-wide assessment roll and the merge that makes it readable, both
+# date-partitioned only. The first run of a roll year downloads 572 MB and
+# unpacks a 2.8 GB GeoPackage into data/cache/role/; later dates reuse both
+uv run dagster asset materialize --select bronze/property_assessment_roll,silver/assessment_units --partition 2026-08-18 -m urban_rag.definitions
+
+# what every lot in that borough is assessed at — needs the two above for the
+# same date and neighborhood_lots for the same partition
+uv run dagster asset materialize --select silver/lot_assessed_values --partition "2026-08-18|VSMPE" -m urban_rag.definitions
 
 # how much street each lot faces — needs building_lot_intersections first, for
 # the rag.lots this reads, and hbu_infra's sql/007 + sql/008 applied

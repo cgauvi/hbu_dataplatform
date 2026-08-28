@@ -68,10 +68,10 @@ STREETS_FILE = "street_sides.parquet"
 
 #: The geobase double's own key for a street side, unique island-wide (91,546
 #: of 91,546 in the first snapshot). Carried through silver and into
-#: `rag.streets.cote_rue_id` as the id that survives a reload.
+#: `silver.neighborhood_streets.cote_rue_id` as the id that survives a reload.
 STREET_ID_COLUMN = "COTE_RUE_ID"
 
-#: The street's name, kept as its own column all the way to `rag.streets`
+#: The street's name, kept as its own column all the way to `silver.neighborhood_streets`
 #: because it is what a frontage row is read for.
 STREET_NAME_COLUMN = "NOM_VOIE"
 

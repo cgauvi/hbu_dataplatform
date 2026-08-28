@@ -5,13 +5,12 @@ PostGIS by `building_lot_intersections` and `lot_frontage`, and what is left
 here is a parse and two merges, which is exactly what these cover.
 
 The one seam stubbed out is the download. `PdfCache` hands back a fetcher that
-reads bytes off disk or off the city's web server, and the parser turns those
-bytes into columns; the fixture below substitutes a fetcher that returns a grid
-*page* and a `parse_grid_pdf` that reads it with the real `parse_grid_page`. So
-the parser is exercised for real and only `pypdf` is not, which keeps these
-tests about the assets rather than about PDF containers.
+reads bytes off disk or off the city's web server; the fixture below
+substitutes one that serves bytes from a dict, and nothing else is replaced -
+`zoning_grid_columns` runs the real `parse_grid_pdf` over a real PDF, so what
+these cover includes the parse.
 
-The grid itself comes from `test_zoning_grid.grid_page` - the published
+The grid itself comes from `test_zoning_grid.grid_pdf` - the published
 C01-001, one Commerce column and one bare Habitation column - so what these
 assert about `usages`, `levels` and `governs_residential` is a real grid's own
 reading of itself.
@@ -24,11 +23,10 @@ import json
 import geopandas as gpd
 import pandas as pd
 import pytest
+from asset_helpers import materialization_metadata, stub_publish as stub_publish_into
 from dagster import Failure, MultiPartitionKey, materialize
 from shapely.geometry import LineString, Polygon
-
-from asset_helpers import materialization_metadata
-from test_zoning_grid import grid_page
+from test_zoning_grid import grid_pdf
 
 from urban_rag.building_lots_assets import (
     LOT_FEATURES_FILE,
@@ -40,12 +38,12 @@ from urban_rag.envelope_assets import (
     lot_zoning_envelopes,
     zoning_grid_columns,
 )
+from urban_rag import envelope_assets
 from urban_rag.frames import write_frame
 from urban_rag.frontage_assets import LOT_FRONTAGE_FILE, lot_frontage
 from urban_rag.rag_assets import DOCUMENTS_FILE, linked_documents
-from urban_rag.resources import ParquetStore, PdfCache
+from urban_rag.resources import ParquetStore, PdfCache, PostgisResource
 from urban_rag.storage import join
-from urban_rag.zoning_grid import parse_grid_page
 
 DATE = "2026-08-24"
 NEIGHBORHOOD = "VSMPE"
@@ -65,24 +63,20 @@ def cache(tmp_path):
 
 @pytest.fixture
 def stub_pdfs(monkeypatch):
-    """Serve grid pages instead of PDFs, keyed by URL.
+    """Serve PDFs out of a dict instead of off the network, keyed by URL.
 
     Returns the dict the test fills in; a URL left out of it raises on fetch,
     which is how the dead-link case below is set up.
     """
-    pages: dict[str, str] = {}
+    pages: dict[str, bytes] = {}
 
     class _Fetcher:
         def fetch(self, url):
             if url not in pages:
                 raise OSError(f"{url}: no such document")
-            return pages[url].encode("utf-8"), True
+            return pages[url], True
 
     monkeypatch.setattr(PdfCache, "fetcher", lambda self: _Fetcher())
-    monkeypatch.setattr(
-        "urban_rag.envelope_assets.parse_grid_pdf",
-        lambda content, url=None: parse_grid_page(content.decode("utf-8")),
-    )
     return pages
 
 
@@ -173,11 +167,26 @@ def write_frontage(store, *, lot_uids=(1,), lengths=(30.0,), ranks=(1,)):
     )
 
 
+@pytest.fixture(autouse=True)
+def stub_publish(monkeypatch):
+    """The upsert into silver.zoning_grid_columns / silver.lot_zoning_envelopes.
+
+    Recorded rather than run: both assets publish the same frame they write to
+    the tree, and every test here is about the parse and the join. The frames
+    handed over are kept for the tests that check what reaches the database.
+    """
+    return stub_publish_into(monkeypatch, envelope_assets)
+
+
 def run_columns(store, cache):
     return materialize(
         [zoning_grid_columns],
         partition_key=MultiPartitionKey({"date": DATE, "neighborhood": NEIGHBORHOOD}),
-        resources={"store": store, "pdf_cache": cache},
+        resources={
+            "store": store,
+            "pdf_cache": cache,
+            "postgis": PostgisResource(),
+        },
         selection=[zoning_grid_columns],
     )
 
@@ -186,7 +195,7 @@ def run_envelopes(store, run_config=None):
     return materialize(
         [lot_zoning_envelopes],
         partition_key=MultiPartitionKey({"date": DATE, "neighborhood": NEIGHBORHOOD}),
-        resources={"store": store},
+        resources={"store": store, "postgis": PostgisResource()},
         selection=[lot_zoning_envelopes],
         run_config=run_config,
     )
@@ -218,7 +227,7 @@ def read_envelopes(store):
 
 
 def test_writes_one_row_per_grid_column(store, cache, stub_pdfs):
-    stub_pdfs[GRID_URL] = grid_page()
+    stub_pdfs[GRID_URL] = grid_pdf()
     write_documents(store)
 
     result = run_columns(store, cache)
@@ -232,7 +241,7 @@ def test_writes_one_row_per_grid_column(store, cache, stub_pdfs):
 
 
 def test_carries_the_norms_as_columns_of_the_row(store, cache, stub_pdfs):
-    stub_pdfs[GRID_URL] = grid_page()
+    stub_pdfs[GRID_URL] = grid_pdf()
     write_documents(store)
     run_columns(store, cache)
 
@@ -258,7 +267,7 @@ def read_envelope_column(frame):
 
 def test_a_grid_two_zones_share_reaches_both(store, cache, stub_pdfs):
     """`linked_documents` dedupes by URL, so one document can be two zones."""
-    stub_pdfs[GRID_URL] = grid_page()
+    stub_pdfs[GRID_URL] = grid_pdf()
     write_documents(store, feature_ids=(["C01-001", "C01-009"],))
 
     run_columns(store, cache)
@@ -272,7 +281,7 @@ def test_a_grid_two_zones_share_reaches_both(store, cache, stub_pdfs):
 def test_one_unreadable_grid_costs_its_zone_and_not_the_borough(
     store, cache, stub_pdfs
 ):
-    stub_pdfs[GRID_URL] = grid_page()
+    stub_pdfs[GRID_URL] = grid_pdf()
     write_documents(
         store,
         urls=(GRID_URL, "http://example.invalid/zone/dead.pdf"),
@@ -298,7 +307,7 @@ def test_every_grid_failing_fails_the_partition(store, cache, stub_pdfs):
 def test_a_column_with_no_storey_ceiling_lands_but_is_not_solver_ready(
     store, cache, stub_pdfs
 ):
-    stub_pdfs[GRID_URL] = grid_page(floors=("2/6", "-"))
+    stub_pdfs[GRID_URL] = grid_pdf(floors=("2/6", "-"))
     write_documents(store)
     run_columns(store, cache)
 
@@ -312,7 +321,7 @@ def test_a_column_with_no_storey_ceiling_lands_but_is_not_solver_ready(
 
 
 def materialize_both(store, cache, stub_pdfs, **envelope_kwargs):
-    stub_pdfs.setdefault(GRID_URL, grid_page())
+    stub_pdfs.setdefault(GRID_URL, grid_pdf())
     write_documents(store)
     run_columns(store, cache)
     return run_envelopes(store, **envelope_kwargs)
@@ -377,7 +386,7 @@ def test_a_lot_too_narrow_for_every_residential_column_governs_none(
     store, cache, stub_pdfs
 ):
     """*Largeur du terrain min* is a real answer about the parcel."""
-    stub_pdfs[GRID_URL] = grid_page(lot_width=("-", "18"))
+    stub_pdfs[GRID_URL] = grid_pdf(lot_width=("-", "18"))
     write_lot_features(store)
     write_frontage(store, lengths=(9.0,))
 

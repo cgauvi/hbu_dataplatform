@@ -14,6 +14,7 @@ snapshot` and `test_silver_without_its_bronze_snapshot_says_what_to_run`.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
 
 import pandas as pd
@@ -44,8 +45,9 @@ from urban_rag.cmhc_assets import (
     cmhc_vacancy_survey,
     vacancy_rates,
 )
+from urban_rag import cmhc_assets
 from urban_rag.partitions import CMHC_QUARTIERS, quartiers_for
-from urban_rag.resources import CmhcResource, ParquetStore
+from urban_rag.resources import CmhcResource, ParquetStore, PostgisResource
 from urban_rag.storage import join
 
 DATE = "2026-08-20"
@@ -458,7 +460,7 @@ def run(store, cache, *, neighborhood=NEIGHBORHOOD):
     return materialize(
         [vacancy_rates],
         partition_key=MultiPartitionKey({"date": DATE, "neighborhood": neighborhood}),
-        resources={"store": store},
+        resources={"store": store, "postgis": PostgisResource()},
     )
 
 
@@ -467,8 +469,42 @@ def materialize_silver_vacancy(store, *, neighborhood=NEIGHBORHOOD):
     return materialize(
         [vacancy_rates],
         partition_key=MultiPartitionKey({"date": DATE, "neighborhood": neighborhood}),
-        resources={"store": store},
+        resources={"store": store, "postgis": PostgisResource()},
     )
+
+
+@pytest.fixture(autouse=True)
+def stub_publish(monkeypatch):
+    """The upsert into the four silver.* CMHC tables, recorded rather than run.
+
+    Both silver assets publish the borough average and the quartier rows it
+    was taken over in one transaction. Every test here is about the crosswalk
+    and the averaging, so the load is stubbed; the frames it was handed are
+    kept for the two tests that check what reaches the database.
+    """
+    seen: dict[str, object] = {"datasets": {}, "partition": None}
+
+    def publish(connect, datasets, *, neighborhood, scrape_date):
+        seen["datasets"] = dict(datasets)
+        seen["partition"] = (neighborhood, scrape_date)
+        return {
+            name: {
+                "copied": len(frame),
+                "duplicates": 0,
+                "upserted": len(frame),
+                "pruned": 0,
+            }
+            for name, frame in datasets.items()
+        }
+
+    monkeypatch.setattr(PostgisResource, "connect", _fake_connect)
+    monkeypatch.setattr(cmhc_assets, "publish", publish)
+    return seen
+
+
+@contextmanager
+def _fake_connect(self):
+    yield object()
 
 
 def read_bronze(store, asset_def, filename):
@@ -504,7 +540,7 @@ def run_rents(store, cache, monkeypatch, *, neighborhood=NEIGHBORHOOD):
     return materialize(
         [average_rents],
         partition_key=MultiPartitionKey({"date": DATE, "neighborhood": neighborhood}),
-        resources={"store": store},
+        resources={"store": store, "postgis": PostgisResource()},
     )
 
 

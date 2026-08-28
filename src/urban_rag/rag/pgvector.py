@@ -214,6 +214,18 @@ class PgSettings:
             "connect_timeout": self.connect_timeout,
             "application_name": "urban_rag",
             "options": options,
+            # A load reaching RDS through an SSM port-forward has no way to
+            # notice that tunnel dying: Session Manager leaves the local
+            # listener bound, so the socket stays open and a COPY of a
+            # borough's cadastre blocks on it forever - no error, no timeout,
+            # because `statement_timeout` only starts once the server has the
+            # query. These make the kernel probe an idle connection and give
+            # up after ~1 min, turning a silent overnight hang into a
+            # connection error the asset reports and a re-run fixes.
+            "keepalives": 1,
+            "keepalives_idle": 30,
+            "keepalives_interval": 10,
+            "keepalives_count": 3,
         }
         return {k: v for k, v in keywords.items() if v is not None}
 
@@ -413,9 +425,40 @@ class PgVectorStore:
         self._create_extension(cursor)
         _register_vector(connection)
         self._check_compatible(cursor, dimension, model)
-        cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {self.settings.db_schema}")
+        self._ensure_schema(cursor)
         self._create_table(cursor, dimension)
         self._create_meta_table(cursor)
+
+    def _ensure_schema(self, cursor: "Cursor") -> None:
+        """Create the schema only when it is genuinely absent.
+
+        `CREATE SCHEMA IF NOT EXISTS` is not the no-op its name suggests:
+        unlike `CREATE EXTENSION IF NOT EXISTS`, Postgres checks `CREATE` on
+        the *database* before it checks whether the schema is already there,
+        so a role without that privilege is refused with `permission denied
+        for database` even though there is nothing to do. `rag` belongs to
+        hbu_infra - sql/000_roles.sql creates it `AUTHORIZATION urban_rag` -
+        so on a deployed database this asks for a privilege the pipeline is
+        deliberately not granted, to do work already done. Asking first keeps
+        the create for the one case that needs it: a scratch database where
+        the schema really is missing.
+        """
+        schema = self.settings.db_schema
+        found = cursor.execute(
+            "SELECT 1 FROM pg_namespace WHERE nspname = %s", (schema,)
+        ).fetchone()
+        if found:
+            return
+        try:
+            cursor.execute(f"CREATE SCHEMA {schema}")
+        except Exception as exc:
+            raise PostgresUnavailable(
+                f"Schema {schema!r} does not exist in {self.settings.database} "
+                f"and {self.settings.user} may not create it "
+                f"({_first_line(exc)}).\n"
+                "hbu_infra owns it: run `db.py init` in that repo, which "
+                "applies sql/000_roles.sql."
+            ) from exc
 
     def _create_extension(self, cursor: "Cursor") -> None:
         try:
@@ -572,6 +615,14 @@ class PgVectorStore:
         with self.connect(register=False) as connection:
             cursor = connection.cursor()
             self._prepare(cursor, connection, dimension, model)
+            # A fresh cursor, and not for tidiness: registering the `vector`
+            # type above only reaches cursors created afterwards. psycopg builds
+            # a cursor's transformer the first time that cursor is executed and
+            # the transformer keeps the type registry it saw then - so the very
+            # cursor that just ran `CREATE EXTENSION` cannot resolve "vector" in
+            # a binary COPY. It fails with `couldn't find the type 'vector' in
+            # the types registry`, naming neither the column nor the cause.
+            cursor = connection.cursor()
             self._create_indexes(cursor)
             cursor.execute(
                 f"CREATE TEMP TABLE {staging} "
@@ -642,12 +693,18 @@ class PgVectorStore:
                     dimension, model = width, file_model
                     self._create_extension(cursor)
                     _register_vector(connection)
+                    # A fresh cursor, and not for tidiness: registering the `vector`
+                    # type above only reaches cursors created afterwards. psycopg builds
+                    # a cursor's transformer the first time that cursor is executed and
+                    # the transformer keeps the type registry it saw then - so the very
+                    # cursor that just ran `CREATE EXTENSION` cannot resolve "vector" in
+                    # a binary COPY. It fails with `couldn't find the type 'vector' in
+                    # the types registry`, naming neither the column nor the cause.
+                    cursor = connection.cursor()
                     # A rebuild, so the old table goes before the new one is
                     # described - that is what lets the width change.
                     self._drop(cursor)
-                    cursor.execute(
-                        f"CREATE SCHEMA IF NOT EXISTS {self.settings.db_schema}"
-                    )
+                    self._ensure_schema(cursor)
                     self._create_table(cursor, dimension)
                     self._create_meta_table(cursor)
                     cursor.execute(

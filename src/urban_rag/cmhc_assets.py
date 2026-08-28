@@ -60,8 +60,10 @@ from urban_rag.cmhc import (
 from urban_rag.frames import write_frame
 from urban_rag.layers import key_prefix
 from urban_rag.partitions import date_partitions, quartiers_for, scrape_partitions
-from urban_rag.resources import CmhcResource, ParquetStore
+from urban_rag.rag.pgvector import PostgresUnavailable
+from urban_rag.resources import CmhcResource, ParquetStore, PostgisResource
 from urban_rag.storage import clear_parquet, filesystem, join, storage_options
+from urban_rag.warehouse import MissingRelation, publish, published_metadata
 
 BRONZE_GROUP = "bronze_cmhc"
 SILVER_GROUP = "silver_cmhc"
@@ -260,7 +262,7 @@ def cmhc_rent_survey(
         )
     ],
     group_name=SILVER_GROUP,
-    kinds={"parquet"},
+    kinds={"postgres", "parquet"},
     description=(
         "One borough's CMHC vacancy rates, as silver/vacancy_rates/"
         "<YYYY-MM-DD>/<neighborhood>/vacancy_rates.parquet: the survey's "
@@ -269,13 +271,15 @@ def cmhc_rent_survey(
         "cmhc_vacancy_survey snapshot, relabelled to the crosswalk's "
         "spelling and averaged into one rate per dwelling type x bedroom "
         f"class, with the borough's own rows kept alongside in {QUARTIERS_FILE}. "
-        "Reads parquet, not CMHC: a respelling upstream fails this asset and "
-        "leaves the bronze snapshot intact."
+        "Both are upserted into silver.vacancy_rates and "
+        "silver.quartier_vacancy_rates. Reads parquet, not CMHC: a respelling "
+        "upstream fails this asset and leaves the bronze snapshot intact."
     ),
 )
 def vacancy_rates(
     context: AssetExecutionContext,
     store: ParquetStore,
+    postgis: PostgisResource,
 ) -> MaterializeResult:
     neighborhood, scrape_date = _borough_partition(context)
     quartiers = quartiers_for(neighborhood)
@@ -306,6 +310,13 @@ def vacancy_rates(
     _clear(context, output_dir)
     write_frame(borough, join(output_dir, QUARTIERS_FILE))
     path = write_frame(averages, join(output_dir, VACANCY_FILE))
+    loaded = _publish(
+        context,
+        postgis,
+        {"vacancy_rates": averages, "quartier_vacancy_rates": borough},
+        neighborhood=neighborhood,
+        scrape_date=scrape_date,
+    )
 
     published = averages[averages["num_quartiers"] > 0]
     context.log.info(
@@ -346,6 +357,7 @@ def vacancy_rates(
             "survey_period": provenance["survey_period"] or "unknown",
             "output_path": MetadataValue.path(str(path)),
             "source_url": MetadataValue.url(SOURCE_URL),
+            **published_metadata(loaded),
         }
     )
 
@@ -362,18 +374,20 @@ def vacancy_rates(
         )
     ],
     group_name=SILVER_GROUP,
-    kinds={"parquet"},
+    kinds={"postgres", "parquet"},
     description=(
         "One borough's CMHC average rents, as silver/average_rents/"
         "<YYYY-MM-DD>/<neighborhood>/average_rents.parquet: the crosswalk "
         "applied to that day's cmhc_rent_survey snapshot and averaged into "
         "one rent per bedroom class, with the borough's own rows kept "
-        f"alongside in {QUARTIER_AVERAGE_RENTS_FILE}."
+        f"alongside in {QUARTIER_AVERAGE_RENTS_FILE}. Both are upserted into "
+        "silver.average_rents and silver.quartier_average_rents."
     ),
 )
 def average_rents(
     context: AssetExecutionContext,
     store: ParquetStore,
+    postgis: PostgisResource,
 ) -> MaterializeResult:
     neighborhood, scrape_date = _borough_partition(context)
     quartiers = quartiers_for(neighborhood)
@@ -404,6 +418,13 @@ def average_rents(
     _clear(context, output_dir)
     write_frame(borough, join(output_dir, QUARTIER_AVERAGE_RENTS_FILE))
     path = write_frame(averages, join(output_dir, AVERAGE_RENTS_FILE))
+    loaded = _publish(
+        context,
+        postgis,
+        {"average_rents": averages, "quartier_average_rents": borough},
+        neighborhood=neighborhood,
+        scrape_date=scrape_date,
+    )
 
     published = averages[averages["num_quartiers"] > 0]
     context.log.info(
@@ -439,6 +460,7 @@ def average_rents(
             "survey_period": provenance["survey_period"],
             "output_path": MetadataValue.path(str(path)),
             "source_url": MetadataValue.url(AVERAGE_RENTS_SOURCE_URL),
+            **published_metadata(loaded),
         }
     )
 
@@ -468,6 +490,38 @@ def _clear(context: AssetExecutionContext, output_dir: str) -> None:
     removed = clear_parquet(output_dir)
     if removed:
         context.log.info("Removed %d file(s) from a previous run", len(removed))
+
+
+def _publish(
+    context: AssetExecutionContext,
+    postgis: PostgisResource,
+    datasets: dict[str, pd.DataFrame],
+    *,
+    neighborhood: str,
+    scrape_date: str,
+) -> dict[str, dict[str, int]]:
+    """The borough average and the quartier rows it was taken over, upserted.
+
+    One transaction for both, so a reader never sees a borough figure without
+    the rows behind it - which for a table where most cells are suppressed is
+    the difference between a number and a number that can be checked.
+
+    Called after the parquet is written: the crosswalk is the expensive part
+    and the survey is a live publication no later run can re-read, so a
+    database that is down should cost the load and not the conforming.
+    """
+    try:
+        return publish(
+            postgis.connect,
+            datasets,
+            neighborhood=neighborhood,
+            scrape_date=scrape_date,
+        )
+    except (PostgresUnavailable, MissingRelation) as exc:
+        raise Failure(
+            f"{', '.join(datasets)} for {neighborhood} {scrape_date} were "
+            f"written to the tree but could not be published: {exc}"
+        ) from exc
 
 
 def _with_provenance(

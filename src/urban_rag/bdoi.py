@@ -14,6 +14,7 @@ Deliberately free of Dagster imports, mirroring `urban_rag.open_data` and
 from __future__ import annotations
 
 import time
+import zipfile
 from pathlib import Path
 
 import geopandas as gpd
@@ -104,16 +105,44 @@ class BdoiFetcher:
         return cached
 
 
-def read_shapefile_zip(path: Path | str) -> gpd.GeoDataFrame:
-    """Read the shapefile inside a zip, reprojected to EPSG:4326.
+#: Vector members BDOI has shipped, newest layout first. v3 (2025) packs a
+#: GeoPackage next to a CSV and a PDF; the 2018 release was a bare shapefile.
+_VECTOR_SUFFIXES: tuple[str, ...] = (".gpkg", ".shp")
 
-    Handed to GDAL's own zip handling via the ``zip://`` prefix, so the
-    archive is never unpacked to disk on top of the cached copy.
+
+def _vector_member(path: Path | str) -> str:
+    """Name of the single vector layer inside the archive.
+
+    GDAL's ``/vsizip`` handler opens a shapefile sitting at the archive root
+    on its own, but not a lone GeoPackage - that has to be addressed
+    explicitly - so the member is always named rather than guessed.
     """
     try:
-        frame = gpd.read_file(f"zip://{path}")
+        names = zipfile.ZipFile(path).namelist()
+    except zipfile.BadZipFile as exc:
+        raise BdoiError(f"{path}: not a readable zip ({exc})") from exc
+    for suffix in _VECTOR_SUFFIXES:
+        for name in names:
+            if name.lower().endswith(suffix):
+                return name
+    raise BdoiError(
+        f"{path}: no {' or '.join(_VECTOR_SUFFIXES)} member (contains {names})"
+    )
+
+
+def read_shapefile_zip(path: Path | str) -> gpd.GeoDataFrame:
+    """Read the vector layer inside a zip, reprojected to EPSG:4326.
+
+    Handed to GDAL's own zip handling via the ``zip://`` prefix, so the
+    archive is never unpacked to disk on top of the cached copy. Handles both
+    layouts BDOI has published: a zipped shapefile (2018) and a GeoPackage
+    packed with sidecar files (v3, 2025).
+    """
+    member = _vector_member(path)
+    try:
+        frame = gpd.read_file(f"zip://{path}!{member}")
     except Exception as exc:  # pyogrio/fiona raise their own error types
-        raise BdoiError(f"{path}: not readable as a shapefile ({exc})") from exc
+        raise BdoiError(f"{path}: {member} not readable as a vector layer ({exc})") from exc
     if frame.crs is None:
-        raise BdoiError(f"{path}: shapefile carries no CRS")
+        raise BdoiError(f"{path}: {member} carries no CRS")
     return frame.to_crs("EPSG:4326")

@@ -13,6 +13,7 @@ somewhere else would project to numbers that mean nothing.
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 
 import geopandas as gpd
 import pytest
@@ -31,8 +32,9 @@ from urban_rag.open_data_assets import (
     reference_neighborhoods,
     street_network,
 )
-from urban_rag.resources import OpenDataResource, ParquetStore
+from urban_rag.resources import OpenDataResource, ParquetStore, PostgisResource
 from urban_rag.storage import join
+from urban_rag import street_assets
 from urban_rag.street_assets import STREETS_FILE_OUT, neighborhood_streets
 
 DATE = "2026-08-24"
@@ -265,13 +267,42 @@ def write_bronze(store, *features, scrape_date=DATE):
     )
 
 
+@pytest.fixture(autouse=True)
+def stub_postgis(monkeypatch):
+    """The upsert into `silver.neighborhood_streets`, recorded rather than run.
+
+    The asset publishes the same frame it writes to the tree, which needs a
+    database; every test here is about the cut, so the load is stubbed and the
+    frame it was handed is kept for the two tests that do care.
+    """
+    seen: dict[str, object] = {}
+
+    @contextmanager
+    def connect(self):
+        yield object()
+
+    def load_streets(connection, frame, *, neighborhood, scrape_date):
+        seen["frame"] = frame
+        seen["partition"] = (neighborhood, scrape_date)
+        return {
+            "copied": len(frame),
+            "duplicates": 0,
+            "upserted": len(frame),
+            "pruned": 0,
+        }
+
+    monkeypatch.setattr(PostgisResource, "connect", connect)
+    monkeypatch.setattr(street_assets, "load_streets", load_streets)
+    return seen
+
+
 def materialize_silver(store):
     return materialize(
         [neighborhood_streets],
         partition_key=MultiPartitionKey(
             {"date": DATE, "neighborhood": NEIGHBORHOOD}
         ),
-        resources={"store": store},
+        resources={"store": store, "postgis": PostgisResource()},
     )
 
 

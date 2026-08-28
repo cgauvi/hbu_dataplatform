@@ -176,6 +176,15 @@ def trusted_ca(ca_bundle: str | None) -> Iterator[None]:
     the ambient `SSL_CERT_FILE` is the corporate root, which huggingface.co is
     *not* signed by - so a model download fails with `CERTIFICATE_VERIFY_FAILED`
     until these are swapped for the public bundle.
+
+    The default is only half the story on such a machine: huggingface.co serves
+    the *metadata*, then redirects the weights to a CDN - `us.aws.cdn.hf.co` -
+    which *is* intercepted, and which certifi alone cannot verify. Pass a bundle
+    holding both roots, or set `URBAN_RAG_HF_CA_BUNDLE` to one, and note that
+    the resulting error names the wrong thing: huggingface_hub 1.x raises httpx
+    exceptions, which are not `OSError` subclasses, so transformers re-raises
+    them as "Can't load the model for '<name>' ... a file named
+    pytorch_model.bin" with the real cause buried in the chain.
     """
     import certifi
 

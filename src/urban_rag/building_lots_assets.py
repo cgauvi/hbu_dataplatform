@@ -84,6 +84,7 @@ from urban_rag.infolot_assets import LOTS_FILE, neighborhood_lots
 from urban_rag.layers import key_prefix
 from urban_rag.partitions import scrape_partitions
 from urban_rag.postgis import (
+    MissingRelation,
     compute_intersections,
     compute_lot_features,
     fetch_building_lots,
@@ -91,6 +92,7 @@ from urban_rag.postgis import (
     load_buildings,
     load_features,
     load_lots,
+    require_working_set,
 )
 from urban_rag.rag.pgvector import PostgresUnavailable
 from urban_rag.resources import ParquetStore, PostgisResource
@@ -141,11 +143,11 @@ FEATURE_ID_COLUMNS = ("NUMERO_COMPLET", "ID")
         "self-intersecting rings repaired, which is what makes ST_Intersection "
         "over them mean anything), neighborhood_buildings and "
         "neighborhood_features snapshots into "
-        "rag.lots/rag.buildings/rag.features, computes rag.building_lots and "
-        "rag.lot_features, then writes both to silver/"
+        "rag.lots/rag.buildings/rag.features, upserts "
+        "silver.building_lot_intersections and silver.lot_features for this "
+        "partition, then writes both to silver/"
         "building_lot_intersections/<YYYY-MM-DD>/<neighborhood>/ as "
-        f"{BUILDING_LOTS_FILE} and {LOT_FEATURES_FILE}. Replaces that "
-        "partition's prior rows in both places."
+        f"{BUILDING_LOTS_FILE} and {LOT_FEATURES_FILE}."
     ),
 )
 def building_lot_intersections(
@@ -202,6 +204,12 @@ def building_lot_intersections(
     skipped: dict[str, str] = {}
     try:
         with postgis.connect() as connection:
+            # Before the first load, not on the way into it. All three tables
+            # come from one hbu_infra file, so a database that has never had
+            # it applied should say so once and name the file - rather than
+            # failing on whichever `DELETE FROM rag.<x>` ran first, with an
+            # identifier and no owner.
+            require_working_set(connection)
             # Once, for both joins below - the reason they share an asset.
             num_lots = load_lots(
                 connection, lots, neighborhood=neighborhood, scrape_date=scrape_date
@@ -260,6 +268,8 @@ def building_lot_intersections(
             )
     except PostgresUnavailable as exc:
         raise Failure(f"Postgres unreachable for {neighborhood} {scrape_date}: {exc}")
+    except MissingRelation as exc:
+        raise Failure(str(exc))
 
     output_dir = store.partition_dir(
         context.asset_key.path[-1], scrape_date, neighborhood
@@ -324,6 +334,12 @@ def building_lot_intersections(
             "num_features_matched": features_result["features_matched"],
             "num_lot_feature_rows_written": len(lot_features),
             "lot_features_path": MetadataValue.path(str(lot_features_path)),
+            # What the upsert dropped as superseded. Normally the whole prior
+            # partition, since `building_uid` is a bigserial `load_buildings`
+            # mints again - see `urban_rag.warehouse`. A partition being
+            # computed for the first time prunes nothing.
+            "num_building_lot_rows_pruned": buildings_result["pruned"],
+            "num_lot_feature_rows_pruned": features_result["pruned"],
             "features_per_layer": MetadataValue.json(loaded),
             **({"skipped_layers": MetadataValue.json(skipped)} if skipped else {}),
         }

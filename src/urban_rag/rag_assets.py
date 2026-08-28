@@ -58,8 +58,10 @@ from urban_rag.resources import (
     ParquetStore,
     PdfCache,
     PgVectorResource,
+    PostgisResource,
 )
 from urban_rag.storage import dirname, filesystem, join, storage_options
+from urban_rag.warehouse import MissingRelation, publish, published_metadata
 
 BRONZE_GROUP = "bronze_documents"
 SILVER_GROUP = "silver_corpus"
@@ -192,16 +194,20 @@ def linked_documents(
     partitions_def=scrape_partitions,
     deps=[linked_documents],
     group_name=SILVER_GROUP,
-    kinds={"parquet"},
+    kinds={"postgres", "parquet"},
     description=(
         "Documents cut into overlapping, paragraph-aligned chunks, measured "
-        "with the embedding model's own tokenizer."
+        "with the embedding model's own tokenizer. Written to the tree and "
+        "upserted into silver.document_chunks on (scrape_date, neighborhood, "
+        "chunk_id) - the corpus before it is embedded, which rag.chunks only "
+        "ever holds the current scrape of."
     ),
 )
 def document_chunks(
     context: AssetExecutionContext,
     store: ParquetStore,
     embedding_model: EmbeddingModel,
+    postgis: PostgisResource,
 ) -> MaterializeResult:
     neighborhood, scrape_date = _partition(context)
     frame = _read(
@@ -242,6 +248,21 @@ def document_chunks(
 
     chunks_frame = pd.DataFrame(rows)
     path = _write(chunks_frame, _partition_dir(context, store), CHUNKS_FILE)
+    # After the file, so a database that is down costs the load rather than
+    # the chunking - which re-reads every PDF of the borough through the
+    # tokenizer. Same order every parquet-first asset here uses.
+    try:
+        loaded = publish(
+            postgis.connect,
+            {"document_chunks": chunks_frame},
+            neighborhood=neighborhood,
+            scrape_date=scrape_date,
+        )
+    except (PostgresUnavailable, MissingRelation) as exc:
+        raise Failure(
+            f"{path} was written, but silver.document_chunks could not be "
+            f"updated for {neighborhood} {scrape_date}: {exc}"
+        ) from exc
     tokens = chunks_frame["num_tokens"]
 
     return MaterializeResult(
@@ -255,6 +276,7 @@ def document_chunks(
             "tokens_median": int(tokens.median()),
             "tokens_max": int(tokens.max()),
             "output_path": MetadataValue.path(str(path)),
+            **published_metadata(loaded),
             "preview": MetadataValue.md(
                 _preview("First chunk", chunks_frame["text"].iloc[0])
             ),

@@ -140,6 +140,7 @@ def stub_postgis(
     lot_features=3,
     lots_matched=2,
     features_matched=2,
+    require_raises=None,
 ):
     """Patched on the class: Dagster rebuilds the resource before the run."""
     calls: dict[str, object] = {"features": [], "lot_loads": []}
@@ -147,6 +148,14 @@ def stub_postgis(
     @contextmanager
     def connect(self):
         yield object()
+
+    def require_working_set(connection):
+        """The real one runs `to_regclass` against a connection the stubs above
+        do not have; what a test needs of it is whether it ran and what it
+        raised."""
+        calls["require_working_set"] = True
+        if require_raises is not None:
+            raise require_raises
 
     def load_lots(connection, frame, *, neighborhood, scrape_date):
         calls["lots"] = (neighborhood, scrape_date, len(frame))
@@ -172,6 +181,7 @@ def stub_postgis(
         return {
             "intersections": intersections,
             "buildings_matched": buildings_matched,
+            "pruned": 0,
             "total_area_m2": total_area_m2,
         }
 
@@ -179,6 +189,7 @@ def stub_postgis(
         calls["join"] = (neighborhood, scrape_date)
         return {
             "lot_features": lot_features,
+            "pruned": 0,
             "lots_matched": lots_matched,
             "features_matched": features_matched,
             "layers": 1,
@@ -228,6 +239,9 @@ def stub_postgis(
         )
 
     monkeypatch.setattr(PostgisResource, "connect", connect)
+    monkeypatch.setattr(
+        building_lots_assets, "require_working_set", require_working_set
+    )
     monkeypatch.setattr(building_lots_assets, "load_lots", load_lots)
     monkeypatch.setattr(building_lots_assets, "load_buildings", load_buildings)
     monkeypatch.setattr(building_lots_assets, "load_features", load_features)
@@ -273,6 +287,37 @@ def test_loads_all_three_partitions_then_computes_both_joins(store, monkeypatch)
     # Read back out of the same transaction that computed them.
     assert calls["fetch_building_lots"] == (NEIGHBORHOOD, DATE)
     assert calls["fetch_lot_features"] == (NEIGHBORHOOD, DATE)
+    # Checked before any of it, so the run does not reach a COPY to find out.
+    assert calls["require_working_set"] is True
+
+
+def test_a_missing_rag_working_set_names_the_file_to_apply(store, monkeypatch):
+    """The three `rag` tables are hbu_infra's, and nothing else checks them.
+
+    Every silver and gold write goes through `urban_rag.warehouse`, which
+    checks its own target; `rag.lots`/`rag.buildings`/`rag.features` are loaded
+    by raw DELETE/COPY/INSERT, so without the preflight a database that has
+    never had sql/002 applied fails as `relation "rag.lots" does not exist` -
+    an identifier, with nothing about which repo owns it.
+    """
+    write_partition(store)
+    calls = stub_postgis(
+        monkeypatch,
+        require_raises=building_lots_assets.MissingRelation(
+            "hbu_infra has not created: rag.lots (sql/002_spatial.sql), "
+            "rag.buildings (sql/002_spatial.sql), "
+            "rag.features (sql/002_spatial.sql)"
+        ),
+    )
+
+    with pytest.raises(Failure, match="sql/002_spatial.sql"):
+        run(store)
+
+    # Nothing was loaded: the check runs before the first DELETE, so a
+    # partition on a database with no working set costs no write at all.
+    assert "lots" not in calls
+    assert "buildings" not in calls
+    assert calls["features"] == []
 
 
 def test_the_lots_are_loaded_once_for_both_joins(store, monkeypatch):

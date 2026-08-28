@@ -58,8 +58,11 @@ from urban_rag.open_data_assets import (
     street_network,
 )
 from urban_rag.partitions import scrape_partitions
-from urban_rag.resources import ParquetStore
+from urban_rag.postgis import load_streets
+from urban_rag.rag.pgvector import PostgresUnavailable
+from urban_rag.resources import ParquetStore, PostgisResource
 from urban_rag.storage import clear_parquet, join, storage_options
+from urban_rag.warehouse import MissingRelation, published_metadata
 
 GROUP = "silver_streets"
 
@@ -95,19 +98,22 @@ _LINE_TYPES = ("LineString", "MultiLineString", "LinearRing")
         ),
     ],
     group_name=GROUP,
-    kinds={"geoparquet"},
+    kinds={"postgres", "geoparquet"},
     description=(
         "One borough's sides of street, cut out of that day's island-wide "
         "geobase double against its boundary from reference_neighborhoods. "
         "One row per COTE_RUE_ID, geometry clipped to the borough and valid, "
         "with the published length, the length inside the borough and the "
         "share of the segment that survived the cut, as silver/"
-        f"neighborhood_streets/<YYYY-MM-DD>/<neighborhood>/{STREETS_FILE_OUT}."
+        f"neighborhood_streets/<YYYY-MM-DD>/<neighborhood>/{STREETS_FILE_OUT} "
+        "and upserted into silver.neighborhood_streets on (scrape_date, "
+        "neighborhood, cote_rue_id)."
     ),
 )
 def neighborhood_streets(
     context: AssetExecutionContext,
     store: ParquetStore,
+    postgis: PostgisResource,
 ) -> MaterializeResult:
     dimensions = context.partition_key.keys_by_dimension
     neighborhood = dimensions["neighborhood"]
@@ -187,6 +193,24 @@ def neighborhood_streets(
         context.log.info("Removed %d file(s) from a previous run", len(removed))
     path = write_frame(clipped, join(output_dir, STREETS_FILE_OUT))
 
+    # Published after the file is written, so a database that is down costs a
+    # re-run of the load rather than of the cut. This asset owns
+    # `silver.neighborhood_streets`: `lot_frontage` used to load it on its way
+    # past, which left a table whose writer was not the asset it is named for.
+    try:
+        with postgis.connect() as connection:
+            published = load_streets(
+                connection,
+                clipped,
+                neighborhood=neighborhood,
+                scrape_date=scrape_date,
+            )
+    except (PostgresUnavailable, MissingRelation) as exc:
+        raise Failure(
+            f"{path} was written, but silver.neighborhood_streets could not be "
+            f"updated for {neighborhood} {scrape_date}: {exc}"
+        ) from exc
+
     # A side whose published length did not survive the cut whole is one that
     # straddles the borough line - the edge effect the module docstring names.
     boundary_clipped = int((clipped["pct_in_borough"] < 99.9).sum())
@@ -216,6 +240,7 @@ def neighborhood_streets(
             "num_touching_only": len(touching) - len(clipped),
             "num_invalid_geometries": still_invalid,
             "output_path": MetadataValue.path(str(path)),
+            **published_metadata({"neighborhood_streets": published}),
         }
     )
 

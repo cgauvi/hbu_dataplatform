@@ -62,7 +62,13 @@ from urban_rag.resources import (
     PdfCache,
     PgVectorResource,
     PostgisResource,
+    RoleResource,
     SpectrumResource,
+)
+from urban_rag.role_assets import (
+    assessment_units,
+    lot_assessed_values,
+    property_assessment_roll,
 )
 from urban_rag.storage import DATA_ROOT, output_root
 from urban_rag.street_assets import neighborhood_streets
@@ -84,7 +90,10 @@ ASSETS = [
     linked_documents,
     montreal_residential_costs,
     montreal_nonresidential_costs,
+    property_assessment_roll,
     # silver
+    assessment_units,
+    lot_assessed_values,
     vacancy_rates,
     average_rents,
     building_lot_intersections,
@@ -179,6 +188,25 @@ street_network_job = define_asset_job(
 neighborhood_streets_job = define_asset_job(
     "neighborhood_streets_job",
     selection=AssetSelection.assets(neighborhood_streets),
+    partitions_def=scrape_partitions,
+)
+
+# The assessment roll is one 572 MB download for the whole province, so DATE
+# only - same posture as street_network and the two CMHC surveys. The bronze
+# snapshot and the merge that makes it usable share a run: neither is
+# borough-shaped, the merge is a few seconds over a file the snapshot has just
+# written, and a day whose points landed without their characteristics is a day
+# with a table nothing can read. The borough axis appears one asset later, in
+# lot_assessed_values.
+assessment_roll_job = define_asset_job(
+    "assessment_roll_job",
+    selection=AssetSelection.assets(property_assessment_roll, assessment_units),
+    partitions_def=date_partitions,
+)
+
+lot_assessed_values_job = define_asset_job(
+    "lot_assessed_values_job",
+    selection=AssetSelection.assets(lot_assessed_values),
     partitions_def=scrape_partitions,
 )
 
@@ -308,6 +336,52 @@ def daily_reference_neighborhoods_schedule(
 def daily_street_network_schedule(context: ScheduleEvaluationContext) -> RunRequest:
     scrape_date = context.scheduled_execution_time.strftime("%Y-%m-%d")
     return RunRequest(run_key=f"street-network-{scrape_date}", partition_key=scrape_date)
+
+
+@schedule(
+    job=assessment_roll_job,
+    # Alongside street_network and the CMHC surveys rather than behind
+    # anything: the assessment roll has no upstream in this pipeline. One run
+    # for the whole province; the boroughs are cut out of it against the
+    # cadastre an hour and a half later. Kept at its own minute because the
+    # first run of a roll year pulls 572 MB and unpacks 2.8 GB, and a run that
+    # long should not be sharing a slot with the city's servers.
+    cron_schedule="52 4 * * *",
+    execution_timezone=TIMEZONE,
+    description="Snapshot the property assessment roll for today, and merge it.",
+)
+def daily_assessment_roll_schedule(context: ScheduleEvaluationContext) -> RunRequest:
+    scrape_date = context.scheduled_execution_time.strftime("%Y-%m-%d")
+    return RunRequest(
+        run_key=f"assessment-roll-{scrape_date}", partition_key=scrape_date
+    )
+
+
+@schedule(
+    job=lot_assessed_values_job,
+    # After assessment_units (52 4) and neighborhood_lots (40 5), which supply
+    # the two sides of the join. Behind the cadastre rather than beside it: the
+    # lots are what the units are placed on, and a borough whose cadastre has
+    # not landed would value nothing.
+    #
+    # Scheduled, unlike `lot_frontage` and `lot_profiles`: this asset also
+    # upserts into silver.lot_assessed_values, but hbu_infra's
+    # sql/013_silver_lot_assessed_values.sql carries no `-- requires:` header,
+    # so it lands on the *first* `db.py init` - the same footing
+    # `neighborhood_streets` and the CMHC pair are on.
+    cron_schedule="30 6 * * *",
+    execution_timezone=TIMEZONE,
+    description="Total today's assessment roll onto every enabled borough's lots.",
+)
+def daily_lot_assessed_values_schedule(context: ScheduleEvaluationContext):
+    scrape_date = context.scheduled_execution_time.strftime("%Y-%m-%d")
+    for neighborhood in ENABLED_NEIGHBORHOODS:
+        yield RunRequest(
+            run_key=f"lot-assessed-values-{neighborhood}-{scrape_date}",
+            partition_key=MultiPartitionKey(
+                {"date": scrape_date, "neighborhood": neighborhood}
+            ),
+        )
 
 
 @schedule(
@@ -461,19 +535,30 @@ def daily_neighborhood_streets_schedule(context: ScheduleEvaluationContext):
         )
 
 
-# No schedule for `lot_frontage` either, and for the same reason as
-# `lot_profiles` below: `rag.streets` and `rag.lot_frontage` are hbu_infra's to
-# create, and until sql/007_streets.sql and sql/008_lot_frontage.sql have been
-# applied to the database a nightly run fails on `relation "rag.streets" does
-# not exist` every morning. Both files exist in that repo; what is outstanding
-# is `db.py init` against the target database. It is registered and has a job,
-# so it appears in the lineage and can be run by hand the moment the tables
-# land - see `lot_frontage_job` and `make frontage`. Add the schedule then, at
-# 30 7, behind daily_building_lots_schedule which loads the cadastre it reads.
+# Every scheduled silver asset above now publishes to Postgres as well as to
+# the tree - `neighborhood_streets` to `silver.neighborhood_streets`, the two
+# CMHC assets to `silver.vacancy_rates`/`silver.average_rents` and the quartier
+# tables beside them. All of those are created by hbu_infra files with no
+# `-- requires:` header, so they land on the *first* `db.py init` and a
+# database that has had one is enough. Until it has, those schedules fail every
+# morning naming the file to apply - which is the same failure `lot_frontage`
+# and `lot_profiles` are kept off the schedules for, at a much lower cost: the
+# parquet is written before the publish, so a re-run after `db.py init` is a
+# load rather than a scrape.
+
+# No schedule for `lot_frontage`, and for the same reason as `lot_profiles`
+# below: `silver.lot_frontage` is hbu_infra's to create, and until
+# sql/008_silver_lot_frontage.sql has been applied to the database a nightly
+# run fails naming it every morning. The file exists in that repo; what is
+# outstanding is `db.py init` against the target database. It is registered and
+# has a job, so it appears in the lineage and can be run by hand the moment the
+# table lands - see `lot_frontage_job` and `make frontage`. Add the schedule
+# then, at 30 7, behind daily_building_lots_schedule which loads the cadastre
+# it reads.
 
 # No schedule for `lot_profiles`, unlike every other asset here, and not an
 # oversight: it reads two relations hbu_infra has to create first.
-# sql/009_lot_profiles.sql creates the table it writes into, and
+# sql/009_gold_lot_profiles.sql creates the table it writes into, and
 # sql/006_lot_documents.sql creates the `rag.lot_documents` view it takes the
 # document columns from - and that second file carries a `-- requires:
 # rag.chunks` header, so `db.py init` skips it on a database that has never
@@ -481,7 +566,7 @@ def daily_neighborhood_streets_schedule(context: ScheduleEvaluationContext):
 # run. Both files exist in that repo; what is outstanding is `db.py init`
 # against the target database, twice. `compute_lot_profiles` checks for both up
 # front and names the file to apply, so the failure says what to do rather than
-# `relation "rag.lot_profiles" does not exist`. It is registered and has a job,
+# `relation "gold.lot_profiles" does not exist`. It is registered and has a job,
 # so it appears in the lineage and can be run by hand the moment the relations
 # land - see `lot_profiles_job` and `make lot-profiles`. Add the schedule then,
 # at 40 7, behind lot_frontage which supplies the frontage it pivots - and
@@ -503,6 +588,8 @@ defs = Definitions(
         lot_profiles_job,
         street_network_job,
         neighborhood_streets_job,
+        assessment_roll_job,
+        lot_assessed_values_job,
         lot_frontage_job,
         zoning_envelopes_job,
         cmhc_survey_job,
@@ -517,6 +604,8 @@ defs = Definitions(
         daily_features_schedule,
         daily_reference_neighborhoods_schedule,
         daily_street_network_schedule,
+        daily_assessment_roll_schedule,
+        daily_lot_assessed_values_schedule,
         daily_lots_schedule,
         daily_buildings_schedule,
         daily_building_lots_schedule,
@@ -555,6 +644,14 @@ defs = Definitions(
             # final, so the workbook is cached once, outside the partition
             # tree, and always local.
             cache_dir=str(DATA_ROOT / "cache" / "cmhc"),
+        ),
+        "role": RoleResource(
+            # Same posture again, and by far the largest of these caches: a
+            # published roll year is final, so the 572 MB archive and the
+            # 2.8 GB GeoPackage unpacked beside it are fetched once and shared
+            # by every scrape date. Always local - the GeoPackage has to be on
+            # a filesystem to be read at all, since SQLite reads it by seeking.
+            cache_dir=str(DATA_ROOT / "cache" / "role"),
         ),
         "embedding_model": EmbeddingModel(),
         # The query side's store. Every field defaults to its URBAN_RAG_PG_*

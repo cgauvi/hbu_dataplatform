@@ -33,7 +33,7 @@ on a threshold, thresholds are judgements rather than properties of the data,
 and a boolean cannot carry one - so that lives in `category` and in
 `max_built_area_m2`, which every row records.
 
-The frontage columns are the top two of `rag.lot_frontage`, pivoted: a lot
+The frontage columns are the top two of `silver.lot_frontage`, pivoted: a lot
 mostly fronts on one street, a corner lot on two, and ranks beyond the second
 are counted in `num_frontages` and summed into `total_frontage_m` rather than
 given a third pair of columns every other row would leave empty. Which edge is
@@ -42,7 +42,7 @@ here, so the two cannot disagree. A lot facing no street reports
 `num_frontages = 0` and NULL metres - not 0 m, which would claim it was
 measured.
 
-The document columns are the last hop of the chain `rag.lot_features` opens up:
+The document columns are the last hop of the chain `silver.lot_features` opens up:
 `rag.chunks.feature_ids` records which map features cite each indexed PDF, and
 `rag.lot_documents` puts that together with the features covering a lot. The
 highest-coverage one across every layer is flattened into `doc_url`/`doc_title`
@@ -99,16 +99,16 @@ Downstream of `building_lot_intersections`, `lot_frontage`, `document_index`,
 partition, and of the two cost snapshots for the same *date* - those are
 partitioned by date alone, so they map onto the `date` dimension the way
 `vacancy_rates` maps its own bronze survey. The first three are what land
-`rag.lots`, `rag.building_lots`, `rag.lot_features`, `rag.lot_frontage` and
+`rag.lots`, `silver.building_lot_intersections`, `silver.lot_features`, `silver.lot_frontage` and
 `rag.chunks`, so by the time this runs the work here is five parquet reads and
 one SQL statement. Like those,
 the answer is computed in Postgres and then written to the tree as well -
-`rag.lot_profiles` is what the query side reads, and
+`gold.lot_profiles` is what the query side reads, and
 `gold/lot_profiles/<date>/<neighborhood>/` is the record it can be rebuilt
 from.
 
 **Two of the relations this reads are hbu_infra's to create.**
-sql/009_lot_profiles.sql creates the table itself, and sql/006_lot_documents.sql
+sql/009_gold_lot_profiles.sql creates the table itself, and sql/006_lot_documents.sql
 creates the `rag.lot_documents` view - the second carries a
 `-- requires: rag.chunks` header, so `db.py init` skips it on a database that
 has never held a corpus and it only lands on the next init after
@@ -360,10 +360,10 @@ class LotProfilesConfig(Config):
         "condo_cost_low/high_cad_sqft, with the other four bands kept in the "
         "object. Replaces the "
         "old vacant_lots asset: that selection is now `WHERE NOT "
-        "has_building`. Lands in Postgres rag.lot_profiles for the query side "
-        "and in gold/lot_profiles/<YYYY-MM-DD>/<neighborhood>/"
-        f"{LOT_PROFILES_FILE} as the record; replaces this partition's prior "
-        "rows in both."
+        "has_building`. Upserted into gold.lot_profiles on (scrape_date, "
+        "neighborhood, lot_number) for the query side, and written to "
+        "gold/lot_profiles/<YYYY-MM-DD>/<neighborhood>/"
+        f"{LOT_PROFILES_FILE} as the record."
     ),
 )
 def lot_profiles(
@@ -524,6 +524,10 @@ def lot_profiles(
             # observation, and it is worth being able to see at a glance.
             "num_lots": num_lots,
             "num_profiles": profiles,
+            # What the upsert superseded: on a first run of a partition, zero;
+            # on a re-run after the cadastre moved, the lots that are no longer
+            # in it. See `urban_rag.warehouse`.
+            "num_profiles_pruned": int(result["pruned"]),
             "num_with_building": int(result["num_with_building"]),
             "num_without_building": num_without_building,
             "pct_without_building": round(100.0 * num_without_building / profiles, 2)

@@ -27,15 +27,30 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 #: its database file locally; only the parquet it *reads* can live on S3).
 DATA_ROOT = Path(os.environ.get("URBAN_RAG_DATA_DIR", PROJECT_ROOT / "data"))
 
-#: When set, (geo)parquet output goes to s3://<S3_BUCKET>/... instead of disk.
+#: When set, (geo)parquet output goes to s3://<S3_BUCKET>/<DEPLOY_ENV>/...
+#: instead of disk.
 S3_BUCKET = os.environ.get("S3_BUCKET")
 #: boto3/fsspec/DuckDB profile used for all S3 access - see ~/.aws/credentials
 #: and ~/.aws/config for the credentials and region behind it.
 AWS_PROFILE = os.environ.get("AWS_PROFILE", "charles_gauvin_east_1")
 
+#: Which environment's slice of the bucket to write to. One bucket holds dev
+#: and prod side by side - `s3://<S3_BUCKET>/dev/bronze/...` and
+#: `s3://<S3_BUCKET>/prod/bronze/...` - so a laptop run and the deployed
+#: pipeline never write over each other. Defaults to `dev`; set `URBAN_RAG_ENV`
+#: to `prod` for the production slice. No effect when `S3_BUCKET` is unset:
+#: local output stays flat under `DATA_ROOT`.
+DEPLOY_ENV = os.environ.get("URBAN_RAG_ENV", "dev")
+
 _VALID_PROFILE = re.compile(r"^[A-Za-z0-9_.-]+$")
 if not _VALID_PROFILE.match(AWS_PROFILE):
     raise ValueError(f"AWS_PROFILE={AWS_PROFILE!r} is not a valid AWS profile name")
+
+_VALID_ENV = {"dev", "prod"}
+if DEPLOY_ENV not in _VALID_ENV:
+    raise ValueError(
+        f"URBAN_RAG_ENV={DEPLOY_ENV!r} is not one of {sorted(_VALID_ENV)}"
+    )
 
 
 def is_s3_enabled() -> bool:
@@ -50,9 +65,11 @@ def is_s3_uri(path: str) -> bool:
 def output_root() -> str:
     """Root for pipeline (geo)parquet output.
 
-    An `s3://<S3_BUCKET>` URI when `S3_BUCKET` is set, `DATA_ROOT` otherwise.
+    An `s3://<S3_BUCKET>/<DEPLOY_ENV>` URI when `S3_BUCKET` is set, `DATA_ROOT`
+    otherwise. The `<DEPLOY_ENV>` segment keeps the dev and prod snapshots in
+    one bucket without either overwriting the other.
     """
-    return f"s3://{S3_BUCKET}" if S3_BUCKET else str(DATA_ROOT)
+    return f"s3://{S3_BUCKET}/{DEPLOY_ENV}" if S3_BUCKET else str(DATA_ROOT)
 
 
 def storage_options(path: str | None = None) -> dict[str, str]:

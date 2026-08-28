@@ -24,18 +24,19 @@ reason `lot_profiles` makes its shed cutoff config: a judgement about the
 built form rather than a property of the data, and every row records the value
 it was computed with so a table can be read back against its own cutoff.
 
-**This asset loads `rag.streets` and nothing else.** `rag.lots` is already
-holding this partition when it runs, because `building_lot_intersections` put
-it there - and that asset's docstring explains why loading the cadastre from
-two places is a race rather than a redundancy: whoever commits second replaces
-the rows the first just computed against. So the dependency here is on that
-asset, the guard below is on `rag.lots` being populated, and the only table
-this one replaces is its own.
+**This asset loads nothing.** Both sides of the join are already in Postgres
+when it runs: `rag.lots` because `building_lot_intersections` put it there, and
+`silver.neighborhood_streets` because that asset now owns its own table. Each
+of those is loaded in exactly one place, which is not tidiness but the fix for
+a real race - see `building_lots_assets` on why loading the cadastre from two
+assets means whoever commits second replaces the rows the first just computed
+against. So the dependencies here are on those two assets, the guards below are
+on their partitions being populated, and the only table this one writes is its
+own.
 
-**`rag.streets` and `rag.lot_frontage` are owned by hbu_infra**, like every
-other table this repo writes into - sql/007_streets.sql and
-sql/008_lot_frontage.sql. Until those are applied to the database, a run fails
-on `relation "rag.streets" does not exist`, which is why this asset is
+**`silver.lot_frontage` is owned by hbu_infra**, like every other table this
+repo writes into - sql/008_silver_lot_frontage.sql. Until it is applied to the
+database, a run fails naming the file to apply, which is why this asset is
 registered and given a job but left off the daily schedules. See
 `urban_rag.definitions`, and `lot_profiles` for the same posture.
 """
@@ -54,13 +55,12 @@ from pydantic import Field
 from urban_rag.building_lots_assets import building_lot_intersections
 from urban_rag.frames import write_frame
 from urban_rag.layers import key_prefix
-from urban_rag.open_data_assets import STREET_ID_COLUMN, STREET_NAME_COLUMN
 from urban_rag.partitions import scrape_partitions
 from urban_rag.postgis import (
     DEFAULT_FRONTAGE_BUFFER_M,
+    MissingRelation,
     compute_lot_frontage,
     fetch_lot_frontage,
-    load_streets,
 )
 from urban_rag.rag.pgvector import PostgresUnavailable
 from urban_rag.resources import ParquetStore, PostgisResource
@@ -103,15 +103,15 @@ class FrontageConfig(Config):
     kinds={"postgres", "geoparquet"},
     description=(
         "How much of each lot's boundary faces each street side, in metres, "
-        "longest frontage first. Loads this partition's neighborhood_streets "
-        "into rag.streets, buffers each side, clips every lot boundary within "
-        "reach of it, and measures what is left; frontage_rank is 1 for the "
-        "street a lot mostly fronts on, so a corner lot has two rows and an "
-        "interior lot none. Computed against the rag.lots that "
-        "building_lot_intersections landed for the same partition, written to "
-        f"rag.lot_frontage and to silver/lot_frontage/<YYYY-MM-DD>/"
-        f"<neighborhood>/{LOT_FRONTAGE_FILE}. Replaces that partition's prior "
-        "rows in both places."
+        "longest frontage first. Buffers each side of "
+        "silver.neighborhood_streets, clips every lot boundary within reach of "
+        "it, and measures what is left; frontage_rank is 1 for the street a "
+        "lot mostly fronts on, so a corner lot has two rows and an interior "
+        "lot none. Computed against the rag.lots that "
+        "building_lot_intersections landed for the same partition, upserted "
+        "into silver.lot_frontage on (scrape_date, neighborhood, lot_uid, "
+        f"cote_rue_id) and written to silver/lot_frontage/<YYYY-MM-DD>/"
+        f"<neighborhood>/{LOT_FRONTAGE_FILE}."
     ),
 )
 def lot_frontage(
@@ -130,6 +130,11 @@ def lot_frontage(
         ),
         STREETS_FILE_OUT,
     )
+    # Read only to check the partition is there and to report the denominator:
+    # the street sides this measures against are the ones `neighborhood_streets`
+    # already upserted into `silver.neighborhood_streets`. That asset used to
+    # write only parquet and this one loaded the table on its way past, which
+    # left a table whose writer was not the asset it is named for.
     streets = _read_streets(
         streets_path, neighborhood=neighborhood, scrape_date=scrape_date
     )
@@ -138,27 +143,27 @@ def lot_frontage(
 
     try:
         with postgis.connect() as connection:
-            num_streets = load_streets(
-                connection,
-                streets,
-                neighborhood=neighborhood,
-                scrape_date=scrape_date,
-                street_id_column=STREET_ID_COLUMN,
-                street_name_column=STREET_NAME_COLUMN,
-            )
             result = compute_lot_frontage(
                 connection,
                 neighborhood=neighborhood,
                 scrape_date=scrape_date,
                 buffer_m=config.buffer_m,
             )
+            num_streets = int(result["num_streets"])
+            if num_streets == 0:
+                raise Failure(
+                    f"silver.neighborhood_streets holds no street side for "
+                    f"{neighborhood} {scrape_date}, though {streets_path} has "
+                    f"{len(streets)} - re-materialize neighborhood_streets for "
+                    "this partition."
+                )
             num_lots = int(result["num_lots"])
             if num_lots == 0:
                 # Not "no lot faces a street": no lots at all, which means the
                 # cadastre was never loaded rather than that the borough is
-                # landlocked. Raised inside the transaction so the streets it
-                # just landed roll back with it rather than sitting in
-                # rag.streets with nothing to join against.
+                # landlocked. Raised inside the transaction so the frontage it
+                # just computed rolls back with it rather than sitting in
+                # silver.lot_frontage against a cadastre that is not there.
                 raise Failure(
                     f"rag.lots holds no lot for {neighborhood} {scrape_date} - "
                     "materialize building_lot_intersections for this partition "
@@ -173,6 +178,8 @@ def lot_frontage(
             )
     except PostgresUnavailable as exc:
         raise Failure(f"Postgres unreachable for {neighborhood} {scrape_date}: {exc}")
+    except MissingRelation as exc:
+        raise Failure(str(exc))
 
     output_dir = store.partition_dir(
         context.asset_key.path[-1], scrape_date, neighborhood
@@ -211,6 +218,7 @@ def lot_frontage(
             # is the second.
             "num_lots_without_frontage": num_lots - lots_matched,
             "num_streets_matched": int(result["streets_matched"]),
+            "num_rows_pruned": int(result["pruned"]),
             "total_frontage_km": round(result["total_frontage_m"] / 1000.0, 2),
             "max_frontage_m": round(result["max_frontage_m"], 1),
             "mean_frontage_m": round(result["total_frontage_m"] / lots_matched, 1)

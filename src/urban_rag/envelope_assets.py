@@ -66,9 +66,11 @@ from urban_rag.program import (
     select_residential_column,
 )
 from urban_rag.rag.documents import DOCUMENT_SOURCES
+from urban_rag.rag.pgvector import PostgresUnavailable
 from urban_rag.rag_assets import DOCUMENTS_FILE, linked_documents
-from urban_rag.resources import ParquetStore, PdfCache
+from urban_rag.resources import ParquetStore, PdfCache, PostgisResource
 from urban_rag.storage import clear_parquet, filesystem, join, storage_options
+from urban_rag.warehouse import MissingRelation, publish, published_metadata
 from urban_rag.zoning_grid import GridColumn, GridParseError, parse_grid_pdf
 
 GROUP = "silver_zoning"
@@ -152,7 +154,7 @@ class EnvelopeConfig(Config):
     partitions_def=scrape_partitions,
     deps=[linked_documents],
     group_name=GROUP,
-    kinds={"pypdf", "parquet"},
+    kinds={"pypdf", "postgres", "parquet"},
     description=(
         "The zoning grids this partition fetched, read as tables rather than "
         "as prose: one row per column of each 'grille des usages et des "
@@ -163,13 +165,15 @@ class EnvelopeConfig(Config):
         "once per (document, feature_id, column), so a grid two zones share "
         "reaches both. A norm the grid prints as '-' is null and not zero. "
         f"Writes silver/zoning_grid_columns/<YYYY-MM-DD>/<neighborhood>/"
-        f"{ZONE_COLUMNS_FILE}."
+        f"{ZONE_COLUMNS_FILE} and upserts silver.zoning_grid_columns on "
+        "(scrape_date, neighborhood, source_table, feature_id, column_index)."
     ),
 )
 def zoning_grid_columns(
     context: AssetExecutionContext,
     store: ParquetStore,
     pdf_cache: PdfCache,
+    postgis: PostgisResource,
 ) -> MaterializeResult:
     neighborhood, scrape_date = _partition(context)
     documents = _read(
@@ -240,6 +244,13 @@ def zoning_grid_columns(
     if removed:
         context.log.info("Removed %d file(s) from a previous run", len(removed))
     path = write_frame(frame, join(output_dir, ZONE_COLUMNS_FILE))
+    keyed = frame[frame["feature_id"].notna()]
+    loaded = _publish(
+        postgis,
+        {"zoning_grid_columns": keyed},
+        neighborhood=neighborhood,
+        scrape_date=scrape_date,
+    )
 
     residential = int(frame["permits_residential"].sum())
     solvable = int(frame["solver_ready"].sum())
@@ -274,6 +285,11 @@ def zoning_grid_columns(
             - int((frame["permits_residential"] & frame["solver_ready"]).sum()),
             "num_columns_with_notes": int((frame["parse_notes"] != "[]").sum()),
             "output_path": MetadataValue.path(str(path)),
+            # A grid nothing on the map cites has no zone number to be keyed
+            # on, so it reaches the tree and not the table. Rare, and worth
+            # seeing when it is not.
+            "num_columns_unkeyed": len(frame) - len(keyed),
+            **published_metadata(loaded),
             **({"failures": MetadataValue.json(failures)} if failures else {}),
         }
     )
@@ -284,7 +300,7 @@ def zoning_grid_columns(
     partitions_def=scrape_partitions,
     deps=[building_lot_intersections, lot_frontage, zoning_grid_columns],
     group_name=GROUP,
-    kinds={"parquet"},
+    kinds={"postgres", "parquet"},
     description=(
         "Every lot's zoning envelope, denormalised to the grain "
         "urban_rag.program reads: one row per (lot, grid column), carrying the "
@@ -295,13 +311,16 @@ def zoning_grid_columns(
         "zoning_grid_columns on the zone number, and lot_frontage on the lot. "
         "governs_residential marks the column select_residential_column picks "
         "for that lot's width. Writes silver/lot_zoning_envelopes/"
-        f"<YYYY-MM-DD>/<neighborhood>/{LOT_ENVELOPES_FILE}."
+        f"<YYYY-MM-DD>/<neighborhood>/{LOT_ENVELOPES_FILE} and upserts "
+        "silver.lot_zoning_envelopes on (scrape_date, neighborhood, lot_uid, "
+        "feature_id, column_index)."
     ),
 )
 def lot_zoning_envelopes(
     context: AssetExecutionContext,
     config: EnvelopeConfig,
     store: ParquetStore,
+    postgis: PostgisResource,
 ) -> MaterializeResult:
     neighborhood, scrape_date = _partition(context)
     lot_features = _read(
@@ -378,6 +397,12 @@ def lot_zoning_envelopes(
     if removed:
         context.log.info("Removed %d file(s) from a previous run", len(removed))
     path = write_frame(frame, join(output_dir, LOT_ENVELOPES_FILE))
+    loaded = _publish(
+        postgis,
+        {"lot_zoning_envelopes": frame},
+        neighborhood=neighborhood,
+        scrape_date=scrape_date,
+    )
 
     solvable = frame[frame["governs_residential"] & frame["solver_ready"]]
     with_frontage = int(frame["primary_frontage_m"].notna().sum())
@@ -420,6 +445,7 @@ def lot_zoning_envelopes(
             # with it rather than only in the run's config.
             "min_pct_of_lot": config.min_pct_of_lot,
             "output_path": MetadataValue.path(str(path)),
+            **published_metadata(loaded),
         }
     )
 
@@ -598,6 +624,33 @@ def _feature_ids(document) -> list[str]:
     except (TypeError, ValueError):
         return []
     return [str(value) for value in ids if value is not None]
+
+
+def _publish(
+    postgis: PostgisResource,
+    datasets: dict[str, pd.DataFrame],
+    *,
+    neighborhood: str,
+    scrape_date: str,
+) -> dict[str, dict[str, int]]:
+    """Upsert what was just written, naming the file already on disk if not.
+
+    After the parquet, deliberately: parsing a borough's grids is minutes of
+    pypdf over documents a later run may no longer be able to fetch, and a
+    database that is down should cost the load rather than the parse.
+    """
+    try:
+        return publish(
+            postgis.connect,
+            datasets,
+            neighborhood=neighborhood,
+            scrape_date=scrape_date,
+        )
+    except (PostgresUnavailable, MissingRelation) as exc:
+        raise Failure(
+            f"{', '.join(datasets)} for {neighborhood} {scrape_date} were "
+            f"written to the tree but could not be published: {exc}"
+        ) from exc
 
 
 def _partition(context: AssetExecutionContext) -> tuple[str, str]:

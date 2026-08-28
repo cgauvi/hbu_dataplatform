@@ -321,6 +321,7 @@ def stub_postgis(
         staged = len(calls["zoning_envelopes"])
         return {
             "profiles": num_lots,
+            "pruned": 0,
             "num_lots": num_lots,
             "num_profiles": num_lots,
             "by_category": {

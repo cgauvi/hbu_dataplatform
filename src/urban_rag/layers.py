@@ -28,12 +28,23 @@ Everything here is (geo)parquet in the tree, including the joins that are
 **gold** - one question, answered at the grain whoever asks it reads. Named
 for the question rather than for the join behind it.
 
-Postgres is a serving copy of silver and gold, never the only copy of either.
-`rag.lots`, `rag.buildings` and `rag.features` are silver tables that happen to
-live in the serving database; `rag.lot_profiles` and `rag.chunks` are gold. The
-tree is the record - a table can be rebuilt from it, and losing the database
-costs a reload rather than a re-scrape, which for a live municipal source is
-not something a later date can undo.
+Postgres is a serving copy of silver and gold, never the only copy of either,
+and **the schema a table is in is the layer its asset is in**: `silver/
+vacancy_rates` in the tree is `silver.vacancy_rates` in the database, and
+`gold/lot_profiles` is `gold.lot_profiles`. `urban_rag.warehouse` derives that
+from this table rather than writing a schema name down twice, the same way
+`ParquetStore.partition_dir` derives its prefix - so an asset moved between
+layers moves its table with it.
+
+Two things in Postgres are outside that rule and are not exceptions to it.
+`rag.lots`, `rag.buildings` and `rag.features` are *bronze* snapshots loaded
+into PostGIS because the silver joins are computed over them there, and
+`rag.chunks` is the vector index `document_index` publishes; neither is a
+silver or gold dataset's own table.
+
+The tree is the record - a table can be rebuilt from it, and losing the
+database costs a reload rather than a re-scrape, which for a live municipal
+source is not something a later date can undo.
 """
 
 from __future__ import annotations
@@ -70,7 +81,10 @@ ASSET_LAYERS: dict[str, Layer] = {
     "linked_documents": Layer.BRONZE,
     "montreal_residential_costs": Layer.BRONZE,
     "montreal_nonresidential_costs": Layer.BRONZE,
+    "property_assessment_roll": Layer.BRONZE,
     # -- silver: this platform's grain and vocabulary -----------------------
+    "assessment_units": Layer.SILVER,
+    "lot_assessed_values": Layer.SILVER,
     "vacancy_rates": Layer.SILVER,
     "average_rents": Layer.SILVER,
     "building_lot_intersections": Layer.SILVER,

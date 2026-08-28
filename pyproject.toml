@@ -21,7 +21,16 @@ dependencies = [
     "pandas>=2.2",
     # Reads linked zoning PDFs for the document corpus. Kept in the base install
     # because it is small and the asset can fetch PDFs without the encoder stack.
-    "pypdf>=6.16.1",
+    #
+    # Capped below 7 because `urban_rag.zoning_grid` reaches into the layout
+    # mode's internals - `_text_extraction._layout_mode` and `_font` - for the
+    # user-space coordinates of each string, which `extract_text` computes and
+    # then spends on a fixed-width character grid rather than returning. The
+    # module docstring says why nothing public will do. These names have moved
+    # between major versions before, so an upgrade past 6 is a change to make
+    # deliberately: tests/unit/test_zoning_grid.py parses a real PDF end to end
+    # and is what fails if they move again.
+    "pypdf>=6.16.1,<7",
     # The Postgres/pgvector store (rag/pgvector.py) and its type adapter. In the
     # base install rather than the `rag` extra: loading a partition into the
     # store is an asset, so the code location needs the driver even in the slim
@@ -29,6 +38,13 @@ dependencies = [
     "pgvector>=0.3",
     "psycopg[binary]>=3.2",
     "pyarrow>=17",
+    # geopandas already depends on this and uses it as its default I/O engine.
+    # Named here because `urban_rag.role_foncier` calls it directly rather than
+    # through geopandas: the assessment roll is a 2.8 GB GeoPackage of five
+    # layers, and `list_layers` (to resolve the year-stamped layer names) and
+    # `read_dataframe(..., where=...)` (to filter to Montreal in OGR rather
+    # than in memory) have no `geopandas.read_file` equivalent.
+    "pyogrio>=0.9",
     "python-dotenv>=1.0",
     "requests>=2.32",
     "s3fs>=2024.6",
