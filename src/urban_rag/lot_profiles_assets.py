@@ -49,6 +49,25 @@ highest-coverage one across every layer is flattened into `doc_url`/`doc_title`
 so the common read is a column, and the whole set travels in `documents` as
 JSON, most-of-the-lot first.
 
+**What the ground is worth arrives from a table, and it is the one input
+already at this grain.** `silver.lot_assessed_values` is one row per lot -
+Quebec's *rôle d'évaluation foncière* carried onto the cadastre by
+`urban_rag.role_assets`, which is the join nobody publishes: Infolot draws the
+lot and says nothing about its worth, the roll values the property and draws no
+lot. So it needs no CTE and no pivot, just a LEFT JOIN on `lot_number`, and it
+completes the question this table exists for - `overall_average_rent_cad` is
+what a building earns, `construction_costs` is what it costs to put up, and
+`total_assessed_value` is what the ground is already worth standing as it is.
+
+**There are two totals and they answer different questions**, which is why both
+travel. `total_assessed_value` counts each unit whole on every lot it covers -
+right for "what is the property on this lot worth", wrong to SUM() across a
+borough. `total_assessed_value_apportioned` divides each unit across its lots,
+so that one adds up; `num_shared_units` is exactly where they diverge. Both are
+NULL rather than 0 on a lot no unit stands on, the same rule the frontage
+measures follow: a lane carrying no assessed property is not a lane worth
+nothing.
+
 **Four of the inputs never reach Postgres at all**, and are handed to the
 INSERT by this asset instead of read out of a `rag` table.
 `lot_zoning_envelopes` is staged into a temp table and aggregated into
@@ -169,6 +188,7 @@ from urban_rag.postgis import (
 from urban_rag.rag.pgvector import PostgresUnavailable
 from urban_rag.rag_assets import document_index
 from urban_rag.resources import ParquetStore, PostgisResource
+from urban_rag.role_assets import lot_assessed_values
 from urban_rag.storage import clear_parquet, filesystem, join, storage_options
 
 GROUP = "gold_lots"
@@ -319,6 +339,12 @@ class LotProfilesConfig(Config):
         lot_frontage,
         document_index,
         lot_zoning_envelopes,
+        # Partitioned by (neighborhood, date) like this asset, so it needs no
+        # mapping - unlike the two cost snapshots below. The join is a plain
+        # LEFT JOIN in SQL, so a partition whose roll has not landed still
+        # profiles every lot; the dependency is what keeps the two in step
+        # rather than what makes the read possible.
+        lot_assessed_values,
         vacancy_rates,
         average_rents,
         # Partitioned by date alone: the guide prices nine Canadian markets and
@@ -351,7 +377,14 @@ class LotProfilesConfig(Config):
         "lot_zoning_envelopes rows - every grid column that governs it, with "
         "the norms it states - and vacancy_rates/average_rents are the "
         "borough's CMHC survey, with the all/all cell flattened into "
-        "overall_vacancy_rate_pct and overall_average_rent_cad. A fourth, "
+        "overall_vacancy_rate_pct and overall_average_rent_cad. What the "
+        "ground is assessed at comes from silver.lot_assessed_values, joined "
+        "on lot_number: total_assessed_value is the roll's VALEUR IMMEUBLE "
+        "summed over the units standing on the lot - null, not zero, where "
+        "none do - with total_assessed_value_apportioned as the one that may "
+        "be summed across lots, and num_assessment_units beside them because "
+        "a condominium's common-parts lot carries one unit per apartment. A "
+        "fourth, "
         "construction_costs, is Montreal's column of the Altus cost guide: "
         "the underground and integrated ground-level parking rates flattened "
         "into underground_stall_cost_low/high_cad and "
@@ -566,6 +599,28 @@ def lot_profiles(
             "num_without_zoning_envelopes": profiles
             - int(result["num_with_zoning_envelopes"]),
             "num_zoning_envelopes": int(result["num_zoning_envelopes"]),
+            # The assessment join. A lot with no value is a lane, a park or a
+            # city parcel and a few percent is the honest reading; a third of
+            # the borough means the roll and the cadastre disagree about where
+            # the ground is, the same symptom num_lots_unvalued reports from
+            # lot_assessed_values' own side.
+            "num_with_assessed_value": int(result["num_with_assessed_value"]),
+            "num_without_assessed_value": profiles
+            - int(result["num_with_assessed_value"]),
+            "num_assessment_units": int(result["num_assessment_units"]),
+            # The apportioned total, and the only one that may be summed
+            # across lots - see gold.lot_profiles' column comments. Billions,
+            # because a borough's roll runs to tens of them and the raw figure
+            # is unreadable at a glance.
+            "total_assessed_value_apportioned_billions": (
+                round(result["total_assessed_value_apportioned"] / 1e9, 2)
+                if result["total_assessed_value_apportioned"] is not None
+                else "not assessed"
+            ),
+            # The roll is triennial and this partition's axis is the cadastre's
+            # scrape date, so the two do not move together and the row cannot
+            # be read back without it.
+            "roll_year": result["roll_year"] or "unknown",
             # Borough figures, identical on every row - reported once here
             # rather than left to be read out of one lot's jsonb. "suppressed"
             # is CMHC publishing nothing for the borough, which is a fact

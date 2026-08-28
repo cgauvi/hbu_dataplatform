@@ -4,48 +4,58 @@ Three assets over one publication - Quebec's *rôle d'évaluation foncière*, th
 province-wide property assessment roll the MAMH republishes as open data.
 
 `property_assessment_roll` snapshots it. The archive holds five layers and this
-keeps two: `rol_unite_p`, one point per *unité d'évaluation*, and
-`b05v_unite_evaln`, the characteristics table those points are described by.
-The other three - addresses, cadastral lot numbers, fiscal breakdowns - are
-one-to-many against the unit and are not read; `UNREAD_LAYERS` names them so a
-run reports what it left rather than leaving eleven million rows unaccounted
-for.
+keeps three: `rol_unite_p`, one point per *unité d'évaluation*;
+`b05v_unite_evaln`, the characteristics table those points are described by;
+and `b05v_lot_cadst`, the crosswalk naming every cadastre lot a unit covers.
+The other two - addresses and fiscal breakdowns - are not read; `UNREAD_LAYERS`
+names them so a run reports what it left rather than leaving five million rows
+unaccounted for.
 
-`assessment_units` puts the two back together on `id_provinc`, which is what
-the publisher splits them by: the geometry is in one file and everything true
-of the property is in the other, and neither is usable alone.
+`assessment_units` puts the first two back together on `id_provinc`, which is
+what the publisher splits them by: the geometry is in one file and everything
+true of the property is in the other, and neither is usable alone.
 
 `lot_assessed_values` carries that onto the cadastre. It is the join this whole
 chain exists for - Infolot draws the lot, the roll values the property, and
-nothing published connects them - and it is spatial, for a reason worth being
-explicit about.
+nothing published connects them.
 
-**Why the lot join is spatial.** The roll *does* publish the lot numbers a unit
-covers, in `b05v_lot_cadst`. That table would give the exact many-to-many
-mapping. It is not read here, so the units are placed on lots by where their
-point falls, and that trades a known error for a different one:
+**The lot join is by lot number, with the point as a fallback.** The roll
+states which lots a property covers, so that statement is used rather than an
+inference from geometry: `b05v_lot_cadst` gives (unit, lot number) and
+`lot_key` is all that stands between the roll's ``"1243415"`` and Infolot's
+``"1 243 415"``. On the first VSMPE snapshot that places 21,204 units on 21,862
+of the borough's 24,952 lots, and 96.7% of those units sit on exactly one lot.
 
-* An assessment point sits at the **visual centre of the unit**, so a unit
-  spanning three lots lands entirely on whichever of the three holds its
-  centre. Its full value is attributed there and the other two get none of it.
-* A point that falls in a lane, a park, or a lot the cadastre draws slightly
-  differently matches nothing at all, and its value is attributed nowhere.
+It cannot place everything, and what it misses is not random. **A condominium
+unit names its *private* lot numbers, which Infolot does not draw** - the
+polygon there is the `PC-*` common parts - so the crosswalk alone loses every
+divided co-ownership in the borough: 5,211 units and $2.9B, none of which name
+a lot that exists in the cadastre. Their point falls squarely on the `PC-*` lot
+the tower stands on, so the point places them, and `LotValuesConfig` decides
+whether it may. `num_units_by_point` says how many rows came that way, so a
+table can be read back against the choice that produced it.
 
-Both are visible rather than assumed: `num_units_unmatched_in_snapshot` counts
-the second, and the first is why `num_assessment_units` travels beside every
-total. On the first VSMPE snapshot 26,484 units landed on 21,676 of the
-borough's 24,952 lots; the other 3,276 are mostly lanes, parks and city parcels
-that carry no assessed property, which is what `num_lots_unvalued` reports.
-Reading `b05v_lot_cadst` and joining on the lot number is the refinement this
-asset is shaped to accept, and the reason the grain is declared here rather
-than assumed downstream.
+Together the two routes beat either alone: 26,489 units on 22,443 of VSMPE's
+24,952 lots, against 21,862 for the crosswalk by itself and 21,676 for the
+point by itself.
+
+**Two totals, because one number cannot be both.** A unit spanning several lots
+has its whole value counted on each of them in `total_assessed_value` - which
+is the right answer to "what is the assessed value of the property standing on
+this lot" and the wrong one to sum across a borough, where it over-counts:
+$32.37B against $27.24B on VSMPE. `total_assessed_value_apportioned` splits
+each unit's value across the lots it covers, so that one adds up - one unit's
+$150,476,700 on four lots is $37,619,175 apportioned to each.
+`num_shared_units` says how many of a lot's units are counted whole somewhere
+else too, which is exactly where the two differ; 691 of the borough's units are
+shared that way.
 
 **The sum is over units, not over buildings.** A divided-co-ownership building
 is one unit per apartment, all of them on the one `PC-*` common-parts lot: the
 largest lot in the first VSMPE snapshot carries 402 units and $258M. That is
-the number a highest-and-best-use question wants - what the ground is
-currently worth in aggregate - and it is only readable as such because the unit
-count sits next to it.
+the number a highest-and-best-use question wants - what the ground is currently
+worth in aggregate - and it is only readable as such because the unit count
+sits next to it.
 
 **`rl0404a` is VALEUR IMMEUBLE**, the whole property on the roll in force -
 land plus buildings, which the roll also splits as `rl0402a` and `rl0403a`. It
@@ -63,6 +73,7 @@ asset. `assessment_units` is a documented absence in
 supply one. Its record is the tree, which is where the record lives anyway.
 """
 
+import re
 from datetime import datetime, timezone
 
 import geopandas as gpd
@@ -88,9 +99,11 @@ from urban_rag.partitions import date_partitions, scrape_partitions
 from urban_rag.rag.pgvector import PostgresUnavailable
 from urban_rag.resources import ParquetStore, PostgisResource, RoleResource
 from urban_rag.role_foncier import (
+    CADASTRE_LAYER,
     JOIN_KEY,
     MONTREAL_CODE_MUN,
     POINT_LAYER,
+    ROLL_LOT_COLUMN,
     UNITS_LAYER,
     UNREAD_LAYERS,
     VALUE_COLUMN,
@@ -121,6 +134,7 @@ SILVER_GROUP = "silver_assessment"
 #: into it untouched.
 POINTS_FILE = "rol_unite_p.parquet"
 UNITS_FILE = "unite_evaln.parquet"
+CADASTRE_FILE = "lot_cadst.parquet"
 
 #: The one file `assessment_units` writes, under
 #: `silver/assessment_units/<YYYY-MM-DD>/`.
@@ -161,6 +175,11 @@ PROVENANCE_COLUMNS = (
 
 SOURCE_URL = "https://donneesouvertes.affmunqc.net/role/"
 
+#: Whitespace of every kind, for `lot_key`. `\s` in a `str` pattern is already
+#: Unicode-aware, so this covers the no-break and narrow no-break spaces French
+#: thousands separators are published with as well as the plain one.
+_SPACES = re.compile(r"\s+")
+
 
 class AssessmentRollConfig(Config):
     """Which municipalities' rolls to keep out of the province-wide archive.
@@ -188,6 +207,39 @@ class AssessmentRollConfig(Config):
     )
 
 
+class LotValuesConfig(Config):
+    """Whether to fall back to the assessment point for units the roll's own
+    cadastre crosswalk cannot place.
+
+    Config rather than a constant because it decides which of two known errors
+    a partition carries, and that is a judgement about what the totals are for
+    rather than a property of the data.
+
+    **On** (the default) is the fuller answer. `b05v_lot_cadst` names a
+    condominium unit's *private* lot numbers, which Infolot does not draw - the
+    polygon there is the `PC-*` common parts - so the crosswalk alone loses
+    every divided co-ownership in the borough: 5,211 units and $2.9B of the
+    first VSMPE snapshot. Their point falls on the `PC-*` lot, which is the lot
+    a reader asking what that ground is worth means.
+
+    **Off** is the stricter one: every row then comes from the roll's own
+    statement of which lots a property covers, and nothing is inferred from
+    where a dot was placed. `num_units_by_point` is 0, and the condominium
+    towers are absent rather than approximated.
+
+    Either way `num_units_by_point` says how many rows came from which, so a
+    table can be read back against the choice that produced it.
+    """
+
+    place_unmatched_by_point: bool = Field(
+        default=True,
+        description=(
+            "Place units the lot-number crosswalk cannot resolve by where "
+            "their point falls. Off leaves them unplaced."
+        ),
+    )
+
+
 @asset(
     key_prefix=key_prefix("property_assessment_roll"),
     partitions_def=date_partitions,
@@ -196,12 +248,12 @@ class AssessmentRollConfig(Config):
     description=(
         "Quebec's property assessment roll, snapshot per scrape date under "
         "bronze/property_assessment_roll/<YYYY-MM-DD>/: one point per unité "
-        f"d'évaluation as {POINTS_FILE}, and the characteristics table those "
-        f"points are described by as {UNITS_FILE}. Two of the archive's five "
-        "layers; the addresses, cadastral lot numbers and fiscal breakdowns "
-        "are one-to-many against the unit and are not read. Scoped to Ville de "
-        "Montréal by default, out of a province-wide publication. Source: "
-        f"{SOURCE_URL}"
+        f"d'évaluation as {POINTS_FILE}, the characteristics table those "
+        f"points are described by as {UNITS_FILE}, and the crosswalk naming "
+        f"every cadastre lot a unit covers as {CADASTRE_FILE}. Three of the "
+        "archive's five layers; the addresses and fiscal breakdowns are not "
+        "read. Scoped to Ville de Montréal by default, out of a province-wide "
+        f"publication. Source: {SOURCE_URL}"
     ),
 )
 def property_assessment_roll(
@@ -223,26 +275,32 @@ def property_assessment_roll(
         where = municipality_filter(config.municipality_codes)
         points_layer = layer_named(geopackage, POINT_LAYER)
         units_layer = layer_named(geopackage, UNITS_LAYER)
+        cadastre_layer = layer_named(geopackage, CADASTRE_LAYER)
         context.log.info(
-            "%s: reading %s and %s%s",
+            "%s: reading %s, %s and %s%s",
             filename,
             points_layer,
             units_layer,
+            cadastre_layer,
             f" where {where}" if where else " (whole province)",
         )
         points = read_layer(geopackage, points_layer, where=where)
         units = read_layer(geopackage, units_layer, where=where, geometry=False)
+        cadastre = read_layer(
+            geopackage, cadastre_layer, where=where, geometry=False
+        )
     except RoleError as exc:
         # One archive, one query each: a failure here costs the whole
         # partition, the way it does for Infolot rather than for the Spectrum
         # scrape's per-table salvage.
         raise Failure(f"Assessment roll read for {scrape_date} failed: {exc}")
 
-    if points.empty or units.empty:
+    if points.empty or units.empty or cadastre.empty:
         raise Failure(
-            f"{filename} returned {len(points)} point(s) and {len(units)} "
-            f"characteristics row(s) for {where or 'the whole province'}; "
-            "check the municipality codes against the archive's `code_mun`."
+            f"{filename} returned {len(points)} point(s), {len(units)} "
+            f"characteristics row(s) and {len(cadastre)} lot crosswalk row(s) "
+            f"for {where or 'the whole province'}; check the municipality "
+            "codes against the archive's `code_mun`."
         )
 
     scraped_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -254,6 +312,7 @@ def property_assessment_roll(
     for frame, layer, filename_out in (
         (points, points_layer, POINTS_FILE),
         (units, units_layer, UNITS_FILE),
+        (cadastre, cadastre_layer, CADASTRE_FILE),
     ):
         # Written as columns because the output path holds bare keys rather
         # than hive `key=value` pairs, so a reader that opens one file still
@@ -270,11 +329,13 @@ def property_assessment_roll(
     if invalid:
         context.log.warning("%s: %d invalid geometr(ies)", POINTS_FILE, invalid)
     context.log.info(
-        "%s %s: %d point(s), %d characteristics row(s) -> %s",
+        "%s %s: %d point(s), %d characteristics row(s), %d lot crosswalk "
+        "row(s) -> %s",
         filename,
         scrape_date,
         len(points),
         len(units),
+        len(cadastre),
         output_dir,
     )
 
@@ -283,6 +344,10 @@ def property_assessment_roll(
             "dagster/row_count": len(points),
             "num_assessment_points": len(points),
             "num_characteristics_rows": len(units),
+            "num_lot_crosswalk_rows": len(cadastre),
+            # One row per (unit, lot), so this is the lot side of the grain
+            # `lot_assessed_values` joins Infolot's polygons on.
+            "num_cadastre_lots": int(cadastre[ROLL_LOT_COLUMN].nunique()),
             # The key silver declares its grain on. Reported rather than
             # enforced: bronze keeps whatever the publisher sent, and a
             # duplicate here is the publisher's fact, not this asset's failure.
@@ -294,6 +359,7 @@ def property_assessment_roll(
             "layers_not_read": MetadataValue.json(list(UNREAD_LAYERS)),
             "points_path": MetadataValue.path(str(paths[POINTS_FILE])),
             "units_path": MetadataValue.path(str(paths[UNITS_FILE])),
+            "cadastre_path": MetadataValue.path(str(paths[CADASTRE_FILE])),
             "geopackage_path": MetadataValue.path(str(geopackage)),
             "source_url": MetadataValue.url(f"{SOURCE_URL}{filename}"),
         }
@@ -412,22 +478,32 @@ def assessment_units(
                 partition_dimension_name="date"
             ),
         ),
+        AssetDep(
+            property_assessment_roll,
+            partition_mapping=MultiToSingleDimensionPartitionMapping(
+                partition_dimension_name="date"
+            ),
+        ),
     ],
     group_name=SILVER_GROUP,
     kinds={"postgres", "geoparquet"},
     description=(
-        "What every lot in one borough is assessed at: the assessment units "
-        "whose point falls inside it, summed. One row per NO_LOT with the "
-        f"lot's geometry, the number of units on it and the total {VALUE_COLUMN} "
-        "(VALEUR IMMEUBLE) they carry - a lot with none keeps its row with a "
-        "null total, since no assessed property is not a property worth zero. "
-        f"Written to silver/lot_assessed_values/<YYYY-MM-DD>/<neighborhood>/"
-        f"{LOT_VALUES_FILE} and upserted into silver.lot_assessed_values on "
-        "(scrape_date, neighborhood, lot_number)."
+        "What every lot in one borough is assessed at. Units are placed on "
+        "lots by the roll's own cadastre crosswalk - b05v_lot_cadst, joined to "
+        "Infolot on the lot number - and, for the units it cannot place, by "
+        "where their point falls. One row per NO_LOT with the lot's geometry, "
+        f"the units on it, the total {VALUE_COLUMN} (VALEUR IMMEUBLE) they "
+        "carry and that total apportioned across the lots each unit spans. A "
+        "lot with no unit keeps its row with a null total, since no assessed "
+        "property is not a property worth zero. Written to silver/"
+        f"lot_assessed_values/<YYYY-MM-DD>/<neighborhood>/{LOT_VALUES_FILE} "
+        "and upserted into silver.lot_assessed_values on (scrape_date, "
+        "neighborhood, lot_number)."
     ),
 )
 def lot_assessed_values(
     context: AssetExecutionContext,
+    config: LotValuesConfig,
     store: ParquetStore,
     postgis: PostgisResource,
 ) -> MaterializeResult:
@@ -443,6 +519,10 @@ def lot_assessed_values(
         store.partition_dir(assessment_units.key.path[-1], scrape_date),
         ASSESSMENT_UNITS_FILE,
     )
+    cadastre_path = join(
+        store.partition_dir(property_assessment_roll.key.path[-1], scrape_date),
+        CADASTRE_FILE,
+    )
     lots = _read_geoparquet(
         lots_path,
         written_by="/".join(neighborhood_lots.key.path),
@@ -451,6 +531,11 @@ def lot_assessed_values(
     units = _read_geoparquet(
         units_path,
         written_by="/".join(assessment_units.key.path),
+        partition=scrape_date,
+    )
+    crosswalk = _read_parquet(
+        cadastre_path,
+        written_by="/".join(property_assessment_roll.key.path),
         partition=scrape_date,
     )
     if lots.empty:
@@ -463,11 +548,12 @@ def lot_assessed_values(
             "written by neighborhood_lots."
         )
 
-    # Bronze reports invalid rings and keeps them; what reads this frame is a
-    # point-in-polygon join, which on a self-intersecting ring either raises or
-    # answers a question nobody asked. The same repair
-    # `building_lot_intersections` makes on the way into PostGIS, made here for
-    # the same reason and counted so it stays visible.
+    # Bronze reports invalid rings and keeps them. Only the point fallback
+    # below reads the geometry, but it reads it with a point-in-polygon test,
+    # which on a self-intersecting ring either raises or answers a question
+    # nobody asked. The same repair `building_lot_intersections` makes on the
+    # way into PostGIS, made here for the same reason and counted so it stays
+    # visible.
     repaired = count_invalid_geometries(lots)
     if repaired:
         lots = _make_valid(lots)
@@ -481,28 +567,52 @@ def lot_assessed_values(
     _require_unique_lots(lots, neighborhood=neighborhood, scrape_date=scrape_date)
 
     lots = lots.to_crs(units.crs)
-    paired = gpd.sjoin(
-        units[[JOIN_KEY, VALUE_COLUMN, "geometry"]],
-        lots[[LOT_NUMBER_COLUMN, "geometry"]],
-        predicate="within",
-        how="inner",
+    lots = lots.assign(lot_key=lots[LOT_NUMBER_COLUMN].map(lot_key))
+    by_number = _pairs_by_lot_number(crosswalk, units, lots)
+    placed = set(by_number[JOIN_KEY])
+
+    # The fallback, and why it is on by default: the roll names a condominium
+    # unit's *private* lots, and Infolot draws the common parts. So a tower's
+    # units name lot numbers that have no polygon in the cadastre, match
+    # nothing above, and their value - $2.9B across 5,211 units in the first
+    # VSMPE snapshot - would simply be missing. Their point still falls
+    # squarely on the `PC-*` lot the building stands on, which is the lot a
+    # reader asking what that ground is worth means.
+    by_point = (
+        _pairs_by_point(units[~units[JOIN_KEY].isin(placed)], lots)
+        if config.place_unmatched_by_point
+        else _empty_pairs()
     )
-    if paired.empty:
-        # Not "this borough has no assessed property": no unit anywhere in the
-        # snapshot falls in any of its lots, which means the two sides do not
-        # overlap at all - a municipality filter that excluded this borough, or
-        # a cadastre and a roll from territories that do not meet.
+    pairs = pd.concat([by_number, by_point], ignore_index=True)
+    if pairs.empty:
+        # Not "this borough has no assessed property": no unit in the snapshot
+        # reaches any of its lots by either route, which means the two sides do
+        # not overlap at all - a municipality filter that excluded this
+        # borough, or a cadastre and a roll from territories that do not meet.
         raise Failure(
-            f"No assessment unit falls inside any {neighborhood} lot for "
-            f"{scrape_date}. {units_path} holds {len(units)} unit(s) and "
-            f"{lots_path} holds {len(lots)} lot(s); check that "
+            f"No assessment unit could be placed on any {neighborhood} lot for "
+            f"{scrape_date}. {units_path} holds {len(units)} unit(s), "
+            f"{cadastre_path} {len(crosswalk)} crosswalk row(s), and "
+            f"{lots_path} {len(lots)} lot(s); check that "
             "property_assessment_roll kept this borough's municipality."
         )
+
+    # Apportioned over the lots the unit covers *in the snapshot*, not over the
+    # ones in this borough: a unit straddling a borough line should contribute
+    # its share here and the rest there, and dividing by the local lots alone
+    # would hand this partition the whole of it.
+    pairs["value_share"] = pairs[VALUE_COLUMN] / pairs["num_lots"]
     totals = (
-        paired.groupby(LOT_NUMBER_COLUMN)
+        pairs.groupby(LOT_NUMBER_COLUMN)
         .agg(
             num_assessment_units=(JOIN_KEY, "nunique"),
+            # Units this lot shares with another - the ones whose whole value
+            # is counted here *and* elsewhere. Exactly what makes the two
+            # totals below differ, reported so the difference is attributable.
+            num_shared_units=("shared", "sum"),
+            num_units_by_point=("by_point", "sum"),
             total_assessed_value=(VALUE_COLUMN, "sum"),
+            total_assessed_value_apportioned=("value_share", "sum"),
         )
         .reset_index()
     )
@@ -511,11 +621,13 @@ def lot_assessed_values(
     # parcel, and its absence from the answer would read as a lot that has no
     # row rather than as one that carries no assessed property. The total stays
     # null there - a sum over nothing is not a value of zero.
-    valued = lots.merge(totals, on=LOT_NUMBER_COLUMN, how="left")
-    valued["num_assessment_units"] = (
-        valued["num_assessment_units"].fillna(0).astype("int64")
+    valued = lots.drop(columns="lot_key").merge(
+        totals, on=LOT_NUMBER_COLUMN, how="left"
     )
-    valued["total_assessed_value"] = valued["total_assessed_value"].astype("Float64")
+    for column in ("num_assessment_units", "num_shared_units", "num_units_by_point"):
+        valued[column] = valued[column].fillna(0).astype("int64")
+    for column in ("total_assessed_value", "total_assessed_value_apportioned"):
+        valued[column] = valued[column].astype("Float64")
     valued["roll_year"] = int(units["roll_year"].iloc[0])
     # `scrape_date` is already a column, from bronze, and is overwritten rather
     # than trusted: this partition's date is the one that was asked for.
@@ -546,18 +658,23 @@ def lot_assessed_values(
         ) from exc
 
     lots_valued = len(totals)
-    units_matched = int(paired[JOIN_KEY].nunique())
-    total_value = float(totals["total_assessed_value"].sum())
+    units_matched = int(pairs[JOIN_KEY].nunique())
+    by_number_units = int(by_number[JOIN_KEY].nunique())
+    by_point_units = int(by_point[JOIN_KEY].nunique())
+    full_total = float(totals["total_assessed_value"].sum())
+    apportioned_total = float(totals["total_assessed_value_apportioned"].sum())
     context.log.info(
-        "%s %s: %d of %d unit(s) fell inside %d of %d lot(s), $%.1fB assessed "
-        "-> %s",
+        "%s %s: %d unit(s) on %d of %d lot(s) - %d by lot number, %d by point "
+        "- $%.2fB assessed, $%.2fB apportioned -> %s",
         neighborhood,
         scrape_date,
         units_matched,
-        len(units),
         lots_valued,
         len(lots),
-        total_value / 1e9,
+        by_number_units,
+        by_point_units,
+        full_total / 1e9,
+        apportioned_total / 1e9,
         path,
     )
 
@@ -572,13 +689,34 @@ def lot_assessed_values(
             "num_lots_unvalued": len(lots) - lots_valued,
             "num_units_in_snapshot": len(units),
             "num_units_matched": units_matched,
-            # Units whose point fell in no lot of this borough. Almost all of
-            # them are in another borough; what is left are the ones this
+            # How each unit got here. The first is the roll's own answer; the
+            # second is the fallback, and a large one means a borough thick
+            # with divided co-ownership rather than a broken join.
+            "num_units_by_lot_number": by_number_units,
+            "num_units_by_point": by_point_units,
+            # Units the crosswalk placed on more than one lot. Each is counted
+            # whole on every one of them, which is exactly the gap between the
+            # two totals below.
+            "num_units_on_several_lots": int(
+                by_number.loc[by_number["num_lots"] > 1, JOIN_KEY].nunique()
+            ),
+            # Units that name no lot of this borough and whose point falls in
+            # none either. Almost all are in another borough; what is left this
             # partition attributes to nobody.
             "num_units_unmatched_in_snapshot": len(units) - units_matched,
             "num_geometries_repaired": repaired,
-            "total_assessed_value": round(total_value, 2),
-            "total_assessed_value_billions": round(total_value / 1e9, 2),
+            # Sum over lots of each unit's whole value. Over-counts the borough
+            # by exactly the multi-lot units' repeated value - read one lot's
+            # row with this, and the borough's total with the one below.
+            "total_assessed_value": round(full_total, 2),
+            "total_assessed_value_billions": round(full_total / 1e9, 2),
+            # Each unit's value split across the lots it covers, so this one
+            # sums across lots without counting anything twice.
+            "total_assessed_value_apportioned": round(apportioned_total, 2),
+            "total_assessed_value_apportioned_billions": round(
+                apportioned_total / 1e9, 2
+            ),
+            "placed_unmatched_by_point": config.place_unmatched_by_point,
             "max_lot_value": round(float(totals["total_assessed_value"].max()), 2),
             "max_units_on_a_lot": int(totals["num_assessment_units"].max()),
             "mean_units_per_valued_lot": round(
@@ -587,6 +725,121 @@ def lot_assessed_values(
             "roll_year": int(valued["roll_year"].iloc[0]),
             "output_path": MetadataValue.path(str(path)),
             **published_metadata(loaded),
+        }
+    )
+
+
+#: The columns a pair frame carries, whichever route produced it: the unit, the
+#: lot it was placed on, the value it brings, how many lots that value is spread
+#: over, and which route placed it.
+_PAIR_COLUMNS = (
+    JOIN_KEY,
+    LOT_NUMBER_COLUMN,
+    VALUE_COLUMN,
+    "num_lots",
+    "shared",
+    "by_point",
+)
+
+
+def lot_key(number) -> str | None:
+    """A lot number as the two publishers can be compared on.
+
+    Infolot writes a lot as ``"1 243 415"`` and the roll writes the same lot as
+    ``"1243415"``, so the spaces come out and nothing else does. In particular
+    the `PC-` prefix on a divided co-ownership's common parts is *kept*: the
+    roll has no such lot, so those keys are meant to miss rather than to be
+    coerced into matching something.
+    """
+    if number is None:
+        return None
+    text = str(number).strip()
+    if not text or text.lower() == "nan":
+        return None
+    # Every kind of space, not just U+0020: French thousands separators are
+    # published as no-break (U+00A0) and narrow no-break (U+202F) spaces as
+    # often as plain ones, and one of those left in makes the key miss
+    # silently. Written as a pattern rather than as literals, which would be
+    # invisible characters in the source.
+    return _SPACES.sub("", text)
+
+
+def _empty_pairs() -> pd.DataFrame:
+    """A pair frame with no rows, for when the fallback is switched off."""
+    return pd.DataFrame({column: [] for column in _PAIR_COLUMNS})
+
+
+def _pairs_by_lot_number(
+    crosswalk: pd.DataFrame, units: gpd.GeoDataFrame, lots: gpd.GeoDataFrame
+) -> pd.DataFrame:
+    """(unit, lot) pairs from the roll's own cadastre crosswalk.
+
+    The roll states which lots a property covers, so this is its answer rather
+    than an inference from geometry - the reason `b05v_lot_cadst` is snapshot
+    at all. Three things happen on the way:
+
+    * **The suffix is dropped.** `ROLL_LOT_SUFFIX_COLUMN` distinguishes rows of
+      the non-renewed cadastre naming one renewed lot, so ignoring it leaves
+      duplicate (unit, lot) rows - 1,758 of Montreal's - which would count a
+      unit twice on the same lot.
+    * **`num_lots` is counted before the borough is cut**, over every lot the
+      snapshot says the unit covers. That is what makes the apportioned total
+      add up across boroughs instead of giving each one the whole unit.
+    * **The lot numbers are keyed with `lot_key`**, which is the only thing
+      standing between the roll's ``"1243415"`` and Infolot's ``"1 243 415"``.
+    """
+    if crosswalk.empty or ROLL_LOT_COLUMN not in crosswalk.columns:
+        return _empty_pairs()
+
+    edges = crosswalk[[JOIN_KEY, ROLL_LOT_COLUMN]].copy()
+    edges["lot_key"] = edges[ROLL_LOT_COLUMN].map(lot_key)
+    edges = edges[edges["lot_key"].notna()].drop_duplicates(
+        subset=[JOIN_KEY, "lot_key"]
+    )
+    if edges.empty:
+        return _empty_pairs()
+
+    spread = edges.groupby(JOIN_KEY)["lot_key"].transform("size")
+    edges = edges.assign(num_lots=spread)
+
+    paired = edges.merge(
+        units[[JOIN_KEY, VALUE_COLUMN]], on=JOIN_KEY, how="inner"
+    ).merge(lots[[LOT_NUMBER_COLUMN, "lot_key"]], on="lot_key", how="inner")
+    if paired.empty:
+        return _empty_pairs()
+    paired["shared"] = paired["num_lots"] > 1
+    paired["by_point"] = False
+    return paired[list(_PAIR_COLUMNS)]
+
+
+def _pairs_by_point(units: gpd.GeoDataFrame, lots: gpd.GeoDataFrame) -> pd.DataFrame:
+    """(unit, lot) pairs from where each unit's point falls.
+
+    The fallback for units the crosswalk could not place. A point sits at the
+    unit's visual centre and falls in exactly one lot, so `num_lots` is 1 and
+    the two totals agree on every row this produces.
+    """
+    if units.empty:
+        return _empty_pairs()
+    paired = gpd.sjoin(
+        units[[JOIN_KEY, VALUE_COLUMN, "geometry"]],
+        lots[[LOT_NUMBER_COLUMN, "geometry"]],
+        predicate="within",
+        how="inner",
+    )
+    if paired.empty:
+        return _empty_pairs()
+    # A point on a shared boundary can land in two lots; the value is not
+    # duplicated over them, so the first is taken and `num_lots` stays 1.
+    paired = paired.drop_duplicates(subset=[JOIN_KEY])
+    return pd.DataFrame(
+        {
+            JOIN_KEY: paired[JOIN_KEY].to_numpy(),
+            LOT_NUMBER_COLUMN: paired[LOT_NUMBER_COLUMN].to_numpy(),
+            VALUE_COLUMN: paired[VALUE_COLUMN].to_numpy(),
+            "num_lots": 1,
+            "shared": False,
+            "by_point": True,
         }
     )
 

@@ -52,14 +52,20 @@ K ?= 5
 # the shared Postgres/pgvector one (configured from URBAN_RAG_PG_*, see the
 # README). `make index BACKEND=postgres` reloads the latter from parquet.
 BACKEND ?= duckdb
-# How far behind the curb line a lot boundary still counts as facing it, for
-# `make frontage`. See silver/lot_frontage in the README.
-BUFFER_M ?= 3.0
+# How far a lot boundary may be from a street side and still be matched to it,
+# for `make frontage`. It decides which lots get measured, not what they then
+# measure. See silver/lot_frontage in the README.
+BUFFER_M ?= 10.0
 # Which municipalities' assessment rolls `make roll` keeps out of the
 # province-wide archive, as a JSON list of five-digit `code_mun` values.
 # Defaults to Ville de Montréal, which is every borough this pipeline has; `[]`
 # keeps the province. See bronze/property_assessment_roll in the README.
 CODE_MUN ?= ["66023"]
+# Whether `make lot-values` falls back to the assessment point for the units
+# the roll's own lot-number crosswalk cannot place - which is every divided
+# co-ownership, since those name private lots Infolot does not draw. `false`
+# leaves them unplaced and every row then comes from the crosswalk alone.
+BY_POINT ?= true
 
 IMAGE ?= urban-rag
 TAG ?= latest
@@ -187,11 +193,12 @@ roll: | $(UV_SYNC_STAMP) ## Snapshot the property assessment roll for DATE and m
 # `-- requires:` header. The parquet is written first, so a database that is
 # down costs a re-run of the load rather than of the join.
 lot-values: | $(UV_SYNC_STAMP) ## Total DATE's assessment roll onto NEIGHBORHOOD's lots
-	$(DAGSTER) asset materialize --select silver/lot_assessed_values --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
+	$(DAGSTER) asset materialize --select silver/lot_assessed_values --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE) \
+		--config-json '{"ops":{"silver__lot_assessed_values":{"config":{"place_unmatched_by_point":$(BY_POINT)}}}}'
 
 # Needs silver.neighborhood_streets and silver.lot_frontage (hbu_infra sql/007, sql/008) applied,
 # and building_lot_intersections run first for the same partition - that is what
-# puts this borough's cadastre in rag.lots. BUFFER_M overrides the 3 m default.
+# puts this borough's cadastre in rag.lots. BUFFER_M overrides the 10 m default.
 frontage: | $(UV_SYNC_STAMP) ## Materialize lot_frontage for DATE x NEIGHBORHOOD
 	$(DAGSTER) asset materialize --select silver/lot_frontage --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE) \
 		--config-json '{"ops":{"silver__lot_frontage":{"config":{"buffer_m":$(BUFFER_M)}}}}'

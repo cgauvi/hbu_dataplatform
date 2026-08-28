@@ -81,6 +81,7 @@ def stub_postgis(
     num_streets=2,
     total_frontage_m=60.0,
     max_frontage_m=30.0,
+    lots_without_frontage=("3 790 556", "3 790 557"),
 ):
     """Patched on the class: Dagster rebuilds the resource before the run."""
     calls: dict[str, object] = {}
@@ -99,6 +100,9 @@ def stub_postgis(
             "max_frontage_m": max_frontage_m,
             "num_lots": num_lots,
             "num_streets": num_streets,
+            # A sample of the lots that faced nothing, as the real one returns
+            # it - the count is num_lots - lots_matched, this is which ones.
+            "lots_without_frontage": list(lots_without_frontage),
             "buffer_m": buffer_m,
             "pruned": 0,
         }
@@ -283,6 +287,43 @@ def test_no_lot_matching_is_not_a_failure(store, monkeypatch):
     metadata = materialization_metadata(result, lot_frontage)
     assert metadata["num_lots_without_frontage"].value == 4
     assert metadata["mean_frontage_m"].value == 0.0
+
+
+def test_the_lots_that_face_no_street_are_named_not_only_counted(store, monkeypatch):
+    """"Two lots failed" is not something anyone can act on.
+
+    A lot with no frontage is either a real interior parcel or the measure not
+    reaching it - the second is what a cutoff below the borough's setback looks
+    like, and it is diagnosed by pulling up the lots, so the run publishes
+    which ones alongside how many."""
+    stub_postgis(
+        monkeypatch,
+        lots_matched=2,
+        num_lots=4,
+        lots_without_frontage=("3 790 556", "3 790 557"),
+    )
+    write_streets(store)
+
+    metadata = materialization_metadata(materialize_partition(store), lot_frontage)
+
+    assert metadata["num_lots_without_frontage"].value == 2
+    assert metadata["pct_lots_without_frontage"].value == 50.0
+    assert metadata["lots_without_frontage"].value == "3 790 556, 3 790 557"
+
+
+def test_a_borough_where_every_lot_faces_a_street_flags_nothing(store, monkeypatch):
+    """The expected shape of a healthy partition, and the one the fixture in
+    tests/integration measures: every lot in it has street on a side."""
+    stub_postgis(
+        monkeypatch, lots_matched=4, num_lots=4, lots_without_frontage=()
+    )
+    write_streets(store)
+
+    metadata = materialization_metadata(materialize_partition(store), lot_frontage)
+
+    assert metadata["num_lots_without_frontage"].value == 0
+    assert metadata["pct_lots_without_frontage"].value == 0.0
+    assert metadata["lots_without_frontage"].value == ""
 
 
 def test_a_missing_street_partition_names_the_asset_to_run(store, monkeypatch):

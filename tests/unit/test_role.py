@@ -1,10 +1,17 @@
 """Offline tests for the assessment-roll client and the three assets over it.
 
 Nothing here touches the network. The province-wide archive is stubbed by
-writing a tiny real GeoPackage - two layers, named the way the publisher names
-them, with the roll year stamped on - and zipping it the way the MAMH ships it,
-so what is under test is GDAL's own GeoPackage reading, the download and unpack
-cache, the merge on `id_provinc`, and the point-in-lot totals - not the network.
+writing a tiny real GeoPackage - three layers, named the way the publisher
+names them, with the roll year stamped on - and zipping it the way the MAMH
+ships it, so what is under test is GDAL's own GeoPackage reading, the download
+and unpack cache, the merge on `id_provinc`, and the lot totals - not the
+network.
+
+The fixture borough is built to carry one of each shape the real one does: two
+units on an ordinary lot, one unit spanning two lots (which is what makes the
+full and apportioned totals differ), a divided co-ownership whose private lot
+the cadastre does not draw (which only its point can place), and a lane nothing
+is assessed on. See `borough_lots` and the `role` fixture.
 """
 
 from __future__ import annotations
@@ -27,17 +34,22 @@ from urban_rag.infolot_assets import LOTS_FILE, neighborhood_lots
 from urban_rag.resources import ParquetStore, PostgisResource, RoleResource
 from urban_rag.role_assets import (
     ASSESSMENT_UNITS_FILE,
+    CADASTRE_FILE,
     LOT_VALUES_FILE,
     POINTS_FILE,
     UNITS_FILE,
     assessment_units,
     lot_assessed_values,
+    lot_key,
     property_assessment_roll,
 )
 from urban_rag.role_foncier import (
+    CADASTRE_LAYER,
     JOIN_KEY,
     MONTREAL_CODE_MUN,
     POINT_LAYER,
+    ROLL_LOT_COLUMN,
+    ROLL_LOT_SUFFIX_COLUMN,
     UNITS_LAYER,
     VALUE_COLUMN,
     RoleError,
@@ -54,9 +66,10 @@ NEIGHBORHOOD = "VSMPE"
 ROLL_YEAR = 2026
 ARCHIVE = filename_for(ROLL_YEAR)
 
-#: What the publisher calls the two layers this reads, roll year and all.
+#: What the publisher calls the three layers this reads, roll year and all.
 POINT_LAYER_NAME = f"{POINT_LAYER}_{ROLL_YEAR}"
 UNITS_LAYER_NAME = f"{UNITS_LAYER}_{ROLL_YEAR}"
+CADASTRE_LAYER_NAME = f"{CADASTRE_LAYER}_{ROLL_YEAR}"
 
 #: Another municipality's code, so the `code_mun` filter has something to drop.
 LAVAL_CODE_MUN = "65005"
@@ -94,14 +107,33 @@ def units_layer(rows: list[tuple[str, str, float]]) -> pd.DataFrame:
     )
 
 
+def cadastre_layer(rows: list[tuple[str, str, str]]) -> pd.DataFrame:
+    """`b05v_lot_cadst`: one row per (unit, lot the unit covers).
+
+    Lot numbers are written the way the roll writes them - seven digits, no
+    spaces - against Infolot's ``"1 000 001"``, which is the gap `lot_key`
+    closes.
+    """
+    return pd.DataFrame(
+        {
+            JOIN_KEY: [unit_id(code, mat) for code, mat, _ in rows],
+            "code_mun": [code for code, _, _ in rows],
+            "mat18": [mat for _, mat, _ in rows],
+            ROLL_LOT_COLUMN: [lot for _, _, lot in rows],
+            ROLL_LOT_SUFFIX_COLUMN: [None for _ in rows],
+        }
+    )
+
+
 def zipped_geopackage(
     directory: Path,
     points: gpd.GeoDataFrame,
     units: pd.DataFrame,
+    cadastre: pd.DataFrame,
     *,
     name: str = ARCHIVE,
 ) -> Path:
-    """Write both layers as a real GeoPackage, zipped the way the roll is.
+    """Write the three layers as a real GeoPackage, zipped the way the roll is.
 
     The archive nests the GeoPackage under a year-stamped folder and ships a
     codebook and a PDF beside it, so the fixture does too - that is what
@@ -110,9 +142,10 @@ def zipped_geopackage(
     directory.mkdir(parents=True, exist_ok=True)
     gpkg = directory / f"Role_{ROLL_YEAR}_2.gpkg"
     points.to_file(gpkg, layer=POINT_LAYER_NAME, driver="GPKG")
-    # A non-spatial layer: GeoPandas needs a GeoDataFrame to write one, so the
-    # table goes in through pyogrio, which is what reads it back.
+    # Non-spatial layers: GeoPandas needs a GeoDataFrame to write one, so the
+    # tables go in through pyogrio, which is what reads them back.
     pyogrio.write_dataframe(units, gpkg, layer=UNITS_LAYER_NAME, append=True)
+    pyogrio.write_dataframe(cadastre, gpkg, layer=CADASTRE_LAYER_NAME, append=True)
 
     zip_path = directory / name
     folder = f"Role{ROLL_YEAR}_geopackage"
@@ -185,6 +218,7 @@ def test_fetch_downloads_once_and_caches_by_filename(tmp_path):
         tmp_path / "src",
         points_layer([(MONTREAL_CODE_MUN, "1" * 18, -73.6, 45.5)]),
         units_layer([(MONTREAL_CODE_MUN, "1" * 18, 100.0)]),
+        cadastre_layer([(MONTREAL_CODE_MUN, "1" * 18, "1000001")]),
     )
     fetcher, session = fetcher_for(tmp_path, archive)
 
@@ -219,6 +253,7 @@ def test_geopackage_is_unpacked_beside_the_archive_and_cached(tmp_path):
         tmp_path / "src",
         points_layer([(MONTREAL_CODE_MUN, "1" * 18, -73.6, 45.5)]),
         units_layer([(MONTREAL_CODE_MUN, "1" * 18, 100.0)]),
+        cadastre_layer([(MONTREAL_CODE_MUN, "1" * 18, "1000001")]),
     )
     fetcher, _ = fetcher_for(tmp_path, archive)
 
@@ -237,14 +272,18 @@ def test_layer_named_resolves_the_roll_year_suffix(tmp_path):
         tmp_path / "src",
         points_layer([(MONTREAL_CODE_MUN, "1" * 18, -73.6, 45.5)]),
         units_layer([(MONTREAL_CODE_MUN, "1" * 18, 100.0)]),
+        cadastre_layer([(MONTREAL_CODE_MUN, "1" * 18, "1000001")]),
     )
     fetcher, _ = fetcher_for(tmp_path, archive)
     gpkg = fetcher.geopackage(ARCHIVE)
 
     assert layer_named(gpkg, POINT_LAYER) == POINT_LAYER_NAME
     assert layer_named(gpkg, UNITS_LAYER) == UNITS_LAYER_NAME
+    assert layer_named(gpkg, CADASTRE_LAYER) == CADASTRE_LAYER_NAME
+    # And the prefix match is whole-name: `b05v_unite_evaln` must not also
+    # claim `b05v_adr_unite_evaln`, which the real archive ships beside it.
     with pytest.raises(RoleError, match="no layer named"):
-        layer_named(gpkg, "b05v_lot_cadst")
+        layer_named(gpkg, "b05v_repar_fisc")
 
 
 def test_read_layer_filters_in_ogr_and_reprojects_to_4326(tmp_path):
@@ -258,6 +297,12 @@ def test_read_layer_filters_in_ogr_and_reprojects_to_4326(tmp_path):
         ),
         units_layer(
             [(MONTREAL_CODE_MUN, "1" * 18, 100.0), (LAVAL_CODE_MUN, "2" * 18, 200.0)]
+        ),
+        cadastre_layer(
+            [
+                (MONTREAL_CODE_MUN, "1" * 18, "1000001"),
+                (LAVAL_CODE_MUN, "2" * 18, "2000002"),
+            ]
         ),
     )
     fetcher, _ = fetcher_for(tmp_path, archive)
@@ -294,9 +339,29 @@ def store(tmp_path):
     return ParquetStore(root_dir=str(tmp_path / "store"))
 
 
+#: The four Montreal units the asset fixtures below are built from, and the
+#: shape of the borough each one is there to exercise:
+#:
+#: * `U_PAIR_A` / `U_PAIR_B` - two units on one ordinary lot, both placed by
+#:   lot number. The plain case.
+#: * `U_SPLIT` - one unit covering two lots, which is what makes the full and
+#:   apportioned totals differ.
+#: * `U_CONDO` - a divided co-ownership: it names a private lot the cadastre
+#:   does not draw, so only its point can place it, on the `PC-*` lot.
+U_PAIR_A, U_PAIR_B, U_SPLIT, U_CONDO = ("1" * 18, "2" * 18, "3" * 18, "5" * 18)
+U_LAVAL = "4" * 18
+
+#: The lots those units land on. `LOT_EMPTY` is the lane nothing is assessed
+#: on, and `LOT_UNDRAWN` is the private lot the condo names and Infolot has no
+#: polygon for.
+LOT_A, LOT_SPLIT_1, LOT_SPLIT_2 = ("1 000 001", "1 000 002", "1 000 003")
+LOT_CONDO, LOT_EMPTY = ("PC-9001", "1 000 004")
+LOT_UNDRAWN = "9999999"
+
+
 @pytest.fixture
 def role(tmp_path, monkeypatch):
-    """Two Montreal units on the same lot, and one in Laval to be filtered out.
+    """A borough with one of each shape, plus a Laval unit to be filtered out.
 
     Patched on the class rather than on an instance: Dagster rebuilds the
     resource before the run.
@@ -305,24 +370,58 @@ def role(tmp_path, monkeypatch):
         tmp_path / "src",
         points_layer(
             [
-                (MONTREAL_CODE_MUN, "1" * 18, -73.60, 45.50),
-                (MONTREAL_CODE_MUN, "2" * 18, -73.60, 45.50),
-                (MONTREAL_CODE_MUN, "3" * 18, -73.40, 45.50),
-                (LAVAL_CODE_MUN, "4" * 18, -73.70, 45.60),
+                (MONTREAL_CODE_MUN, U_PAIR_A, -73.60, 45.50),
+                (MONTREAL_CODE_MUN, U_PAIR_B, -73.60, 45.50),
+                (MONTREAL_CODE_MUN, U_SPLIT, -73.40, 45.50),
+                (MONTREAL_CODE_MUN, U_CONDO, -73.30, 45.50),
+                (LAVAL_CODE_MUN, U_LAVAL, -73.70, 45.60),
             ]
         ),
         units_layer(
             [
-                (MONTREAL_CODE_MUN, "1" * 18, 300_000.0),
-                (MONTREAL_CODE_MUN, "2" * 18, 200_000.0),
-                (MONTREAL_CODE_MUN, "3" * 18, 500_000.0),
-                (LAVAL_CODE_MUN, "4" * 18, 900_000.0),
+                (MONTREAL_CODE_MUN, U_PAIR_A, 300_000.0),
+                (MONTREAL_CODE_MUN, U_PAIR_B, 200_000.0),
+                (MONTREAL_CODE_MUN, U_SPLIT, 500_000.0),
+                (MONTREAL_CODE_MUN, U_CONDO, 800_000.0),
+                (LAVAL_CODE_MUN, U_LAVAL, 900_000.0),
+            ]
+        ),
+        cadastre_layer(
+            [
+                (MONTREAL_CODE_MUN, U_PAIR_A, "1000001"),
+                (MONTREAL_CODE_MUN, U_PAIR_B, "1000001"),
+                # One unit, two lots - the value is counted whole on each in
+                # `total_assessed_value` and halved in the apportioned one.
+                (MONTREAL_CODE_MUN, U_SPLIT, "1000002"),
+                (MONTREAL_CODE_MUN, U_SPLIT, "1000003"),
+                # The condo names its private lot, which has no polygon.
+                (MONTREAL_CODE_MUN, U_CONDO, LOT_UNDRAWN),
+                (LAVAL_CODE_MUN, U_LAVAL, "2000002"),
             ]
         ),
     )
     fetcher, session = fetcher_for(tmp_path, archive)
     monkeypatch.setattr(RoleResource, "fetcher", lambda self: fetcher)
     return session
+
+
+def borough_lots() -> gpd.GeoDataFrame:
+    """The cadastre the fixture's units are placed on.
+
+    Infolot spells a lot number with spaces and the roll does not, which is the
+    gap `lot_key` closes - so these are written the way Infolot writes them.
+    """
+    return gpd.GeoDataFrame(
+        {"NO_LOT": [LOT_A, LOT_SPLIT_1, LOT_SPLIT_2, LOT_CONDO, LOT_EMPTY]},
+        geometry=[
+            box(-73.61, 45.49, -73.59, 45.51),  # both U_PAIR_* points
+            box(-73.41, 45.49, -73.39, 45.51),  # U_SPLIT's point
+            box(-73.51, 45.49, -73.49, 45.51),  # U_SPLIT by lot number only
+            box(-73.31, 45.49, -73.29, 45.51),  # U_CONDO's point
+            box(-73.21, 45.49, -73.19, 45.51),  # nothing at all
+        ],
+        crs="EPSG:4326",
+    )
 
 
 def run_roll(store, *, codes=(MONTREAL_CODE_MUN,)):
@@ -367,15 +466,32 @@ def published(monkeypatch):
     return stub_publish(monkeypatch, role_assets)
 
 
-def run_lot_values(store):
+def run_lot_values(store, *, by_point: bool = True):
     return materialize(
         [lot_assessed_values],
         partition_key=MultiPartitionKey({"date": DATE, "neighborhood": NEIGHBORHOOD}),
         resources={"store": store, "postgis": PostgisResource()},
+        run_config={
+            "ops": {
+                "silver__lot_assessed_values": {
+                    "config": {"place_unmatched_by_point": by_point}
+                }
+            }
+        },
     )
 
 
-def test_bronze_writes_both_layers_under_the_scrape_date(store, role):
+def lot_values(store) -> gpd.GeoDataFrame:
+    """The partition `lot_assessed_values` just wrote, indexed by lot number."""
+    return gpd.read_parquet(
+        Path(
+            store.partition_dir(lot_assessed_values.key.path[-1], DATE, NEIGHBORHOOD)
+        )
+        / LOT_VALUES_FILE
+    ).set_index("NO_LOT")
+
+
+def test_bronze_writes_all_three_layers_under_the_scrape_date(store, role):
     result = run_roll(store)
 
     assert result.success
@@ -384,10 +500,11 @@ def test_bronze_writes_both_layers_under_the_scrape_date(store, role):
     )
     assert (output_dir / POINTS_FILE).exists()
     assert (output_dir / UNITS_FILE).exists()
+    assert (output_dir / CADASTRE_FILE).exists()
 
     points = gpd.read_parquet(output_dir / POINTS_FILE)
     # Filtered in OGR, so Laval never reaches the frame.
-    assert len(points) == 3
+    assert len(points) == 4
     assert set(points["code_mun"]) == {MONTREAL_CODE_MUN}
     assert points.crs.to_string() == "EPSG:4326"
     # The path holds bare keys, so the snapshot travels as columns.
@@ -395,9 +512,16 @@ def test_bronze_writes_both_layers_under_the_scrape_date(store, role):
     assert set(points["roll_year"]) == {ROLL_YEAR}
     assert set(points["source_layer"]) == {POINT_LAYER_NAME}
 
+    # One row per (unit, lot), so the crosswalk is longer than the unit list.
+    crosswalk = pd.read_parquet(output_dir / CADASTRE_FILE)
+    assert len(crosswalk) == 5
+    assert set(crosswalk["source_layer"]) == {CADASTRE_LAYER_NAME}
+
     metadata = materialization_metadata(result, property_assessment_roll)
-    assert metadata["num_assessment_points"].value == 3
-    assert metadata["num_characteristics_rows"].value == 3
+    assert metadata["num_assessment_points"].value == 4
+    assert metadata["num_characteristics_rows"].value == 4
+    assert metadata["num_lot_crosswalk_rows"].value == 5
+    assert metadata["num_cadastre_lots"].value == 4
     assert metadata["municipality_filter"].value == "code_mun IN ('66023')"
 
 
@@ -406,7 +530,7 @@ def test_bronze_keeps_the_province_when_no_code_is_given(store, role):
 
     assert result.success
     metadata = materialization_metadata(result, property_assessment_roll)
-    assert metadata["num_assessment_points"].value == 4
+    assert metadata["num_assessment_points"].value == 5
     assert metadata["num_municipalities"].value == 2
 
 
@@ -425,9 +549,9 @@ def test_silver_merges_the_two_layers_on_id_provinc(store, role):
         Path(store.partition_dir(assessment_units.key.path[-1], DATE))
         / ASSESSMENT_UNITS_FILE
     )
-    assert len(merged) == 3
+    assert len(merged) == 4
     # The value column is what the merge exists to bring across.
-    assert merged[VALUE_COLUMN].sum() == 1_000_000.0
+    assert merged[VALUE_COLUMN].sum() == 1_800_000.0
     # `code_mun` and `mat18` are published in both and are dropped from the
     # right-hand side rather than suffixed, since they say the same thing.
     assert "code_mun_unite" not in merged.columns
@@ -437,9 +561,9 @@ def test_silver_merges_the_two_layers_on_id_provinc(store, role):
     assert {"arrond", "rl0102a"} <= set(merged.columns)
 
     metadata = materialization_metadata(result, assessment_units)
-    assert metadata["num_assessment_units"].value == 3
+    assert metadata["num_assessment_units"].value == 4
     assert metadata["num_points_unmatched"].value == 0
-    assert metadata["total_assessed_value"].value == 1_000_000.0
+    assert metadata["total_assessed_value"].value == 1_800_000.0
 
 
 def test_silver_refuses_a_duplicated_unit(store, role):
@@ -456,55 +580,181 @@ def test_silver_names_the_asset_to_materialize_when_bronze_is_missing(store):
     with pytest.raises(Failure, match="does not exist"):
         run_units(store)
 
+def test_lot_values_place_units_by_the_rolls_own_lot_numbers(store, role, published):
+    """The roll says which lots a property covers; that is what is used.
 
-def test_lot_values_sum_every_unit_inside_a_lot(store, role, published):
+    `LOT_SPLIT_2` is the case worth watching: no unit's point falls inside it,
+    and it is valued anyway, because `U_SPLIT` names it in the crosswalk.
+    """
     run_roll(store)
     run_units(store)
-    write_lots(
-        store,
-        gpd.GeoDataFrame(
-            {"NO_LOT": ["1 000 001", "1 000 002", "1 000 003"]},
-            geometry=[
-                # Two units fall in the first lot, one in the second, none in
-                # the third.
-                box(-73.61, 45.49, -73.59, 45.51),
-                box(-73.41, 45.49, -73.39, 45.51),
-                box(-73.31, 45.49, -73.29, 45.51),
-            ],
-            crs="EPSG:4326",
-        ),
-    )
+    write_lots(store, borough_lots())
 
     result = run_lot_values(store)
 
     assert result.success
-    values = gpd.read_parquet(
-        Path(
-            store.partition_dir(
-                lot_assessed_values.key.path[-1], DATE, NEIGHBORHOOD
-            )
-        )
-        / LOT_VALUES_FILE
-    ).set_index("NO_LOT")
+    values = lot_values(store)
 
-    assert values.loc["1 000 001", "num_assessment_units"] == 2
-    assert values.loc["1 000 001", "total_assessed_value"] == 500_000.0
-    assert values.loc["1 000 002", "num_assessment_units"] == 1
-    assert values.loc["1 000 002", "total_assessed_value"] == 500_000.0
-    # A lot nothing is assessed on keeps its row, and its total stays null: a
-    # sum over nothing is not a value of zero.
-    assert values.loc["1 000 003", "num_assessment_units"] == 0
-    assert pd.isna(values.loc["1 000 003", "total_assessed_value"])
+    # Two units on one lot, both by lot number, neither shared.
+    assert values.loc[LOT_A, "num_assessment_units"] == 2
+    assert values.loc[LOT_A, "total_assessed_value"] == 500_000.0
+    assert values.loc[LOT_A, "total_assessed_value_apportioned"] == 500_000.0
+    assert values.loc[LOT_A, "num_shared_units"] == 0
+    assert values.loc[LOT_A, "num_units_by_point"] == 0
+
+    # Valued off the crosswalk alone - no point falls in it. A spatial join
+    # would have left this lot empty.
+    assert values.loc[LOT_SPLIT_2, "num_assessment_units"] == 1
+    assert values.loc[LOT_SPLIT_2, "num_units_by_point"] == 0
+
     assert set(values["neighborhood"]) == {NEIGHBORHOOD}
     assert set(values["scrape_date"]) == {DATE}
 
     metadata = materialization_metadata(result, lot_assessed_values)
-    assert metadata["num_lots"].value == 3
-    assert metadata["num_lots_valued"].value == 2
+    assert metadata["num_lots"].value == 5
+    assert metadata["num_lots_valued"].value == 4
+    assert metadata["num_units_by_lot_number"].value == 3
+    assert metadata["num_units_matched"].value == 4
+
+
+def test_a_unit_on_several_lots_is_whole_on_each_and_split_across_them(
+    store, role, published
+):
+    """The two totals, and the one number that says where they differ.
+
+    `U_SPLIT` is worth $500,000 and covers two lots. Its whole value is on each
+    of them, because that is what "the property on this lot is assessed at"
+    means; the apportioned column halves it, because that is what adds up.
+    """
+    run_roll(store)
+    run_units(store)
+    write_lots(store, borough_lots())
+
+    result = run_lot_values(store)
+    values = lot_values(store)
+
+    for lot in (LOT_SPLIT_1, LOT_SPLIT_2):
+        assert values.loc[lot, "num_assessment_units"] == 1
+        assert values.loc[lot, "num_shared_units"] == 1
+        assert values.loc[lot, "total_assessed_value"] == 500_000.0
+        assert values.loc[lot, "total_assessed_value_apportioned"] == 250_000.0
+
+    metadata = materialization_metadata(result, lot_assessed_values)
+    assert metadata["num_units_on_several_lots"].value == 1
+    # 300k + 200k on LOT_A, 500k twice over the split pair, 800k on the condo.
+    assert metadata["total_assessed_value"].value == 2_300_000.0
+    # The same, counting the split unit once: this is the one that adds up.
+    assert metadata["total_assessed_value_apportioned"].value == 1_800_000.0
+
+
+def test_a_condominium_is_placed_by_its_point_because_its_lots_are_undrawn(
+    store, role, published
+):
+    """The fallback, and the reason it exists.
+
+    `U_CONDO` names a private lot the cadastre has no polygon for - which is
+    every divided co-ownership in a real borough - so the crosswalk cannot
+    place it and only its point can, on the `PC-*` common-parts lot.
+    """
+    run_roll(store)
+    run_units(store)
+    write_lots(store, borough_lots())
+
+    result = run_lot_values(store)
+    values = lot_values(store)
+
+    assert values.loc[LOT_CONDO, "num_assessment_units"] == 1
+    assert values.loc[LOT_CONDO, "num_units_by_point"] == 1
+    assert values.loc[LOT_CONDO, "total_assessed_value"] == 800_000.0
+    # Placed by a point, so it sits on one lot and the two totals agree.
+    assert values.loc[LOT_CONDO, "total_assessed_value_apportioned"] == 800_000.0
+
+    metadata = materialization_metadata(result, lot_assessed_values)
+    assert metadata["num_units_by_point"].value == 1
+    assert metadata["placed_unmatched_by_point"].value is True
+
+
+def test_the_point_fallback_can_be_switched_off(store, role, published):
+    """Off, every row comes from the roll's own statement of which lots it
+    covers - and the condominium is absent rather than approximated."""
+    run_roll(store)
+    run_units(store)
+    write_lots(store, borough_lots())
+
+    result = run_lot_values(store, by_point=False)
+    values = lot_values(store)
+
+    assert values.loc[LOT_CONDO, "num_assessment_units"] == 0
+    assert pd.isna(values.loc[LOT_CONDO, "total_assessed_value"])
+    assert int(values["num_units_by_point"].sum()) == 0
+
+    metadata = materialization_metadata(result, lot_assessed_values)
+    assert metadata["num_units_by_point"].value == 0
+    assert metadata["num_lots_valued"].value == 3
+    assert metadata["placed_unmatched_by_point"].value is False
+    assert metadata["total_assessed_value"].value == 1_500_000.0
+
+
+def test_a_lot_nothing_is_assessed_on_keeps_its_row_with_a_null_total(
+    store, role, published
+):
+    """A lane is not worth nothing; it is unassessed, and the two read
+    differently to anyone averaging over the borough."""
+    run_roll(store)
+    run_units(store)
+    write_lots(store, borough_lots())
+
+    result = run_lot_values(store)
+    values = lot_values(store)
+
+    assert values.loc[LOT_EMPTY, "num_assessment_units"] == 0
+    assert pd.isna(values.loc[LOT_EMPTY, "total_assessed_value"])
+    assert pd.isna(values.loc[LOT_EMPTY, "total_assessed_value_apportioned"])
+
+    metadata = materialization_metadata(result, lot_assessed_values)
     assert metadata["num_lots_unvalued"].value == 1
-    assert metadata["num_units_matched"].value == 3
-    assert metadata["max_units_on_a_lot"].value == 2
-    assert metadata["total_assessed_value"].value == 1_000_000.0
+
+
+def test_the_lot_key_closes_the_gap_between_the_two_spellings():
+    """Infolot writes "1 000 001", the roll writes "1000001"."""
+    assert lot_key("1 000 001") == "1000001"
+    assert lot_key("1000001") == "1000001"
+    # A no-break space is what French thousands separators are often published
+    # with, and one left in would make the key miss silently.
+    assert lot_key("1 000 001") == "1000001"
+    # The PC- prefix is kept: the roll has no such lot, so the key is meant to
+    # miss rather than be coerced into matching a numbered one.
+    assert lot_key("PC-9001") == "PC-9001"
+    assert lot_key(None) is None
+    assert lot_key("  ") is None
+
+
+def test_the_suffix_does_not_split_one_lot_into_two(store, role, published, tmp_path):
+    """`rl0103b` distinguishes non-renewed rows naming one renewed lot.
+
+    Left in the key it would count a unit twice on the same lot - 1,758 of
+    Montreal's crosswalk rows are exactly that shape.
+    """
+    run_roll(store)
+    run_units(store)
+    write_lots(store, borough_lots())
+    # Give U_PAIR_A a second crosswalk row for the same lot, under a suffix.
+    cadastre_path = join(
+        store.partition_dir(property_assessment_roll.key.path[-1], DATE),
+        CADASTRE_FILE,
+    )
+    crosswalk = pd.read_parquet(cadastre_path)
+    repeated = crosswalk[crosswalk[JOIN_KEY] == unit_id(MONTREAL_CODE_MUN, U_PAIR_A)]
+    repeated = repeated.assign(**{ROLL_LOT_SUFFIX_COLUMN: "1"})
+    write_frame(pd.concat([crosswalk, repeated], ignore_index=True), cadastre_path)
+
+    run_lot_values(store)
+    values = lot_values(store)
+
+    # Still two units and still $500,000: the duplicate row was dropped, not
+    # counted.
+    assert values.loc[LOT_A, "num_assessment_units"] == 2
+    assert values.loc[LOT_A, "total_assessed_value"] == 500_000.0
 
 
 def test_lot_values_publish_the_frame_they_wrote(store, role, published):
@@ -515,34 +765,23 @@ def test_lot_values_publish_the_frame_they_wrote(store, role, published):
     """
     run_roll(store)
     run_units(store)
-    write_lots(
-        store,
-        gpd.GeoDataFrame(
-            {"NO_LOT": ["1 000 001"]},
-            geometry=[box(-73.61, 45.49, -73.59, 45.51)],
-            crs="EPSG:4326",
-        ),
-    )
+    write_lots(store, borough_lots())
 
     result = run_lot_values(store)
 
     assert published["calls"] == 1
     assert published["partition"] == (NEIGHBORHOOD, DATE)
     assert set(published["datasets"]) == {"lot_assessed_values"}
-    assert len(published["datasets"]["lot_assessed_values"]) == 1
+    assert len(published["datasets"]["lot_assessed_values"]) == 5
     metadata = materialization_metadata(result, lot_assessed_values)
-    assert metadata["lot_assessed_values_rows_upserted"].value == 1
+    assert metadata["lot_assessed_values_rows_upserted"].value == 5
 
 
 def test_lot_values_refuse_a_duplicated_lot(store, role, published):
     run_roll(store)
     run_units(store)
-    lots = gpd.GeoDataFrame(
-        {"NO_LOT": ["1 000 001", "1 000 001"]},
-        geometry=[box(-73.61, 45.49, -73.59, 45.51)] * 2,
-        crs="EPSG:4326",
-    )
-    write_lots(store, lots)
+    lots = borough_lots()
+    write_lots(store, pd.concat([lots, lots.iloc[:1]], ignore_index=True))
 
     with pytest.raises(Failure, match="appear more than once"):
         run_lot_values(store)
@@ -551,37 +790,30 @@ def test_lot_values_refuse_a_duplicated_lot(store, role, published):
 def test_lot_values_refuse_a_partition_with_no_overlap_at_all(store, role, published):
     run_roll(store)
     run_units(store)
-    # Lots nowhere near any assessment point: the two sides do not meet, which
-    # is a filter or a partition mistake rather than a borough of empty lanes.
+    # Lots that no unit names and no point falls in: the two sides do not meet,
+    # which is a filter or a partition mistake rather than a borough of lanes.
     write_lots(
         store,
         gpd.GeoDataFrame(
-            {"NO_LOT": ["1 000 009"]},
+            {"NO_LOT": ["8 000 009"]},
             geometry=[box(10, 10, 11, 11)],
             crs="EPSG:4326",
         ),
     )
 
-    with pytest.raises(Failure, match="No assessment unit falls inside"):
+    with pytest.raises(Failure, match="No assessment unit could be placed"):
         run_lot_values(store)
 
 
-def test_lot_values_report_units_that_fell_in_no_lot(store, role, published):
+def test_lot_values_report_units_the_borough_holds_none_of(store, role, published):
     run_roll(store)
     run_units(store)
-    write_lots(
-        store,
-        gpd.GeoDataFrame(
-            {"NO_LOT": ["1 000 002"]},
-            geometry=[box(-73.41, 45.49, -73.39, 45.51)],
-            crs="EPSG:4326",
-        ),
-    )
+    write_lots(store, borough_lots().iloc[:1])  # LOT_A only
 
     result = run_lot_values(store)
 
     metadata = materialization_metadata(result, lot_assessed_values)
-    assert metadata["num_units_matched"].value == 1
-    # The two units on the other lot are somewhere else in the snapshot, and
-    # this partition attributes them to nobody.
+    assert metadata["num_units_matched"].value == 2
+    # U_SPLIT and U_CONDO are elsewhere in the snapshot, and this partition
+    # attributes them to nobody.
     assert metadata["num_units_unmatched_in_snapshot"].value == 2

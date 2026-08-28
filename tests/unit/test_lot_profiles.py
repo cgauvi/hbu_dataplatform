@@ -285,6 +285,8 @@ def stub_postgis(
     with_frontage=8,
     with_secondary=2,
     with_documents=7,
+    with_assessed_value=5,
+    roll_year=2026,
     compute_raises=None,
 ):
     """Patched on the class: Dagster rebuilds the resource before the run.
@@ -367,6 +369,21 @@ def stub_postgis(
                     "condo_cost_high_cad_sqft",
                 )
             },
+            # The assessment join, read back out of gold.lot_profiles by the
+            # real function. `None` for the total rather than 0.0 when no lot
+            # carries one - a borough whose roll has not landed is not a
+            # borough whose ground is worth nothing.
+            "num_with_assessed_value": with_assessed_value,
+            "num_assessment_units": with_assessed_value * 3,
+            # A borough-scale figure rather than one scaled off the lot
+            # count, because the asset reports it in billions rounded to two
+            # places and a stub total of a few million would round to 0.0 and
+            # test nothing. $29.4B is the first VSMPE snapshot's apportioned
+            # total.
+            "total_assessed_value_apportioned": (
+                29_400_000_000.0 if with_assessed_value else None
+            ),
+            "roll_year": roll_year,
             "num_buildings": with_building * 2,
             "total_lot_area_m2": 22_400.0,
             "max_primary_frontage_m": 31.25,
@@ -700,6 +717,47 @@ def test_the_cmhc_grid_becomes_one_object_per_borough_not_one_per_lot(
     assert rents["overall_average_rent_cad"] == pytest.approx(1_275.0)
     assert rents["num_published_cells"] == 1
     assert len(rents["cells"]) == 2
+
+
+def test_the_assessment_counts_reach_the_metadata(store, monkeypatch):
+    write_partition(store)
+    stub_postgis(monkeypatch, num_lots=10, with_assessed_value=7)
+
+    result = run(store)
+
+    metadata = materialization_metadata(result, lot_profiles)
+    assert metadata["num_with_assessed_value"].value == 7
+    # The symptom worth seeing, the same way num_without_frontage is: a lane or
+    # a park is the honest reading, a third of the borough is the roll and the
+    # cadastre disagreeing about where the ground is.
+    assert metadata["num_without_assessed_value"].value == 3
+    assert metadata["num_assessment_units"].value == 21
+    assert metadata["total_assessed_value_apportioned_billions"].value == pytest.approx(
+        29.4
+    )
+    # The roll is triennial and this partition's axis is the cadastre's scrape
+    # date, so the row cannot be read back without it.
+    assert metadata["roll_year"].value == 2026
+
+
+def test_a_partition_whose_roll_has_not_landed_says_so_rather_than_zero(
+    store, monkeypatch
+):
+    """`lot_assessed_values` has not run for this partition.
+
+    A $0.0B borough and a borough nobody has valued are different answers, and
+    the second one is the one worth acting on.
+    """
+    write_partition(store)
+    stub_postgis(monkeypatch, num_lots=10, with_assessed_value=0, roll_year=None)
+
+    result = run(store)
+
+    metadata = materialization_metadata(result, lot_profiles)
+    assert metadata["num_with_assessed_value"].value == 0
+    assert metadata["num_without_assessed_value"].value == 10
+    assert metadata["total_assessed_value_apportioned_billions"].value == "not assessed"
+    assert metadata["roll_year"].value == "unknown"
 
 
 def test_the_borough_figures_and_the_envelope_counts_reach_the_metadata(

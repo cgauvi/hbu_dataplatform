@@ -59,9 +59,18 @@ class FakeCursor:
     statements does not silently hand one of them another's result.
     """
 
-    def __init__(self, *, missing: tuple[str, ...] = (), num_envelopes: int = 4):
+    def __init__(
+        self,
+        *,
+        missing: tuple[str, ...] = (),
+        num_envelopes: int = 4,
+        assessed: tuple[object, ...] = (7, 19, 4_200_000.0, 2026),
+    ):
         self.missing = missing
         self.num_envelopes = num_envelopes
+        #: What the assessment join reports back: lots carrying a total, the
+        #: units standing on them, the apportioned total and the roll year.
+        self.assessed = assessed
         self.statements: list[tuple[str, object]] = []
         self.copied: list[list[object]] = []
         self.copy_statements: list[str] = []
@@ -100,11 +109,14 @@ class FakeCursor:
             #  area, max primary, mean primary, enveloped, envelopes,
             #  overall vacancy, overall rent, then the six cost rates:
             #  underground low/high and above-grade low/high per stall,
-            #  condo low/high per square foot.
+            #  condo low/high per square foot - and last the assessment join:
+            #  lots with a total, units on them, the apportioned total, and
+            #  the roll year those values came from.
             self._result = (
                 10, 6, 8, 2, 7, 12, 22_400.0, 31.25, 12.34,
                 3, self.num_envelopes, 0.5, 1_275.0,
                 51_925.0, 68_675.0, 38_500.0, 57_750.0, 225.0, 290.0,
+                *self.assessed,
             )
         elif "FROM rag.lots" in text:
             self._result = (10,)
@@ -140,6 +152,22 @@ def compute(cursor, **kwargs):
         scrape_date=DATE,
         **kwargs,
     )
+
+
+def _statement_containing(cursor, needle: str) -> str:
+    """The one executed statement mentioning ``needle``, whitespace-collapsed.
+
+    Dispatching on the text rather than on an index for the reason `FakeCursor`
+    does: reordering the statements should not silently point a test at
+    another one.
+    """
+    found = [
+        " ".join(statement.split())
+        for statement, _ in cursor.statements
+        if needle in statement
+    ]
+    assert found, f"no statement mentions {needle!r}"
+    return found[0]
 
 
 def test_every_statement_is_one_psycopg_will_accept():
@@ -179,6 +207,83 @@ def test_the_result_carries_every_key_the_asset_reads():
     assert result["total_lot_area_m2"] == pytest.approx(22_400.0)
     assert result["max_primary_frontage_m"] == pytest.approx(31.25)
     assert result["mean_primary_frontage_m"] == pytest.approx(12.34)
+
+
+def test_the_assessment_join_is_reported_back_to_the_asset():
+    cursor = FakeCursor()
+
+    result = compute(cursor)
+
+    assert result["num_with_assessed_value"] == 7
+    assert result["num_assessment_units"] == 19
+    assert result["total_assessed_value_apportioned"] == pytest.approx(4_200_000.0)
+    assert result["roll_year"] == 2026
+
+
+def test_a_partition_the_roll_never_reached_reports_none_not_zero():
+    """`silver.lot_assessed_values` has not run for this partition.
+
+    Zero would read as a borough whose every lot is worth nothing, which is a
+    different claim from one whose roll has not been joined yet - the same
+    distinction the nullable column itself draws.
+    """
+    cursor = FakeCursor(assessed=(0, 0, None, None))
+
+    result = compute(cursor)
+
+    assert result["num_with_assessed_value"] == 0
+    assert result["total_assessed_value_apportioned"] is None
+    assert result["roll_year"] is None
+
+
+def test_the_assessment_table_is_joined_on_the_lot_number_not_the_uid():
+    """`lot_uid` is a bigserial `load_lots` mints again on every reload, and
+    `silver.lot_assessed_values` does not carry one at all."""
+    cursor = FakeCursor()
+
+    compute(cursor)
+
+    insert = _statement_containing(cursor, "silver.lot_assessed_values")
+    assert "assessed.lot_number = l.lot_number" in insert
+    # Scoped to the partition as well - the table holds every borough-day -
+    # and by the parameters rather than by equality with `l`, so the partition
+    # prunes at plan time.
+    assert "assessed.neighborhood = %(neighborhood)s" in insert
+    assert "assessed.scrape_date = %(scrape_date)s::date" in insert
+    assert "assessed.lot_uid" not in insert
+
+
+def test_a_lot_with_no_assessment_unit_keeps_a_null_total_and_a_zero_count():
+    """The same split the frontage columns make, and for the same reason.
+
+    A lane carrying no assessed property was not valued at zero - it was not
+    valued. The counts are a measurement and do COALESCE.
+    """
+    cursor = FakeCursor()
+
+    compute(cursor)
+
+    insert = _statement_containing(cursor, "silver.lot_assessed_values")
+    assert "COALESCE(assessed.num_assessment_units, 0)" in insert
+    assert "COALESCE(assessed.num_shared_units, 0)" in insert
+    assert "COALESCE(assessed.num_units_by_point, 0)" in insert
+    # Left alone, so a lot the roll never reached lands NULL.
+    assert "COALESCE(assessed.total_assessed_value" not in insert
+    assert "assessed.total_assessed_value," in insert
+    assert "assessed.total_assessed_value_apportioned," in insert
+
+
+def test_the_borough_total_is_summed_from_the_apportioned_column():
+    """The other total counts a multi-lot unit whole on each of its lots, so
+    summing it across a borough over-reports - by $5.1B of $29.4B on the first
+    VSMPE snapshot. Only one of the two adds up this way."""
+    cursor = FakeCursor()
+
+    compute(cursor)
+
+    metrics = _statement_containing(cursor, "FILTER (WHERE has_building)")
+    assert "sum(total_assessed_value_apportioned)" in metrics
+    assert "sum(total_assessed_value)" not in metrics
 
 
 def test_a_category_no_lot_fell_into_reads_as_zero_rather_than_missing():

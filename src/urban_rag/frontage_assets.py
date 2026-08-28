@@ -10,19 +10,26 @@ reason `building_lot_intersections` computes its joins rather than reading
 them off a column.
 
 A lot's boundary does not sit *on* the street line. The geobase double is
-drawn along the curb and sidewalk limits, published "à titre indicatif", and
-the lot line is behind those by a sidewalk's width and whatever the survey
-disagrees by. So the street side is buffered by a few metres and the lot's
-boundary is clipped to that buffer; what is left is the part of the parcel's
-edge facing that street, and its length is the frontage. See
-`postgis.compute_lot_frontage` for why the measure is taken on `ST_Boundary`
-and not on the lot - `ST_Length` of a polygon is zero, so the direct reading of
-the question would report no frontage anywhere.
+drawn along the roadway, published "à titre indicatif", and the lot line is
+behind it by a sidewalk, a service strip and whatever the survey disagrees by -
+4.85 m for the median lot in VSMPE. So the lot's boundary is chopped up, each
+piece is matched to the nearest street side within `FrontageConfig.buffer_m`,
+and the pieces that run *along* that side rather than at it are its frontage.
+See `postgis.compute_lot_frontage` for why the measure is taken on the
+boundary and not on the lot - `ST_Length` of a polygon is zero, so the direct
+reading of the question would report no frontage anywhere - and for why it is
+no longer a clip against a buffered street, which could not be both wide
+enough to reach the lots and narrow enough not to distort what it measured.
 
-The buffer is `FrontageConfig.buffer_m` rather than a constant, for the same
+The cutoff is `FrontageConfig.buffer_m` rather than a constant, for the same
 reason `lot_profiles` makes its shed cutoff config: a judgement about the
 built form rather than a property of the data, and every row records the value
 it was computed with so a table can be read back against its own cutoff.
+
+A lot that faces no street side within it gets no row. That is expected for a
+true interior parcel and is a symptom otherwise, so the count, the share and a
+sample of the lot numbers are logged as a warning and published as metadata
+rather than left to be noticed - see `num_lots_without_frontage` below.
 
 **This asset loads nothing.** Both sides of the join are already in Postgres
 when it runs: `rag.lots` because `building_lot_intersections` put it there, and
@@ -78,11 +85,15 @@ class FrontageConfig(Config):
     """How far behind the curb line a lot boundary may sit and still face it.
 
     Config rather than a constant because it is a judgement about the street
-    section, not a property of the data: three metres crosses a sidewalk, and
-    a borough with grass verges and deep service strips may want five. Widening
-    it costs accuracy at the corners - the first `buffer_m` of each *side*
-    boundary falls inside the buffer too and is counted as frontage - so the
-    value that produced a table travels on every row of it.
+    section, not a property of the data: a borough of deep service strips and
+    grass verges holds its lot lines further back than one of them.
+
+    Widening it used to cost accuracy at the corners, which is why it defaulted
+    to a value too small to reach most lots at all. It no longer does -
+    `postgis.compute_lot_frontage` measures only the boundary running *along* a
+    street side, so the measure is flat in this - but the value that produced a
+    table still travels on every row of it, because which lots got a row at all
+    depends on it.
     """
 
     buffer_m: float = Field(
@@ -191,7 +202,7 @@ def lot_frontage(
 
     lots_matched = int(result["lots_matched"])
     context.log.info(
-        "%s %s: %d street side(s) buffered by %.1f m -> %d frontage(s) across "
+        "%s %s: %d street side(s) within %.1f m -> %d frontage(s) across "
         "%d of %d lot(s), %.1f km in total, longest %.1f m -> %s",
         neighborhood,
         scrape_date,
@@ -205,6 +216,29 @@ def lot_frontage(
         path,
     )
 
+    # Every lot in a Montreal borough is expected to face a street. The ones
+    # that do not are named rather than only counted: a handful are genuine
+    # interior parcels, but a run where the share jumps is a street snapshot
+    # that stopped short or a cutoff that is too tight, and the lot numbers
+    # are what turns that from a percentage into something to go and look at.
+    # A warning rather than a Failure - see `test_no_lot_matching_is_not_a
+    # _failure`: a borough measuring badly is a number to read, not a
+    # partition to refuse.
+    unmatched = num_lots - lots_matched
+    sample = [str(number) for number in result.get("lots_without_frontage", [])]
+    if unmatched:
+        context.log.warning(
+            "%s %s: %d of %d lot(s) (%.1f %%) face no street side within "
+            "%.1f m and are flagged as potentially problematic%s",
+            neighborhood,
+            scrape_date,
+            unmatched,
+            num_lots,
+            100.0 * unmatched / num_lots,
+            config.buffer_m,
+            f" - e.g. {', '.join(sample)}" if sample else "",
+        )
+
     return MaterializeResult(
         metadata={
             "dagster/row_count": int(result["frontages"]),
@@ -216,7 +250,15 @@ def lot_frontage(
             # interior parcel or a partition whose street snapshot stops short
             # of it. Under a few percent is the first; a third of the borough
             # is the second.
-            "num_lots_without_frontage": num_lots - lots_matched,
+            "num_lots_without_frontage": unmatched,
+            # Which ones, up to a sample's worth - the count says how bad, this
+            # says where to start. Empty when every lot faced a street.
+            "lots_without_frontage": MetadataValue.text(", ".join(sample)),
+            "pct_lots_without_frontage": round(
+                100.0 * unmatched / num_lots, 2
+            )
+            if num_lots
+            else 0.0,
             "num_streets_matched": int(result["streets_matched"]),
             "num_rows_pruned": int(result["pruned"]),
             "total_frontage_km": round(result["total_frontage_m"] / 1000.0, 2),

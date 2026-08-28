@@ -55,13 +55,13 @@ re-scrape, which for a live municipal source no later run can undo.
 | bronze | `street_network` | date | Montreal's *géobase double* — one line per side of street — as published, island-wide |
 | bronze | `montreal_residential_costs` | date | The Montreal column of the Altus construction cost guide's residential types — condo/apartment by storey band, townhouses, single family, seniors, student residences — in $/sf |
 | bronze | `montreal_nonresidential_costs` | date | The same column's commercial and industrial types in $/sf, plus the three parking types in **$/stall** |
-| bronze | `property_assessment_roll` | date | Quebec's *rôle d'évaluation foncière* — one point per assessment unit and the characteristics table describing it, out of a province-wide GeoPackage, scoped to Ville de Montréal |
+| bronze | `property_assessment_roll` | date | Quebec's *rôle d'évaluation foncière* — one point per assessment unit, the characteristics table describing it, and the crosswalk naming every lot it covers, out of a province-wide GeoPackage, scoped to Ville de Montréal |
 | bronze | `linked_documents` | date × neighborhood | The PDFs those tables link to, fetched and flattened to text |
 | silver | `vacancy_rates` | date × neighborhood | That borough's quartiers taken out of the snapshot and averaged into one rate per dwelling type × bedroom class — as parquet and as `silver.vacancy_rates`, with the quartier rows behind it in `silver.quartier_vacancy_rates` |
 | silver | `average_rents` | date × neighborhood | The same, per bedroom class, for rents — `silver.average_rents` and `silver.quartier_average_rents` |
 | silver | `building_lot_intersections` | date × neighborhood | Both spatial joins, computed against one load of the cadastre — repaired on the way in, which is where `make_valid` runs: building footprints clipped to the lots they intersect (`silver.building_lot_intersections`) and map features clipped to the lots they cover (`silver.lot_features`, the hop from a lot to its documents), as two geoparquet files |
 | silver | `assessment_units` | date | The roll's two layers put back together on `id_provinc` — one row per assessment unit, its point and everything the roll says about it. The one silver asset with **no table**: it has no borough axis to partition one by |
-| silver | `lot_assessed_values` | date × neighborhood | What every lot in the borough is assessed at: the units whose point falls inside it, summed on `rl0404a`, with the count beside the total — as geoparquet and as `silver.lot_assessed_values` |
+| silver | `lot_assessed_values` | date × neighborhood | What every lot in the borough is assessed at: the units the roll's own cadastre crosswalk puts on it (and, for the condos it cannot place, the ones whose point falls in it), summed on `rl0404a` both whole and apportioned — as geoparquet and as `silver.lot_assessed_values` |
 | silver | `neighborhood_streets` | date × neighborhood | That day's street sides clipped to one borough, with the published length, the length inside it, and the share that survived the cut — as geoparquet and as `silver.neighborhood_streets` |
 | silver | `lot_frontage` | date × neighborhood | How much of each lot's boundary faces each street side, in metres, longest first — as geoparquet and as `silver.lot_frontage`. **Blocked**, see below |
 | silver | `zoning_grid_columns` | date × neighborhood | Those PDFs read as the tables they are — one row per column of each *grille des usages et des normes*, with its usages, authorised levels and every norm of its CADRE BÂTI block as columns — as parquet and as `silver.zoning_grid_columns` |
@@ -236,7 +236,8 @@ data/
 │   │   └── non_residential_costs.parquet
 │   ├── property_assessment_roll/2026-08-18/
 │   │   ├── rol_unite_p.parquet       # one point per assessment unit
-│   │   └── unite_evaln.parquet       # what the roll says about each
+│   │   ├── unite_evaln.parquet       # what the roll says about each
+│   │   └── lot_cadst.parquet         # one row per (unit, lot it covers)
 │   └── linked_documents/2026-08-18/VSMPE/
 │       └── documents.parquet
 ├── silver/
@@ -426,14 +427,19 @@ The GeoPackage holds one feature class and four tables, all keyed on
 | --- | --- | --- | --- |
 | `rol_unite_p_2026` | 3 747 008 | One point per *unité d'évaluation*, at the unit's visual centre. EPSG:4269 | ✅ |
 | `b05v_unite_evaln_2026` | 3 747 176 | The characteristics: values, area, storeys, year built, dwellings, use code | ✅ |
+| `b05v_lot_cadst_2026` | 5 595 995 | The cadastre lot numbers the unit covers, one to many | ✅ |
 | `b05v_adr_unite_evaln_2026` | 3 819 572 | Civic addresses, one to many | — |
-| `b05v_lot_cadst_2026` | 5 595 995 | The cadastral lot numbers the unit covers, one to many | — |
 | `b05v_repar_fisc_2026` | 1 626 132 | Fiscal breakdowns and exemptions, one to many | — |
 
-The three that are not read are one-to-many against the unit, so keeping them
-would mean four grains in one partition. `UNREAD_LAYERS` names them and the
-asset reports them in its `layers_not_read` metadata, so what was dropped is on
-the record rather than inferred from what is absent.
+The two that are not read are one-to-many against the unit and answer no
+question this pipeline asks. `UNREAD_LAYERS` names them and the asset reports
+them in its `layers_not_read` metadata, so what was dropped is on the record
+rather than inferred from what is absent.
+
+`b05v_lot_cadst` is the one that makes the lot join possible at all, and it
+keeps its own grain — one row per (unit, lot) — in its own file. It is not
+merged into `assessment_units`, which is one row per unit; the two are put
+together where the lot join happens.
 
 The layer names carry the roll year, so they are resolved by prefix rather than
 written out: next year's archive is the same five layers ending `_2027`, and a
@@ -495,53 +501,90 @@ The result is as wide as the bronze snapshot — the roll has no borough axis, s
 this asset is partitioned by **date alone**, like `street_network` and the two
 CMHC surveys. The borough cut happens one asset later, against the cadastre.
 
-### The lot join is spatial, and that is a choice
+### The lot join is by lot number, with the point as a fallback
 
-`lot_assessed_values` puts each unit on the lot its point falls inside, then
-groups by `NO_LOT` and sums `rl0404a` (VALEUR IMMEUBLE — land plus buildings,
-which the roll also splits as `rl0402a` and `rl0403a`).
+`lot_assessed_values` places each unit on the lots the roll itself says it
+covers — `b05v_lot_cadst` gives (unit, lot number), and `lot_key` is all that
+stands between the roll's `"1243415"` and Infolot's `"1 243 415"` — then groups
+by `NO_LOT` and sums `rl0404a` (VALEUR IMMEUBLE: land plus buildings, which the
+roll also splits as `rl0402a` and `rl0403a`).
 
-The roll *does* publish the exact mapping, in `b05v_lot_cadst`. Not reading it
-trades a known error for a different one, and both are worth naming:
+`rl0103b`, the lot-number suffix, is **not** part of the key: it distinguishes
+rows of the *non-renewed* cadastre naming one renewed lot, and leaving it in
+would count a unit twice on the same lot — 1 758 of Montreal's crosswalk rows
+are exactly that shape.
 
-- An assessment point sits at the **visual centre of the unit**, so a unit
-  spanning three lots lands entirely on whichever of the three holds its
-  centre. Its full value goes there and the other two get none of it.
-- A point falling in a lane, a park, or a lot the cadastre draws slightly
-  differently matches nothing, and its value is attributed nowhere.
+**The crosswalk cannot place everything, and what it misses is not random.** A
+condominium unit names its **private** lot numbers, and Infolot does not draw
+those — the polygon there is the `PC-*` common parts. So the crosswalk alone
+loses every divided co-ownership in the borough. On VSMPE that is 5 211 units
+and **$2.92 B**, none of which name a lot that exists in the cadastre:
 
-Neither is assumed. `num_units_unmatched_in_snapshot` counts the second, and
-the first is why `num_assessment_units` travels beside every total. Reading
-`b05v_lot_cadst` and joining on the lot number is the refinement this asset is
-shaped to accept.
+```
+a PC-29987 unit names: 5346252, 5346253, 5346256, 5332344, …
+in the VSMPE cadastre: (none)
+```
+
+Their point still falls squarely on the `PC-*` lot the tower stands on, so the
+point places them. `place_unmatched_by_point` decides whether it may (default
+on), and `num_units_by_point` says how many rows came that way — so a table can
+be read back against the choice that produced it. Turned off, every row comes
+from the roll's own statement and the towers are absent rather than
+approximated: 21 862 lots valued instead of 22 443, and $24.26 B instead of
+$27.24 B.
+
+```bash
+make lot-values DATE=2026-08-26                  # crosswalk + point fallback
+make lot-values DATE=2026-08-26 BY_POINT=false   # crosswalk only
+```
+
+The two routes are genuinely complementary on real data — neither finds what
+the other does, and together they beat both:
+
+| VSMPE, 2026 roll | lot number only | point only | **both (default)** |
+| --- | --- | --- | --- |
+| lots valued | 21 862 | 21 676 | **22 443** |
+| of which `PC-*` | 0 | 582 | 582 |
+| lots only that route finds | 778 | 592 | — |
+| units placed | 21 204 | 26 484 | **26 489** |
+| total (apportioned) | $24.26 B | — | **$27.24 B** |
+
+### Two totals, because one number cannot be both
+
+43% of Montreal's units name two lots or more, so a group-by-sum has to decide
+what a shared unit contributes. It reports **both**:
+
+| Column | What it is | Sum it across lots? |
+| --- | --- | --- |
+| `total_assessed_value` | Every unit's whole value, on each lot it covers | **No** — over-counts |
+| `total_assessed_value_apportioned` | Each unit's value ÷ the lots it covers | Yes |
+
+The first answers "what is the property standing on this lot assessed at"; the
+second is the one that adds up. On VSMPE they are $32.37 B and $27.24 B — a
+$5.1 B gap, and one unit's $150 476 700 landing on four lots is $37 619 175
+apportioned to each. 691 of the borough's units are shared this way.
+`num_shared_units` counts the ones on a given lot, so the gap is attributable
+per row; it is 0 for most lots, and the two totals are then equal.
+
+Apportionment divides by the lots the unit covers **in the snapshot**, not by
+the ones in this borough — a unit straddling a borough line contributes its
+share here and the rest there.
 
 **The sum is over units, not over buildings.** A divided-co-ownership building
-is one unit per apartment, all on the one `PC-*` common-parts lot. On the first
-VSMPE snapshot:
-
-```
-NO_LOT     num_assessment_units  total_assessed_value
-PC-29987                    402           257 660 500
-PC-36627                    323           202 657 400
-3 801 513                     1           150 476 700
-```
-
-That is the number a highest-and-best-use question wants — what the ground is
-currently worth in aggregate — and it is only readable as such because the
-count sits next to it.
+is one unit per apartment, all on the one `PC-*` common-parts lot: `PC-29987`
+carries 402 units and $257 660 500. That is the number a highest-and-best-use
+question wants — what the ground is currently worth in aggregate — and it is
+only readable as such because the count sits next to it.
 
 A lot nothing is assessed on **keeps its row**, with `num_assessment_units = 0`
-and a **null** total: a sum over nothing is not a value of zero. On that same
-snapshot 26 484 of the borough's units fell inside 21 676 of its 24 952 lots,
-$27.36 B in total; the 3 276 unvalued lots are mostly lanes, parks and city
-parcels. A few percent is the honest reading of `num_lots_unvalued`; a third of
-the borough would mean the cadastre and the roll disagree about where the
-ground is.
+and **null** totals: a sum over nothing is not a value of zero. A few percent is
+the honest reading of `num_lots_unvalued`; a third of the borough would mean the
+cadastre and the roll disagree about where the ground is.
 
-The cadastre's self-intersecting rings are repaired here with `make_valid`
-before the point-in-polygon join, and the count reported as
-`num_geometries_repaired` — the same repair `building_lot_intersections` makes
-on the way into PostGIS, for the same reason and made visible the same way.
+The cadastre's self-intersecting rings are repaired with `make_valid` before the
+point fallback runs, and the count reported as `num_geometries_repaired` — the
+same repair `building_lot_intersections` makes on the way into PostGIS, for the
+same reason and made visible the same way.
 
 > `rl0404a` is an **assessed value for taxation**, not a market appraisal, and
 > Montreal's roll is triennial: every unit in a 2026 roll is valued as of the
@@ -1010,40 +1053,113 @@ geometry is 0 in PostGIS** — `ST_Perimeter` is the function for polygons.
 Frontage is a length along the parcel's *edge*, so the left-hand side has to be
 the boundary:
 
+### It is not a clip against a buffered street
+
+It was, and that measure could not be made to work at any setting. The street
+side was buffered by `buffer_m` and the lot boundary clipped to the result,
+which fails from both ends at once:
+
+- **Too narrow and it reaches nothing.** A lot line does not sit on the curb
+  line — the géobase double is drawn along the roadway, published *à titre
+  indicatif*, and the lot is behind a sidewalk and a service strip. The median
+  lot in VSMPE sits **4.85 m** from its nearest street side. At the 3 m this
+  defaulted to, **22,545 of the borough's 24,952 lots (90 %) got no row at
+  all.**
+- **Too wide and it inflates what it does reach.** A lot's two *side*
+  boundaries run at the street, so their first `buffer_m` falls inside the
+  buffer too and is counted. Every lot gains 2 m of frontage it does not have
+  per metre of buffer, and past about 12 m the buffer reaches the far kerb and
+  a mid-block lot acquires a second street.
+
+Lot 3 790 556 on avenue Chabot — a rectangle with 15.24 m of street edge —
+measured like this under the clip:
+
+| `buffer_m` | rows | frontage |
+| --- | --- | --- |
+| 3 m | **0** | no street at all |
+| 4 m | 1 | 16.27 m |
+| 8 m | 1 | 24.27 m |
+| 12 m | **2** — reaches across Chabot | 32.27 m |
+
+What is measured instead is the lot boundary that runs *along* a street side.
+The boundary is chopped into 1 m pieces; each piece is matched to the single
+nearest side within `buffer_m`; and a piece counts only if it runs within 45°
+of parallel to that side. The parallel test needs no trigonometry — for a piece
+of length `L` whose ends sit `d1` and `d2` from the side, `|d1 - d2| / L` *is*
+the sine of the angle between them, 0 along the street and 1 straight at it:
+
 ```sql
-SELECT ST_Length(geography(
-    ST_CollectionExtract(
-        ST_Intersection(ST_Boundary(l.geom), ST_Buffer(geography(s.geom), 3.0)::geometry),
-        2  -- linework only: a boundary grazing the buffer clips to a point
-    )
-))
+-- per 1 m piece of ST_Segmentize(ST_Boundary(lot), 1.0), in EPSG:32188
+CROSS JOIN LATERAL (                    -- nearest side wins, and only it:
+    SELECT cote_rue_id, geom            -- the two sides of one roadway are
+    FROM sides                          -- 5-8 m apart, well inside the reach
+    WHERE ST_DWithin(sides.geom, piece.geom, buffer_m)
+    ORDER BY sides.geom <-> piece.geom
+    LIMIT 1
+) AS near
+WHERE abs(ST_Distance(ST_StartPoint(piece.geom), near.geom)
+        - ST_Distance(ST_EndPoint(piece.geom), near.geom))
+      / ST_Length(piece.geom) <= 0.7071
 ```
 
-Two details in there earn their keep. The buffer goes through `geography` so
-its distance is in **metres**; `ST_Buffer` on a 4326 geometry takes degrees,
-where `3` would be some 300 km. And `ST_CollectionExtract(..., 2)` drops the
-points where a boundary only touches the buffer's edge — an intersection, but
-not a frontage.
+Measured in **EPSG:32188** rather than through `geography`, for the same reason
+street lengths are: metres in MTM zone 8 are metres on the ground. It also
+gives the assignment an index to walk — `<->` against a GiST index turns each
+of the borough's 2.6 million pieces into a probe instead of a scan, which is
+the difference between a minute and not finishing.
 
-### Why there is a buffer at all
+### What `buffer_m` now means
 
-A lot line does not sit on the curb line. There is a sidewalk between them, and
-the city publishes the géobase *à titre indicatif* rather than to survey
-accuracy, so the two layers disagree by a metre or two even where they agree in
-substance. `buffer_m` is how much of that to forgive.
+It is a **reach**, not a buffer: how far a lot boundary may be from a street
+side and still be matched to it. It decides *which lots get measured*, and no
+longer what they measure — lot 3 790 556 comes out at 15.24 m at a reach of 6,
+8, 10 and 12 m alike.
+
+That is what lets it be wide enough to be useful. The default is **10 m**,
+where coverage plateaus:
+
+| reach | lots with no frontage | of 24,952 |
+| --- | --- | --- |
+| 3 m | 22,545 | 90.4 % |
+| 6 m | 5,121 | 20.5 % |
+| 8 m | 1,316 | 5.3 % |
+| **10 m** | **698** | **2.8 %** |
+| 12 m | 673 | 2.7 % |
+
+Measured by running the asset over VSMPE 2026-08-26. What is left at 10 m is
+the right residual rather than a shortfall: those 698 lots have a **median
+area of 56 m²** and sit a **median 26.5 m** from the nearest street side —
+interior remnants deep inside blocks, which is what a lot with no frontage is
+supposed to be.
 
 It is `FrontageConfig` rather than a constant, the same way `lot_profiles` makes
-its shed cutoff config: it is a judgement about the street section, not a
-property of the data. The default is **3 m** — wide enough to cross a sidewalk
-and the publisher's own error, narrow enough to limit the one bias the measure
-has: the first `buffer_m` of each *side* boundary falls inside the buffer too
-and is counted as frontage, so a widened buffer inflates every corner. Every
-row carries the `buffer_m` it was computed with, so a table can always be read
-back against its own cutoff.
+its shed cutoff config: a judgement about the street section, not a property of
+the data. Every row carries the `buffer_m` it was computed with, so a table can
+always be read back against its own cutoff — and a table whose rows say `3.0`
+was measured the old way and is missing most of its borough.
 
 ```
-make frontage DATE=2026-08-18 NEIGHBORHOOD=VSMPE BUFFER_M=5
+make frontage DATE=2026-08-18 NEIGHBORHOOD=VSMPE BUFFER_M=12
 ```
+
+### Lots that face no street
+
+Every lot in a Montreal borough is expected to have street on at least one
+side. The ones that do not are a finding, not a shrug: a handful are genuine
+interior parcels, but a share that jumps is a street snapshot that stopped
+short or a reach that is too tight — which is exactly what the 3 m default
+looked like. So the run logs the count, the share **and a sample of the lot
+numbers**, and publishes all three as asset metadata:
+
+```
+num_lots_without_frontage     687
+pct_lots_without_frontage     2.75
+lots_without_frontage         1 000 140, 1 000 141, 1 000 215, ...
+```
+
+It is a warning rather than a failure — a borough that measures badly is a
+number to read, not a partition to refuse — and `tests/integration` asserts the
+stronger form on a slice where every lot does face a street.
 
 ### Reading the result
 
@@ -1098,6 +1214,31 @@ question a person actually asks:
 | `rag.lot_documents` | (lot, feature, document) | `doc_*` and the `documents` array |
 | `silver/lot_zoning_envelopes` | (lot, grid column) | `num_zoning_envelopes` and the `zoning_envelopes` array |
 
+A fifth is already the right shape, and is the only upstream here that is:
+
+| upstream | grain | what it contributes |
+|---|---|---|
+| `silver.lot_assessed_values` | **lot** | `total_assessed_value`, `total_assessed_value_apportioned`, `num_assessment_units`, `num_shared_units`, `num_units_by_point`, `roll_year` |
+
+Its primary key is `(scrape_date, neighborhood, lot_number)`, so it needs no
+CTE and no pivot — a plain `LEFT JOIN` on `lot_number`, which cannot fan a lot
+out into several rows. It is Quebec's *rôle d'évaluation foncière* carried onto
+the cadastre, and it is what makes this table answer the whole of a
+highest-and-best-use question rather than half of it: `overall_average_rent_cad`
+is what a building earns, `construction_costs` is what it costs to put up, and
+`total_assessed_value` is what the ground is already worth standing as it is.
+
+**Two totals, and only one of them may be summed.** `total_assessed_value`
+counts each assessment unit whole on every lot it covers — right for "what is
+the property on this lot worth", wrong to `SUM()` across a borough, where it
+over-counts by every unit that spans more than one lot.
+`total_assessed_value_apportioned` divides each unit across its lots, so that
+one adds up; `num_shared_units` is exactly where the two diverge. Both stay
+**NULL rather than 0** on a lot no unit stands on, the same rule the frontage
+measures follow — a lane carrying no assessed property is not a lane worth
+nothing, and a reader averaging $0 across the borough's lanes would be
+answering a question it did not ask.
+
 Four more contribute nothing per-lot at all, and are written identically onto
 every row of the partition:
 
@@ -1109,10 +1250,11 @@ every row of the partition:
 | `bronze/montreal_residential_costs` | (building type) | the condo half of `construction_costs`, `condo_cost_low/high_cad_sqft` |
 
 Somebody asking "what can I do with lot 1 234 567" wants one row. This asset is
-where they collapse onto it, and every one of the per-lot four arrives by
+where they collapse onto it, and every one of the per-lot five arrives by
 `LEFT JOIN`: a lot no building touches, a lot facing no street, a lot no
-document covers and a lot no readable grid reaches are each a real answer, and
-an inner join would delete exactly those rows.
+document covers, a lot no readable grid reaches and a lot no assessment unit
+stands on are each a real answer, and an inner join would delete exactly those
+rows.
 
 The last five never reach Postgres as tables. `lot_zoning_envelopes` is
 staged into a temp table keyed on `lot_number` — not `lot_uid`, which is a
@@ -1982,4 +2124,28 @@ uv run pytest
 ```
 
 Offline only: the client is exercised with a stub session that asserts the URL
-shapes the proxy demands.
+shapes the proxy demands, and every PostGIS statement is stubbed at the
+function that issues it.
+
+### The spatial ones need a database
+
+Stubbing PostGIS tests the asset's plumbing and not the measure, which is how a
+`buffer_m` too small to reach 90 % of a borough's lots survived in
+`compute_lot_frontage`: every unit test passed, because none of them ever
+intersected a lot with a street. `tests/integration` runs the real SQL against
+a real PostGIS on a committed slice of VSMPE — 164 lots around lot 3 790 556,
+see [tests/fixtures/frontage](tests/fixtures/frontage/README.md). It is opt-in
+and skips when `URBAN_RAG_TEST_PG_URL` is unset, so `make test` stays offline.
+
+```bash
+docker run -d --name urban_postgis \
+    -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=urban \
+    -p 55432:5432 postgis/postgis:16-3.4-alpine
+
+URBAN_RAG_TEST_PG_URL=postgresql://postgres:postgres@localhost:55432/urban \
+    uv run pytest tests/integration
+```
+
+Point it at a **throwaway** database: the fixture applies hbu_infra's schema
+(from `../hbu_infra/sql`, or `URBAN_RAG_INFRA_SQL`) and truncates the partition
+it loads into.

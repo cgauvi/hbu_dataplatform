@@ -30,12 +30,12 @@ change.
 The five layers, and the one relation between them: `rol_unite_p` is the only
 one with geometry - one point per *unité d'évaluation*, placed at the unit's
 visual centre - and the other four hang off it by `id_provinc`, the municipality
-code and the 18-character matricule concatenated. `b05v_unite_evaln` is the
-characteristics table, one row per unit, and holds the assessed values.
-`b05v_adr_unite_evaln` (addresses), `b05v_lot_cadst` (the cadastral lot numbers
-the unit covers) and `b05v_repar_fisc` (fiscal breakdowns) are one-to-many and
-are not read - see `urban_rag.role_assets` on what dropping `b05v_lot_cadst`
-costs.
+code and the 18-character matricule concatenated. Three are read:
+`b05v_unite_evaln`, the characteristics table, one row per unit, holding the
+assessed values; and `b05v_lot_cadst`, the crosswalk naming every cadastre lot
+a unit covers, which is what lets a lot be valued by lot number rather than by
+where a point falls. `b05v_adr_unite_evaln` (addresses) and `b05v_repar_fisc`
+(fiscal breakdowns) are not read.
 
 Deliberately free of Dagster imports, mirroring `urban_rag.bdoi` and
 `urban_rag.open_data`.
@@ -77,11 +77,17 @@ ROLL_YEAR_VAR = "URBAN_RAG_ROLL_YEAR"
 POINT_LAYER = "rol_unite_p"
 #: The characteristics table: one row per unit, and where the values are.
 UNITS_LAYER = "b05v_unite_evaln"
+#: The cadastre crosswalk: one row per (unit, lot the unit covers). The roll's
+#: own answer to "which lots is this property on", and what
+#: `urban_rag.role_assets` joins to Infolot's polygons by lot number rather
+#: than by geometry. One-to-many - 43% of Montreal's units name two lots or
+#: more - which is why it is its own file and its own grain.
+CADASTRE_LAYER = "b05v_lot_cadst"
 
-#: The three tables this pipeline does not read. Listed so a run can report
-#: what it dropped rather than leaving the archive's other 11 million rows
+#: The two tables this pipeline does not read. Listed so a run can report what
+#: it dropped rather than leaving the archive's other 5 million rows
 #: unaccounted for.
-UNREAD_LAYERS = ("b05v_adr_unite_evaln", "b05v_lot_cadst", "b05v_repar_fisc")
+UNREAD_LAYERS = ("b05v_adr_unite_evaln", "b05v_repar_fisc")
 
 #: What every table in the archive is keyed on: the municipality's five-digit
 #: geographic code followed by the 18-character matricule.
@@ -91,6 +97,19 @@ JOIN_KEY = "id_provinc"
 #: buildings) entered on the roll in force. `rl0402a` and `rl0403a` are its
 #: land and building halves.
 VALUE_COLUMN = "rl0404a"
+
+#: `rl0103a`, NUMÉRO LOT - the cadastre lot number a unit covers, in
+#: `CADASTRE_LAYER`. Seven digits, unpadded and unspaced (`"1243415"`), where
+#: Infolot spells the same lot `"1 243 415"` - see
+#: `urban_rag.role_assets.lot_key`, which is what makes the two comparable.
+ROLL_LOT_COLUMN = "rl0103a"
+
+#: `rl0103b`, SUFFIXE NUMÉRO LOT. Not part of the key: a renewed Quebec lot is
+#: the number alone, and the suffix only distinguishes rows of the *non-renewed*
+#: cadastre that name the same one. Ignoring it makes 1,758 of Montreal's
+#: crosswalk rows duplicate (unit, lot) pairs, which `lot_assessed_values`
+#: drops rather than counts twice.
+ROLL_LOT_SUFFIX_COLUMN = "rl0103b"
 
 #: Geographic code of Ville de Montréal. The other on-island municipalities
 #: (Westmount, Mont-Royal, Côte-Saint-Luc, ...) file their own rolls under
