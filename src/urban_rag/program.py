@@ -62,6 +62,29 @@ would run wider than the tower above it (article 43 excludes *une partie du
 bâtiment qui est entièrement sous terre* from the site-coverage calculation,
 so it could), and modelling that would need a second footprint.
 
+**The storey cap is printed twice.** A grid states *En étage* and *Hauteur en
+mètre* side by side, and they are two ceilings on the same stack rather than
+one stated in two units: a storey is only a fixed number of metres if you say
+what is in it, and `StoreyHeights` is where that is said - three metres for a
+dwelling storey, four for commerce or for industry, three for an above-grade
+deck. Six storeys of housing clear an 18 m limit and four of commerce do not
+clear a 15, so a column printing ``6`` and ``15`` allows five of one or three
+of the other, and neither number is the storey row.
+
+That is what a metric cap does to the mix: it prices the storey types against
+each other. *En étage* charges a retail plate exactly what it charges a
+residential one, so commerce wins any storey its rent can pay for; *Hauteur*
+charges it a third more, on top of the parking a retail plate already owes,
+which is what can hand the storey back to the housing. Both caps are linear in
+the storey counts - no product of decision variables, so the metric one costs
+the model nothing to carry - and `binding` reports `height_max` where it is
+what stopped the building.
+
+An underground level is charged nothing, which is not a simplification: height
+is measured from grade up. It is the same exclusion article 38 1° gives the
+parking against *Densité*, arriving from a different article and pointing the
+same way, and it is why a tight envelope digs.
+
 **The objective is net operating income.** Revenue is `rent x (1 - vacancy)`
 a month, and against it stand the two things the building costs to put up:
 the dwellings at `ConstructionCosts.residential_cost_per_sqft` over the
@@ -164,6 +187,13 @@ UNIT_AREAS_SQFT: Mapping[str, float] = {
 #: of every unit's area - which compounds across a hundred of them into a
 #: floor's worth of slack in the density constraint.
 AREA_SCALE = 100
+
+#: Heights are held as integers in hundredths of a metre - centimetres - for
+#: the reason above. A grid prints *Hauteur en metre* to the decimetre where it
+#: prints one at all (``0/12,5``), and a storey height is a stated assumption
+#: rather than a measurement, so a centimetre is finer than either input and
+#: the rounding never reaches the answer.
+HEIGHT_SCALE = 100
 
 #: The objective is money, and it is an integer for the same reason - held in
 #: ten-thousandths of a dollar rather than in cents. Cents are ample for a
@@ -299,6 +329,36 @@ INDUSTRIAL_VACANCY_PCT = 7.0
 #: rather than passed off as the envelope's own answer.
 MAX_UNDERGROUND_LEVELS = 6
 
+#: Floor to floor, in metres, by what the storey is filled with. Three metres
+#: is the dwelling storey a Montreal walk-up is built at; four is what a retail
+#: or a warehouse plate needs once the plenum over it - ducts, sprinklers, the
+#: clear height a tenant signs a lease for - is counted, and that difference is
+#: the whole of the reason a commercial storey is a dearer thing to spend a
+#: metric cap on than a residential one.
+#:
+#: Stated assumptions, like `AMORTIZATION_MONTHS` and unlike the norms read off
+#: a grid: no by-law says a dwelling storey is three metres. They are named
+#: here and passed as `StoreyHeights` precisely so a building known to be built
+#: otherwise can say so.
+RESIDENTIAL_STOREY_HEIGHT_M = 3.0
+COMMERCIAL_STOREY_HEIGHT_M = 4.0
+INDUSTRIAL_STOREY_HEIGHT_M = 4.0
+
+#: An above-grade parking storey, which is the one storey type the three-and-
+#: four rule above says nothing about. It is above grade, so it is inside the
+#: height the by-law measures and cannot be zero; three metres is the figure a
+#: self-parking deck is laid out at, and it is the residential number rather
+#: than the commercial one because a garage carries no plenum.
+ABOVE_GRADE_PARKING_STOREY_HEIGHT_M = 3.0
+
+#: What an underground level adds to the building's height: nothing. Not an
+#: approximation but the definition - *hauteur en metre* is measured from grade
+#: up, so a level dug below it is outside the measurement the same way article
+#: 38 1° puts it outside the *superficie de plancher*. It is a named constant
+#: rather than a silence in the arithmetic so that the one place the model
+#: could have charged for it is visibly a zero.
+UNDERGROUND_LEVEL_HEIGHT_M = 0.0
+
 #: A usage code that authorises dwellings: bare ``H`` as printed in zone
 #: C01-001, or one of the numbered classes ``H.1``..``H.7``, optionally
 #: lettered (``H.7A``). Footnote markers - CMHC-style ``C.3(9)`` - are stripped
@@ -425,6 +485,13 @@ class ZoneColumn:
     levels: frozenset[BuildingLevel] = frozenset()
     #: *En étage min/max*, the minimum. A grid that prints ``2/6`` requires two.
     floors_min: int = 0
+    #: *Hauteur en mètre min/max* - the same ceiling measured the other way.
+    #: ``None`` where the grid prints ``-``, and independent of *En étage*
+    #: rather than derived from it: a grid states both, they can disagree, and
+    #: whichever is reached first is the one that stops the building. See
+    #: `StoreyHeights` for what a storey costs against this one.
+    height_min_m: float | None = None
+    height_max_m: float | None = None
     #: *Largeur du terrain min (m)*. ``None`` where the grid prints ``-``.
     min_lot_width_m: float | None = None
     #: *Nombre de logements maximal*. ``None`` where the grid leaves it blank.
@@ -443,7 +510,7 @@ class ZoneColumn:
             raise ProgramError(f"{self!r}: floors_max must not be negative")
         if self.floors_min < 0:
             raise ProgramError(f"{self!r}: floors_min must not be negative")
-        for name in ("density_min", "density_max"):
+        for name in ("density_min", "density_max", "height_min_m", "height_max_m"):
             value = getattr(self, name)
             if value is not None and value < 0:
                 raise ProgramError(f"{self!r}: {name} must not be negative")
@@ -494,17 +561,146 @@ class Lot:
     width and its street frontage differ on a wedge-shaped parcel) and this
     treats them as one, which is the approximation the frontage asset exists to
     support.
+
+    ``buildable_area_m2`` is what `lot_buildable_setbacks` computes: the area
+    left once the grid's four margins are taken off the parcel, for the column
+    being solved. It is the *second* cap on a footprint and it is optional
+    because it has to be - it is computed from a zoning column, so it belongs
+    to one candidate rather than to the lot, and a caller solving a column
+    whose grid states no margins has nothing to pass. ``None`` leaves the
+    footprint capped on *Taux d'implantation* alone, which is what every
+    caller did before that asset existed.
+
+    Passing it is what makes a shallow lot solve differently from a deep one of
+    the same area - which, on the coverage cap alone, it does not.
     """
 
     area_m2: float
     frontage_m: float
     lot_number: str | None = None
+    buildable_area_m2: float | None = None
 
     def __post_init__(self) -> None:
         if self.area_m2 <= 0:
             raise ProgramError(f"lot area must be positive, got {self.area_m2}")
         if self.frontage_m < 0:
             raise ProgramError(f"frontage must not be negative, got {self.frontage_m}")
+        if self.buildable_area_m2 is not None and self.buildable_area_m2 < 0:
+            # 0 is allowed and is a real answer - a parcel narrower than twice
+            # its side margin has nowhere to put a building, and the solver
+            # should return an empty program for it rather than refuse the lot.
+            raise ProgramError(
+                f"buildable area must not be negative, got "
+                f"{self.buildable_area_m2}"
+            )
+
+
+@dataclass(frozen=True)
+class StoreyHeights:
+    """Floor to floor, in metres, by what the storey is filled with.
+
+    The metric half of the storey cap. *En étage* counts plates and *Hauteur
+    en mètre* measures them, so a grid printing both states two ceilings on the
+    same stack, and the shorter one is the answer: six residential storeys need
+    18 m and four commercial ones need 16, so a column printing ``6`` storeys
+    and ``15`` metres allows five of housing and three of commerce, whatever
+    the storey row says on its own.
+
+    Which is what makes this more than a unit conversion. The heights are not
+    equal - four metres for commerce and industry against three for a dwelling
+    - so under a metric cap the storey types stop being interchangeable in a
+    way *En étage* alone never made them: a retail plate now costs a third more
+    of the ceiling than the housing it displaces, on top of the parking it
+    already owes. A tight *Hauteur* is where commerce stops outbidding housing
+    for a storey it would otherwise win.
+
+    An underground level is not in here, and its absence is the rule rather
+    than an omission - `UNDERGROUND_LEVEL_HEIGHT_M` is the zero written down.
+    Height is measured from grade up, so digging is free of this cap exactly as
+    article 38 1° makes it free of *Densité*, and the two exclusions point the
+    same way: underground is where the model puts what an envelope has no room
+    for above.
+    """
+
+    #: Metres per residential storey.
+    residential_m: float = RESIDENTIAL_STOREY_HEIGHT_M
+    #: Metres per commercial and per industrial storey. Taller than a dwelling
+    #: storey, and the reason a metric cap ranks the usages differently from a
+    #: storey cap.
+    commercial_m: float = COMMERCIAL_STOREY_HEIGHT_M
+    industrial_m: float = INDUSTRIAL_STOREY_HEIGHT_M
+    #: Metres per above-grade parking storey. Above grade, therefore measured;
+    #: see `ABOVE_GRADE_PARKING_STOREY_HEIGHT_M` for why it is the residential
+    #: figure and not the commercial one.
+    above_grade_parking_m: float = ABOVE_GRADE_PARKING_STOREY_HEIGHT_M
+
+    def __post_init__(self) -> None:
+        for name in (
+            "residential_m",
+            "commercial_m",
+            "industrial_m",
+            "above_grade_parking_m",
+        ):
+            value = getattr(self, name)
+            if value <= 0:
+                # Not merely nonsensical: a storey of no height would be one
+                # the metric cap never charges for, and the solver would stack
+                # them without limit under any *Hauteur* at all. The way to
+                # take the cap off is a column that prints no maximum.
+                raise ProgramError(f"{name} must be positive, got {value}")
+
+    @property
+    def residential_cm(self) -> int:
+        """The same, in the hundredths of a metre the model counts in."""
+        return _scale_height(self.residential_m)
+
+    @property
+    def commercial_cm(self) -> int:
+        return _scale_height(self.commercial_m)
+
+    @property
+    def industrial_cm(self) -> int:
+        return _scale_height(self.industrial_m)
+
+    @property
+    def above_grade_parking_cm(self) -> int:
+        return _scale_height(self.above_grade_parking_m)
+
+    @property
+    def shortest_cm(self) -> int:
+        """The cheapest storey to spend a metric cap on.
+
+        What bounds the *building's* storeys, as against any one usage's:
+        below this many centimetres no storey of any kind can be added, so
+        `height_max / shortest` is the most plates a height cap can hold.
+        """
+        return min(
+            self.residential_cm,
+            self.commercial_cm,
+            self.industrial_cm,
+            self.above_grade_parking_cm,
+        )
+
+    def height_m(
+        self,
+        *,
+        residential: int = 0,
+        above_grade_parking: int = 0,
+        commercial: int = 0,
+        industrial: int = 0,
+    ) -> float:
+        """What a storey split stands, in metres. The underground is not in it."""
+        return _unscale_height(
+            self.residential_cm * residential
+            + self.above_grade_parking_cm * above_grade_parking
+            + self.commercial_cm * commercial
+            + self.industrial_cm * industrial
+        )
+
+
+#: Three metres a dwelling storey, four a commercial or industrial one, three
+#: an above-grade deck, nothing below grade.
+DEFAULT_STOREY_HEIGHTS = StoreyHeights()
 
 
 @dataclass(frozen=True)
@@ -852,6 +1048,11 @@ class DevelopmentProgram:
     #: the module docstring for the long list of things it does *not* net out.
     net_operating_income: float
     status: str
+    #: The building's height above grade, in metres: the storey split below
+    #: priced at `StoreyHeights`. This is the number *Hauteur en mètre* is
+    #: tested against, and the underground levels are not in it - they are not
+    #: measured from grade up, the same way they are not floor area.
+    height_m: float = 0.0
     #: The storey split behind `floors`. Residential floors carry the mix;
     #: parking floors carry stalls and nothing else; the other two carry the
     #: usages the column authorises beside the housing, and are zero on a
@@ -977,6 +1178,7 @@ def solve_program(
     parking: ParkingRules = DEFAULT_PARKING,
     construction: ConstructionCosts = DEFAULT_CONSTRUCTION,
     non_residential: NonResidentialEconomics = DEFAULT_NON_RESIDENTIAL,
+    heights: StoreyHeights = DEFAULT_STOREY_HEIGHTS,
     max_seconds: float = 10.0,
 ) -> DevelopmentProgram:
     """The program maximising monthly net operating income on ``lot``.
@@ -985,7 +1187,9 @@ def solve_program(
 
     ====================================  ===================================
     ``footprint``                         within *Taux d'implantation* x lot
-                                          area, and shared by every floor
+                                          area **and** `Lot.buildable_area_m2`
+                                          where one is given, and shared by
+                                          every floor
     ``residential_floors``                within *En étage min* .. storeys the
                                           level rows allow this usage
     ``parking_floors``                    above-grade parking storeys, 0 or
@@ -1002,6 +1206,10 @@ def solve_program(
     ``commercial_area``                   ``footprint x commercial_floors``
     ``industrial_area``                   ``footprint x industrial_floors``
     ``underground_area``                  ``footprint x underground_levels``
+    ``height``                            the above-grade storeys at
+                                          `StoreyHeights`, within *Hauteur en
+                                          mètre*; the underground levels add
+                                          nothing to it
     ``gross``                             the four above-grade areas, within
                                           *Densité* x lot area
     ``sum(area_t x n_t) <= residential``  the dwellings fit in their storeys
@@ -1014,6 +1222,22 @@ def solve_program(
     Five products of decision variables now rather than one, and they share
     the ``footprint`` factor, which is what makes ``gross`` a plain sum of four
     of them instead of a sixth multiplication.
+
+    **Two ceilings on the same stack.** *En étage* counts storeys and
+    *Hauteur en mètre* measures them, and a grid states both. They are not the
+    same cap because the storeys are not the same height: a residential plate
+    stands 3 m, a commercial or industrial one 4 m, an above-grade deck 3 m, so
+    ``6`` storeys and ``15`` metres is five of housing or three of commerce and
+    never six of anything. Both are linear in the storey counts, which is why
+    the metric one adds a constraint and no new product - the expensive part of
+    this model is the areas, and the height does not touch them.
+
+    Where it bites is the mix. Under *En étage* alone a retail plate and a
+    residential plate cost the same storey, so commerce takes every storey its
+    rent can pay for; under *Hauteur* it costs a third more of the ceiling as
+    well, on top of the parking it already owes, and a column with a tight
+    metric cap is where the housing wins a storey back. `binding` reports
+    ``height_max`` where the answer is sitting against it.
 
     **What the density cap does and does not see.** ``gross`` is above-grade
     area only. ``underground_area`` is built and paid for and appears in
@@ -1086,7 +1310,54 @@ def solve_program(
             "select_residential_column is what picks a column that does"
         )
 
+    # *Hauteur en mètre*, as centimetres. Rounded the way each bound wants to
+    # be read: a maximum floors so a building may not exceed it by a rounding,
+    # a minimum ceils so one may not fall short of it by the same.
+    height_cap_cm = (
+        _floor_scaled_height(column.height_max_m)
+        if column.height_max_m is not None
+        else None
+    )
+    height_floor_cm = (
+        _ceil_scaled_height(column.height_min_m)
+        if column.height_min_m is not None
+        else 0
+    )
+    if height_cap_cm is not None and height_floor_cm > height_cap_cm:
+        # Two rows of the same column contradicting each other, like
+        # `site_coverage_range` below and named for the same reason.
+        return _empty_program(
+            column,
+            lot,
+            status="INFEASIBLE",
+            binding=("height_range",),
+        )
+    if (
+        height_cap_cm is not None
+        and heights.residential_cm * column.floors_min > height_cap_cm
+    ):
+        # *En étage min* demands storeys that *Hauteur max* has no room for.
+        # Named apart from the level-row contradiction below because it is a
+        # different pair of rows disagreeing, and because the fix is a
+        # different one: a shorter `StoreyHeights` can resolve this and cannot
+        # resolve that.
+        return _empty_program(
+            column,
+            lot,
+            status="INFEASIBLE",
+            binding=("height_max_below_floors_min",),
+        )
+
+    # The metric cap, read as the storey count it allows *this* usage. Read
+    # per usage rather than once for the building because the storey types are
+    # different heights: the same 15 m is five residential storeys and three
+    # commercial ones.
+    height_floors_cap = (
+        None if height_cap_cm is None else height_cap_cm // heights.residential_cm
+    )
     floors_allowed = column.residential_floors
+    if height_floors_cap is not None:
+        floors_allowed = min(floors_allowed, height_floors_cap)
     if floors_allowed < column.floors_min:
         # Not an empty solution but a contradiction between two rows of the
         # same column, so it is named rather than returned as a bare
@@ -1124,15 +1395,7 @@ def solve_program(
     footprint_lo = _ceil_scaled(
         lot.area_m2 * (column.site_coverage_min_pct or 0.0) / 100.0
     )
-    footprint_hi = _floor_scaled(
-        lot.area_m2
-        * (
-            100.0
-            if column.site_coverage_max_pct is None
-            else column.site_coverage_max_pct
-        )
-        / 100.0
-    )
+    footprint_hi = _site_coverage_cap(column, lot)
     if footprint_lo > footprint_hi:
         return _empty_program(
             column,
@@ -1141,6 +1404,28 @@ def solve_program(
             binding=("site_coverage_range",),
             unpriced=unpriced,
         )
+
+    # The second cap, and an independent one: *Taux d'implantation* says what
+    # share of the parcel may be covered, the margins say where on it, and a
+    # building satisfies both. Applied after the range check above so a column
+    # whose own two coverage bounds contradict each other still reports that
+    # rather than being masked by a lot too narrow to build on.
+    if lot.buildable_area_m2 is not None:
+        footprint_hi = min(footprint_hi, _floor_scaled(lot.buildable_area_m2))
+        if footprint_lo > footprint_hi:
+            # Not a contradiction inside the grid, unlike `site_coverage_range`
+            # above: the column is coherent and this parcel cannot satisfy it.
+            # A named binding rather than a bare INFEASIBLE because the fix is
+            # a different one - *Taux d'implantation min* demands a footprint
+            # the margins leave no room for, which on a narrow lot is the whole
+            # answer to what may be built here.
+            return _empty_program(
+                column,
+                lot,
+                status="INFEASIBLE",
+                binding=("buildable_area_below_site_coverage_min",),
+                unpriced=unpriced,
+            )
 
     density_cap = (
         _floor_scaled(lot.area_m2 * column.density_max)
@@ -1169,6 +1454,23 @@ def solve_program(
     industrial_floors_hi = (
         min(spare_floors, floors_allowed) if column.permits_industrial else 0
     )
+    if height_cap_cm is not None:
+        # Same reading of the same cap, for the storey types that are not the
+        # dwellings. A four-metre plate gets fewer of them than the housing
+        # does out of the identical number of metres, which is the whole of
+        # what a metric cap adds to a storey cap.
+        parking_floors_hi = min(
+            parking_floors_hi, height_cap_cm // heights.above_grade_parking_cm
+        )
+        commercial_floors_hi = min(
+            commercial_floors_hi, height_cap_cm // heights.commercial_cm
+        )
+        industrial_floors_hi = min(
+            industrial_floors_hi, height_cap_cm // heights.industrial_cm
+        )
+    # An underground level is not a storey and stands no metres, so nothing
+    # here narrows it - `UNDERGROUND_LEVEL_HEIGHT_M` is that zero, and the
+    # reason a lot whose *Hauteur* binds digs rather than stops.
     underground_levels_hi = parking.max_underground_levels if parking.required else 0
 
     smallest_unit_area = min(
@@ -1217,7 +1519,17 @@ def solve_program(
     commercial_floors = model.NewIntVar(0, commercial_floors_hi, "commercial_floors")
     industrial_floors = model.NewIntVar(0, industrial_floors_hi, "industrial_floors")
     underground_levels = model.NewIntVar(0, underground_levels_hi, "underground_levels")
-    floors = model.NewIntVar(column.floors_min, column.floors_max, "floors")
+    # The building's own ceiling, which is the storey row narrowed by the most
+    # plates the metric cap could hold if every one of them were the shortest
+    # kind available. Any real mix stands taller than that, and the height
+    # constraint below is what holds it - this only keeps CP-SAT out of a
+    # region it can prove nothing in. It cannot fall below *En étage min*: the
+    # check above already established that `floors_min` residential storeys
+    # fit, and no storey type is taller than the tallest of them.
+    floors_hi = column.floors_max
+    if height_cap_cm is not None:
+        floors_hi = min(floors_hi, height_cap_cm // heights.shortest_cm)
+    floors = model.NewIntVar(column.floors_min, floors_hi, "floors")
     model.Add(
         floors
         == residential_floors + parking_floors + commercial_floors + industrial_floors
@@ -1264,6 +1576,37 @@ def solve_program(
         0, max(footprint_hi * underground_levels_hi, 0), "underground_area"
     )
     model.AddMultiplicationEquality(underground_area, [footprint, underground_levels])
+
+    # *Hauteur en mètre*, and the one constraint in this model that is linear
+    # in the decision variables it reads. The four above-grade storey types
+    # enter at their own heights; `underground_levels` does not enter at all,
+    # which is the by-law's own arithmetic rather than a shortcut - height is
+    # measured from grade up.
+    height = model.NewIntVar(
+        0,
+        max(
+            heights.residential_cm * floors_allowed
+            + heights.above_grade_parking_cm * parking_floors_hi
+            + heights.commercial_cm * commercial_floors_hi
+            + heights.industrial_cm * industrial_floors_hi,
+            0,
+        ),
+        "height",
+    )
+    model.Add(
+        height
+        == heights.residential_cm * residential_floors
+        + heights.above_grade_parking_cm * parking_floors
+        + heights.commercial_cm * commercial_floors
+        + heights.industrial_cm * industrial_floors
+    )
+    if height_cap_cm is not None:
+        model.Add(height <= height_cap_cm)
+    if height_floor_cm:
+        # A minimum, like *Densité min* and *En étage min*, and infeasible in
+        # the same way: a metric minimum no permitted stack of storeys reaches
+        # is an answer about the column rather than a bug.
+        model.Add(height >= height_floor_cm)
 
     # `gross` is the *superficie de plancher*: above grade only, article 38 1°.
     # Commerce and industry are in it - they are storeys, and nothing in the
@@ -1388,6 +1731,7 @@ def solve_program(
     chosen_industrial_area = solver.Value(industrial_area)
     commercial_sqft = _unscale(chosen_commercial_area) / M2_PER_SQFT
     industrial_sqft = _unscale(chosen_industrial_area) / M2_PER_SQFT
+    chosen_height = solver.Value(height)
     chosen_underground_levels = solver.Value(underground_levels)
     chosen_underground_stalls = solver.Value(underground_stalls)
     chosen_above_grade_stalls = solver.Value(above_grade_stalls)
@@ -1399,6 +1743,7 @@ def solve_program(
     return DevelopmentProgram(
         units=units,
         floors=solver.Value(floors),
+        height_m=_unscale_height(chosen_height),
         footprint_m2=_unscale(solver.Value(footprint)),
         gross_floor_area_m2=_unscale(solver.Value(gross)),
         unit_area_m2=_unscale(unit_area),
@@ -1445,11 +1790,55 @@ def solve_program(
             smallest_unit_area=smallest_unit_area,
             underground_levels=chosen_underground_levels,
             underground_levels_hi=underground_levels_hi,
+            height_floors_cap=height_floors_cap,
         ),
         unpriced_types=unpriced,
         zone=column.zone,
         lot_number=lot.lot_number,
     )
+
+
+def _site_coverage_cap(column: ZoneColumn, lot: Lot) -> int:
+    """*Taux d'implantation au sol max* x lot area, as a scaled footprint.
+
+    A column stating no maximum may cover the whole parcel, which is what the
+    100 stands in for - the grid's silence is not a coverage of zero.
+
+    Its own function because two places need the same number and they must not
+    disagree: `solve_program` takes it as one of the two footprint ceilings,
+    and `_binding_caps` compares it against the other to say which of them
+    produced the answer. Computed twice by hand, the second copy is the one
+    that goes stale and starts reporting the wrong binding norm.
+    """
+    return _floor_scaled(
+        lot.area_m2
+        * (
+            100.0
+            if column.site_coverage_max_pct is None
+            else column.site_coverage_max_pct
+        )
+        / 100.0
+    )
+
+
+def _footprint_cap_norm(column: ZoneColumn, lot: Lot) -> str:
+    """Which of the two footprint ceilings is the binding one.
+
+    `solve_program` caps a footprint at the lesser of *Taux d'implantation au
+    sol* and the area the zone's margins leave, and "the envelope is full" is a
+    different answer to the caller depending on which. A borough reporting
+    `setbacks` is one where the margins, not the coverage, decide what gets
+    built - and the fix for a site is a different one: a coverage cap is
+    argued at the plan, a margin is argued at the lot line.
+
+    Ties go to the coverage, which is the norm that has always been reported
+    and the one a reader will recognise.
+    """
+    if lot.buildable_area_m2 is None:
+        return "site_coverage_max"
+    if _floor_scaled(lot.buildable_area_m2) < _site_coverage_cap(column, lot):
+        return "setbacks"
+    return "site_coverage_max"
 
 
 def _binding_caps(
@@ -1468,6 +1857,7 @@ def _binding_caps(
     smallest_unit_area: int,
     underground_levels: int,
     underground_levels_hi: int,
+    height_floors_cap: int | None,
 ) -> tuple[str, ...]:
     """Which caps the answer is pressed against.
 
@@ -1493,6 +1883,16 @@ def _binding_caps(
     the dwellings rather than an artefact of a tie. `max_underground_levels` is
     reported on the same footing, with the caveat that it is this module's
     bound rather than anything the grid prints.
+
+    `height_max` is reported beside `floors` and from the caps for the same
+    reason the rest of them are: the height of a tied solution is as arbitrary
+    as its storey count, since a storey nobody pays for can stand empty at no
+    cost to the objective. What is true of the parcel is how many residential
+    storeys *Hauteur en mètre* leaves room for - 15 m is five at three metres
+    apiece - and whether that is fewer than the level rows would have allowed.
+    Where it is, the metric cap is what built the envelope the dwellings just
+    filled, and both norms are named because a reader who changes only the
+    storey row will get the same answer back.
 
     `commercial_floor_area` and `industrial_floor_area` are reported on a
     condition of their own rather than inside the density branch, because they
@@ -1526,8 +1926,18 @@ def _binding_caps(
             if parking_area > 0:
                 binding.append("above_grade_parking")
         if remaining_density is None or envelope_cap <= remaining_density:
-            binding.append("site_coverage_max")
+            # Which of the two footprint ceilings produced this envelope - the
+            # coverage or the margins. See `_footprint_cap_norm`; on a lot with
+            # no buildable area passed it is always the coverage, which is what
+            # this line said before that cap existed.
+            binding.append(_footprint_cap_norm(column, lot))
             binding.append("floors")
+            if height_floors_cap is not None and height_floors_cap <= floors_allowed:
+                # `floors_allowed` is the storey row and the metric cap
+                # whichever is smaller, so this is the metric one being at
+                # least as tight - the storeys the envelope was built from are
+                # the ones *Hauteur* left room for.
+                binding.append("height_max")
 
     if residential_floors < floors_allowed:
         if commercial_area > 0:
@@ -1577,6 +1987,22 @@ def _ceil_scaled(m2: float) -> int:
 
 def _unscale(scaled: int) -> float:
     return scaled / AREA_SCALE
+
+
+def _scale_height(m: float) -> int:
+    return round(m * HEIGHT_SCALE)
+
+
+def _floor_scaled_height(m: float) -> int:
+    return math.floor(m * HEIGHT_SCALE)
+
+
+def _ceil_scaled_height(m: float) -> int:
+    return math.ceil(m * HEIGHT_SCALE)
+
+
+def _unscale_height(scaled: int) -> float:
+    return scaled / HEIGHT_SCALE
 
 
 def _area_coefficient(per_sqft_month: float) -> int:

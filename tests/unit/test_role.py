@@ -26,13 +26,20 @@ import pytest
 from dagster import Failure, MultiPartitionKey, materialize
 from shapely.geometry import Point, box
 
-from asset_helpers import materialization_metadata, stub_publish
+from asset_helpers import (
+    materialization_metadata,
+    stub_publish,
+    stub_publish_by_neighborhood,
+)
 
 from urban_rag import role_assets
 from urban_rag.frames import write_frame
 from urban_rag.infolot_assets import LOTS_FILE, neighborhood_lots
+from urban_rag.open_data_assets import QUARTIERS_FILE, reference_neighborhoods
+from urban_rag.partitions import borough_code_for
 from urban_rag.resources import ParquetStore, PostgisResource, RoleResource
 from urban_rag.role_assets import (
+    ARROND_PREFIX,
     ASSESSMENT_UNITS_FILE,
     CADASTRE_FILE,
     LOT_VALUES_FILE,
@@ -439,11 +446,67 @@ def run_roll(store, *, codes=(MONTREAL_CODE_MUN,)):
     )
 
 
-def run_units(store):
+#: The borough outline the fixture's Montreal points fall inside, and the
+#: Laval one does not. Wide enough to hold all three Montreal units - which sit
+#: at -73.60, -73.40 and -73.30 - and nowhere near U_LAVAL at (-73.70, 45.60).
+BOROUGH = box(-73.65, 45.45, -73.25, 45.55)
+
+
+def write_quartiers(store, *, geometry=None, code=None):
+    """The reference layer `assign_boroughs` cuts the province against.
+
+    As `reference_neighborhoods` writes it: one row per quartier, carrying the
+    borough code `borough_code_for` resolves the partition key to.
+    """
+    frame = gpd.GeoDataFrame(
+        {
+            "no_qr": ["01"],
+            "no_arr": [code or borough_code_for(NEIGHBORHOOD)],
+            "nom_qr": ["Villeray"],
+        },
+        geometry=[geometry if geometry is not None else BOROUGH],
+        crs="EPSG:4326",
+    )
+    write_frame(
+        frame,
+        join(
+            store.partition_dir(reference_neighborhoods.key.path[-1], DATE),
+            QUARTIERS_FILE,
+        ),
+    )
+
+
+@pytest.fixture(autouse=True)
+def units_published(monkeypatch):
+    """`silver.assessment_units` needs a database; the borough cut is recorded.
+
+    Autouse, the same posture `test_streets` takes for its own load: every
+    test here that materializes the silver merge would otherwise open a real
+    connection, and none of them is about the upsert. A test that wants to read
+    the cut back asks for the fixture by name.
+    """
+    return stub_publish_by_neighborhood(monkeypatch, role_assets)
+
+
+def run_units(store, *, quartiers: bool = True):
+    """Materialize `assessment_units`, over the boundary it cuts the roll on.
+
+    The quartiers are written here rather than in every test because most of
+    these are about the merge and not about the cut, and an asset that cannot
+    find a boundary fails before it merges anything. Only when there is none
+    already, so a test that wants a different outline writes it first;
+    ``quartiers=False`` is for the one that wants none at all.
+    """
+    written = join(
+        store.partition_dir(reference_neighborhoods.key.path[-1], DATE),
+        QUARTIERS_FILE,
+    )
+    if quartiers and not Path(written).exists():
+        write_quartiers(store)
     return materialize(
         [assessment_units],
         partition_key=DATE,
-        resources={"store": store},
+        resources={"store": store, "postgis": PostgisResource()},
     )
 
 
@@ -579,6 +642,120 @@ def test_silver_refuses_a_duplicated_unit(store, role):
 def test_silver_names_the_asset_to_materialize_when_bronze_is_missing(store):
     with pytest.raises(Failure, match="does not exist"):
         run_units(store)
+
+
+def test_silver_publishes_a_borough_partition_for_each_boundary_hit(
+    store, role, units_published
+):
+    """The roll has no borough axis, so this is where the province is cut.
+
+    One date partition in the tree, one Postgres partition per borough, and the
+    borough is the one whose outline the unit's point falls inside - not the
+    `arrond` the roll states, which travels alongside as a cross-check.
+    """
+    run_roll(store)
+
+    result = run_units(store)
+
+    assert result.success
+    assert units_published["dataset"] == "assessment_units"
+    assert units_published["scrape_date"] == DATE
+    # All three Montreal points are inside `BOROUGH`; the Laval one was
+    # filtered out in bronze.
+    assert set(units_published["frames"]) == {NEIGHBORHOOD}
+    published = units_published["frames"][NEIGHBORHOOD]
+    assert len(published) == 4
+    assert set(published["neighborhood"]) == {NEIGHBORHOOD}
+    # The spatial join's bookkeeping column is not a column of the table, and
+    # would otherwise land in `attributes` as noise.
+    assert "index_right" not in published.columns
+
+    metadata = materialization_metadata(result, assessment_units)
+    assert metadata["num_units_in_a_borough"].value == 4
+    assert metadata["num_units_outside_every_borough"].value == 0
+    assert metadata[f"{NEIGHBORHOOD}_rows_upserted"].value == 4
+
+
+def test_silver_keeps_the_province_in_the_tree_and_the_boroughs_in_the_table(
+    store, role, units_published
+):
+    """The parquet and the table do not hold the same rows, on purpose.
+
+    Westmount and Laval file rolls too and are not boroughs, so a run that kept
+    the province writes every unit to the tree and publishes only the ones that
+    fell in a borough. The difference is a count rather than an error.
+    """
+    run_roll(store, codes=())
+
+    result = run_units(store)
+
+    merged = gpd.read_parquet(
+        Path(store.partition_dir(assessment_units.key.path[-1], DATE))
+        / ASSESSMENT_UNITS_FILE
+    )
+    assert len(merged) == 5  # the Laval unit is in the tree
+    assert len(units_published["frames"][NEIGHBORHOOD]) == 4  # and not in the table
+
+    metadata = materialization_metadata(result, assessment_units)
+    assert metadata["num_assessment_units"].value == 5
+    assert metadata["num_units_in_a_borough"].value == 4
+    assert metadata["num_units_outside_every_borough"].value == 1
+
+
+def test_silver_counts_where_the_roll_and_the_map_disagree_on_the_borough(
+    store, role, units_published
+):
+    """Two agencies, one question. The geometry decides and the count says so.
+
+    The fixture's points carry no `arrond` of their own, so this drives the
+    disagreement from the other side: the outline is filed under a borough code
+    the units were never going to match.
+    """
+    run_roll(store)
+    bronze = Path(store.partition_dir(property_assessment_roll.key.path[-1], DATE))
+    points = gpd.read_parquet(bronze / POINTS_FILE)
+    # Three units the roll files in this borough, one it files next door.
+    points["arrond"] = [
+        f"{ARROND_PREFIX}{borough_code_for(NEIGHBORHOOD)}"
+    ] * 3 + [f"{ARROND_PREFIX}99"]
+    write_frame(points, str(bronze / POINTS_FILE))
+
+    result = run_units(store)
+
+    assert result.success
+    # Placed by geometry regardless - all four points are inside the outline.
+    assert len(units_published["frames"][NEIGHBORHOOD]) == 4
+    metadata = materialization_metadata(result, assessment_units)
+    assert metadata["num_units_arrond_disagrees"].value == 1
+
+
+def test_silver_names_reference_neighborhoods_when_the_boundary_is_missing(
+    store, role
+):
+    """The cut has no boundary to make, and the message says which asset owns it."""
+    run_roll(store)
+
+    with pytest.raises(Failure, match="materialize reference_neighborhoods"):
+        run_units(store, quartiers=False)
+
+
+def test_silver_refuses_a_cut_that_placed_no_unit_in_any_borough(store, role):
+    """A boundary that holds none of them is a boundary, not a fact about Quebec.
+
+    The same refusal `neighborhood_streets` makes when nothing intersects the
+    borough. The parquet is written first either way, so the re-run costs the
+    merge rather than the 572 MB download.
+    """
+    run_roll(store)
+    write_quartiers(store, geometry=box(-70.0, 40.0, -69.0, 41.0))
+
+    with pytest.raises(Failure, match="no assessment unit fell inside"):
+        run_units(store)
+
+    assert (
+        Path(store.partition_dir(assessment_units.key.path[-1], DATE))
+        / ASSESSMENT_UNITS_FILE
+    ).exists()
 
 def test_lot_values_place_units_by_the_rolls_own_lot_numbers(store, role, published):
     """The roll says which lots a property covers; that is what is used.

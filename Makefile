@@ -56,6 +56,12 @@ BACKEND ?= duckdb
 # for `make frontage`. It decides which lots get measured, not what they then
 # measure. See silver/lot_frontage in the README.
 BUFFER_M ?= 10.0
+# How far off a lot boundary a measured street edge still counts as lying on
+# it, for `make setbacks`. Much smaller than BUFFER_M above and a much smaller
+# judgement: the frontage geometry was cut from that very boundary, so this
+# only absorbs the round trip through EPSG:4326. See
+# silver/lot_buildable_setbacks in the README.
+TOLERANCE_M ?= 0.05
 # Which municipalities' assessment rolls `make roll` keeps out of the
 # province-wide archive, as a JSON list of five-digit `code_mun` values.
 # Defaults to Ville de Montréal, which is every borough this pipeline has; `[]`
@@ -75,7 +81,7 @@ DOCKER_RUN := docker run --rm -it \
 	-p $(PORT):2500
 
 .PHONY: help sync dagster_run daemon test materialize catalog features \
-	quartiers cmhc costs vacancy rents envelopes lot-profiles \
+	quartiers cmhc costs vacancy rents envelopes setbacks lot-profiles \
 	streets borough-streets roll lot-values \
 	frontage corpus publish index search ask status \
 	require-q validate_defs clean clean-data clean-silver \
@@ -159,6 +165,16 @@ rents: | $(UV_SYNC_STAMP) ## Materialize average_rents for DATE x NEIGHBORHOOD
 envelopes: | $(UV_SYNC_STAMP) ## Materialize the zoning envelopes for DATE x NEIGHBORHOOD
 	$(DAGSTER) asset materialize --select silver/zoning_grid_columns,silver/lot_zoning_envelopes --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
 
+# Subtracts the four margins those envelopes carry from the parcels `frontage`
+# measured, leaving what may actually be built on. Needs
+# silver.lot_buildable_setbacks (hbu_infra sql/015) applied, and both
+# `frontage` and `envelopes` run first for the same partition - the first
+# supplies the street edge a boundary is sorted against, the second the margins
+# to subtract. TOLERANCE_M overrides the 0.05 m default.
+setbacks: | $(UV_SYNC_STAMP) ## Materialize lot_buildable_setbacks for DATE x NEIGHBORHOOD
+	$(DAGSTER) asset materialize --select silver/lot_buildable_setbacks --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE) \
+		--config-json '{"ops":{"silver__lot_buildable_setbacks":{"config":{"edge_tolerance_m":$(TOLERANCE_M)}}}}'
+
 # Needs gold.lot_profiles and the rag.lot_documents view (hbu_infra sql/009,
 # sql/006) applied, and 006 only lands on a db.py init run *after* a corpus has
 # been indexed - see urban_rag.lot_profiles_assets. Also reads three silver
@@ -182,6 +198,12 @@ borough-streets: | $(UV_SYNC_STAMP) ## Materialize neighborhood_streets for DATE
 # unpacks a 2.8 GB GeoPackage into data/cache/role/; every later scrape date
 # reuses both. CODE_MUN picks the municipalities out of the province-wide
 # archive - `CODE_MUN='[]'` keeps all of them, at ten times the rows.
+#
+# Needs `quartiers` for the same DATE, and hbu_infra's sql/014 applied: the
+# parquet stays province-wide, but the merge is also cut into borough
+# partitions of silver.assessment_units by where each unit's point falls, and
+# one run publishes every enabled borough. The file lands first, so a database
+# that is down costs a re-run of the load rather than of the merge.
 roll: | $(UV_SYNC_STAMP) ## Snapshot the property assessment roll for DATE and merge it
 	$(DAGSTER) asset materialize --select bronze/property_assessment_roll,silver/assessment_units --partition $(DATE) -m $(MODULE) \
 		--config-json '{"ops":{"bronze__property_assessment_roll":{"config":{"municipality_codes":$(CODE_MUN)}}}}'

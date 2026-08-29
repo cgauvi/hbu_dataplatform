@@ -51,6 +51,11 @@ SCHEMA_FILES = (
     "003_warehouse.sql",
     "007_silver_streets.sql",
     "008_silver_lot_frontage.sql",
+    # What `compute_lot_buildable_setbacks` reads the margins from, and the
+    # table it writes. Neither declares a foreign key on the frontage above, so
+    # the order here is only the order the files are numbered in.
+    "012_silver_zoning.sql",
+    "015_silver_lot_buildable_setbacks.sql",
 )
 
 #: The slice of VSMPE these tests measure: every lot within 120 m of lot

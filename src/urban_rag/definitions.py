@@ -70,6 +70,7 @@ from urban_rag.role_assets import (
     lot_assessed_values,
     property_assessment_roll,
 )
+from urban_rag.setback_assets import lot_buildable_setbacks
 from urban_rag.storage import DATA_ROOT, output_root
 from urban_rag.street_assets import neighborhood_streets
 
@@ -103,6 +104,7 @@ ASSETS = [
     document_embeddings,
     zoning_grid_columns,
     lot_zoning_envelopes,
+    lot_buildable_setbacks,
     # gold
     lot_profiles,
     document_index,
@@ -213,6 +215,18 @@ lot_assessed_values_job = define_asset_job(
 lot_frontage_job = define_asset_job(
     "lot_frontage_job",
     selection=AssetSelection.assets(lot_frontage),
+    partitions_def=scrape_partitions,
+)
+
+# Its own job rather than a place in `zoning_envelopes_job`, though it reads
+# that job's output: parsing a borough's grids is minutes of pypdf over
+# documents a later run may no longer be able to fetch, and this is one PostGIS
+# statement over what they already left in the database. Re-running the
+# subtraction after a change to the margin rules should not re-parse a
+# borough's PDFs to do it.
+lot_buildable_setbacks_job = define_asset_job(
+    "lot_buildable_setbacks_job",
+    selection=AssetSelection.assets(lot_buildable_setbacks),
     partitions_def=scrape_partitions,
 )
 
@@ -340,15 +354,20 @@ def daily_street_network_schedule(context: ScheduleEvaluationContext) -> RunRequ
 
 @schedule(
     job=assessment_roll_job,
-    # Alongside street_network and the CMHC surveys rather than behind
-    # anything: the assessment roll has no upstream in this pipeline. One run
-    # for the whole province; the boroughs are cut out of it against the
-    # cadastre an hour and a half later. Kept at its own minute because the
-    # first run of a roll year pulls 572 MB and unpacks 2.8 GB, and a run that
-    # long should not be sharing a slot with the city's servers.
+    # Behind reference_neighborhoods (40 4), and that ordering is load-bearing
+    # rather than tidy: the roll itself has no upstream here, but the
+    # `assessment_units` half of this job cuts the province into borough
+    # partitions against those boundaries, and a run that finds no quartiers
+    # file for the date fails naming it. Otherwise alongside street_network and
+    # the CMHC surveys. Kept at its own minute because the first run of a roll
+    # year pulls 572 MB and unpacks 2.8 GB, and a run that long should not be
+    # sharing a slot with the city's servers.
     cron_schedule="52 4 * * *",
     execution_timezone=TIMEZONE,
-    description="Snapshot the property assessment roll for today, and merge it.",
+    description=(
+        "Snapshot the property assessment roll for today, merge it, and "
+        "publish each borough's units."
+    ),
 )
 def daily_assessment_roll_schedule(context: ScheduleEvaluationContext) -> RunRequest:
     scrape_date = context.scheduled_execution_time.strftime("%Y-%m-%d")
@@ -556,6 +575,16 @@ def daily_neighborhood_streets_schedule(context: ScheduleEvaluationContext):
 # then, at 30 7, behind daily_building_lots_schedule which loads the cadastre
 # it reads.
 
+# No schedule for `lot_buildable_setbacks` either, and for the same reason as
+# `lot_frontage` above: `silver.lot_buildable_setbacks` is hbu_infra's to
+# create, and until sql/015_silver_lot_buildable_setbacks.sql has been applied
+# a nightly run fails naming it every morning. It is registered and has a job -
+# see `lot_buildable_setbacks_job` and `make setbacks`. Add the schedule when
+# the table lands, at 35 7: behind `lot_frontage`, whose street edges it sorts
+# a boundary against, and behind `zoning_envelopes_job`, which supplies the
+# margins it subtracts. Both of those have to run first and neither is
+# scheduled yet, so the ordering is a matter for whoever adds all three.
+
 # No schedule for `lot_profiles`, unlike every other asset here, and not an
 # oversight: it reads two relations hbu_infra has to create first.
 # sql/009_gold_lot_profiles.sql creates the table it writes into, and
@@ -592,6 +621,7 @@ defs = Definitions(
         lot_assessed_values_job,
         lot_frontage_job,
         zoning_envelopes_job,
+        lot_buildable_setbacks_job,
         cmhc_survey_job,
         construction_costs_job,
         vacancy_rates_job,

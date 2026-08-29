@@ -50,14 +50,18 @@ import math
 import pytest
 
 from urban_rag.program import (
+    ABOVE_GRADE_PARKING_STOREY_HEIGHT_M,
     ABOVE_GRADE_STALL_AREA_SQFT,
     ABOVE_GRADE_STALL_COST_CAD,
     AMORTIZATION_MONTHS,
     COMMERCIAL_COST_PER_SQFT_CAD,
     COMMERCIAL_REVENUE_PER_SQFT_CAD,
+    COMMERCIAL_STOREY_HEIGHT_M,
     COMMERCIAL_VACANCY_PCT,
+    DEFAULT_STOREY_HEIGHTS,
     INDUSTRIAL_COST_PER_SQFT_CAD,
     INDUSTRIAL_REVENUE_PER_SQFT_CAD,
+    INDUSTRIAL_STOREY_HEIGHT_M,
     INDUSTRIAL_VACANCY_PCT,
     M2_PER_SQFT,
     MONEY_SCALE,
@@ -66,8 +70,10 @@ from urban_rag.program import (
     NO_NON_RESIDENTIAL,
     NO_PARKING,
     RESIDENTIAL_COST_PER_SQFT_CAD,
+    RESIDENTIAL_STOREY_HEIGHT_M,
     STALLS_PER_1000_SQFT,
     STALLS_PER_DWELLING,
+    UNDERGROUND_LEVEL_HEIGHT_M,
     UNDERGROUND_STALL_AREA_SQFT,
     UNDERGROUND_STALL_COST_CAD,
     UNIT_AREAS_SQFT,
@@ -77,6 +83,7 @@ from urban_rag.program import (
     NonResidentialEconomics,
     ParkingRules,
     ProgramError,
+    StoreyHeights,
     UnitEconomics,
     ZoneColumn,
     is_commercial_usage,
@@ -298,6 +305,116 @@ def test_site_coverage_and_storeys_bound_the_envelope_without_a_density_cap():
     assert 278.7 - 1e-9 <= program.footprint_m2 <= 280.0 + 1e-9
     assert program.footprint_m2 * program.residential_floors <= 1400.0 + 1e-9
     assert {"site_coverage_max", "floors"} <= set(program.binding)
+
+
+# -- the margins, as the second cap on a footprint -------------------------
+#
+# `lot_buildable_setbacks` subtracts the grid's four margins from the parcel
+# and hands the result in as `Lot.buildable_area_m2`. It is independent of
+# *Taux d'implantation*: coverage says what share of the lot may be built on,
+# the margins say where, and a building satisfies both. Every number below is
+# against the same 400 m2 lot the coverage tests use, where 70 per cent is a
+# 280 m2 plate - so a buildable area under 280 binds and one over it does not.
+
+
+def test_the_margins_bind_when_they_leave_less_than_the_coverage_allows():
+    # 240 m2 left after the margins against the 280 m2 coverage allows, over
+    # the five storeys "Tous sauf le RDC" permits = 1 200 m2 - against 1 400
+    # for the same lot with no margins, which is twenty-five one-bedrooms.
+    #
+    # The 200 m2 that goes is worth more than the four one-bedrooms it looks
+    # like: twenty 55.74 m2 one-bedrooms and one 83.61 m2 two-bedroom is
+    # 1 198.45 m2 and $10 013.50 a month, where twenty-one one-bedrooms is
+    # 1 170.58 m2 and $9 870. At 1 400 the mono-mix wins because 25 of them
+    # leave only 6.5 m2 spare; at 1 200 there is room to spend the remainder
+    # on the better dwelling instead of the better square foot, which is the
+    # trade the module docstring's last two columns describe.
+    lot = Lot(area_m2=400.0, frontage_m=12.0, buildable_area_m2=240.0)
+    program = solve_program(
+        column(density_max=None), lot, ECONOMICS, parking=NO_PARKING
+    )
+    assert program.solved
+    assert program.footprint_m2 <= 240.0 + 1e-9
+    assert program.footprint_m2 * program.residential_floors <= 1200.0 + 1e-9
+    assert program.units == {"1_bedroom": 20, "2_bedroom": 1}
+    assert program.net_operating_income == pytest.approx(20 * 470.00 + 613.50)
+
+
+def test_the_binding_norm_says_margins_and_not_coverage():
+    """Which of the two ceilings produced the envelope is the useful half of
+    the answer: a coverage cap is argued at the plan, a margin at the lot
+    line."""
+    lot = Lot(area_m2=400.0, frontage_m=12.0, buildable_area_m2=240.0)
+    program = solve_program(
+        column(density_max=None), lot, ECONOMICS, parking=NO_PARKING
+    )
+    assert "setbacks" in program.binding
+    assert "site_coverage_max" not in program.binding
+
+
+def test_a_buildable_area_the_coverage_already_undercuts_changes_nothing():
+    """Margins leaving more room than *Taux d'implantation* allows are not the
+    binding norm, and must not be reported as one."""
+    lot = Lot(area_m2=400.0, frontage_m=12.0, buildable_area_m2=390.0)
+    program = solve_program(
+        column(density_max=None), lot, ECONOMICS, parking=NO_PARKING
+    )
+    assert program.units == {"1_bedroom": 25}
+    assert "site_coverage_max" in program.binding
+    assert "setbacks" not in program.binding
+
+
+def test_a_lot_with_no_buildable_area_passed_solves_as_it_always_did():
+    """The field is optional because it has to be - it is computed from a
+    zoning column, so a caller solving a column whose grid states no margins
+    has nothing to pass. `None` must leave the answer exactly as it was before
+    the setback asset existed."""
+    without = solve_program(
+        column(density_max=None),
+        Lot(area_m2=400.0, frontage_m=12.0),
+        ECONOMICS,
+        parking=NO_PARKING,
+    )
+    assert without.units == {"1_bedroom": 25}
+    assert "site_coverage_max" in without.binding
+    assert "setbacks" not in without.binding
+
+
+def test_a_parcel_with_nowhere_to_build_returns_an_empty_program():
+    """0 is a real answer - a lot narrower than twice its side margin - and
+    the solver should report an empty program for it rather than refuse the
+    lot. Against a column with no coverage *minimum*, so what is being tested
+    is the empty envelope and not the contradiction below."""
+    lot = Lot(area_m2=400.0, frontage_m=12.0, buildable_area_m2=0.0)
+    program = solve_program(
+        column(density_max=None, site_coverage_min_pct=0.0),
+        lot,
+        ECONOMICS,
+        parking=NO_PARKING,
+    )
+    assert program.total_dwellings == 0
+    assert program.footprint_m2 == 0.0
+
+
+def test_margins_leaving_less_than_the_coverage_minimum_demands_are_infeasible():
+    """C01-001 requires at least 50 per cent coverage - 200 m2 on this lot -
+    and margins leaving 150 make that impossible. Named apart from
+    `site_coverage_range` because the column is coherent and it is the parcel
+    that cannot satisfy it, which is a different thing to tell a reader."""
+    lot = Lot(area_m2=400.0, frontage_m=12.0, buildable_area_m2=150.0)
+    program = solve_program(
+        column(density_max=None), lot, ECONOMICS, parking=NO_PARKING
+    )
+    assert not program.solved
+    assert program.status == "INFEASIBLE"
+    assert program.binding == ("buildable_area_below_site_coverage_min",)
+
+
+def test_a_negative_buildable_area_is_refused_and_zero_is_not():
+    with pytest.raises(ProgramError, match="buildable area"):
+        Lot(area_m2=400.0, frontage_m=12.0, buildable_area_m2=-1.0)
+
+    assert Lot(area_m2=400.0, frontage_m=12.0, buildable_area_m2=0.0)
 
 
 def test_fewer_storeys_when_the_level_rows_say_ground_floor_only():
@@ -1170,3 +1287,226 @@ def test_a_stall_ratio_that_cannot_be_applied_is_refused():
 def test_the_stall_ratios_are_the_ones_the_docstring_quotes():
     assert STALLS_PER_DWELLING == 0.5
     assert STALLS_PER_1000_SQFT == 3.0
+
+
+# -- the metric cap ---------------------------------------------------------
+#
+# *En etage* counts storeys and *Hauteur en metre* measures them, so a grid
+# printing both states two ceilings on one stack. The heights are stated
+# assumptions rather than norms - 3 m a dwelling storey, 4 m a commercial or
+# industrial one, 3 m an above-grade deck, nothing at all below grade - which
+# is why every number below is arrived at by multiplying one of them by a
+# storey count the test also asserts.
+
+
+def test_the_storey_heights_are_the_ones_the_module_was_specified_with():
+    assert RESIDENTIAL_STOREY_HEIGHT_M == 3.0
+    assert COMMERCIAL_STOREY_HEIGHT_M == 4.0
+    assert INDUSTRIAL_STOREY_HEIGHT_M == 4.0
+    assert ABOVE_GRADE_PARKING_STOREY_HEIGHT_M == 3.0
+    assert UNDERGROUND_LEVEL_HEIGHT_M == 0.0
+    assert DEFAULT_STOREY_HEIGHTS.residential_m == RESIDENTIAL_STOREY_HEIGHT_M
+    assert DEFAULT_STOREY_HEIGHTS.commercial_m == COMMERCIAL_STOREY_HEIGHT_M
+
+
+def test_a_column_printing_no_metric_cap_is_unchanged_by_one():
+    # The row is optional like every other, and a grid printing "-" for it must
+    # give back exactly the answer this module gave before the row existed.
+    lot = Lot(area_m2=400.0, frontage_m=12.0)
+    program = solve_program(column(), lot, ECONOMICS, parking=NO_PARKING)
+    assert program.residential_floors == 5
+    assert program.units == {"1_bedroom": 25}
+    assert "height_max" not in program.binding
+    # Reported all the same: five storeys of housing stand fifteen metres.
+    assert program.height_m == pytest.approx(15.0)
+
+
+def test_a_metric_cap_is_read_as_the_storeys_it_leaves_room_for():
+    # 11 m at three metres a dwelling storey is three of them and not the five
+    # "Tous sauf le RDC" allows of a six-storey building - 12 m would be four.
+    # Three storeys of 280 m2 is 840 m2, which is fifteen 55.74 m2
+    # one-bedrooms with 3.9 m2 left over.
+    lot = Lot(area_m2=400.0, frontage_m=12.0)
+    program = solve_program(
+        column(height_max_m=11.0), lot, ECONOMICS, parking=NO_PARKING
+    )
+    assert program.residential_floors == 3
+    assert program.height_m == pytest.approx(9.0)
+    assert program.units == {"1_bedroom": 15}
+    # Both ceilings are named: the envelope the dwellings filled was built from
+    # the storeys *Hauteur* left room for, not the ones *En etage* prints.
+    assert {"site_coverage_max", "floors", "height_max"} <= set(program.binding)
+
+
+def test_the_slacker_of_the_two_ceilings_is_not_the_one_that_binds():
+    # 18 m is six storeys of housing and the level rows allow five, so the
+    # metric cap is not what stopped the building and does not claim to be.
+    lot = Lot(area_m2=400.0, frontage_m=12.0)
+    program = solve_program(
+        column(height_max_m=18.0), lot, ECONOMICS, parking=NO_PARKING
+    )
+    assert program.residential_floors == 5
+    assert program.units == {"1_bedroom": 25}
+    assert "height_max" not in program.binding
+
+
+def test_a_commercial_storey_spends_four_metres_of_the_cap_and_housing_three():
+    # The whole of what a metric cap adds to a storey cap. This column allows
+    # six storeys on every level and the commerce outbids the housing for all
+    # four it can have, so *En etage* alone builds 2 x 3 m + 4 x 4 m = 22 m.
+    # An 18 m limit buys one fewer commercial plate, a 14 m limit two fewer,
+    # and neither is a number the storey row could have produced.
+    lot = Lot(area_m2=400.0, frontage_m=12.0)
+    expected = {None: (4, 22.0), 18.0: (3, 18.0), 14.0: (2, 14.0)}
+    for cap, (commercial_floors, height_m) in expected.items():
+        program = solve_program(
+            mixed("C.2", height_max_m=cap), lot, ECONOMICS, parking=NO_PARKING
+        )
+        assert program.residential_floors == 2
+        assert program.commercial_floors == commercial_floors
+        assert program.height_m == pytest.approx(height_m)
+        if cap is not None:
+            assert program.height_m <= cap + 1e-9
+        # The storey row is unmoved throughout: what changed is the metres.
+        assert program.floors == 2 + commercial_floors
+
+
+def test_an_underground_level_stands_no_metres():
+    # The other half of article 38 1o's bargain, arriving from a different
+    # article: height is measured from grade up, so what is dug is outside the
+    # measurement exactly as it is outside the *superficie de plancher*. The
+    # levels are not asserted - see the parking tests on why they are a tie -
+    # but whatever they are, they are worth nothing in metres.
+    program = solve_program(
+        column(density_max=2.0, height_max_m=18.0),
+        Lot(area_m2=400.0, frontage_m=12.0),
+        ECONOMICS,
+    )
+    assert program.underground_levels >= 1
+    assert program.underground_area_m2 > 0.0
+    assert program.above_grade_parking_floors == 0
+    assert program.height_m == pytest.approx(3.0 * program.residential_floors)
+
+
+def test_an_above_grade_deck_is_measured_and_a_dug_one_is_not():
+    # The same lot with the excavator taken away: the stalls go on a storey of
+    # their own, and that storey is three metres of the building's height where
+    # the levels dug beside it were none.
+    program = solve_program(
+        column(density_max=2.0),
+        Lot(area_m2=400.0, frontage_m=12.0),
+        ECONOMICS,
+        parking=ParkingRules(max_underground_levels=0),
+    )
+    assert program.above_grade_parking_floors == 1
+    assert program.underground_levels == 0
+    assert program.height_m == pytest.approx(3.0 * program.floors)
+
+
+def test_the_reported_height_is_the_storey_split_priced():
+    program = solve_program(
+        mixed("C.2", "I.1", height_max_m=20.0),
+        Lot(area_m2=400.0, frontage_m=12.0),
+        ECONOMICS,
+    )
+    assert program.solved
+    assert program.height_m == pytest.approx(
+        DEFAULT_STOREY_HEIGHTS.height_m(
+            residential=program.residential_floors,
+            above_grade_parking=program.above_grade_parking_floors,
+            commercial=program.commercial_floors,
+            industrial=program.industrial_floors,
+        )
+    )
+    assert program.height_m <= 20.0 + 1e-9
+
+
+def test_taller_storeys_get_fewer_of_them_out_of_the_same_metres():
+    # The heights are assumptions, and a building known to be built otherwise
+    # says so at the call site. 18 m is six three-metre storeys and three
+    # five-metre ones, and the level rows allow five either way.
+    program = solve_program(
+        column(height_max_m=18.0),
+        Lot(area_m2=400.0, frontage_m=12.0),
+        ECONOMICS,
+        parking=NO_PARKING,
+        heights=StoreyHeights(residential_m=5.0),
+    )
+    assert program.residential_floors == 3
+    assert program.height_m == pytest.approx(15.0)
+    assert "height_max" in program.binding
+
+
+def test_a_metric_minimum_above_the_metric_maximum_is_infeasible():
+    # Two rows of one column contradicting each other, named rather than
+    # returned as a bare status - the treatment `site_coverage_range` gets.
+    program = solve_program(
+        column(height_min_m=12.0, height_max_m=6.0),
+        Lot(area_m2=400.0, frontage_m=12.0),
+        ECONOMICS,
+    )
+    assert not program.solved
+    assert program.binding == ("height_range",)
+
+
+def test_a_storey_minimum_the_metric_cap_cannot_reach_is_infeasible():
+    # *En etage min 2* is six metres of housing, and this column allows five.
+    # Named apart from the level-row contradiction because it is a different
+    # pair of rows disagreeing, and because a shorter storey would resolve it.
+    program = solve_program(
+        column(height_max_m=5.0),
+        Lot(area_m2=400.0, frontage_m=12.0),
+        ECONOMICS,
+    )
+    assert not program.solved
+    assert program.binding == ("height_max_below_floors_min",)
+
+
+def test_a_metric_minimum_no_permitted_stack_reaches_is_infeasible():
+    # Five storeys of housing is fifteen metres and this column authorises
+    # nothing else, so a twenty-metre minimum has no program. A real answer
+    # about the column, like a *Densite min* nothing satisfies.
+    program = solve_program(
+        column(height_min_m=20.0),
+        Lot(area_m2=400.0, frontage_m=12.0),
+        ECONOMICS,
+        parking=NO_PARKING,
+    )
+    assert not program.solved
+    assert program.status == "INFEASIBLE"
+
+
+def test_a_metric_minimum_the_envelope_can_reach_is_met():
+    # A minimum is a floor, so a building exactly as tall as one meets it.
+    program = solve_program(
+        column(height_min_m=15.0),
+        Lot(area_m2=400.0, frontage_m=12.0),
+        ECONOMICS,
+        parking=NO_PARKING,
+    )
+    assert program.solved
+    assert program.height_m >= 15.0 - 1e-9
+    assert program.residential_floors == 5
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"residential_m": 0.0},
+        {"commercial_m": -3.0},
+        {"industrial_m": 0.0},
+        {"above_grade_parking_m": 0.0},
+    ],
+)
+def test_a_storey_of_no_height_is_refused(overrides):
+    # A storey the metric cap never charges for is one the solver would stack
+    # without limit under any *Hauteur* at all. Taking the cap off is what a
+    # column printing no maximum is for.
+    with pytest.raises(ProgramError):
+        StoreyHeights(**overrides)
+
+
+@pytest.mark.parametrize("norm", ["height_min_m", "height_max_m"])
+def test_a_negative_metric_norm_is_refused(norm):
+    with pytest.raises(ProgramError):
+        column(**{norm: -1.0})

@@ -346,6 +346,14 @@ def stub_postgis(
             "num_envelopes_staged": staged,
             "num_zoning_envelopes": staged,
             "num_with_zoning_envelopes": min(staged, num_lots),
+            # The setback join, read back out of gold.lot_profiles by the real
+            # function. A lot only gets a buildable area where it had both an
+            # envelope to take margins from and a frontage row to sort its
+            # boundary against, so the stub bounds it by the envelope count the
+            # way the table does.
+            "num_with_buildable_area": min(staged, with_frontage),
+            "num_bound_by_setbacks": min(staged, with_frontage),
+            "mean_buildable_pct_of_lot": 41.5,
             "has_vacancy_rates": bool(vacancy_rates),
             "has_average_rents": bool(average_rents),
             "overall_vacancy_rate_pct": (vacancy_rates or {}).get(

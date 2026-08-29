@@ -970,6 +970,549 @@ def compute_lot_frontage(
     }
 
 
+# --------------------------------------------------------------------------
+# what is left of a lot once its margins are taken off it
+# --------------------------------------------------------------------------
+
+#: Where the buildable envelope is carved, how finely the boundary is chopped
+#: to sort it, and how near parallel a piece has to run to count as the rear
+#: rather than a side. All three are `compute_lot_frontage`'s values, aliased
+#: rather than restated: the rear/side test *is* that function's parallel test
+#: pointed at the lot's front edge instead of at a street side, so the two
+#: moving apart should be a decision someone makes here rather than a drift
+#: nobody notices. See `FRONTAGE_MAX_SIN` for the derivation.
+SETBACK_METRIC_SRID = FRONTAGE_METRIC_SRID
+SETBACK_SEGMENT_M = FRONTAGE_SEGMENT_M
+SETBACK_MAX_SIN = FRONTAGE_MAX_SIN
+
+#: How far off the lot's boundary a `silver.lot_frontage` linestring may sit
+#: and still be subtracted from it as street edge, in metres.
+#:
+#: Not a tolerance on the data: that geometry was cut *from* this boundary one
+#: asset earlier, so the two are the same line and this only has to absorb the
+#: round trip through EPSG:4326 the table stores it in. Small enough that the
+#: 5 cm it also nibbles off either end of a side edge is well under
+#: `SETBACK_SEGMENT_M`, and therefore under the resolution of the sort it
+#: feeds.
+DEFAULT_SETBACK_EDGE_TOLERANCE_M = 0.05
+
+#: The side setback each reading of *Mode d'implantation* produces, as a
+#: multiple of the *Latérale min* the grid printed.
+#:
+#: Documented in sql/015 and restated here only as the numbers: contiguous
+#: building is built to both party lines, semi-detached to one. A half margin
+#: off both sides removes exactly what a whole margin off one side does for any
+#: parcel whose side lines are parallel, and which side carries the party wall
+#: is a fact about the neighbour that no layer this platform reads publishes.
+SIDE_SETBACK_FACTORS: dict[str, float] = {
+    "contigu": 0.0,
+    "jumele": 0.5,
+    "isole": 1.0,
+    # A column stating no mode at all takes the full margin on both sides: the
+    # conservative reading, and the one that cannot quietly hand a lot more
+    # buildable area than its grid allows.
+    "unknown": 1.0,
+}
+
+#: The relations `compute_lot_buildable_setbacks` reads, and the hbu_infra file
+#: that creates each. `silver.lot_buildable_setbacks` is deliberately not among
+#: them - it is the target, and `warehouse.upsert_select` checks that one.
+_BUILDABLE_RELATIONS: tuple[tuple[str, str], ...] = (
+    ("rag.lots", "sql/002_spatial.sql"),
+    ("silver.lot_frontage", "sql/008_silver_lot_frontage.sql"),
+    ("silver.lot_zoning_envelopes", "sql/012_silver_zoning.sql"),
+)
+
+#: The per-lot temp table the boundary sort lands in, named to the same
+#: convention `_frontage_sides` follows.
+_SETBACK_EDGES = "_setback_edges"
+
+#: The boundary sort itself: one row per lot, carrying the parcel, the two
+#: street edges `lot_frontage` measured, and the rear and side edges this
+#: derives - every geometry in `SETBACK_METRIC_SRID`.
+#:
+#: A temp table and not a CTE, for the reason `_frontage_sides` is one: the
+#: statement below joins it once per *(lot, zone, column)*, and a lot in a
+#: borough of overlapping zones has several. Sorting a boundary is per-lot work
+#: and belongs on the lot side of that fan-out - inlined as a CTE it would be
+#: re-derived for every candidate envelope of every parcel.
+_SETBACK_EDGES_SQL = """
+WITH parcels AS (
+    SELECT lot_uid, lot_number,
+           ST_Transform(geom, %(srid)s) AS geom
+      FROM rag.lots
+     WHERE neighborhood = %(neighborhood)s
+       AND scrape_date = %(scrape_date)s::date
+),
+-- The street edges, as `lot_frontage` measured them rather than as anything
+-- guessed at from the parcel's shape. Rank 1 is the street the lot mostly
+-- fronts on and takes *Avant principale*; rank 2 exists only on a corner lot
+-- and takes *Avant secondaire*. `all_geom` is every rank, and is what gets
+-- subtracted from the boundary below - a lot facing three streets must not
+-- have its third edge come back as a side.
+street AS (
+    SELECT lot_uid,
+           ST_Union(ST_Transform(geom, %(srid)s))
+               FILTER (WHERE frontage_rank = 1) AS front_geom,
+           ST_Union(ST_Transform(geom, %(srid)s))
+               FILTER (WHERE frontage_rank = 2) AS secondary_geom,
+           ST_Union(ST_Transform(geom, %(srid)s)) AS all_geom
+      FROM silver.lot_frontage
+     WHERE neighborhood = %(neighborhood)s
+       AND scrape_date = %(scrape_date)s::date
+     GROUP BY lot_uid
+),
+-- What is left of the boundary once the street edges are taken out of it,
+-- chopped into pieces of at most `step_m`. ST_Segmentize only ever adds
+-- vertices, so an edge shorter than the step survives whole.
+pieces AS (
+    SELECT p.lot_uid, (seg).geom AS geom
+      FROM parcels p
+      JOIN street s ON s.lot_uid = p.lot_uid
+      CROSS JOIN LATERAL ST_DumpSegments(
+          ST_Segmentize(
+              ST_Difference(
+                  ST_Boundary(p.geom),
+                  ST_Buffer(s.all_geom, %(tolerance_m)s::double precision)
+              ),
+              %(step_m)s::double precision
+          )
+      ) AS seg
+     WHERE s.front_geom IS NOT NULL
+),
+-- The sort. |d_start - d_end| / length is the sine of the angle between the
+-- piece and the front edge: 0 for one running parallel to the street, 1 for
+-- one running straight at it. A lot's rear line is parallel to its front and
+-- its side lines are perpendicular, so the one threshold separates them.
+classified AS (
+    SELECT c.lot_uid, c.geom,
+           ST_Length(c.geom) AS piece_m,
+           CASE WHEN abs(
+                        ST_Distance(ST_StartPoint(c.geom), s.front_geom)
+                      - ST_Distance(ST_EndPoint(c.geom), s.front_geom)
+                    ) / ST_Length(c.geom) <= %(max_sin)s::double precision
+                THEN 'rear'
+                ELSE 'side'
+           END AS edge_class
+      FROM pieces c
+      JOIN street s ON s.lot_uid = c.lot_uid
+     WHERE ST_Length(c.geom) > 0
+),
+edges AS (
+    SELECT lot_uid,
+           ST_Union(geom) FILTER (WHERE edge_class = 'rear') AS rear_geom,
+           ST_Union(geom) FILTER (WHERE edge_class = 'side') AS side_geom,
+           COALESCE(sum(piece_m) FILTER (WHERE edge_class = 'rear'), 0.0)
+               AS rear_edge_m,
+           COALESCE(sum(piece_m) FILTER (WHERE edge_class = 'side'), 0.0)
+               AS side_edge_m
+      FROM classified
+     GROUP BY lot_uid
+)
+SELECT p.lot_uid,
+       p.lot_number,
+       p.geom AS lot_geom,
+       ST_Area(p.geom) AS lot_area_m2,
+       s.front_geom,
+       s.secondary_geom,
+       e.rear_geom,
+       e.side_geom,
+       COALESCE(ST_Length(s.front_geom), 0.0) AS front_edge_m,
+       COALESCE(ST_Length(s.secondary_geom), 0.0) AS secondary_front_edge_m,
+       COALESCE(e.rear_edge_m, 0.0) AS rear_edge_m,
+       COALESCE(e.side_edge_m, 0.0) AS side_edge_m
+  FROM parcels p
+  JOIN street s ON s.lot_uid = p.lot_uid
+  -- LEFT, unlike the join above: a lot whose entire boundary was measured as
+  -- street edge - a through lot, an island parcel - has a front and no other
+  -- class, and is a row with two zero lengths rather than a row that is gone.
+  LEFT JOIN edges e ON e.lot_uid = p.lot_uid
+ WHERE s.front_geom IS NOT NULL
+"""
+
+
+def compute_lot_buildable_setbacks(
+    connection: "Connection",
+    *,
+    neighborhood: str,
+    scrape_date: str,
+    edge_tolerance_m: float = DEFAULT_SETBACK_EDGE_TOLERANCE_M,
+) -> dict[str, object]:
+    """(Re)compute `silver.lot_buildable_setbacks` for one partition.
+
+    What is left of each lot once the four margins its zoning grid states are
+    taken off it, at the grain the grid states them: one row per (lot, zone,
+    grid column). `silver.lot_zoning_envelopes` has carried *Avant principale*,
+    *Avant secondaire*, *Latérale* and *Arrière* since sql/012 with nothing
+    subtracting them, and `urban_rag.program` caps a footprint on *Taux
+    d'implantation* alone - so a shallow lot and a deep one of the same area
+    have been solving identically. This is the other cap.
+
+    **The subtraction is directional, which is why it is not a negative
+    buffer.** `ST_Buffer(lot, -d)` takes the same d off every edge; the margins
+    are four different distances at four different edges, and no single d
+    expresses them. So the boundary is sorted first:
+
+    * **front** - `silver.lot_frontage.geom` at `frontage_rank = 1`, which is
+      the boundary that asset *measured* as running along a street rather than
+      an edge guessed at from the parcel's shape.
+    * **secondary** - the same at rank 2. Only a corner lot has one, and it
+      takes *Avant secondaire*, falling back to *Avant principale* where the
+      grid states only the one - a corner lot's second street edge is still a
+      street edge, and leaving it unregulated would hand a corner parcel more
+      room than the mid-block lot beside it.
+    * **rear** - of what is left, the pieces running within `SETBACK_MAX_SIN`
+      of parallel to the front.
+    * **side** - of what is left, everything else.
+
+    That last test is `compute_lot_frontage`'s own, pointed at the lot's front
+    edge instead of at a street side: for a piece of length L whose ends sit d1
+    and d2 from the front, ``|d1 - d2| / L`` is the sine of the angle between
+    them. It needs no trigonometry and it is why the two functions share one
+    constant rather than each carrying a threshold.
+
+    **It is also not a width x depth rectangle.** Estimating depth as area over
+    frontage and multiplying ``(width - 2*side) x (depth - front - rear)`` is
+    exact for a rectangle and wrong for the wedges, dog-legs and skewed rear
+    lines a real cadastre is full of. Both inputs to the honest version are
+    already here - the polygon in `rag.lots`, the street edge in
+    `silver.lot_frontage` - so the proxy would buy nothing.
+
+    **`side_setback_m` is not `side_margin_min_m`,** and this is the difference
+    that moves the answer most. *Mode d'implantation* decides whether the side
+    margin applies at all: a contiguous building is built to the party line and
+    has no side setback, a semi-detached one has a single side. The grid prints
+    the permitted modes together - VSMPE prints `I-J` and `I-J-C` - and the
+    most permissive is applied, because this table answers what *may* be built.
+    `SIDE_SETBACK_FACTORS` holds the three multiples; `side_setback_rule`
+    records which was read and `side_margin_min_m` what the grid printed, so a
+    row can be read back against the rule that produced it. Subtracting the
+    printed margin from both sides of every lot in a borough of plexes would
+    understate most of the stock.
+
+    A margin the grid prints as ``-`` is NULL upstream and 0 here. The two
+    coincide for this purpose - an unstated margin takes nothing off the lot -
+    and the distinction stays visible in `silver.lot_zoning_envelopes` for a
+    reader who needs "no rear margin" apart from "a rear margin of zero".
+
+    **A lot with no frontage row gets no row here.** There is no edge to call
+    the front, so the angle test has no reference and the four classes are
+    undefined; inventing a front from the parcel's longest edge would put
+    *Avant principale* on a party line. The count comes back in
+    `lots_without_frontage` for the asset to report, the same posture
+    `compute_lot_frontage` takes towards the same lots.
+
+    `footprint_cap_m2` is the lesser of the buildable envelope and *Taux
+    d'implantation au sol max* x lot area, and `footprint_cap_binding` says
+    which of the two produced it. They are independent caps - one says where on
+    the lot, the other how much of it - and a building satisfies both.
+
+    Assumes `compute_lot_frontage` and `lot_zoning_envelopes` have both landed
+    this partition. Both are dependencies on the assets rather than something
+    the SQL can check: a borough whose envelopes were never computed yields no
+    rows and looks exactly like a borough whose grids all failed to parse,
+    which is why the caller gets `num_envelopes` back to tell them apart.
+    """
+    tolerance = float(edge_tolerance_m)
+    if tolerance <= 0:
+        raise ValueError(
+            f"edge_tolerance_m must be positive, got {edge_tolerance_m!r}"
+        )
+
+    cursor = connection.cursor()
+    _require_relations(cursor, _BUILDABLE_RELATIONS)
+
+    parameters: dict[str, Any] = {
+        "neighborhood": neighborhood,
+        "scrape_date": scrape_date,
+        "srid": int(SETBACK_METRIC_SRID),
+        "step_m": float(SETBACK_SEGMENT_M),
+        "max_sin": float(SETBACK_MAX_SIN),
+        "tolerance_m": tolerance,
+    }
+
+    # Dropped rather than declared ON COMMIT DROP, for the reason
+    # `_frontage_sides` is: this runs inside the caller's transaction, and
+    # session scope is what makes a second call on one connection work whether
+    # or not that connection is in autocommit.
+    cursor.execute(f"DROP TABLE IF EXISTS {_SETBACK_EDGES}")
+    cursor.execute(
+        f"CREATE TEMP TABLE {_SETBACK_EDGES} AS {_SETBACK_EDGES_SQL}", parameters
+    )
+    cursor.execute(f"CREATE INDEX ON {_SETBACK_EDGES} (lot_uid)")
+    # Without stats the planner costs the join below against a default row
+    # estimate and can pick a scan over the index it was just handed - the
+    # same reason `compute_lot_frontage` analyzes `_frontage_sides`.
+    cursor.execute(f"ANALYZE {_SETBACK_EDGES}")
+    cursor.execute(f"SELECT count(*) FROM {_SETBACK_EDGES}")
+    (lots_sorted,) = cursor.fetchone()
+
+    result = warehouse.upsert_select(
+        cursor,
+        "lot_buildable_setbacks",
+        (
+            "scrape_date", "neighborhood", "lot_uid", "feature_id",
+            "column_index", "lot_number", "source_table", "lot_area_m2",
+            "front_edge_m", "secondary_front_edge_m", "side_edge_m",
+            "rear_edge_m",
+            "implantation_mode", "side_setback_rule", "side_margin_min_m",
+            "front_setback_m", "secondary_front_setback_m", "side_setback_m",
+            "rear_setback_m",
+            "buildable_area_m2", "buildable_pct_of_lot",
+            "coverage_cap_m2", "footprint_cap_m2", "footprint_cap_binding",
+            "pct_of_lot", "governs_residential", "solver_ready",
+            "max_sin", "segment_m", "edge_tolerance_m",
+            "geom",
+        ),
+        """
+        WITH norms AS (
+            -- The margins as the grid states them, and the mode read off the
+            -- text it prints. `strpos` rather than LIKE throughout: a literal
+            -- per-cent sign anywhere in this statement is read by psycopg as
+            -- the start of a placeholder, and the accents are avoided by
+            -- matching the stems 'isol', 'jumel' and 'contigu' - none of which
+            -- carries one - so no unaccent extension is needed either.
+            --
+            -- Two spellings are handled because two exist: a borough printing
+            -- the modes as words, and VSMPE's own template printing them as
+            -- hyphenated letter codes ('I-J', 'I-J-C'). Most permissive wins,
+            -- which is why contiguous is tested first.
+            SELECT
+                e.lot_uid, e.feature_id, e.column_index, e.lot_number,
+                e.source_table, e.implantation_mode, e.side_margin_min_m,
+                e.site_coverage_max_pct, e.pct_of_lot, e.governs_residential,
+                e.solver_ready,
+                CASE
+                    WHEN e.implantation_mode IS NULL THEN 'unknown'
+                    WHEN strpos(lower(e.implantation_mode), 'contigu') > 0
+                      OR 'C' = ANY(string_to_array(
+                             upper(translate(e.implantation_mode, ' .', '')), '-'))
+                        THEN 'contigu'
+                    WHEN strpos(lower(e.implantation_mode), 'jumel') > 0
+                      OR 'J' = ANY(string_to_array(
+                             upper(translate(e.implantation_mode, ' .', '')), '-'))
+                        THEN 'jumele'
+                    WHEN strpos(lower(e.implantation_mode), 'isol') > 0
+                      OR 'I' = ANY(string_to_array(
+                             upper(translate(e.implantation_mode, ' .', '')), '-'))
+                        THEN 'isole'
+                    ELSE 'unknown'
+                END AS side_setback_rule,
+                COALESCE(e.front_margin_min_m, 0.0) AS front_setback_m,
+                -- *Avant secondaire* where the grid states one, *Avant
+                -- principale* where it states only that, 0 where it states
+                -- neither. See the docstring.
+                COALESCE(
+                    e.secondary_front_margin_min_m, e.front_margin_min_m, 0.0
+                ) AS secondary_front_setback_m,
+                COALESCE(e.rear_margin_min_m, 0.0) AS rear_setback_m
+              FROM silver.lot_zoning_envelopes e
+             WHERE e.neighborhood = %(neighborhood)s
+               AND e.scrape_date = %(scrape_date)s::date
+        ),
+        applied AS (
+            SELECT n.*,
+                   CASE n.side_setback_rule
+                       WHEN 'contigu' THEN 0.0
+                       WHEN 'jumele' THEN COALESCE(n.side_margin_min_m, 0.0) / 2.0
+                       ELSE COALESCE(n.side_margin_min_m, 0.0)
+                   END AS side_setback_m
+              FROM norms n
+        ),
+        carved AS (
+            -- One ST_Difference against the union of the four buffers, rather
+            -- than four nested differences: the cuts overlap at every corner
+            -- of the parcel, and unioning them first is what keeps that from
+            -- being counted twice.
+            --
+            -- ST_Buffer of an empty geometry, and of any geometry at distance
+            -- 0, is an empty polygon - so a lot with no second street edge and
+            -- a column stating no rear margin both cut nothing, without either
+            -- needing a branch of its own. The COALESCEs are only to keep a
+            -- NULL out of the array.
+            SELECT a.*,
+                   b.lot_number AS cadastre_lot_number,
+                   b.lot_area_m2,
+                   b.front_edge_m, b.secondary_front_edge_m,
+                   b.side_edge_m, b.rear_edge_m,
+                   ST_CollectionExtract(
+                       ST_Difference(
+                           b.lot_geom,
+                           ST_UnaryUnion(ST_Collect(ARRAY[
+                               ST_Buffer(b.front_geom, a.front_setback_m),
+                               ST_Buffer(
+                                   COALESCE(b.secondary_geom, blank.geom),
+                                   a.secondary_front_setback_m
+                               ),
+                               ST_Buffer(
+                                   COALESCE(b.rear_geom, blank.geom),
+                                   a.rear_setback_m
+                               ),
+                               ST_Buffer(
+                                   COALESCE(b.side_geom, blank.geom),
+                                   a.side_setback_m
+                               )
+                           ]))
+                       ),
+                       3
+                   ) AS buildable_geom
+              FROM applied a
+              JOIN {setback_edges} b ON b.lot_uid = a.lot_uid
+              CROSS JOIN (
+                  SELECT ST_SetSRID('LINESTRING EMPTY'::geometry, %(srid)s) AS geom
+              ) blank
+        ),
+        measured AS (
+            SELECT c.*,
+                   ST_Area(c.buildable_geom) AS buildable_area_m2,
+                   CASE WHEN c.site_coverage_max_pct IS NOT NULL
+                             AND c.lot_area_m2 IS NOT NULL
+                        THEN c.lot_area_m2 * c.site_coverage_max_pct / 100.0
+                   END AS coverage_cap_m2
+              FROM carved c
+        )
+        SELECT
+            %(scrape_date)s::date,
+            %(neighborhood)s,
+            m.lot_uid,
+            m.feature_id,
+            m.column_index,
+            -- The envelope's own lot number where it has one; older envelope
+            -- files predate `lot_features` carrying it, and the cadastre side
+            -- of the join always does.
+            COALESCE(m.lot_number, m.cadastre_lot_number),
+            m.source_table,
+            m.lot_area_m2,
+            m.front_edge_m,
+            m.secondary_front_edge_m,
+            m.side_edge_m,
+            m.rear_edge_m,
+            m.implantation_mode,
+            m.side_setback_rule,
+            m.side_margin_min_m,
+            m.front_setback_m,
+            m.secondary_front_setback_m,
+            m.side_setback_m,
+            m.rear_setback_m,
+            m.buildable_area_m2,
+            CASE WHEN m.lot_area_m2 > 0
+                 THEN 100.0 * m.buildable_area_m2 / m.lot_area_m2
+            END,
+            m.coverage_cap_m2,
+            -- LEAST ignores a NULL argument, which is exactly wrong here: a
+            -- column stating no coverage maximum should leave the setback
+            -- answer standing, not be silently dropped from a comparison a
+            -- reader thinks happened. Spelled out instead.
+            CASE WHEN m.coverage_cap_m2 IS NULL
+                 THEN m.buildable_area_m2
+                 ELSE LEAST(m.buildable_area_m2, m.coverage_cap_m2)
+            END,
+            -- Ties go to 'setbacks': it is the cap that also constrains the
+            -- shape, so when the two agree on the area it is still the one
+            -- doing the work.
+            CASE WHEN m.coverage_cap_m2 IS NOT NULL
+                      AND m.coverage_cap_m2 < m.buildable_area_m2
+                 THEN 'site_coverage'
+                 ELSE 'setbacks'
+            END,
+            m.pct_of_lot,
+            m.governs_residential,
+            m.solver_ready,
+            %(max_sin)s::double precision,
+            %(step_m)s::double precision,
+            %(tolerance_m)s::double precision,
+            ST_Multi(ST_Transform(m.buildable_geom, 4326))
+        FROM measured m
+        """.replace("{setback_edges}", _SETBACK_EDGES),
+        parameters,
+        neighborhood=neighborhood,
+        scrape_date=scrape_date,
+    )
+
+    # The denominators, and the two gaps worth telling apart: a lot with no
+    # frontage row could not be sorted, and a lot with no envelope row has no
+    # margins to subtract. Neither is a failure and they have different fixes.
+    cursor.execute(
+        """
+        SELECT count(*) FROM rag.lots
+        WHERE neighborhood = %s AND scrape_date = %s::date
+        """,
+        [neighborhood, scrape_date],
+    )
+    (num_lots,) = cursor.fetchone()
+    cursor.execute(
+        """
+        SELECT count(*), count(DISTINCT lot_uid)
+        FROM silver.lot_zoning_envelopes
+        WHERE neighborhood = %s AND scrape_date = %s::date
+        """,
+        [neighborhood, scrape_date],
+    )
+    num_envelopes, lots_with_envelopes = cursor.fetchone()
+
+    cursor.execute(
+        """
+        SELECT count(DISTINCT lot_uid),
+               count(*) FILTER (WHERE footprint_cap_binding = 'setbacks'),
+               count(*) FILTER (WHERE footprint_cap_binding = 'site_coverage'),
+               count(*) FILTER (WHERE buildable_area_m2 <= 0),
+               COALESCE(sum(buildable_area_m2), 0),
+               COALESCE(avg(buildable_pct_of_lot), 0)
+        FROM silver.lot_buildable_setbacks
+        WHERE neighborhood = %s AND scrape_date = %s::date
+        """,
+        [neighborhood, scrape_date],
+    )
+    (
+        lots_measured,
+        bound_by_setbacks,
+        bound_by_coverage,
+        num_unbuildable,
+        total_buildable_area_m2,
+        mean_buildable_pct,
+    ) = cursor.fetchone()
+
+    # How the borough's stock reads under each mode, which is the one number
+    # that says whether the side rule is doing what it should: a VSMPE where
+    # nothing came back 'contigu' is a mode column that failed to parse, not a
+    # borough of detached houses.
+    cursor.execute(
+        """
+        SELECT side_setback_rule, count(*)
+        FROM silver.lot_buildable_setbacks
+        WHERE neighborhood = %s AND scrape_date = %s::date
+        GROUP BY side_setback_rule
+        """,
+        [neighborhood, scrape_date],
+    )
+    by_side_rule = {str(rule): int(count) for rule, count in cursor.fetchall()}
+
+    return {
+        "rows": result["upserted"],
+        "pruned": result["pruned"],
+        "num_lots": int(num_lots),
+        # Sorted but not necessarily measured: a lot whose boundary was sorted
+        # and whose zone published no readable grid has no envelope to
+        # subtract, so it is in the first count and not the second.
+        "num_lots_sorted": int(lots_sorted),
+        "num_lots_measured": int(lots_measured),
+        "lots_without_frontage": int(num_lots) - int(lots_sorted),
+        "num_envelopes": int(num_envelopes),
+        "num_lots_with_envelopes": int(lots_with_envelopes),
+        "num_bound_by_setbacks": int(bound_by_setbacks),
+        "num_bound_by_site_coverage": int(bound_by_coverage),
+        # A real answer rather than a gap: a parcel narrower than twice its
+        # side margin has nowhere to put a building.
+        "num_unbuildable": int(num_unbuildable),
+        "total_buildable_area_m2": float(total_buildable_area_m2),
+        "mean_buildable_pct_of_lot": float(mean_buildable_pct),
+        "by_side_setback_rule": by_side_rule,
+        "edge_tolerance_m": tolerance,
+        "max_sin": float(SETBACK_MAX_SIN),
+        "segment_m": float(SETBACK_SEGMENT_M),
+    }
+
+
 #: The categories `compute_lot_profiles` sorts a lot into. Kept here rather
 #: than only in SQL because the asset reports one count per category and a
 #: missing key would silently read as zero.
@@ -1004,6 +1547,14 @@ _LOT_PROFILE_RELATIONS: tuple[tuple[str, str], ...] = (
     (
         "silver.lot_assessed_values",
         "sql/013_silver_lot_assessed_values.sql",
+    ),
+    # Read twice below - once narrowed to the row governing each lot, once at
+    # its own grain to merge into the envelope entries - so a database without
+    # it fails here naming the file rather than on whichever of the two the
+    # planner resolved first.
+    (
+        "silver.lot_buildable_setbacks",
+        "sql/015_silver_lot_buildable_setbacks.sql",
     ),
     ("gold.lot_profiles", "sql/009_gold_lot_profiles.sql"),
 )
@@ -1090,6 +1641,20 @@ def compute_lot_profiles(
     Quebec's *rôle d'évaluation foncière* carried onto the cadastre - what the
     ground is worth standing as it is, which is the half of a
     highest-and-best-use question the cost columns do not answer.
+
+    A fifth is read twice, because the two reads want different grains:
+
+    * `silver.lot_buildable_setbacks` -> `buildable_area_m2`,
+      `footprint_cap_m2` and the two columns that qualify them
+
+    That table is one row per (lot, zone, column) like the envelopes. The
+    flattened columns take the row *governing* the lot - the grid column
+    `select_residential_column` chose, and failing that the zone covering most
+    of the parcel - while `zoning_envelopes` merges each entry with its own
+    row, so a reader solving one candidate gets the area left under that
+    column's margins rather than under the lot's governing ones. Two columns of
+    one grid legitimately state different margins, which is why the per-lot
+    number cannot stand in for both.
 
     All four arrive by LEFT JOIN, which is the whole design: a lot no building
     touches, a lot facing no street, a lot no document covers and a lot no
@@ -1188,6 +1753,8 @@ def compute_lot_profiles(
             "num_documents", "doc_id", "doc_url", "doc_title", "doc_source_table",
             "doc_pct_of_lot", "documents",
             "num_zoning_envelopes", "zoning_envelopes",
+            "buildable_area_m2", "buildable_pct_of_lot", "footprint_cap_m2",
+            "footprint_cap_binding", "side_setback_rule",
             "num_assessment_units", "num_shared_units", "num_units_by_point",
             "total_assessed_value", "total_assessed_value_apportioned",
             "roll_year",
@@ -1294,15 +1861,80 @@ def compute_lot_profiles(
               FROM applies a
              GROUP BY a.lot_uid
         ),
+        buildable_by_column AS (
+            -- `silver.lot_buildable_setbacks` at its own grain, as the object
+            -- each envelope entry is merged with below. One row per (lot,
+            -- zone, column), which is exactly the envelopes' grain, so this
+            -- cannot fan an entry out.
+            SELECT b.lot_number, b.feature_id, b.column_index,
+                   jsonb_build_object(
+                       'buildable_area_m2', b.buildable_area_m2,
+                       'buildable_pct_of_lot', b.buildable_pct_of_lot,
+                       'coverage_cap_m2', b.coverage_cap_m2,
+                       'footprint_cap_m2', b.footprint_cap_m2,
+                       'footprint_cap_binding', b.footprint_cap_binding,
+                       'side_setback_rule', b.side_setback_rule,
+                       'front_setback_m', b.front_setback_m,
+                       'secondary_front_setback_m', b.secondary_front_setback_m,
+                       'side_setback_m', b.side_setback_m,
+                       'rear_setback_m', b.rear_setback_m
+                   ) AS buildable
+              FROM silver.lot_buildable_setbacks b
+             WHERE b.neighborhood = %(neighborhood)s
+               AND b.scrape_date = %(scrape_date)s::date
+        ),
+        buildable_lot AS (
+            -- The same table narrowed to one row per lot, for the flattened
+            -- columns. The row taken is the column that governs the parcel -
+            -- the one `select_residential_column` chose - and failing that the
+            -- zone covering most of it, which is the same precedence
+            -- `zoning_envelopes` is ordered by. feature_id and column_index
+            -- only make the order total, so a re-run picks the same row twice.
+            SELECT DISTINCT ON (b.lot_number)
+                   b.lot_number,
+                   b.buildable_area_m2,
+                   b.buildable_pct_of_lot,
+                   b.footprint_cap_m2,
+                   b.footprint_cap_binding,
+                   b.side_setback_rule
+              FROM silver.lot_buildable_setbacks b
+             WHERE b.neighborhood = %(neighborhood)s
+               AND b.scrape_date = %(scrape_date)s::date
+               AND b.lot_number IS NOT NULL
+             ORDER BY b.lot_number,
+                      b.governs_residential DESC NULLS LAST,
+                      b.pct_of_lot DESC NULLS LAST,
+                      b.feature_id, b.column_index
+        ),
         envelopes AS (
             -- Keyed on lot_number, not lot_uid: see `_stage_lot_envelopes`.
             -- Ordered by the ordinal the caller staged, which is the order
             -- silver/lot_zoning_envelopes decided - the zone covering most of
             -- the lot first - rather than one re-derived from inside the jsonb.
+            --
+            -- Each entry is merged with its own buildable figures rather than
+            -- the lot's governing ones: a reader solving one candidate needs
+            -- the area left under *that* column's margins, and two columns of
+            -- one grid legitimately state different ones. The join reads
+            -- feature_id and column_index back out of the staged jsonb because
+            -- that is where the caller put them - the staging table carries
+            -- only the lot number and the order.
+            --
+            -- `||` on the right-hand side, so a key the buildable table
+            -- supplies wins over one of the same name already in the entry.
+            -- There are none today; if a margin column is ever flattened onto
+            -- both, this is the copy computed from the geometry.
             SELECT e.lot_number,
                    count(*) AS num_zoning_envelopes,
-                   jsonb_agg(e.envelope ORDER BY e.ordinal) AS zoning_envelopes
+                   jsonb_agg(
+                       e.envelope || COALESCE(b.buildable, '{}'::jsonb)
+                       ORDER BY e.ordinal
+                   ) AS zoning_envelopes
               FROM {envelope_staging} e
+              LEFT JOIN buildable_by_column b
+                     ON b.lot_number = e.lot_number
+                    AND b.feature_id = e.envelope ->> 'feature_id'
+                    AND b.column_index = (e.envelope ->> 'column_index')::integer
              GROUP BY e.lot_number
         )
         SELECT
@@ -1346,6 +1978,17 @@ def compute_lot_profiles(
             COALESCE(docs.documents, '[]'::jsonb),
             COALESCE(envelopes.num_zoning_envelopes, 0),
             COALESCE(envelopes.zoning_envelopes, '[]'::jsonb),
+            -- Not COALESCEd, unlike the envelope count above, and the same
+            -- split the frontage columns make: a lot whose zone published no
+            -- readable grid - or one with no frontage row to call a front edge
+            -- - had no buildable area computed, which is not a buildable area
+            -- of zero. A genuine 0 does appear on parcels narrower than twice
+            -- their side margin, and the two must not read alike.
+            buildable.buildable_area_m2,
+            buildable.buildable_pct_of_lot,
+            buildable.footprint_cap_m2,
+            buildable.footprint_cap_binding,
+            buildable.side_setback_rule,
             -- The counts COALESCE to 0 and the two totals do not, which is
             -- the same split the frontage columns above make: a lot no
             -- assessment unit stands on carries none, and that is a
@@ -1391,6 +2034,12 @@ def compute_lot_profiles(
         LEFT JOIN frontage ON frontage.lot_uid = l.lot_uid
         LEFT JOIN docs ON docs.lot_uid = l.lot_uid
         LEFT JOIN envelopes ON envelopes.lot_number = l.lot_number
+        -- One row per lot by construction (DISTINCT ON), so this cannot fan
+        -- the profile out - the same guarantee the assessment join below
+        -- relies on, arrived at by narrowing rather than by the source's own
+        -- primary key. Keyed on lot_number for the reason the envelopes are.
+        LEFT JOIN buildable_lot buildable
+               ON buildable.lot_number = l.lot_number
         -- No CTE, unlike the four above: silver.lot_assessed_values is
         -- already one row per lot - its primary key is (scrape_date,
         -- neighborhood, lot_number) - so there is nothing to group and this
@@ -1454,6 +2103,14 @@ def compute_lot_profiles(
                COALESCE(avg(primary_frontage_m) FILTER (WHERE num_frontages > 0), 0),
                count(*) FILTER (WHERE num_zoning_envelopes > 0),
                COALESCE(sum(num_zoning_envelopes), 0),
+               -- The setback join, from this side. A lot with envelopes but no
+               -- buildable area is one whose boundary could not be sorted, so
+               -- the gap between this and the count above is the frontage gap
+               -- carried forward - which is worth seeing on the gold asset and
+               -- not only on the silver one.
+               count(*) FILTER (WHERE buildable_area_m2 IS NOT NULL),
+               count(*) FILTER (WHERE footprint_cap_binding = 'setbacks'),
+               COALESCE(avg(buildable_pct_of_lot), 0),
                -- Read back rather than reported from what was handed in: what
                -- the asset says landed should be what actually did.
                max(overall_vacancy_rate_pct),
@@ -1499,6 +2156,9 @@ def compute_lot_profiles(
         mean_primary_frontage_m,
         with_envelopes,
         num_envelopes,
+        with_buildable,
+        bound_by_setbacks,
+        mean_buildable_pct,
         overall_vacancy_rate_pct,
         overall_average_rent_cad,
         underground_stall_cost_low_cad,
@@ -1542,6 +2202,12 @@ def compute_lot_profiles(
         "num_envelopes_staged": int(num_envelopes_staged),
         "num_zoning_envelopes": int(num_envelopes),
         "num_with_zoning_envelopes": int(with_envelopes),
+        "num_with_buildable_area": int(with_buildable),
+        # Of the lots that got one, how many are stopped by their margins
+        # rather than by *Taux d'implantation*. The number that says which norm
+        # actually shapes this borough.
+        "num_bound_by_setbacks": int(bound_by_setbacks),
+        "mean_buildable_pct_of_lot": float(mean_buildable_pct),
         "has_vacancy_rates": bool(vacancy_rates),
         "has_average_rents": bool(average_rents),
         "overall_vacancy_rate_pct": (
@@ -1695,6 +2361,46 @@ _LOT_FRONTAGE_COLUMNS = (
     "frontage_rank",
 )
 
+#: `silver.lot_buildable_setbacks`, minus its geometry, in the order a reader
+#: scans them: which lot and which column, how the boundary sorted, what was
+#: taken off it, and what was left.
+#:
+#: `lot_number`, `feature_id` and `column_index` are the trio that survives a
+#: reload - the same reasoning `_LOT_FRONTAGE_COLUMNS` gives - while `lot_uid`
+#: is a bigserial worth keeping only for a join back inside one partition.
+_LOT_BUILDABLE_COLUMNS = (
+    "lot_uid",
+    "lot_number",
+    "neighborhood",
+    "scrape_date",
+    "feature_id",
+    "column_index",
+    "source_table",
+    "lot_area_m2",
+    "front_edge_m",
+    "secondary_front_edge_m",
+    "side_edge_m",
+    "rear_edge_m",
+    "implantation_mode",
+    "side_setback_rule",
+    "side_margin_min_m",
+    "front_setback_m",
+    "secondary_front_setback_m",
+    "side_setback_m",
+    "rear_setback_m",
+    "buildable_area_m2",
+    "buildable_pct_of_lot",
+    "coverage_cap_m2",
+    "footprint_cap_m2",
+    "footprint_cap_binding",
+    "pct_of_lot",
+    "governs_residential",
+    "solver_ready",
+    "max_sin",
+    "segment_m",
+    "edge_tolerance_m",
+)
+
 #: `gold.lot_profiles`, minus its geometry, in the order a reader scans them:
 #: which lot, what stands on it, what it faces, what governs it.
 #:
@@ -1741,6 +2447,11 @@ _LOT_PROFILE_COLUMNS = (
     "documents::text AS documents",
     "num_zoning_envelopes",
     "zoning_envelopes::text AS zoning_envelopes",
+    "buildable_area_m2",
+    "buildable_pct_of_lot",
+    "footprint_cap_m2",
+    "footprint_cap_binding",
+    "side_setback_rule",
     "num_assessment_units",
     "num_shared_units",
     "num_units_by_point",
@@ -1823,6 +2534,29 @@ def fetch_lot_frontage(
         FROM silver.lot_frontage
         WHERE neighborhood = %s AND scrape_date = %s::date
         ORDER BY frontage_m DESC, lot_number, cote_rue_id
+        """,
+        [neighborhood, scrape_date],
+    )
+
+
+def fetch_lot_buildable_setbacks(
+    connection: "Connection", *, neighborhood: str, scrape_date: str
+) -> gpd.GeoDataFrame:
+    """This partition's `silver.lot_buildable_setbacks` rows, roomiest first.
+
+    Ordered by what is left of the lot rather than by the cadastre's own
+    numbering, the same choice `fetch_lot_frontage` makes and for the same
+    reason: this table is read for the top of that list - the parcels with the
+    most room to build on - and `gold.lot_profiles` is what a named lot is
+    looked up in.
+    """
+    return _fetch_partition(
+        connection,
+        _LOT_BUILDABLE_COLUMNS,
+        """
+        FROM silver.lot_buildable_setbacks
+        WHERE neighborhood = %s AND scrape_date = %s::date
+        ORDER BY footprint_cap_m2 DESC, lot_number, feature_id, column_index
         """,
         [neighborhood, scrape_date],
     )

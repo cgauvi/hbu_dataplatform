@@ -293,6 +293,8 @@ class GridColumn:
             floors_max=self.floors_max,
             levels=self.levels,
             floors_min=self.floors_min or 0,
+            height_min_m=self.height_min_m,
+            height_max_m=self.height_max_m,
             min_lot_width_m=self.min_lot_width_m,
             max_dwellings=self.max_dwellings,
             density_min=self.density_min,

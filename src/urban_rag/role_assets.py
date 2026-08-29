@@ -64,16 +64,33 @@ is triennial: every unit in a 2026 roll is valued as of the same reference
 date, so the totals compare across lots and do not track a market between
 rolls.
 
-**Only the last of the three has a Postgres table.** `lot_assessed_values`
-owns `silver.lot_assessed_values` (hbu_infra's
-sql/013_silver_lot_assessed_values.sql), like every other borough-scoped silver
-asset. `assessment_units` is a documented absence in
-`urban_rag.warehouse.TABLES`: every warehouse table is `PARTITION BY LIST
-(neighborhood)` and this is the one silver asset with no borough axis to
-supply one. Its record is the tree, which is where the record lives anyway.
+**Both silver assets have a Postgres table, and one of them fills several
+partitions at once.** `lot_assessed_values` owns `silver.lot_assessed_values`
+(hbu_infra's sql/013), and is borough-partitioned the ordinary way: it is
+materialized per borough and publishes the borough it was asked for.
+`assessment_units` owns `silver.assessment_units` (sql/014) and is not. The
+roll has no borough axis to be partitioned on - it is one publication for the
+province, merged once - so the asset stays date-partitioned and its parquet
+stays province-wide, and the borough each unit belongs to is read off the map:
+`assign_boroughs` puts every unit in the borough whose `reference_neighborhoods`
+boundary its point falls inside, and `warehouse.publish_by_neighborhood` upserts
+all of them in one transaction.
+
+That is the same cut `neighborhood_streets` makes on the island-wide geobase,
+made against points rather than lines, and it is why the tree and the table do
+not hold the same rows: the parquet carries every municipality
+`AssessmentRollConfig` kept, and the table carries the boroughs.
+`num_units_outside_every_borough` is the difference.
+
+The roll states a borough of its own - `arrond`, which is ``REM`` plus the
+`no_arr` the reference layer carries - and it is *not* what the table is
+partitioned on. Geometry decides, because that is what every other borough cut
+in this platform decides on; `num_units_arrond_disagrees` counts where the two
+publishers part company, so the choice is visible rather than assumed.
 """
 
 import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import geopandas as gpd
@@ -95,7 +112,13 @@ from urban_rag.frames import count_invalid_geometries, write_frame
 from urban_rag.infolot_assets import LOTS_FILE, neighborhood_lots
 from urban_rag.layers import key_prefix
 from urban_rag.open_data_assets import GROUP as OPEN_DATA_GROUP
-from urban_rag.partitions import date_partitions, scrape_partitions
+from urban_rag.open_data_assets import borough_boundary, reference_neighborhoods
+from urban_rag.partitions import (
+    ENABLED_NEIGHBORHOODS,
+    borough_code_for,
+    date_partitions,
+    scrape_partitions,
+)
 from urban_rag.rag.pgvector import PostgresUnavailable
 from urban_rag.resources import ParquetStore, PostgisResource, RoleResource
 from urban_rag.role_foncier import (
@@ -114,7 +137,12 @@ from urban_rag.role_foncier import (
     read_layer,
 )
 from urban_rag.storage import clear_parquet, join, storage_options
-from urban_rag.warehouse import MissingRelation, publish, published_metadata
+from urban_rag.warehouse import (
+    MissingRelation,
+    publish,
+    publish_by_neighborhood,
+    published_metadata,
+)
 
 #: Shared with `urban_rag.open_data_assets` rather than restated: both are
 #: municipal/provincial open-data portals read straight off a published URL,
@@ -172,6 +200,16 @@ PROVENANCE_COLUMNS = (
     "scrape_date",
     "scraped_at",
 )
+
+#: The borough the point layer says a unit is in: ``REM`` followed by the
+#: two-digit `no_arr` the reference-neighborhood layer carries, so ``REM25`` is
+#: VSMPE. Not what `silver.assessment_units` is partitioned on - that borough
+#: is the one whose boundary the point falls inside, the same cut every other
+#: borough-scoped asset here makes - but it is the publisher's own answer to
+#: the same question, and `assign_boroughs` counts where the two disagree
+#: rather than assuming they never do.
+ARROND_COLUMN = "arrond"
+ARROND_PREFIX = "REM"
 
 SOURCE_URL = "https://donneesouvertes.affmunqc.net/role/"
 
@@ -369,21 +407,22 @@ def property_assessment_roll(
 @asset(
     key_prefix=key_prefix("assessment_units"),
     partitions_def=date_partitions,
-    deps=[property_assessment_roll],
+    deps=[property_assessment_roll, reference_neighborhoods],
     group_name=SILVER_GROUP,
-    kinds={"geoparquet"},
+    kinds={"postgres", "geoparquet"},
     description=(
         "Every assessment unit as one row: its point, and the characteristics "
         "the roll describes it by - assessed values, floor area, storeys, year "
         "built, dwellings, use code. The two bronze files merged on "
         f"{JOIN_KEY}, which is what the publisher splits them by. Written to "
-        f"silver/assessment_units/<YYYY-MM-DD>/{ASSESSMENT_UNITS_FILE}. As "
-        "wide as the bronze snapshot - the roll has no borough axis, and the "
-        "borough cut happens against the cadastre one asset later."
+        f"silver/assessment_units/<YYYY-MM-DD>/{ASSESSMENT_UNITS_FILE} as wide "
+        "as the bronze snapshot, and upserted into silver.assessment_units on "
+        "(scrape_date, neighborhood, id_provinc) - one borough partition per "
+        "enabled borough, holding the units whose point falls inside it."
     ),
 )
 def assessment_units(
-    context: AssetExecutionContext, store: ParquetStore
+    context: AssetExecutionContext, store: ParquetStore, postgis: PostgisResource
 ) -> MaterializeResult:
     scrape_date = context.partition_key
     bronze_dir = store.partition_dir(
@@ -433,6 +472,39 @@ def assessment_units(
         context.log.info("Removed %d file(s) from a previous run", len(removed))
     path = write_frame(merged, join(output_dir, ASSESSMENT_UNITS_FILE))
 
+    # The parquet stays province-wide and the table does not: the borough is
+    # assigned from where each point falls, and every enabled borough is a
+    # partition published out of this one date partition. Published after the
+    # file is written, the posture every silver asset here takes - the roll is
+    # a 572 MB download and a merge over 437 thousand rows, so a database that
+    # is down should cost the load rather than the merge.
+    cut = assign_boroughs(store, merged, scrape_date=scrape_date)
+    if not cut.frames:
+        # The same refusal `neighborhood_streets` makes when nothing intersects
+        # the borough, and for the same reason: silver is the layer that is
+        # allowed to refuse, and a run that published no borough at all is a
+        # boundary that did not load rather than a province with no properties
+        # in it. The parquet is already written, so the re-run costs the merge
+        # and not the download.
+        raise Failure(
+            f"{path} was written, but no assessment unit fell inside any of "
+            f"{', '.join(ENABLED_NEIGHBORHOODS)} for {scrape_date}. The "
+            "outlines in reference_neighborhoods may be empty for that date."
+        )
+
+    try:
+        loaded = publish_by_neighborhood(
+            postgis.connect,
+            "assessment_units",
+            cut.frames,
+            scrape_date=scrape_date,
+        )
+    except (PostgresUnavailable, MissingRelation) as exc:
+        raise Failure(
+            f"{path} was written, but silver.assessment_units could not be "
+            f"updated for {scrape_date}: {exc}"
+        ) from exc
+
     # A unit with a point and no characteristics is a property with no value on
     # it; one with characteristics and no point is a property that cannot be put
     # on a lot. Both are dropped by the inner merge, so both are counted here.
@@ -441,13 +513,16 @@ def assessment_units(
     total_value = float(merged[VALUE_COLUMN].sum())
     context.log.info(
         "%s: %d unit(s) merged from %d point(s) and %d characteristics row(s), "
-        "$%.1fB assessed -> %s",
+        "$%.1fB assessed -> %s; %d in %d borough(s), %d outside every one",
         scrape_date,
         len(merged),
         len(points),
         len(units),
         total_value / 1e9,
         path,
+        cut.placed,
+        len(cut.frames),
+        cut.outside,
     )
 
     return MaterializeResult(
@@ -462,7 +537,16 @@ def assessment_units(
             "total_assessed_value_billions": round(total_value / 1e9, 2),
             "num_invalid_geometries": count_invalid_geometries(merged),
             "roll_year": int(merged["roll_year"].iloc[0]),
+            "num_units_in_a_borough": cut.placed,
+            # Every unit the province publishes for a municipality this
+            # pipeline does not partition, plus the handful whose point falls
+            # outside every enabled boundary. Not an error - the table is the
+            # boroughs' - but it is the number that says how much of the
+            # parquet the table does not carry.
+            "num_units_outside_every_borough": cut.outside,
+            "num_units_arrond_disagrees": cut.arrond_mismatch,
             "output_path": MetadataValue.path(str(path)),
+            **published_metadata(loaded),
         }
     )
 
@@ -740,6 +824,110 @@ _PAIR_COLUMNS = (
     "shared",
     "by_point",
 )
+
+
+@dataclass(frozen=True)
+class BoroughCut:
+    """One province-wide merge, cut into the borough partitions it publishes.
+
+    ``frames`` is keyed by neighborhood partition key, and a borough that no
+    unit fell in is simply absent rather than an empty frame - an empty frame
+    would upsert nothing and prune the whole partition, which is the right
+    answer for a borough whose units really have gone and the wrong one for a
+    boundary that failed to load.
+
+    The three counts are what makes the cut readable back. ``placed`` and
+    ``outside`` add up to the merge, and ``arrond_mismatch`` is the cross-check
+    against the roll's own `arrond`.
+    """
+
+    frames: dict[str, gpd.GeoDataFrame]
+    placed: int
+    outside: int
+    arrond_mismatch: int
+
+
+def assign_boroughs(
+    store: ParquetStore, units: gpd.GeoDataFrame, *, scrape_date: str
+) -> BoroughCut:
+    """Put every unit in the borough its point falls inside.
+
+    The roll is one publication for the province and `assessment_units` merges
+    it once, so this is where the island is cut into partitions - the same
+    hinge `neighborhood_streets` turns on for the island-wide geobase, and for
+    the same reason: one download serves every borough, and re-reading it per
+    borough would be work done for nothing.
+
+    A spatial join rather than 17 `within` passes, so the units' own index does
+    the work; the boundaries come from `reference_neighborhoods` for the same
+    scrape date, which is what every other borough cut in this platform is
+    taken against.
+
+    **`intersects`, not `within`.** A unit whose point lands exactly on the
+    borough line belongs to that borough rather than to none. Two boroughs
+    cannot both claim it in practice - the published outlines do not overlap -
+    and if they ever did, the unit would be a row in each partition, which is
+    what the partition key already means.
+
+    A unit that falls in no enabled borough is dropped, and counted. Most of
+    them are the point of the count: with `CODE_MUN='[]'` the merge is the
+    whole province, and this table is the boroughs'.
+    """
+    boroughs = gpd.GeoDataFrame(
+        {"neighborhood": list(ENABLED_NEIGHBORHOODS)},
+        geometry=[
+            borough_boundary(store, scrape_date, name)
+            for name in ENABLED_NEIGHBORHOODS
+        ],
+        crs=units.crs,
+    )
+    joined = gpd.sjoin(units, boroughs, how="inner", predicate="intersects")
+    # `neighborhood` is the only thing wanted from the right-hand side. The
+    # bookkeeping column sjoin carries the right index across in is dropped by
+    # what it is *not* rather than by its name - the name is a geopandas
+    # detail, and anything left over would land in the jsonb catch-all as a
+    # column no reader of the table could account for.
+    placed = joined.drop(
+        columns=[
+            name
+            for name in joined.columns
+            if name not in set(units.columns) and name != "neighborhood"
+        ]
+    )
+    frames = {
+        str(name): frame.copy()
+        for name, frame in placed.groupby("neighborhood", sort=False)
+    }
+    # Counted distinctly rather than as `len(placed)`: a unit on a borough line
+    # that two outlines both claimed is two rows in two partitions and one
+    # property, and `placed + outside` has to be the merge.
+    inside = int(placed[JOIN_KEY].nunique())
+    return BoroughCut(
+        frames=frames,
+        placed=inside,
+        outside=len(units) - inside,
+        arrond_mismatch=_arrond_mismatches(frames),
+    )
+
+
+def _arrond_mismatches(frames: dict[str, gpd.GeoDataFrame]) -> int:
+    """Units the roll files under a borough other than the one they fell in.
+
+    Zero is the expected answer and is worth having said: the roll's `arrond`
+    and the city's published outlines are two agencies' answers to one
+    question, and a partition where they part company is a boundary that moved
+    or a point that is in the wrong place - either way something to look at
+    rather than something to average over. Counted and never acted on; the
+    geometry decides, because that is what the rest of the platform cuts on.
+    """
+    total = 0
+    for neighborhood, frame in frames.items():
+        if ARROND_COLUMN not in frame.columns:
+            continue
+        expected = f"{ARROND_PREFIX}{borough_code_for(neighborhood)}"
+        stated = frame[ARROND_COLUMN]
+        total += int((stated.notna() & (stated != expected)).sum())
+    return total
 
 
 def lot_key(number) -> str | None:

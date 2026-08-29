@@ -59,6 +59,25 @@ completes the question this table exists for - `overall_average_rent_cad` is
 what a building earns, `construction_costs` is what it costs to put up, and
 `total_assessed_value` is what the ground is already worth standing as it is.
 
+**How much of the lot may actually be built on arrives from a table too, and
+is read at two grains from the one source.** `silver.lot_buildable_setbacks` is
+what is left of a parcel once its zone's four margins are subtracted, at the
+grain the grid states them: one row per (lot, zone, column). The flattened
+`buildable_area_m2` / `footprint_cap_m2` pair takes the row *governing* the lot,
+while each entry of `zoning_envelopes` is merged with its *own* row - two
+columns of one grid legitimately state different margins, so the per-lot number
+cannot stand in for the per-column ones a solver needs. NULL rather than 0
+where nothing was computed, the same rule the frontage measures follow: a lot
+whose zone published no readable grid, and one with no frontage row to call a
+front edge, were not measured rather than measured at nothing. A buildable area
+*of* zero is a real answer and does occur, on parcels narrower than twice their
+side margin.
+
+`footprint_cap_m2` is the number a solver wants, and it is the lesser of that
+envelope and *Taux d'implantation au sol max* x lot area. The two are
+independent caps - the margins say where on the lot, the coverage says how much
+of it - and `footprint_cap_binding` names which one bound.
+
 **There are two totals and they answer different questions**, which is why both
 travel. `total_assessed_value` counts each unit whole on every lot it covers -
 right for "what is the property on this lot worth", wrong to SUM() across a
@@ -189,6 +208,7 @@ from urban_rag.rag.pgvector import PostgresUnavailable
 from urban_rag.rag_assets import document_index
 from urban_rag.resources import ParquetStore, PostgisResource
 from urban_rag.role_assets import lot_assessed_values
+from urban_rag.setback_assets import lot_buildable_setbacks
 from urban_rag.storage import clear_parquet, filesystem, join, storage_options
 
 GROUP = "gold_lots"
@@ -339,6 +359,12 @@ class LotProfilesConfig(Config):
         lot_frontage,
         document_index,
         lot_zoning_envelopes,
+        # Read out of Postgres rather than from the tree, unlike the envelopes
+        # beside it: it is one row per (lot, zone, column) there already, which
+        # is both grains this asset needs it at - narrowed to the governing row
+        # for the flattened columns, and joined entry by entry into the
+        # zoning_envelopes array. See `compute_lot_profiles`.
+        lot_buildable_setbacks,
         # Partitioned by (neighborhood, date) like this asset, so it needs no
         # mapping - unlike the two cost snapshots below. The join is a plain
         # LEFT JOIN in SQL, so a partition whose roll has not landed still
@@ -375,7 +401,8 @@ class LotProfilesConfig(Config):
         "row carries. Three more JSON columns collapse the rest of the "
         "lineage onto the same row: zoning_envelopes is this lot's "
         "lot_zoning_envelopes rows - every grid column that governs it, with "
-        "the norms it states - and vacancy_rates/average_rents are the "
+        "the norms it states and the buildable area left under that column's "
+        "own margins - and vacancy_rates/average_rents are the "
         "borough's CMHC survey, with the all/all cell flattened into "
         "overall_vacancy_rate_pct and overall_average_rent_cad. What the "
         "ground is assessed at comes from silver.lot_assessed_values, joined "
@@ -383,7 +410,13 @@ class LotProfilesConfig(Config):
         "summed over the units standing on the lot - null, not zero, where "
         "none do - with total_assessed_value_apportioned as the one that may "
         "be summed across lots, and num_assessment_units beside them because "
-        "a condominium's common-parts lot carries one unit per apartment. A "
+        "a condominium's common-parts lot carries one unit per apartment. How "
+        "much of it may be built on comes from "
+        "silver.lot_buildable_setbacks at the grid column governing the lot: "
+        "buildable_area_m2 is what is left once the zone's four margins are "
+        "subtracted, and footprint_cap_m2 is that or Taux d'implantation au "
+        "sol max x lot area, whichever is smaller, with footprint_cap_binding "
+        "naming which one bound. A "
         "fourth, "
         "construction_costs, is Montreal's column of the Altus cost guide: "
         "the underground and integrated ground-level parking rates flattened "
@@ -516,7 +549,8 @@ def lot_profiles(
     context.log.info(
         "%s %s: %d lot(s) profiled - %d built on, %d with frontage "
         "(%d on two streets), %d with a document, %d with a zoning envelope "
-        "(%d in all); %s at <= %.0f m2 -> %s",
+        "(%d in all), %d with a buildable area (mean %.1f pct of lot, %d "
+        "bound by margins); %s at <= %.0f m2 -> %s",
         neighborhood,
         scrape_date,
         profiles,
@@ -526,6 +560,9 @@ def lot_profiles(
         int(result["num_with_documents"]),
         int(result["num_with_zoning_envelopes"]),
         int(result["num_zoning_envelopes"]),
+        int(result["num_with_buildable_area"]),
+        result["mean_buildable_pct_of_lot"],
+        int(result["num_bound_by_setbacks"]),
         ", ".join(f"{name}={by_category[name]}" for name in LOT_CATEGORIES),
         config.max_built_area_m2,
         path,
@@ -599,6 +636,21 @@ def lot_profiles(
             "num_without_zoning_envelopes": profiles
             - int(result["num_with_zoning_envelopes"]),
             "num_zoning_envelopes": int(result["num_zoning_envelopes"]),
+            # The setback join, from this side. The gap between this and
+            # num_with_zoning_envelopes is lots that had margins to subtract
+            # and no measured front edge to sort a boundary against - the
+            # frontage gap carried forward, which lot_buildable_setbacks
+            # reports as num_lots_without_frontage from its own side.
+            "num_with_buildable_area": int(result["num_with_buildable_area"]),
+            "num_without_buildable_area": profiles
+            - int(result["num_with_buildable_area"]),
+            # Of the lots that got one, how many are stopped by their margins
+            # rather than by Taux d'implantation. The number that says which
+            # norm actually shapes this borough.
+            "num_bound_by_setbacks": int(result["num_bound_by_setbacks"]),
+            "mean_buildable_pct_of_lot": round(
+                result["mean_buildable_pct_of_lot"], 1
+            ),
             # The assessment join. A lot with no value is a lane, a park or a
             # city parcel and a few percent is the honest reading; a third of
             # the borough means the roll and the cadastre disagree about where

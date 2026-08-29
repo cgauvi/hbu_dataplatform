@@ -22,6 +22,7 @@ the failure comes at execution time with a message that names nothing.
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 
 import geopandas as gpd
 import numpy as np
@@ -199,21 +200,25 @@ def test_every_table_is_in_the_schema_its_asset_layer_names():
         assert table.qualified == f"{table.schema}.{table.name}"
 
 
-def test_the_registry_covers_every_silver_and_gold_asset_but_the_three_named():
-    """The three documented absences, and why each one is not a gap.
+def test_the_registry_covers_every_silver_and_gold_asset_but_the_two_named():
+    """The two documented absences, and why neither one is a gap.
 
-    `document_embeddings` and `document_index` publish to rag.chunks;
-    `assessment_units` has no borough axis to partition a table by. All three
-    are argued for in the comment above `TABLES`, so this test is what keeps a
-    *fourth* absence from arriving quietly when an asset is added.
+    `document_embeddings` and `document_index` both publish to rag.chunks - the
+    vectors are in Postgres, in the index every reader of the corpus queries,
+    and a silver copy of them would be a second copy of the only thing in this
+    platform measured in gigabytes. Both are argued for in the comment above
+    `TABLES`, so this test is what keeps a *third* absence from arriving
+    quietly when an asset is added.
+
+    `assessment_units` used to be a third, on the grounds that the roll has no
+    borough axis. It has a table now: the borough is the one whose boundary the
+    unit's point falls inside, assigned by `role_assets.assign_boroughs`, and
+    one date partition publishes every borough through
+    `publish_by_neighborhood`.
     """
     published = {table.asset for table in warehouse.TABLES.values()}
     declared = set(assets_in(Layer.SILVER)) | set(assets_in(Layer.GOLD))
-    assert declared - published == {
-        "assessment_units",
-        "document_embeddings",
-        "document_index",
-    }
+    assert declared - published == {"document_embeddings", "document_index"}
 
 
 def test_the_conflict_target_is_the_partition_then_the_natural_key():
@@ -606,3 +611,145 @@ def test_a_computed_partition_is_staged_before_it_is_merged():
         issued[merged]
     )
     assert result["copied"] == 0
+
+
+# -- one dataset, several borough partitions -------------------------------
+
+#: `silver.assessment_units` as `_target_columns` reads it back - see
+#: hbu_infra's sql/014. The table with by far the longest column map, because
+#: the roll names its fields by MAMH code and only the read ones get a name.
+ASSESSMENT_UNIT_COLUMNS = [
+    "scrape_date",
+    "neighborhood",
+    "id_provinc",
+    "code_mun",
+    "mat18",
+    "arrond",
+    "use_code",
+    "frontage_m",
+    "land_area_m2",
+    "num_storeys",
+    "year_built",
+    "floor_area_m2",
+    "num_dwellings",
+    "num_nonresidential_units",
+    "num_rental_rooms",
+    "land_value",
+    "building_value",
+    "assessed_value",
+    "roll_year",
+    "attributes",
+    "geom",
+    "loaded_at",
+]
+
+
+def units(**overrides) -> gpd.GeoDataFrame:
+    """Assessment units as `assessment_units` merges them, MAMH codes and all."""
+    frame = {
+        "id_provinc": ["66023" + "1" * 18],
+        "arrond": ["REM25"],
+        "rl0404a": [735200.0],
+        "rl0402a": [247700],
+        "rl0403a": [487500],
+        "rl0307a": ["1922"],
+        # A code with no column of its own, which is most of them.
+        "rl0405a": [693600],
+        "neighborhood": [NEIGHBORHOOD],
+        "scrape_date": [DATE],
+    }
+    frame.update(overrides)
+    return gpd.GeoDataFrame(frame, geometry=[box(0, 0, 1, 1).centroid], crs="EPSG:4326")
+
+
+def connect_to(cursor):
+    """`PostgisResource.connect`, reduced to the connections it hands out.
+
+    Returned alongside the list so a test can assert on *how many* there were:
+    one connection is one transaction, which is the whole claim
+    `publish_by_neighborhood` makes.
+    """
+    opened: list[object] = []
+
+    @contextmanager
+    def connect():
+        connection = FakeConnection(cursor)
+        opened.append(connection)
+        yield connection
+
+    return connect, opened
+
+
+def test_the_rolls_mamh_codes_are_mapped_and_the_rest_land_in_attributes():
+    """`rl0404a` is a name only if something writes one down; the rest survive.
+
+    The alternative to the map is 40-odd columns nobody reads, or a table that
+    needs a migration every time the province adds a field to the roll.
+    """
+    cursor = FakeCursor(columns=ASSESSMENT_UNIT_COLUMNS, upserted=1)
+
+    upsert(cursor, units(), dataset="assessment_units")
+
+    row = copied(cursor)[0]
+    assert row["assessed_value"] == "735200"
+    assert row["land_value"] == "247700"
+    assert row["building_value"] == "487500"
+    assert row["year_built"] == "1922"
+    # The roll's own borough travels as an ordinary column - it is a
+    # cross-check, and it is not what the row is partitioned on.
+    assert row["arrond"] == "REM25"
+    assert json.loads(row["attributes"]) == {"rl0405a": 693600}
+
+
+def test_one_date_partition_publishes_every_borough_in_one_transaction():
+    """What a province-wide silver asset needs, and the mirror of `publish`.
+
+    Quebec publishes one assessment roll, `assessment_units` merges it once
+    under one date partition, and the borough a unit belongs to is a property
+    of where its point falls - so one materialization has several borough
+    partitions to write, and a reader querying across boroughs should not see
+    half of each.
+    """
+    cursor = FakeCursor(columns=ASSESSMENT_UNIT_COLUMNS, upserted=1)
+    connect, opened = connect_to(cursor)
+
+    result = warehouse.publish_by_neighborhood(
+        connect,
+        "assessment_units",
+        {NEIGHBORHOOD: units(), "PMR": units()},
+        scrape_date=DATE,
+    )
+
+    assert len(opened) == 1
+    assert set(result) == {NEIGHBORHOOD, "PMR"}
+    ensured = [
+        params for statement, params in cursor.statements
+        if "ensure_partition" in statement
+    ]
+    assert [borough for _, borough, _ in ensured] == [NEIGHBORHOOD, "PMR"]
+
+
+def test_each_borough_is_pruned_against_its_own_frame_alone():
+    """A unit that moved boroughs leaves the one it left, not the one it joined.
+
+    The prune is what keeps a partition a snapshot, and a prune that ran over
+    the table rather than over the partition would empty every borough but the
+    last one written on every load.
+    """
+    cursor = FakeCursor(columns=ASSESSMENT_UNIT_COLUMNS, upserted=1, pruned=3)
+    connect, _ = connect_to(cursor)
+
+    warehouse.publish_by_neighborhood(
+        connect,
+        "assessment_units",
+        {NEIGHBORHOOD: units(), "PMR": units()},
+        scrape_date=DATE,
+    )
+
+    deletes = [
+        (statement, params) for statement, params in cursor.statements
+        if statement.startswith("DELETE FROM")
+    ]
+    assert [params[0] for _, params in deletes] == [NEIGHBORHOOD, "PMR"]
+    for statement, _ in deletes:
+        assert "t.neighborhood = %s AND t.scrape_date = %s::date" in statement

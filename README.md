@@ -60,12 +60,13 @@ re-scrape, which for a live municipal source no later run can undo.
 | silver | `vacancy_rates` | date × neighborhood | That borough's quartiers taken out of the snapshot and averaged into one rate per dwelling type × bedroom class — as parquet and as `silver.vacancy_rates`, with the quartier rows behind it in `silver.quartier_vacancy_rates` |
 | silver | `average_rents` | date × neighborhood | The same, per bedroom class, for rents — `silver.average_rents` and `silver.quartier_average_rents` |
 | silver | `building_lot_intersections` | date × neighborhood | Both spatial joins, computed against one load of the cadastre — repaired on the way in, which is where `make_valid` runs: building footprints clipped to the lots they intersect (`silver.building_lot_intersections`) and map features clipped to the lots they cover (`silver.lot_features`, the hop from a lot to its documents), as two geoparquet files |
-| silver | `assessment_units` | date | The roll's two layers put back together on `id_provinc` — one row per assessment unit, its point and everything the roll says about it. The one silver asset with **no table**: it has no borough axis to partition one by |
+| silver | `assessment_units` | date | The roll's two layers put back together on `id_provinc` — one row per assessment unit, its point and everything the roll says about it. Province-wide as parquet, and as `silver.assessment_units` cut into **one partition per borough** by where each unit's point falls: the one asset that publishes partitions it was not asked for, because the roll has no borough axis of its own |
 | silver | `lot_assessed_values` | date × neighborhood | What every lot in the borough is assessed at: the units the roll's own cadastre crosswalk puts on it (and, for the condos it cannot place, the ones whose point falls in it), summed on `rl0404a` both whole and apportioned — as geoparquet and as `silver.lot_assessed_values` |
 | silver | `neighborhood_streets` | date × neighborhood | That day's street sides clipped to one borough, with the published length, the length inside it, and the share that survived the cut — as geoparquet and as `silver.neighborhood_streets` |
 | silver | `lot_frontage` | date × neighborhood | How much of each lot's boundary faces each street side, in metres, longest first — as geoparquet and as `silver.lot_frontage`. **Blocked**, see below |
 | silver | `zoning_grid_columns` | date × neighborhood | Those PDFs read as the tables they are — one row per column of each *grille des usages et des normes*, with its usages, authorised levels and every norm of its CADRE BÂTI block as columns — as parquet and as `silver.zoning_grid_columns` |
 | silver | `lot_zoning_envelopes` | date × neighborhood | Every lot's zoning envelope, denormalised to the grain `urban_rag.program` reads — one row per (lot, grid column), with the lot's area, its primary and secondary frontage, and the norms that bound what may be built on it — as parquet and as `silver.lot_zoning_envelopes` |
+| silver | `lot_buildable_setbacks` | date × neighborhood | What is left of each lot once its zone's four margins are subtracted — one row per (lot, zone, grid column), with the boundary sorted into front, sides and rear and each buffered by the margin that governs it. `footprint_cap_m2` is that envelope or *Taux d'implantation au sol max* × lot area, whichever is smaller — as geoparquet and as `silver.lot_buildable_setbacks`. **Blocked**, see below |
 | silver | `document_chunks` | date × neighborhood | Those documents cut into retrieval-sized chunks — as parquet and as `silver.document_chunks` |
 | silver | `document_embeddings` | date × neighborhood | A bge-m3 vector per chunk. The one silver asset with no table of its own: its vectors' home is the pgvector index `document_index` writes |
 | gold | `lot_profiles` | date × neighborhood | Every lot in the borough, one row each — whether a building stands on it and how many, its primary and secondary street frontage in metres, the zoning PDF that covers most of it, the zoning envelopes that govern it, and the borough's CMHC vacancy and rent grids — as geoparquet and as `gold.lot_profiles`. **Blocked**, see below |
@@ -119,6 +120,67 @@ the way past, so it needs `sql/007_silver_streets.sql` applied too — and it is
 still scheduled normally, since that file has no `-- requires:` header and lands
 on the first `db.py init`.
 
+`lot_buildable_setbacks` is blocked for the same reason again —
+`sql/015_silver_lot_buildable_setbacks.sql` has to be applied first — and has
+the same shape of fix: registered, given a job, run by hand with `make
+setbacks`. It sits behind both `lot_frontage` and the envelope pair, since one
+supplies the street edge it sorts a boundary against and the other the margins
+it subtracts, so whoever schedules the three schedules them in that order.
+
+### What `lot_buildable_setbacks` measures, and why it is not a rectangle
+
+The zoning grid states four margins — *Avant principale*, *Avant secondaire*,
+*Latérale*, *Arrière* — and `lot_zoning_envelopes` has carried all four since
+they were first parsed with nothing subtracting them. `urban_rag.program` caps
+a footprint on *Taux d'implantation au sol* alone, so a deep mid-block lot and
+a shallow one of the same area have been solving identically. They are not the
+same site.
+
+Two shortcuts suggest themselves and both are wrong. `ST_Buffer(lot, -d)`
+shrinks every edge by the same `d`, and margins are four distances at four
+edges. Estimating a depth as `area / frontage` and multiplying out
+`(width − 2·side) × (depth − front − rear)` is exact for a rectangle and wrong
+for the wedges, dog-legs and skewed rear lines a real cadastre is full of —
+and both inputs to the honest version are already here: the polygon in
+`rag.lots`, the street edge in `silver.lot_frontage`.
+
+So the subtraction is directional. The boundary is sorted into four classes,
+each is buffered by the margin that governs it, and the union is differenced
+out of the parcel. The front is what `lot_frontage` *measured*, not an edge
+guessed at from the parcel's shape; of what is left, a piece running within 45°
+of parallel to that front is rear and everything else is side. That test is
+`compute_lot_frontage`'s own parallel test pointed at a different reference
+line, which is why the two share one constant.
+
+**The mode moves the answer more than any single margin does.** *Mode
+d'implantation* decides whether the side margin applies at all — a contiguous
+building is built to the party line and has none — and VSMPE's grids print
+`I-J` and `I-J-C`, where the `C` is exactly that permission. The most
+permissive mode a column allows is the one applied, because the table answers
+what *may* be built:
+
+| mode permitted | `side_setback_rule` | side setback |
+|---|---|---|
+| contigu (`C`) | `contigu` | 0 — both lines are party lines |
+| jumelé (`J`) | `jumele` | half the margin off each side, which removes what a whole margin off one side does |
+| otherwise | `isole` / `unknown` | the full margin, both sides |
+
+Subtracting the printed *Latérale* from both sides of every lot in a borough of
+plexes would understate most of the stock — on the 476 m² test parcel it is the
+difference between 309 m² and 385 m² of buildable area. `side_setback_rule`
+records which reading produced a row and `side_margin_min_m` carries what the
+grid printed, so a number can always be read back against the rule behind it.
+
+`footprint_cap_m2` is the lesser of that envelope and *Taux d'implantation au
+sol max* × lot area, and `footprint_cap_binding` names which of the two bound.
+They are independent caps — one says where on the lot, the other how much of it
+— and a building satisfies both. A borough whose rows mostly read `setbacks` is
+one shaped by its margins rather than by its coverage.
+
+A lot with no frontage row gets no row here: there is no edge to call the front,
+so the angle test has no reference. The asset reports the count rather than
+leaving it to be noticed.
+
 ## The silver and gold tables
 
 Every silver and gold dataset has one table, in the schema its layer is named
@@ -161,7 +223,9 @@ DO UPDATE SET ...
 | `silver.document_chunks` | `chunk_id` |
 | `silver.zoning_grid_columns` | `source_table`, `feature_id`, `column_index` |
 | `silver.lot_zoning_envelopes` | `lot_uid`, `feature_id`, `column_index` |
+| `silver.lot_buildable_setbacks` | `lot_uid`, `feature_id`, `column_index` |
 | `silver.lot_assessed_values` | `lot_number` |
+| `silver.assessment_units` | `id_provinc` |
 | `gold.lot_profiles` | `lot_number` |
 
 **A write is an upsert, and a partition is still a snapshot.** The frame is
@@ -196,7 +260,15 @@ having moved under the partition.
 Those PostGIS joins take the same road by a different door. Their rows are
 computed in the database and never pass through Python, so they go through
 `warehouse.upsert_select` instead: the statement lands in the same staging
-table, and the same upsert and prune run over it. See
+table, and the same upsert and prune run over it.
+
+One asset writes a partition it was not asked for, and it is the third door.
+`assessment_units` merges a publication that has no borough axis at all — one
+provincial roll, one date partition — so it hands `publish_by_neighborhood` a
+frame *per borough*, cut by where each unit's point falls, and every one of
+them is upserted in a single transaction. Each borough is still pruned against
+its own frame alone, so a unit that moved across a borough line between scrapes
+leaves the partition it left and not the one it joined. See
 [`src/urban_rag/warehouse.py`](src/urban_rag/warehouse.py).
 
 ## Output layout
@@ -499,7 +571,16 @@ away.
 
 The result is as wide as the bronze snapshot — the roll has no borough axis, so
 this asset is partitioned by **date alone**, like `street_network` and the two
-CMHC surveys. The borough cut happens one asset later, against the cadastre.
+CMHC surveys, and the parquet it writes stays province-wide.
+
+There are then *two* borough cuts downstream of it, and they answer different
+questions. `lot_assessed_values`, one asset later, cuts against the **cadastre**
+— which lot is this unit's value counted on. `silver.assessment_units` cuts
+against the **borough outline** — which borough is this unit in — and that one
+happens inside this asset, on the way to Postgres, because a table partitioned
+by borough needs a borough and the roll supplies none. See
+[Both have a table](#both-have-a-table-and-one-of-them-fills-several-partitions-at-once)
+below.
 
 ### The lot join is by lot number, with the point as a fallback
 
@@ -591,7 +672,7 @@ same reason and made visible the same way.
 > same reference date. The totals compare across lots; they do not track a
 > market between rolls.
 
-### Only one of the two has a table
+### Both have a table, and one of them fills several partitions at once
 
 `lot_assessed_values` owns `silver.lot_assessed_values`
 (`sql/013_silver_lot_assessed_values.sql`), like every other borough-scoped
@@ -601,14 +682,41 @@ cadastre's other columns in the jsonb catch-all, upserted then pruned by
 header, so it lands on the first `db.py init` and the asset is scheduled
 normally.
 
-`assessment_units` is a **documented absence** in `warehouse.TABLES`, alongside
-`document_embeddings` and `document_index`. Every warehouse table is
-`PARTITION BY LIST (neighborhood)` and keyed `(scrape_date, neighborhood, …)`;
-this is the one silver asset with no borough axis to supply one, and inventing
-a neighborhood — a literal, or a borough read off `arrond` — would be a
-partition key meaning something different from every other table's. Its record
-is the tree, which is where the record lives anyway. `test_warehouse.py` asserts
-those three and only those three, so a fourth absence cannot arrive quietly.
+`assessment_units` owns `silver.assessment_units`
+(`sql/014_silver_assessment_units.sql`) and is the one asset in the platform
+that does **not** publish the partition it was asked for. The roll has no
+borough axis — it is one publication for the province, merged once — so the
+asset stays partitioned by date and its parquet stays province-wide, and the
+borough is read off the map instead: `assign_boroughs` puts every unit in the
+borough whose `reference_neighborhoods` outline its point falls inside, and
+`warehouse.publish_by_neighborhood` upserts all of them in one transaction.
+
+That is the same cut `neighborhood_streets` makes on the island-wide geobase,
+made against points rather than lines — and it is why **the tree and the table
+do not hold the same rows**. The parquet carries every municipality
+`municipality_codes` kept (the whole province with `CODE_MUN='[]'`); the table
+carries the boroughs. `num_units_outside_every_borough` is the difference, and
+it is a count rather than an error — Westmount and Laval file rolls too and are
+not boroughs. A run in which *no* unit fell in any enabled borough fails
+instead, the same refusal `neighborhood_streets` makes: that is a boundary that
+did not load, not a province with no properties in it.
+
+The roll does state a borough of its own — `arrond`, which is `REM` plus the
+`no_arr` the reference layer carries. It travels as an ordinary column and is
+never partitioned on: geometry is what the rest of this platform cuts on, so
+geometry decides here too, and `num_units_arrond_disagrees` counts where the
+two publishers part company so the choice stays visible.
+
+The roll names its fields by MAMH code, so `warehouse.TABLES` carries by far
+its longest column map — `rl0404a` → `assessed_value`, `rl0308a` →
+`floor_area_m2`, and a dozen more. The forty-odd codes nothing reads land in
+`attributes`, where a reader who knows the code can still reach them and a roll
+that gains a field needs no migration.
+
+The only remaining **documented absences** in `warehouse.TABLES` are
+`document_embeddings` and `document_index`, both of which publish to
+`rag.chunks`. `test_warehouse.py` asserts those two and only those two, so a
+third absence cannot arrive quietly.
 
 ## The vacancy rates
 
@@ -1213,6 +1321,7 @@ question a person actually asks:
 | `silver.lot_frontage` | (lot, street side) | `primary_*` and `secondary_*`, `num_frontages` |
 | `rag.lot_documents` | (lot, feature, document) | `doc_*` and the `documents` array |
 | `silver/lot_zoning_envelopes` | (lot, grid column) | `num_zoning_envelopes` and the `zoning_envelopes` array |
+| `silver.lot_buildable_setbacks` | (lot, zone, grid column) | `buildable_area_m2`, `footprint_cap_m2` and the buildable figures merged into each `zoning_envelopes` entry |
 
 A fifth is already the right shape, and is the only upstream here that is:
 
@@ -2056,7 +2165,9 @@ uv run dagster asset materialize --select silver/neighborhood_streets --partitio
 
 # the province-wide assessment roll and the merge that makes it readable, both
 # date-partitioned only. The first run of a roll year downloads 572 MB and
-# unpacks a 2.8 GB GeoPackage into data/cache/role/; later dates reuse both
+# unpacks a 2.8 GB GeoPackage into data/cache/role/; later dates reuse both.
+# Needs reference_neighborhoods for the same date: the merge is also cut into
+# one silver.assessment_units partition per borough against those outlines
 uv run dagster asset materialize --select bronze/property_assessment_roll,silver/assessment_units --partition 2026-08-18 -m urban_rag.definitions
 
 # what every lot in that borough is assessed at — needs the two above for the

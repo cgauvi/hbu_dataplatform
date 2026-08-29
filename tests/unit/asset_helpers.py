@@ -49,6 +49,50 @@ def stub_publish(monkeypatch, module, *, pruned: int = 0) -> dict[str, object]:
     return seen
 
 
+def stub_publish_by_neighborhood(monkeypatch, module) -> dict[str, object]:
+    """Patch out `urban_rag.warehouse.publish_by_neighborhood` for one module.
+
+    The sibling of `stub_publish`, for the one asset that publishes several
+    borough partitions out of a single date partition: `assessment_units`
+    merges the province-wide roll once and hands the boroughs over keyed by
+    partition key. What is worth checking offline is exactly that mapping -
+    which boroughs it cut, and which rows went to each - so the frames are
+    recorded and the counts are made up.
+
+    Returns the record: `{"frames": {borough: frame}, "dataset": ...,
+    "scrape_date": ..., "calls": n}`.
+    """
+    seen: dict[str, object] = {
+        "frames": {},
+        "dataset": None,
+        "scrape_date": None,
+        "calls": 0,
+    }
+
+    @contextmanager
+    def connect(self):
+        yield object()
+
+    def publish_by_neighborhood(connect_fn, dataset, frames, *, scrape_date):
+        seen["calls"] += 1
+        seen["frames"] = dict(frames)
+        seen["dataset"] = dataset
+        seen["scrape_date"] = scrape_date
+        return {
+            neighborhood: {
+                "copied": len(frame),
+                "duplicates": 0,
+                "upserted": len(frame),
+                "pruned": 0,
+            }
+            for neighborhood, frame in frames.items()
+        }
+
+    monkeypatch.setattr(PostgisResource, "connect", connect)
+    monkeypatch.setattr(module, "publish_by_neighborhood", publish_by_neighborhood)
+    return seen
+
+
 def node_name(asset_def) -> str:
     """The op name Dagster gives ``asset_def``, for looking its events up by.
 

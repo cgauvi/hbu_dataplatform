@@ -94,6 +94,7 @@ ASSET_LAYERS: dict[str, Layer] = {
     "document_embeddings": Layer.SILVER,
     "zoning_grid_columns": Layer.SILVER,
     "lot_zoning_envelopes": Layer.SILVER,
+    "lot_buildable_setbacks": Layer.SILVER,
     # -- gold: a question, answered -----------------------------------------
     "lot_profiles": Layer.GOLD,
     "document_index": Layer.GOLD,

@@ -139,17 +139,8 @@ class Table:
 #: `building_lot_intersections` writes both `building_lots.parquet` and
 #: `lot_features.parquet`, and they are two grains, so they are two tables.
 #:
-#: Three assets are deliberately absent, and none is an oversight:
+#: Two assets are deliberately absent, and neither is an oversight:
 #:
-#: * `assessment_units` (silver) - the one silver asset with no borough axis.
-#:   The roll is published for the province and merged on `id_provinc`, which
-#:   is a key with no geography in it, so the asset is partitioned by date
-#:   alone. Every table here is `PARTITION BY LIST (neighborhood)` and keyed
-#:   `(scrape_date, neighborhood, ...)`; there is no neighborhood to write, and
-#:   inventing one - a literal, a borough taken from `arrond` - would be a
-#:   partition key that means something different from every other table's.
-#:   The borough-scoped half of this lineage is `lot_assessed_values`, which
-#:   does have a table below, and the merge itself stays in the tree.
 #: * `document_embeddings` (silver) - its vectors' home is the pgvector index
 #:   `rag.chunks`, which `document_index` writes and every reader of the corpus
 #:   queries. A `silver.document_embeddings` would be a second copy of the one
@@ -233,6 +224,52 @@ TABLES: dict[str, Table] = {
         name="lot_zoning_envelopes",
         keys=("lot_uid", "feature_id", "column_index"),
         source="sql/012_silver_zoning.sql",
+    ),
+    # The same key as the envelopes it subtracts the margins from, because it
+    # is the same grain: one candidate envelope per (lot, zone, column), and
+    # each column states its own four margins.
+    "lot_buildable_setbacks": Table(
+        asset="lot_buildable_setbacks",
+        name="lot_buildable_setbacks",
+        keys=("lot_uid", "feature_id", "column_index"),
+        source="sql/015_silver_lot_buildable_setbacks.sql",
+        geometry="geom",
+    ),
+    # The roll is published for the province, so the asset that merges it is
+    # partitioned by date alone and its parquet stays province-wide. The
+    # borough this table is partitioned on is not in the merge: it is the one
+    # whose boundary the unit's point falls inside, assigned by
+    # `role_assets.assign_boroughs` on the way here. That is a cut of the same
+    # kind `neighborhood_streets` makes on the island-wide geobase - one
+    # publication, cut into partitions in silver - and it is why one date
+    # partition publishes several borough partitions in one transaction. See
+    # `publish_by_neighborhood`.
+    #
+    # `columns` is longer here than anywhere else because the roll names its
+    # fields by MAMH code. Only the ones this platform reads are given a name;
+    # the other forty land in `attributes`, where a reader who knows the code
+    # can still reach them and a roll that adds one needs no migration.
+    "assessment_units": Table(
+        asset="assessment_units",
+        name="assessment_units",
+        keys=("id_provinc",),
+        source="sql/014_silver_assessment_units.sql",
+        columns={
+            "use_code": "rl0105a",
+            "frontage_m": "rl0301a",
+            "land_area_m2": "rl0302a",
+            "num_storeys": "rl0306a",
+            "year_built": "rl0307a",
+            "floor_area_m2": "rl0308a",
+            "num_dwellings": "rl0311a",
+            "num_nonresidential_units": "rl0312a",
+            "num_rental_rooms": "rl0313a",
+            "land_value": "rl0402a",
+            "building_value": "rl0403a",
+            "assessed_value": "rl0404a",
+        },
+        geometry="geom",
+        attributes="attributes",
     ),
     "lot_assessed_values": Table(
         asset="lot_assessed_values",
@@ -422,6 +459,45 @@ def publish(
                 scrape_date=scrape_date,
             )
             for name, frame in datasets.items()
+        }
+
+
+def publish_by_neighborhood(
+    connect: Any,
+    dataset: str,
+    frames: Mapping[str, Any],
+    *,
+    scrape_date: str,
+) -> dict[str, dict[str, int]]:
+    """Upsert one dataset's boroughs in one transaction, keyed by borough.
+
+    The mirror of `publish`, which writes several datasets into one partition;
+    this writes one dataset into several partitions. It is what a silver asset
+    computed *once for the province* needs: Quebec publishes one assessment
+    roll, `assessment_units` merges it once under one date partition, and the
+    borough each unit belongs to is a property of where its point falls rather
+    than of which run produced it - so one materialization has seventeen
+    borough partitions to publish out of it.
+
+    One transaction for all of them, for the reason `publish` gives: a reader
+    querying across boroughs should see the island as it was or as it now is,
+    not half of each. Every borough is still pruned against its own frame
+    alone, so a unit that has moved out of one borough's boundary between
+    scrapes is dropped from that partition and not from the one it moved into.
+
+    ``connect`` is `PostgisResource.connect` - the *method*, not a connection,
+    for the import-cycle reason `publish` documents.
+    """
+    with connect() as connection:
+        return {
+            neighborhood: upsert_frame(
+                connection,
+                dataset,
+                frame,
+                neighborhood=neighborhood,
+                scrape_date=scrape_date,
+            )
+            for neighborhood, frame in frames.items()
         }
 
 
