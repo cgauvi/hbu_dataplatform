@@ -11,7 +11,7 @@
 # connection settings are present. Then the image entrypoint writes a
 # dagster.yaml that stores run/event/schedule metadata in the same database,
 # under the `dagster` schema. Set S3_BUCKET to write (geo)parquet output to S3
-# instead of the /data volume - see README "Setup".
+# instead of the /data volume - see docs/setup.md.
 
 services:
   webserver:
@@ -24,7 +24,7 @@ services:
       - "${PORT:-2500}:2500"
     environment:
       # Set these on a machine behind a TLS-inspecting proxy; requests and
-      # huggingface_hub both read them (see README "Setup").
+      # huggingface_hub both read them (see docs/setup.md).
       REQUESTS_CA_BUNDLE: ${REQUESTS_CA_BUNDLE:-}
       URBAN_RAG_EMBEDDING_MODEL: ${URBAN_RAG_EMBEDDING_MODEL:-}
       # When S3_BUCKET is set, (geo)parquet output goes to s3://S3_BUCKET/...
@@ -36,7 +36,7 @@ services:
       # The shared vector store the `document_index` asset publishes to. With
       # no host set that asset has nowhere to write and fails; every other
       # asset is unaffected. Prefer SECRET_ID or IAM_AUTH over PASSWORD - see
-      # README "The shared vector store".
+      # docs/corpus.md, "The shared vector store".
       URBAN_RAG_PG_HOST: ${URBAN_RAG_PG_HOST:-}
       URBAN_RAG_PG_DATABASE: ${URBAN_RAG_PG_DATABASE:-}
       URBAN_RAG_PG_USER: ${URBAN_RAG_PG_USER:-}
@@ -77,7 +77,7 @@ services:
       # The shared vector store the `document_index` asset publishes to. With
       # no host set that asset has nowhere to write and fails; every other
       # asset is unaffected. Prefer SECRET_ID or IAM_AUTH over PASSWORD - see
-      # README "The shared vector store".
+      # docs/corpus.md, "The shared vector store".
       URBAN_RAG_PG_HOST: ${URBAN_RAG_PG_HOST:-}
       URBAN_RAG_PG_DATABASE: ${URBAN_RAG_PG_DATABASE:-}
       URBAN_RAG_PG_USER: ${URBAN_RAG_PG_USER:-}
