@@ -85,6 +85,7 @@ ASSET_LAYERS: dict[str, Layer] = {
     # -- silver: this platform's grain and vocabulary -----------------------
     "assessment_units": Layer.SILVER,
     "lot_assessed_values": Layer.SILVER,
+    "lot_assessment_comparables": Layer.SILVER,
     "vacancy_rates": Layer.SILVER,
     "average_rents": Layer.SILVER,
     "building_lot_intersections": Layer.SILVER,

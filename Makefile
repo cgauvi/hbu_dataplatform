@@ -9,7 +9,7 @@ SHELL := /bin/bash
 UNAME_S := $(shell uname -s 2>/dev/null)
 ifneq (,$(filter MINGW% MSYS% CYGWIN%,$(UNAME_S)))
 $(error This Makefile targets Linux. Run it from WSL or from the devcontainer, \
-not from Git Bash - see the Containers section of the README.)
+not from Git Bash - see docs/setup.md.)
 endif
 
 export DAGSTER_HOME := $(CURDIR)/.dagster_home
@@ -49,29 +49,43 @@ NEIGHBORHOOD ?= VSMPE
 PORT ?= 2500
 K ?= 5
 # Which vector store the retrieval targets act on: the local DuckDB file, or
-# the shared Postgres/pgvector one (configured from URBAN_RAG_PG_*, see the
-# README). `make index BACKEND=postgres` reloads the latter from parquet.
+# the shared Postgres/pgvector one (configured from URBAN_RAG_PG_*, see
+# docs/corpus.md). `make index BACKEND=postgres` reloads the latter from parquet.
 BACKEND ?= duckdb
 # How far a lot boundary may be from a street side and still be matched to it,
 # for `make frontage`. It decides which lots get measured, not what they then
-# measure. See silver/lot_frontage in the README.
+# measure. See docs/street-frontage.md.
 BUFFER_M ?= 10.0
 # How far off a lot boundary a measured street edge still counts as lying on
 # it, for `make setbacks`. Much smaller than BUFFER_M above and a much smaller
 # judgement: the frontage geometry was cut from that very boundary, so this
 # only absorbs the round trip through EPSG:4326. See
-# silver/lot_buildable_setbacks in the README.
+# docs/assets.md, under silver/lot_buildable_setbacks.
 TOLERANCE_M ?= 0.05
 # Which municipalities' assessment rolls `make roll` keeps out of the
 # province-wide archive, as a JSON list of five-digit `code_mun` values.
 # Defaults to Ville de Montréal, which is every borough this pipeline has; `[]`
-# keeps the province. See bronze/property_assessment_roll in the README.
+# keeps the province. See docs/assessment-roll.md.
 CODE_MUN ?= ["66023"]
 # Whether `make lot-values` falls back to the assessment point for the units
 # the roll's own lot-number crosswalk cannot place - which is every divided
 # co-ownership, since those name private lots Infolot does not draw. `false`
 # leaves them unplaced and every row then comes from the crosswalk alone.
 BY_POINT ?= true
+# How many comparable lots `make comparables` gives each lot, and the ground
+# radius past which one stops being a comparable however alike it looks. 8 is
+# the size an appraisal actually reasons over; 2 km is most of a borough.
+K_COMPARABLES ?= 8
+MAX_DISTANCE_M ?= 2000.0
+# Share of gross income that never reaches the owner - taxes, insurance,
+# management, maintenance - for `make comparables`. Vacancy is netted per class
+# from the surveyed rate and is *not* in this. The single largest lever on every
+# cap rate the asset produces. See docs/comparables.md.
+OPEX ?= 0.35
+# Scales the assessed value into the cap rate's denominator. 1.0 reports the
+# yield on the roll, which is the honest default: Quebec's *facteur comparatif*
+# is not in the published roll. Set it to the year's factor for a market rate.
+MARKET_FACTOR ?= 1.0
 
 IMAGE ?= urban-rag
 TAG ?= latest
@@ -82,7 +96,7 @@ DOCKER_RUN := docker run --rm -it \
 
 .PHONY: help sync dagster_run daemon test materialize catalog features \
 	quartiers cmhc costs vacancy rents envelopes setbacks lot-profiles \
-	streets borough-streets roll lot-values \
+	streets borough-streets roll lot-values comparables \
 	frontage corpus publish index search ask status \
 	require-q validate_defs clean clean-data clean-silver \
 	docker-build docker-build-slim docker-run docker-shell docker-test up down logs
@@ -93,6 +107,7 @@ help: ## Show this help
 	@echo ""
 	@echo "Vars: DATE=$(DATE) NEIGHBORHOOD=$(NEIGHBORHOOD) PORT=$(PORT) K=$(K)"
 	@echo "      BACKEND=$(BACKEND) BUFFER_M=$(BUFFER_M)"
+	@echo "      K_COMPARABLES=$(K_COMPARABLES) MAX_DISTANCE_M=$(MAX_DISTANCE_M) OPEX=$(OPEX) MARKET_FACTOR=$(MARKET_FACTOR)"
 	@echo "      IMAGE=$(IMAGE):$(TAG)"
 	@echo "      DAGSTER_HOME=$(DAGSTER_HOME)"
 
@@ -218,6 +233,23 @@ lot-values: | $(UV_SYNC_STAMP) ## Total DATE's assessment roll onto NEIGHBORHOOD
 	$(DAGSTER) asset materialize --select silver/lot_assessed_values --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE) \
 		--config-json '{"ops":{"silver__lot_assessed_values":{"config":{"place_unmatched_by_point":$(BY_POINT)}}}}'
 
+# Needs `lot-values` and both CMHC silver assets (`vacancy`, `rents`) for the
+# same DATE x NEIGHBORHOOD: it prices the roll's dwellings and floor area at the
+# borough's surveyed rent, then finds each lot's K nearest comparables over the
+# same partition. Also upserts into silver.lot_assessment_comparables (hbu_infra
+# sql/016), which lands on the first `db.py init` - the file has no
+# `-- requires:` header. The parquet is written first, so a database that is
+# down costs a re-run of the load rather than of the borough-wide search.
+#
+# BY_POINT must match the `lot-values` run that produced the partition: it
+# decides which units reach a lot at all, and the characteristics summed here
+# would otherwise be over a different set of units than the totals there.
+# OPEX is the single largest lever on every cap rate; MARKET_FACTOR is 1.0 by
+# default, which reports the yield on the roll. See docs/comparables.md.
+comparables: | $(UV_SYNC_STAMP) ## Price DATE's roll onto NEIGHBORHOOD's lots and find each lot's comparables
+	$(DAGSTER) asset materialize --select silver/lot_assessment_comparables --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE) \
+		--config-json '{"ops":{"silver__lot_assessment_comparables":{"config":{"k":$(K_COMPARABLES),"max_distance_m":$(MAX_DISTANCE_M),"operating_expense_ratio":$(OPEX),"market_value_factor":$(MARKET_FACTOR),"place_unmatched_by_point":$(BY_POINT)}}}}'
+
 # Needs silver.neighborhood_streets and silver.lot_frontage (hbu_infra sql/007, sql/008) applied,
 # and building_lot_intersections run first for the same partition - that is what
 # puts this borough's cadastre in rag.lots. BUFFER_M overrides the 10 m default.
@@ -306,7 +338,7 @@ clean: ## Remove Python and pytest caches
 # The PDF/BDOI/CMHC caches and vect_db.duckdb stay: they are keyed by URL or
 # filename rather than by scrape date, and the store is rebuilt by `make index`
 # from whatever is left. Three directories, one per medallion layer, each
-# holding one directory per asset - see "Output layout" in the README. Naming
+# holding one directory per asset - see docs/architecture.md. Naming
 # the layers rather than the assets is the point: an asset added later is
 # covered without editing this line.
 clean-data: ## Delete every parquet snapshot under data/

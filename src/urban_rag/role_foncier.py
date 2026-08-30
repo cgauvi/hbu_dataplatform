@@ -98,6 +98,29 @@ JOIN_KEY = "id_provinc"
 #: land and building halves.
 VALUE_COLUMN = "rl0404a"
 
+#: The characteristics `UNITS_LAYER` describes a unit by, under the MAMH codes
+#: it publishes them as. Named here rather than written out at each use for the
+#: reason `VALUE_COLUMN` is: `rl0308a` says nothing at a call site, and a roll
+#: that renames a field should be one edit rather than a search.
+#:
+#: `USE_CODE_COLUMN` is the CUBF - four digits whose *leading* one is the
+#: category, which is why `urban_rag.comparables` reads a character of it and
+#: never compares two codes as numbers. `LAND_AREA_COLUMN` is the unit's own
+#: superficie and is not the cadastre's: a divided co-ownership states the
+#: whole parcel's area on every one of its apartments, so the lot polygon is
+#: the ground measurement to trust and this one is carried for reading.
+USE_CODE_COLUMN = "rl0105a"
+FRONTAGE_COLUMN = "rl0301a"
+LAND_AREA_COLUMN = "rl0302a"
+STOREYS_COLUMN = "rl0306a"
+YEAR_BUILT_COLUMN = "rl0307a"
+FLOOR_AREA_COLUMN = "rl0308a"
+DWELLINGS_COLUMN = "rl0311a"
+NONRESIDENTIAL_UNITS_COLUMN = "rl0312a"
+RENTAL_ROOMS_COLUMN = "rl0313a"
+LAND_VALUE_COLUMN = "rl0402a"
+BUILDING_VALUE_COLUMN = "rl0403a"
+
 #: `rl0103a`, NUMÉRO LOT - the cadastre lot number a unit covers, in
 #: `CADASTRE_LAYER`. Seven digits, unpadded and unspaced (`"1243415"`), where
 #: Infolot spells the same lot `"1 243 415"` - see

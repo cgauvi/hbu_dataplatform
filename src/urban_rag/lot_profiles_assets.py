@@ -207,6 +207,7 @@ from urban_rag.postgis import (
 from urban_rag.rag.pgvector import PostgresUnavailable
 from urban_rag.rag_assets import document_index
 from urban_rag.resources import ParquetStore, PostgisResource
+from urban_rag.comparables_assets import lot_assessment_comparables
 from urban_rag.role_assets import lot_assessed_values
 from urban_rag.setback_assets import lot_buildable_setbacks
 from urban_rag.storage import clear_parquet, filesystem, join, storage_options
@@ -371,6 +372,11 @@ class LotProfilesConfig(Config):
         # profiles every lot; the dependency is what keeps the two in step
         # rather than what makes the read possible.
         lot_assessed_values,
+        # Read out of Postgres the same way and joined on the same column. It
+        # sits behind `lot_assessed_values` rather than beside it - it reads
+        # that asset's parquet - so declaring both is what puts this asset
+        # behind the whole assessment lineage rather than behind its first half.
+        lot_assessment_comparables,
         vacancy_rates,
         average_rents,
         # Partitioned by date alone: the guide prices nine Canadian markets and
@@ -673,6 +679,31 @@ def lot_profiles(
             # scrape date, so the two do not move together and the row cannot
             # be read back without it.
             "roll_year": result["roll_year"] or "unknown",
+            # The comparables join. A lot gets neighbours from its size and its
+            # ground alone and needs a priced income to get a rate, so the
+            # second being under the first is ordinary rather than a fault -
+            # the gap is the lots CMHC's suppressed rent left unpriced.
+            "num_with_comparables": int(result["num_with_comparables"]),
+            "num_without_comparables": profiles
+            - int(result["num_with_comparables"]),
+            "num_with_cap_rate": int(result["num_with_cap_rate"]),
+            # Median rather than mean for the reason the silver asset takes
+            # medians: one condominium's 402-unit common-parts lot would
+            # otherwise decide the borough's figure on its own.
+            "median_cap_rate_pct": _rate_metadata(
+                result["median_cap_rate_pct"], missing="not priced"
+            ),
+            # Under 1 means the borough's roll sits below what its own
+            # comparables imply, which for a triennial roll in a rising market
+            # is what it should look like. It is also the screen a
+            # highest-and-best-use question starts from - see sql/016.
+            "median_assessed_to_estimated_ratio": _rate_metadata(
+                result["median_assessed_to_estimated_ratio"],
+                missing="not estimated",
+            ),
+            "net_operating_income_millions": round(
+                result["net_operating_income_cad"] / 1e6, 2
+            ),
             # Borough figures, identical on every row - reported once here
             # rather than left to be read out of one lot's jsonb. "suppressed"
             # is CMHC publishing nothing for the borough, which is a fact

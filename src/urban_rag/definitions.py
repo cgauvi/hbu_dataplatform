@@ -30,6 +30,7 @@ from urban_rag.cmhc_assets import (
     cmhc_vacancy_survey,
     vacancy_rates,
 )
+from urban_rag.comparables_assets import lot_assessment_comparables
 from urban_rag.envelope_assets import lot_zoning_envelopes, zoning_grid_columns
 from urban_rag.estimator_assets import (
     montreal_nonresidential_costs,
@@ -95,6 +96,7 @@ ASSETS = [
     # silver
     assessment_units,
     lot_assessed_values,
+    lot_assessment_comparables,
     vacancy_rates,
     average_rents,
     building_lot_intersections,
@@ -209,6 +211,18 @@ assessment_roll_job = define_asset_job(
 lot_assessed_values_job = define_asset_job(
     "lot_assessed_values_job",
     selection=AssetSelection.assets(lot_assessed_values),
+    partitions_def=scrape_partitions,
+)
+
+# Its own job rather than a place in `lot_assessed_values_job`, though it reads
+# that job's output and re-derives the placement behind it: the neighbour
+# search is a borough-wide pass whose whole shape is set by config nothing
+# upstream shares - k, the radius, the weights - and re-scoring the borough
+# after a change to those should not re-total the roll to do it. The same split
+# `lot_buildable_setbacks_job` makes behind `zoning_envelopes_job`.
+lot_assessment_comparables_job = define_asset_job(
+    "lot_assessment_comparables_job",
+    selection=AssetSelection.assets(lot_assessment_comparables),
     partitions_def=scrape_partitions,
 )
 
@@ -397,6 +411,35 @@ def daily_lot_assessed_values_schedule(context: ScheduleEvaluationContext):
     for neighborhood in ENABLED_NEIGHBORHOODS:
         yield RunRequest(
             run_key=f"lot-assessed-values-{neighborhood}-{scrape_date}",
+            partition_key=MultiPartitionKey(
+                {"date": scrape_date, "neighborhood": neighborhood}
+            ),
+        )
+
+
+@schedule(
+    job=lot_assessment_comparables_job,
+    # Ten minutes behind lot_assessed_values (30 6), which supplies the lot
+    # geometry and the two totals, and well behind the CMHC pair (55 5, 58 5),
+    # which supplies the rent and the vacancy the income is priced at. Last of
+    # the assessment lineage, and the one gold reads after it.
+    #
+    # Scheduled for the reason lot_assessed_values is: hbu_infra's
+    # sql/016_silver_lot_assessment_comparables.sql carries no `-- requires:`
+    # header, so the table lands on the first `db.py init` rather than waiting
+    # on a corpus the way sql/006 does.
+    cron_schedule="40 6 * * *",
+    execution_timezone=TIMEZONE,
+    description=(
+        "Price today's roll onto every enabled borough's lots and find each "
+        "lot's comparables."
+    ),
+)
+def daily_lot_assessment_comparables_schedule(context: ScheduleEvaluationContext):
+    scrape_date = context.scheduled_execution_time.strftime("%Y-%m-%d")
+    for neighborhood in ENABLED_NEIGHBORHOODS:
+        yield RunRequest(
+            run_key=f"lot-comparables-{neighborhood}-{scrape_date}",
             partition_key=MultiPartitionKey(
                 {"date": scrape_date, "neighborhood": neighborhood}
             ),
@@ -619,6 +662,7 @@ defs = Definitions(
         neighborhood_streets_job,
         assessment_roll_job,
         lot_assessed_values_job,
+        lot_assessment_comparables_job,
         lot_frontage_job,
         zoning_envelopes_job,
         lot_buildable_setbacks_job,
@@ -636,6 +680,7 @@ defs = Definitions(
         daily_street_network_schedule,
         daily_assessment_roll_schedule,
         daily_lot_assessed_values_schedule,
+        daily_lot_assessment_comparables_schedule,
         daily_lots_schedule,
         daily_buildings_schedule,
         daily_building_lots_schedule,

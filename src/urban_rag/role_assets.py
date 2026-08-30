@@ -652,22 +652,24 @@ def lot_assessed_values(
 
     lots = lots.to_crs(units.crs)
     lots = lots.assign(lot_key=lots[LOT_NUMBER_COLUMN].map(lot_key))
-    by_number = _pairs_by_lot_number(crosswalk, units, lots)
-    placed = set(by_number[JOIN_KEY])
-
-    # The fallback, and why it is on by default: the roll names a condominium
-    # unit's *private* lots, and Infolot draws the common parts. So a tower's
-    # units name lot numbers that have no polygon in the cadastre, match
-    # nothing above, and their value - $2.9B across 5,211 units in the first
-    # VSMPE snapshot - would simply be missing. Their point still falls
-    # squarely on the `PC-*` lot the building stands on, which is the lot a
-    # reader asking what that ground is worth means.
-    by_point = (
-        _pairs_by_point(units[~units[JOIN_KEY].isin(placed)], lots)
-        if config.place_unmatched_by_point
-        else _empty_pairs()
+    # Both routes, in one call, because `lot_assessment_comparables` sums the
+    # roll's characteristics over the very same pairs and two implementations
+    # of this join would be two answers to which lot a property is on. The
+    # fallback is why it is on by default: the roll names a condominium unit's
+    # *private* lots, and Infolot draws the common parts - so a tower's units
+    # name lot numbers with no polygon in the cadastre, match nothing by
+    # number, and their value ($2.9B across 5,211 units in the first VSMPE
+    # snapshot) would simply be missing. Their point still falls squarely on
+    # the `PC-*` lot the building stands on, which is the lot a reader asking
+    # what that ground is worth means.
+    pairs = place_units_on_lots(
+        crosswalk,
+        units,
+        lots,
+        place_unmatched_by_point=config.place_unmatched_by_point,
     )
-    pairs = pd.concat([by_number, by_point], ignore_index=True)
+    by_number = pairs[~pairs["by_point"]]
+    by_point = pairs[pairs["by_point"]]
     if pairs.empty:
         # Not "this borough has no assessed property": no unit in the snapshot
         # reaches any of its lots by either route, which means the two sides do
@@ -952,9 +954,62 @@ def lot_key(number) -> str | None:
     return _SPACES.sub("", text)
 
 
+def place_units_on_lots(
+    crosswalk: pd.DataFrame,
+    units: gpd.GeoDataFrame,
+    lots: gpd.GeoDataFrame,
+    *,
+    place_unmatched_by_point: bool = True,
+) -> pd.DataFrame:
+    """Every (unit, lot) pair in the partition, by both routes.
+
+    The public form of what `lot_assessed_values` does inline, for the assets
+    downstream that need the *placement* rather than the totals it computes
+    from one - `lot_assessment_comparables` sums dwellings and floor area over
+    the same pairs, and a second implementation of this join would be a second
+    answer to "which lot is this property on".
+
+    ``lots`` must already carry the `lot_key` column, which is what makes the
+    roll's ``"1243415"`` and Infolot's ``"1 243 415"`` the same lot; the caller
+    adds it because it is also what the caller repairs geometry for.
+
+    Both routes and their order are the ones the module docstring describes:
+    the roll's own cadastre crosswalk first, then - unless switched off - the
+    assessment point for the units it could not place. `by_point` on each row
+    says which produced it, so a caller can report the split without running
+    the two halves itself.
+    """
+    by_number = _pairs_by_lot_number(crosswalk, units, lots)
+    placed = set(by_number[JOIN_KEY])
+    by_point = (
+        _pairs_by_point(units[~units[JOIN_KEY].isin(placed)], lots)
+        if place_unmatched_by_point
+        else _empty_pairs()
+    )
+    return pd.concat([by_number, by_point], ignore_index=True)
+
+
+#: The dtype each pair column carries, so an empty frame concatenates with a
+#: populated one without widening it. `[]` alone types every column `float64`,
+#: which turns `shared` and `by_point` into objects on the way through
+#: `concat` - and `~` on an object column of Python bools is arithmetic
+#: negation, so `~by_point` comes back `-1` and selects everything. Nothing
+#: reads it that way today; stating the dtypes is what keeps that true.
+_PAIR_DTYPES: dict[str, str] = {
+    JOIN_KEY: "object",
+    LOT_NUMBER_COLUMN: "object",
+    VALUE_COLUMN: "float64",
+    "num_lots": "int64",
+    "shared": "bool",
+    "by_point": "bool",
+}
+
+
 def _empty_pairs() -> pd.DataFrame:
     """A pair frame with no rows, for when the fallback is switched off."""
-    return pd.DataFrame({column: [] for column in _PAIR_COLUMNS})
+    return pd.DataFrame(
+        {column: pd.Series(dtype=_PAIR_DTYPES[column]) for column in _PAIR_COLUMNS}
+    )
 
 
 def _pairs_by_lot_number(

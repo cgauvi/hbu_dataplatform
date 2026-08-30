@@ -1548,6 +1548,10 @@ _LOT_PROFILE_RELATIONS: tuple[tuple[str, str], ...] = (
         "silver.lot_assessed_values",
         "sql/013_silver_lot_assessed_values.sql",
     ),
+    (
+        "silver.lot_assessment_comparables",
+        "sql/016_silver_lot_assessment_comparables.sql",
+    ),
     # Read twice below - once narrowed to the row governing each lot, once at
     # its own grain to merge into the envelope entries - so a database without
     # it fails here naming the file rather than on whichever of the two the
@@ -1758,6 +1762,13 @@ def compute_lot_profiles(
             "num_assessment_units", "num_shared_units", "num_units_by_point",
             "total_assessed_value", "total_assessed_value_apportioned",
             "roll_year",
+            "num_dwellings", "floor_area_m2", "residential_floor_area_m2",
+            "commercial_floor_area_m2", "industrial_floor_area_m2",
+            "dominant_use_code", "year_built",
+            "gross_income_cad", "net_operating_income_cad",
+            "cap_rate_pct", "comparable_cap_rate_pct", "income_assumptions",
+            "estimated_value_cad", "estimated_value_basis",
+            "assessed_to_estimated_ratio", "num_comparables", "comparables",
             "vacancy_rates", "overall_vacancy_rate_pct",
             "average_rents", "overall_average_rent_cad",
             "construction_costs",
@@ -2001,6 +2012,38 @@ def compute_lot_profiles(
             assessed.total_assessed_value,
             assessed.total_assessed_value_apportioned,
             assessed.roll_year,
+            -- silver.lot_assessment_comparables, and the same split again: the
+            -- two things that are counts COALESCE, and every measure does not.
+            -- A lot with no cap rate is a lane that earns nothing the roll
+            -- knows about *or* a borough whose rent CMHC suppressed, and
+            -- neither is a yield of zero - which would drag down every average
+            -- taken over the borough exactly as a $0 lane would.
+            --
+            -- num_dwellings is the one count that stays NULL, because there it
+            -- is a measure: a lot no assessment unit stands on has no dwelling
+            -- count, while one carrying a warehouse has a count of 0, and
+            -- COALESCEing the first to 0 would make the two read alike.
+            comparables.num_dwellings,
+            comparables.floor_area_m2,
+            comparables.residential_floor_area_m2,
+            comparables.commercial_floor_area_m2,
+            comparables.industrial_floor_area_m2,
+            comparables.dominant_use_code,
+            comparables.year_built,
+            comparables.gross_income_cad,
+            comparables.net_operating_income_cad,
+            comparables.cap_rate_pct,
+            comparables.comparable_cap_rate_pct,
+            -- '{}' rather than NULL on both objects, so "this partition's
+            -- silver asset has not run" reads as an empty object and not as a
+            -- null column - the same distinction vacancy_rates and
+            -- construction_costs draw below.
+            COALESCE(comparables.income_assumptions, '{}'::jsonb),
+            comparables.estimated_value_cad,
+            comparables.estimated_value_basis,
+            comparables.assessed_to_estimated_ratio,
+            COALESCE(comparables.num_comparables, 0),
+            COALESCE(comparables.comparables, '{}'::jsonb),
             -- The borough's own figures, written identically onto every lot:
             -- CMHC publishes no geometry, so there is nothing to join on and
             -- nothing per-lot to say.
@@ -2057,6 +2100,16 @@ def compute_lot_profiles(
               -- themselves, so the whole statement reads one way.
               AND assessed.neighborhood = %(neighborhood)s
               AND assessed.scrape_date = %(scrape_date)s::date
+        -- The same shape as the join above it, and for all the same reasons:
+        -- silver.lot_assessment_comparables is one row per lot by its own
+        -- primary key, carries no lot_uid, and is scoped by the parameters
+        -- rather than by equality with `l` so the partition prunes at plan
+        -- time. It reads the table above rather than recomputing it, so the
+        -- two sets of columns cannot disagree about the value a rate divides.
+        LEFT JOIN silver.lot_assessment_comparables comparables
+               ON comparables.lot_number = l.lot_number
+              AND comparables.neighborhood = %(neighborhood)s
+              AND comparables.scrape_date = %(scrape_date)s::date
         WHERE l.neighborhood = %(neighborhood)s
           AND l.scrape_date = %(scrape_date)s::date
         """.replace("{envelope_staging}", _ENVELOPE_STAGING),
@@ -2138,7 +2191,21 @@ def compute_lot_profiles(
                -- Identical on every row that has one, so max() is just "the
                -- roll these values came from" - the same trick the borough
                -- figures above use.
-               max(roll_year)
+               max(roll_year),
+               -- The comparables join, from this side. The gap between this
+               -- and num_with_assessed_value is lots the roll reached but the
+               -- income could not be priced for - a borough whose rent CMHC
+               -- suppressed, carrying nothing but dwellings.
+               count(*) FILTER (WHERE num_comparables > 0),
+               count(*) FILTER (WHERE cap_rate_pct IS NOT NULL),
+               -- Median rather than avg, and for the reason the silver asset
+               -- takes medians: one condominium's common-parts lot carrying
+               -- 402 units would otherwise decide the borough's figure.
+               percentile_cont(0.5) WITHIN GROUP (ORDER BY cap_rate_pct),
+               percentile_cont(0.5) WITHIN GROUP (
+                   ORDER BY assessed_to_estimated_ratio
+               ),
+               COALESCE(sum(net_operating_income_cad), 0)
         FROM gold.lot_profiles
         WHERE neighborhood = %s AND scrape_date = %s::date
         """,
@@ -2171,6 +2238,11 @@ def compute_lot_profiles(
         num_assessment_units,
         total_assessed_value_apportioned,
         roll_year,
+        with_comparables,
+        with_cap_rate,
+        median_cap_rate_pct,
+        median_assessed_to_estimated_ratio,
+        net_operating_income_cad,
     ) = cursor.fetchone()
 
     # The denominator, read from rag.lots rather than from what was just
@@ -2245,6 +2317,23 @@ def compute_lot_profiles(
             else float(total_assessed_value_apportioned)
         ),
         "roll_year": None if roll_year is None else int(roll_year),
+        # The comparables join. `num_with_cap_rate` under `num_with_comparables`
+        # is the ordinary case and not a fault: a lot gets neighbours from its
+        # size and its ground alone, and needs a priced income to get a rate.
+        "num_with_comparables": int(with_comparables),
+        "num_with_cap_rate": int(with_cap_rate),
+        "median_cap_rate_pct": (
+            None if median_cap_rate_pct is None else float(median_cap_rate_pct)
+        ),
+        # Under 1 means the borough's roll sits below what its own comparables
+        # imply, which for a triennial roll in a rising market is what it
+        # should look like.
+        "median_assessed_to_estimated_ratio": (
+            None
+            if median_assessed_to_estimated_ratio is None
+            else float(median_assessed_to_estimated_ratio)
+        ),
+        "net_operating_income_cad": float(net_operating_income_cad),
         "num_buildings": int(num_buildings),
         "total_lot_area_m2": float(total_lot_area_m2),
         "max_primary_frontage_m": float(max_primary_frontage_m),
@@ -2468,6 +2557,27 @@ _LOT_PROFILE_COLUMNS = (
         " AS total_assessed_value_apportioned"
     ),
     "roll_year",
+    "num_dwellings",
+    "floor_area_m2",
+    "residential_floor_area_m2",
+    "commercial_floor_area_m2",
+    "industrial_floor_area_m2",
+    "dominant_use_code",
+    "year_built",
+    "gross_income_cad",
+    "net_operating_income_cad",
+    "cap_rate_pct",
+    "comparable_cap_rate_pct",
+    "income_assumptions::text AS income_assumptions",
+    # Cast for the reason the two totals above are: the column is `numeric`,
+    # because it is dollars, and psycopg hands one back as a `Decimal` that
+    # lands in the parquet as an arrow decimal128 where the rest of the tree
+    # has floats. silver/lot_assessment_comparables writes it as a float.
+    "estimated_value_cad::double precision AS estimated_value_cad",
+    "estimated_value_basis",
+    "assessed_to_estimated_ratio",
+    "num_comparables",
+    "comparables::text AS comparables",
     "vacancy_rates::text AS vacancy_rates",
     "overall_vacancy_rate_pct",
     "average_rents::text AS average_rents",

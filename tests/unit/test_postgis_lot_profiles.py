@@ -66,12 +66,17 @@ class FakeCursor:
         num_envelopes: int = 4,
         assessed: tuple[object, ...] = (7, 19, 4_200_000.0, 2026),
         buildable: tuple[object, ...] = (9, 5, 41.5),
+        comparables: tuple[object, ...] = (8, 6, 4.25, 0.82, 1_450_000.0),
     ):
         self.missing = missing
         self.num_envelopes = num_envelopes
         #: What the assessment join reports back: lots carrying a total, the
         #: units standing on them, the apportioned total and the roll year.
         self.assessed = assessed
+        #: What the comparables join reports back: lots with a neighbour set,
+        #: lots with a cap rate, the median rate, the median assessed-to-
+        #: estimated ratio, and the borough's net operating income.
+        self.comparables = comparables
         #: What the setback join reports back: lots carrying a buildable area,
         #: how many of them are stopped by their margins rather than by *Taux
         #: d'implantation*, and the mean share of a lot left buildable.
@@ -116,14 +121,17 @@ class FakeCursor:
             #  their margins, the mean share left buildable), then overall
             #  vacancy, overall rent, then the six cost rates: underground
             #  low/high and above-grade low/high per stall, condo low/high per
-            #  square foot - and last the assessment join: lots with a total,
+            #  square foot - then the assessment join: lots with a total,
             #  units on them, the apportioned total, and the roll year those
-            #  values came from.
+            #  values came from - and last the comparables join: lots with a
+            #  neighbour set, lots with a cap rate, the median rate, the median
+            #  assessed-to-estimated ratio, and the borough's net operating
+            #  income.
             self._result = (
                 10, 6, 8, 2, 7, 12, 22_400.0, 31.25, 12.34,
                 3, self.num_envelopes, *self.buildable, 0.5, 1_275.0,
                 51_925.0, 68_675.0, 38_500.0, 57_750.0, 225.0, 290.0,
-                *self.assessed,
+                *self.assessed, *self.comparables,
             )
         elif "FROM rag.lots" in text:
             self._result = (10,)

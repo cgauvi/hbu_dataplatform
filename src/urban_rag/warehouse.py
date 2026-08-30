@@ -283,6 +283,28 @@ TABLES: dict[str, Table] = {
         geometry="geom",
         attributes="attributes",
     ),
+    # The same grain and the same key as the table above, because it is the
+    # same lot: this one carries what that one does not - the roll's
+    # characteristics summed onto the parcel, what they earn a year, and the k
+    # lots the borough says are like it. Two tables rather than more columns on
+    # one, because the totals there are a sum over `rl0404a` and nothing else,
+    # and a reader who wants only "what is this lot assessed at" should not
+    # have to read a jsonb of neighbours to get it.
+    #
+    # `columns` is one entry for the same reason 013's is: Infolot shouts
+    # `NO_LOT` and this platform does not. Everything else already carries the
+    # name the column has, and the cadastre's own attributes - which arrive on
+    # the frame because that table's geometry is read whole - land in the jsonb
+    # catch-all beside `comparables`.
+    "lot_assessment_comparables": Table(
+        asset="lot_assessment_comparables",
+        name="lot_assessment_comparables",
+        keys=("lot_number",),
+        source="sql/016_silver_lot_assessment_comparables.sql",
+        columns={"lot_number": "NO_LOT"},
+        geometry="geom",
+        attributes="attributes",
+    ),
     # -- gold --------------------------------------------------------------
     "lot_profiles": Table(
         asset="lot_profiles",

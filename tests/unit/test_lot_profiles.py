@@ -392,6 +392,20 @@ def stub_postgis(
                 29_400_000_000.0 if with_assessed_value else None
             ),
             "roll_year": roll_year,
+            # The comparables join, read back the same way. A lot gets
+            # neighbours from its size and its ground alone and needs a priced
+            # income to get a rate, so the stub keeps the second under the
+            # first the way the table does - and both under the lots the roll
+            # actually reached, since only a valued lot can be a comparable.
+            "num_with_comparables": num_lots,
+            "num_with_cap_rate": with_assessed_value,
+            "median_cap_rate_pct": 4.25 if with_assessed_value else None,
+            # Under 1: a triennial roll sitting below what its own comparables
+            # imply is what a rising market looks like from here.
+            "median_assessed_to_estimated_ratio": (
+                0.82 if with_assessed_value else None
+            ),
+            "net_operating_income_cad": 1_450_000.0 if with_assessed_value else 0.0,
             "num_buildings": with_building * 2,
             "total_lot_area_m2": 22_400.0,
             "max_primary_frontage_m": 31.25,
