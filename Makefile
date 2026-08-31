@@ -78,14 +78,58 @@ BY_POINT ?= true
 K_COMPARABLES ?= 8
 MAX_DISTANCE_M ?= 2000.0
 # Share of gross income that never reaches the owner - taxes, insurance,
-# management, maintenance - for `make comparables`. Vacancy is netted per class
-# from the surveyed rate and is *not* in this. The single largest lever on every
-# cap rate the asset produces. See docs/comparables.md.
+# management, maintenance - for `make comparables`, for a building that is
+# NEW. Vacancy is netted per class from the surveyed rate and is *not* in this.
+# The single largest lever on every cap rate the asset produces. Age is added
+# on top of it by the three settings below. See docs/comparables.md.
 OPEX ?= 0.35
+# What age adds to OPEX, per year of the building's age, capped. Only
+# maintenance among the four things OPEX covers depends on how old a building
+# is, and charging a 1910 triplex and one finished this year the same share of
+# rent for the roof is what most flatters standing stock against redeveloping
+# it. MAINTENANCE_PER_YEAR=0 charges every building OPEX and reproduces the
+# behaviour the asset had before the curve. See docs/maintenance.md.
+MAINTENANCE_PER_YEAR ?= 0.0012
+MAX_MAINTENANCE ?= 0.10
+# Age charged where the roll states no year built. Not zero - an unstated year
+# is likelier to be old stock than new, and the run reports how many lots took
+# it as `num_lots_age_assumed`.
+ASSUMED_AGE ?= 50
 # Scales the assessed value into the cap rate's denominator. 1.0 reports the
 # yield on the roll, which is the honest default: Quebec's *facteur comparatif*
 # is not in the published roll. Set it to the year's factor for a market rate.
 MARKET_FACTOR ?= 1.0
+# The Montreal retail rent `make commercial-rents` states, gross per square
+# foot per year, and the quarter it is stated for. The one rate in the chain
+# with no survey behind it: C&W publish a Montreal office and industrial
+# MarketBeat and no retail one, so this is a judgement carried forward by
+# Statistics Canada's retail index. See docs/commercial-rents.md.
+RETAIL_BASE ?= 26.0
+RETAIL_BASE_PERIOD ?= 2025-01
+# Stalls each dwelling owes, for `make programs`. Villeray abolished
+# residential parking minima, so this is what the building offers rather than
+# what a by-law demands - urban_rag.program's own default. 0 removes the
+# residential half of the parking demand.
+STALLS_PER_DWELLING ?= 0.5
+# Dollars per square foot of dwelling, for `make programs`. The default is the
+# Altus wood-frame condo midpoint, which under-costs a lot zoned for a tower -
+# see urban_rag.hbu_assets.ProgramConfig.
+RES_COST_SQFT ?= 257.5
+# Width-to-depth ratios `make massing` tries when drawing a building, squarest
+# first, as a JSON list; the first that fits the lot's setback envelope at the
+# solved footprint wins. Each is tried at the parcel's own axis and at the
+# perpendicular, so 2.0 covers 1:2 as well. Past 3:1 a "building" is a wall,
+# which is why the default stops there. See docs/massing.md.
+RATIOS ?= [1.0,1.5,2.0,3.0]
+# Where the investment-thesis lines fall for `make opportunities`: the share
+# of proposed floor one class needs to own a lot outright, and what the
+# smaller of residential and commercial needs for it to be mixed-use instead.
+# LAND_FACTOR scales the assessed value into the yield's denominator - 1.0
+# costs the land at the roll. TOP_N is the shortlist length per thesis.
+DOMINANT_SHARE ?= 0.85
+MIXED_MIN_SHARE ?= 0.15
+LAND_FACTOR ?= 1.0
+TOP_N ?= 25
 
 IMAGE ?= urban-rag
 TAG ?= latest
@@ -96,7 +140,9 @@ DOCKER_RUN := docker run --rm -it \
 
 .PHONY: help sync dagster_run daemon test materialize catalog features \
 	quartiers cmhc costs vacancy rents envelopes setbacks lot-profiles \
+	programs hbu massing \
 	streets borough-streets roll lot-values comparables \
+	rent-sources commercial-rents \
 	frontage corpus publish index search ask status \
 	require-q validate_defs clean clean-data clean-silver \
 	docker-build docker-build-slim docker-run docker-shell docker-test up down logs
@@ -108,6 +154,7 @@ help: ## Show this help
 	@echo "Vars: DATE=$(DATE) NEIGHBORHOOD=$(NEIGHBORHOOD) PORT=$(PORT) K=$(K)"
 	@echo "      BACKEND=$(BACKEND) BUFFER_M=$(BUFFER_M)"
 	@echo "      K_COMPARABLES=$(K_COMPARABLES) MAX_DISTANCE_M=$(MAX_DISTANCE_M) OPEX=$(OPEX) MARKET_FACTOR=$(MARKET_FACTOR)"
+	@echo "      RETAIL_BASE=$(RETAIL_BASE) RETAIL_BASE_PERIOD=$(RETAIL_BASE_PERIOD)"
 	@echo "      IMAGE=$(IMAGE):$(TAG)"
 	@echo "      DAGSTER_HOME=$(DAGSTER_HOME)"
 
@@ -198,6 +245,46 @@ setbacks: | $(UV_SYNC_STAMP) ## Materialize lot_buildable_setbacks for DATE x NE
 lot-profiles: | $(UV_SYNC_STAMP) ## Materialize lot_profiles for DATE x NEIGHBORHOOD
 	$(DAGSTER) asset materialize --select gold/lot_profiles --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
 
+# Needs silver.lot_development_programs (hbu_infra sql/017) applied, and
+# `envelopes` run first for the same partition - the CP-SAT model in
+# urban_rag.program is run once per candidate row it wrote. `setbacks` is
+# read too if it has run, and is optional: without it the footprint is capped
+# on Taux d'implantation alone. STALLS_PER_DWELLING and RES_COST_SQFT are the
+# two levers most worth moving; see urban_rag.hbu_assets.ProgramConfig for the
+# rest.
+programs: | $(UV_SYNC_STAMP) ## Materialize lot_development_programs for DATE x NEIGHBORHOOD
+	$(DAGSTER) asset materialize --select silver/lot_development_programs --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE) \
+		--config-json '{"ops":{"silver__lot_development_programs":{"config":{"stalls_per_dwelling":$(STALLS_PER_DWELLING),"residential_cost_per_sqft_cad":$(RES_COST_SQFT)}}}}'
+
+# Needs gold.lot_highest_best_use and gold.lot_redevelopment_gap (hbu_infra
+# sql/018, sql/019) applied, and `programs` run first for the same partition.
+# lot_redevelopment_gap also needs `comparables` for the same partition - the
+# assessment side it compares against.
+hbu: | $(UV_SYNC_STAMP) ## Materialize lot_highest_best_use and lot_redevelopment_gap for DATE x NEIGHBORHOOD
+	$(DAGSTER) asset materialize --select gold/lot_highest_best_use,gold/lot_redevelopment_gap --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
+
+# Needs gold.lot_investment_opportunities (hbu_infra sql/021) applied and
+# `hbu` run first for the same partition. Ranks the under-built lots within
+# each investment thesis on yield on cost - a classification and two sorts
+# over one parquet, so it is cheap to re-run at a different threshold.
+# DOMINANT_SHARE / MIXED_MIN_SHARE move the facet lines, LAND_FACTOR costs
+# the land at something other than the roll, TOP_N sets the shortlist length.
+opportunities: | $(UV_SYNC_STAMP) ## Rank DATE x NEIGHBORHOOD's under-built lots by thesis
+	$(DAGSTER) asset materialize --select gold/lot_investment_opportunities --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE) \
+		--config-json '{"ops":{"gold__lot_investment_opportunities":{"config":{"dominant_share":$(DOMINANT_SHARE),"mixed_min_share":$(MIXED_MIN_SHARE),"land_value_factor":$(LAND_FACTOR),"top_n":$(TOP_N)}}}}'
+
+# Needs gold.lot_building_massing (hbu_infra sql/022) applied, and both `hbu`
+# and `setbacks` run first for the same partition: the first supplies the
+# footprint to draw, the second the envelope to draw it inside. Without the
+# setbacks every row comes back no_buildable_geometry rather than a rectangle
+# with the margins ignored. The output is a geoparquet of polygons in
+# EPSG:4326 - open it in QGIS beside silver/lot_buildable_setbacks and the
+# cadastre. RATIOS is the aspect ratios to try, squarest first, as a JSON
+# list; footprint_fit_pct below 100 is the column to sort on.
+massing: | $(UV_SYNC_STAMP) ## Draw DATE x NEIGHBORHOOD's HBU buildings as map polygons
+	$(DAGSTER) asset materialize --select gold/lot_building_massing --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE) \
+		--config-json '{"ops":{"gold__lot_building_massing":{"config":{"aspect_ratios":$(RATIOS)}}}}'
+
 # Bronze: one 91 MB download for the whole island, so DATE only.
 streets: | $(UV_SYNC_STAMP) ## Snapshot the island-wide geobase double for DATE
 	$(DAGSTER) asset materialize --select bronze/street_network --partition $(DATE) -m $(MODULE)
@@ -233,6 +320,24 @@ lot-values: | $(UV_SYNC_STAMP) ## Total DATE's assessment roll onto NEIGHBORHOOD
 	$(DAGSTER) asset materialize --select silver/lot_assessed_values --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE) \
 		--config-json '{"ops":{"silver__lot_assessed_values":{"config":{"place_unmatched_by_point":$(BY_POINT)}}}}'
 
+# The two commercial-rent publishers, both DATE-only: Cushman & Wakefield's
+# Montreal office and industrial MarketBeats (two PDFs, discovered off the
+# landing page because their filenames change shape every quarter) and
+# Statistics Canada's rent index (one 14 kB zipped CSV). Cheap, and the first
+# run of a quarter is the only one that pays for the PDFs.
+rent-sources: | $(UV_SYNC_STAMP) ## Snapshot the MarketBeats and the rent index for DATE
+	$(DAGSTER) asset materialize --select bronze/montreal_commercial_rents,bronze/commercial_rent_index --partition $(DATE) -m $(MODULE)
+
+# Needs `rent-sources` for the same DATE. Resolves one gross rent per rent
+# class for the borough: office and industrial off the C&W submarket the
+# borough sits in (VSMPE is Midtown North), retail from RETAIL_BASE - the one
+# rate with no free survey behind it - and all three carried to the latest
+# quarter Statistics Canada publishes. Also upserts into
+# silver.commercial_rents (hbu_infra sql/020). See docs/commercial-rents.md.
+commercial-rents: | $(UV_SYNC_STAMP) ## Resolve NEIGHBORHOOD's retail, office and industrial rent for DATE
+	$(DAGSTER) asset materialize --select silver/commercial_rents --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE) \
+		--config-json '{"ops":{"silver__commercial_rents":{"config":{"retail_base_gross_rent_psf_cad":$(RETAIL_BASE),"retail_base_period":"$(RETAIL_BASE_PERIOD)"}}}}'
+
 # Needs `lot-values` and both CMHC silver assets (`vacancy`, `rents`) for the
 # same DATE x NEIGHBORHOOD: it prices the roll's dwellings and floor area at the
 # borough's surveyed rent, then finds each lot's K nearest comparables over the
@@ -248,7 +353,7 @@ lot-values: | $(UV_SYNC_STAMP) ## Total DATE's assessment roll onto NEIGHBORHOOD
 # default, which reports the yield on the roll. See docs/comparables.md.
 comparables: | $(UV_SYNC_STAMP) ## Price DATE's roll onto NEIGHBORHOOD's lots and find each lot's comparables
 	$(DAGSTER) asset materialize --select silver/lot_assessment_comparables --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE) \
-		--config-json '{"ops":{"silver__lot_assessment_comparables":{"config":{"k":$(K_COMPARABLES),"max_distance_m":$(MAX_DISTANCE_M),"operating_expense_ratio":$(OPEX),"market_value_factor":$(MARKET_FACTOR),"place_unmatched_by_point":$(BY_POINT)}}}}'
+		--config-json '{"ops":{"silver__lot_assessment_comparables":{"config":{"k":$(K_COMPARABLES),"max_distance_m":$(MAX_DISTANCE_M),"operating_expense_ratio":$(OPEX),"maintenance_premium_per_year":$(MAINTENANCE_PER_YEAR),"max_maintenance_premium":$(MAX_MAINTENANCE),"assumed_building_age_years":$(ASSUMED_AGE),"market_value_factor":$(MARKET_FACTOR),"place_unmatched_by_point":$(BY_POINT)}}}}'
 
 # Needs silver.neighborhood_streets and silver.lot_frontage (hbu_infra sql/007, sql/008) applied,
 # and building_lot_intersections run first for the same partition - that is what

@@ -95,6 +95,44 @@ CMHC_QUARTIERS: dict[str, tuple[str, ...]] = {
     "VSMPE": ("Parc-Extension", "Saint-Michel", "Villeray"),
 }
 
+#: Cushman & Wakefield's MarketBeat submarket covering each borough, keyed by
+#: partition key. The same kind of crosswalk `CMHC_QUARTIERS` is and applied
+#: for the same reason: the publisher carves the island its own way, and a
+#: borough-level rent is a much better answer than an island-level one.
+#:
+#: **One name for both sectors, matched loosely.** The office report writes
+#: `Midtown North` and the industrial one writes `Montréal Midtown North` for
+#: what is the same territory, so `submarket_for` matches on the name with any
+#: leading `Montréal` taken off - see `urban_rag.marketbeat`.
+#:
+#: A borough with no entry falls back to the whole-market row, which is a real
+#: answer rather than a gap: C&W's submarkets are drawn around industrial and
+#: office concentrations, and several residential boroughs sit inside none of
+#: them. `num_lots_priced_by_submarket` says which happened.
+#:
+#: Only the boroughs whose mapping has actually been checked against a report
+#: are here. An unlisted one is not an error; it is the island-wide rent.
+MARKETBEAT_SUBMARKETS: dict[str, str] = {
+    # Villeray-Saint-Michel-Parc-Extension sits in Midtown North on both the
+    # office and the industrial maps - the belt north of the Metropolitain,
+    # which is where the borough's industrial stock actually is.
+    "VSMPE": "Midtown North",
+    "AC": "Midtown North",
+    "RPP": "Midtown Central",
+    "CDNNDG": "Décarie CDN",
+    "VM": "Downtown South",
+    "SO": "Downtown Southwest",
+    "Verdun": "Île-Des-Soeurs",
+    "Lachine": "Lachine",
+    "StLeonard": "Montréal East",
+    "MHM": "Montréal East",
+    "MN": "Montréal East",
+    "RDPPAT": "Montréal East",
+    "Anjou": "Montréal East",
+    "PR": "West Island",
+    "LaSalle": "Lachine",
+}
+
 #: Only these are scraped. Add keys from NEIGHBORHOOD_NAMESPACES to widen the
 #: partition set; existing partitions are untouched by the addition.
 ENABLED_NEIGHBORHOODS: tuple[str, ...] = ("VSMPE",)
@@ -137,6 +175,18 @@ def borough_code_for(neighborhood: str) -> str:
             f"Unknown neighborhood {neighborhood!r}; "
             f"known keys: {sorted(NEIGHBORHOOD_BOROUGH_CODES)}"
         ) from None
+
+
+def submarket_for(neighborhood: str) -> str | None:
+    """The MarketBeat submarket a borough sits in, or None for none.
+
+    None rather than a raise, unlike `quartiers_for`: a borough C&W draws no
+    submarket around is priced at the island-wide rent, which is a worse answer
+    but a real one. A missing CMHC quartier is different - that crosswalk is
+    the only route from the survey to the borough, and a gap there means a
+    partition that cannot be computed at all.
+    """
+    return MARKETBEAT_SUBMARKETS.get(neighborhood)
 
 
 def quartiers_for(neighborhood: str) -> tuple[str, ...]:

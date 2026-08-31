@@ -62,33 +62,54 @@ tree: [docs/architecture.md](docs/architecture.md).
 
 ## The assets
 
-27 assets, listed with their partitions and outputs in
+36 assets, listed with their partitions and outputs in
 [docs/assets.md](docs/assets.md).
 
 | Layer | |
 | --- | --- |
-| **bronze** | `spectrum_table_catalog` `neighborhood_features` `reference_neighborhoods` `neighborhood_lots` `neighborhood_buildings` `cmhc_vacancy_survey` `cmhc_rent_survey` `street_network` `montreal_residential_costs` `montreal_nonresidential_costs` `property_assessment_roll` `linked_documents` |
-| **silver** | `vacancy_rates` `average_rents` `building_lot_intersections` `assessment_units` `lot_assessed_values` `lot_assessment_comparables` `neighborhood_streets` `lot_frontage` `zoning_grid_columns` `lot_zoning_envelopes` `lot_buildable_setbacks` `document_chunks` `document_embeddings` |
-| **gold** | `lot_profiles` `document_index` |
+| **bronze** | `spectrum_table_catalog` `neighborhood_features` `reference_neighborhoods` `neighborhood_lots` `neighborhood_buildings` `cmhc_vacancy_survey` `cmhc_rent_survey` `street_network` `montreal_residential_costs` `montreal_nonresidential_costs` `property_assessment_roll` `uniformized_property_wealth` `montreal_commercial_rents` `commercial_rent_index` `linked_documents` |
+| **silver** | `vacancy_rates` `average_rents` `building_lot_intersections` `assessment_units` `lot_assessed_values` `lot_assessment_comparables` `commercial_rents` `neighborhood_streets` `lot_frontage` `zoning_grid_columns` `lot_zoning_envelopes` `lot_buildable_setbacks` `lot_development_programs` `document_chunks` `document_embeddings` |
+| **gold** | `lot_profiles` `lot_highest_best_use` `lot_redevelopment_gap` `lot_investment_opportunities` `lot_building_massing` `document_index` |
 
 They read seven publishers: Spectrum and the open-data portal (Ville de
 Montréal), Infolot and the assessment roll (Québec), BDOI, CMHC, and the Altus
 cost guide. Why each is read the way it is — and what each one gets wrong — is a
 page per source under [docs/](docs/README.md#the-data).
 
-### Three assets are blocked
+`lot_development_programs` is where the highest-and-best-use question
+actually gets solved — one `urban_rag.program.solve_program` CP-SAT run per
+candidate envelope, maximising monthly net operating income over the mix of
+dwellings, commerce, industry and parking. `lot_highest_best_use` picks the
+governing envelope's program for each lot, and `lot_redevelopment_gap` puts it
+beside what `lot_assessment_comparables` says already stands there — the floor
+area gap by residential/commercial/industrial class, in m² and sqft, and the
+two incomes reconciled onto one stated definition of NOI. `make programs` and
+`make hbu` run the three by hand.
 
-`lot_frontage`, `lot_buildable_setbacks` and `lot_profiles` are registered and
-have jobs, but **no schedule**: each reads a relation hbu_infra creates. The SQL
-files all exist; what is outstanding is `db.py init` against the target database
-— twice, since `sql/006_lot_documents.sql` carries a `-- requires: rag.chunks`
-header and only lands after `document_index` has run.
+`lot_building_massing` then draws the answer: one rectangle per lot, fitted
+inside that lot's setback envelope so the margins are respected by
+construction, in EPSG:4326 and ready to put on a map beside the cadastre.
+Its `footprint_fit_pct` is a check on the solver rather than a decoration —
+`solve_program` caps a footprint on the lesser of two *areas* and never asks
+whether a building of that area has a shape the parcel can take.
+`make massing`, and [docs/massing.md](docs/massing.md).
+
+### Seven assets are blocked
+
+`lot_frontage`, `lot_buildable_setbacks`, `lot_profiles`,
+`lot_development_programs`, `lot_highest_best_use`, `lot_redevelopment_gap` and
+`lot_building_massing` are registered and have jobs, but **no schedule**: each
+reads a relation hbu_infra creates. The SQL files all exist; what is
+outstanding is `db.py init` against the target database — twice for
+`lot_profiles`, since `sql/006_lot_documents.sql` carries a
+`-- requires: rag.chunks` header and only lands after `document_index`
+has run.
 
 Each fails up front naming the file to apply, rather than letting psycopg raise.
-Run them by hand with `make frontage`, `make setbacks` and `make lot-profiles`;
-the envelope pair they sit behind has no schedule either (`make envelopes`).
-Details, and the order the three want scheduling in, are in
-[docs/assets.md](docs/assets.md).
+Run them by hand with `make frontage`, `make setbacks`, `make lot-profiles`,
+`make programs`, `make hbu` and `make massing`; the envelope pair they all sit
+behind has no schedule either (`make envelopes`). Details, and the order the
+seven want scheduling in, are in [docs/assets.md](docs/assets.md).
 
 ## Retrieval
 

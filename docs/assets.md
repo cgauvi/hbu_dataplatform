@@ -1,6 +1,6 @@
 # Assets
 
-All 27 assets, their partition axes and what each one writes. The layer
+All 35 assets, their partition axes and what each one writes. The layer
 contracts they answer to are in [architecture.md](architecture.md).
 
 | Layer | Asset | Partitions | Output |
@@ -16,12 +16,15 @@ contracts they answer to are in [architecture.md](architecture.md).
 | bronze | `montreal_residential_costs` | date | The Montreal column of the Altus construction cost guide's residential types — condo/apartment by storey band, townhouses, single family, seniors, student residences — in $/sf |
 | bronze | `montreal_nonresidential_costs` | date | The same column's commercial and industrial types in $/sf, plus the three parking types in **$/stall** |
 | bronze | `property_assessment_roll` | date | Quebec's *rôle d'évaluation foncière* — one point per assessment unit, the characteristics table describing it, and the crosswalk naming every lot it covers, out of a province-wide GeoPackage, scoped to Ville de Montréal |
+| bronze | `montreal_commercial_rents` | date | Cushman & Wakefield's Montreal office and industrial MarketBeats, one row per (sector, submarket), with the net, additional and gross rent per square foot on one footing across both. The reports are discovered off the landing page: the filename changes shape every quarter and only the `/<year>/q<n>/` path is stable |
+| bronze | `commercial_rent_index` | date | Statistics Canada's Commercial Rents Services Price Index for the Montreal CMA (table 18-10-0260-01), quarterly, by building type. An **index** (2019=100), not a level — it carries a measured rent to the quarter being scraped, and carries the stated retail base forward |
 | bronze | `linked_documents` | date × neighborhood | The PDFs those tables link to, fetched and flattened to text |
 | silver | `vacancy_rates` | date × neighborhood | That borough's quartiers taken out of the snapshot and averaged into one rate per dwelling type × bedroom class — as parquet and as `silver.vacancy_rates`, with the quartier rows behind it in `silver.quartier_vacancy_rates` |
 | silver | `average_rents` | date × neighborhood | The same, per bedroom class, for rents — `silver.average_rents` and `silver.quartier_average_rents` |
 | silver | `building_lot_intersections` | date × neighborhood | Both spatial joins, computed against one load of the cadastre — repaired on the way in, which is where `make_valid` runs: building footprints clipped to the lots they intersect (`silver.building_lot_intersections`) and map features clipped to the lots they cover (`silver.lot_features`, the hop from a lot to its documents), as two geoparquet files |
 | silver | `assessment_units` | date | The roll's two layers put back together on `id_provinc` — one row per assessment unit, its point and everything the roll says about it. Province-wide as parquet, and as `silver.assessment_units` cut into **one partition per borough** by where each unit's point falls: the one asset that publishes partitions it was not asked for, because the roll has no borough axis of its own |
 | silver | `lot_assessed_values` | date × neighborhood | What every lot in the borough is assessed at: the units the roll's own cadastre crosswalk puts on it (and, for the condos it cannot place, the ones whose point falls in it), summed on `rl0404a` both whole and apportioned — as geoparquet and as `silver.lot_assessed_values` |
+| silver | `commercial_rents` | date × neighborhood | One gross rent per rent class for the borough — office and industrial off the C&W submarket it sits in (VSMPE is Midtown North), retail from a stated base, all three carried to the latest quarter the index publishes. `rent_basis` says measured, escalated, unescalated or stated — as parquet and as `silver.commercial_rents` |
 | silver | `lot_assessment_comparables` | date × neighborhood | What each lot yields on that assessment, and which lots are like it: the roll's dwellings and floor area summed onto the parcel and split by each unit's own CUBF use code, priced at CMHC's borough rent and `urban_rag.program`'s stated non-residential rates into `cap_rate_pct` — plus the k nearest comparable lots, scored on use, size, dwellings and ground distance at once, and the `estimated_value_cad` their median ratios imply. `assessed_to_estimated_ratio` is the screen. As geoparquet and as `silver.lot_assessment_comparables`
 | silver | `neighborhood_streets` | date × neighborhood | That day's street sides clipped to one borough, with the published length, the length inside it, and the share that survived the cut — as geoparquet and as `silver.neighborhood_streets` |
 | silver | `lot_frontage` | date × neighborhood | How much of each lot's boundary faces each street side, in metres, longest first — as geoparquet and as `silver.lot_frontage`. **Blocked**, see below |
@@ -30,7 +33,12 @@ contracts they answer to are in [architecture.md](architecture.md).
 | silver | `lot_buildable_setbacks` | date × neighborhood | What is left of each lot once its zone's four margins are subtracted — one row per (lot, zone, grid column), with the boundary sorted into front, sides and rear and each buffered by the margin that governs it. `footprint_cap_m2` is that envelope or *Taux d'implantation au sol max* × lot area, whichever is smaller — as geoparquet and as `silver.lot_buildable_setbacks`. **Blocked**, see below |
 | silver | `document_chunks` | date × neighborhood | Those documents cut into retrieval-sized chunks — as parquet and as `silver.document_chunks` |
 | silver | `document_embeddings` | date × neighborhood | A bge-m3 vector per chunk. The one silver asset with no table of its own: its vectors' home is the pgvector index `document_index` writes |
+| silver | `lot_development_programs` | date × neighborhood | One `urban_rag.program.solve_program` CP-SAT run per candidate row of `lot_zoning_envelopes` that authorises dwellings and parses — the mix of dwellings, commerce, industry and parking that maximises monthly net operating income under that envelope, with the storey split, footprint, stalls, build cost and `binding` caps — as parquet and as `silver.lot_development_programs`. **Blocked**, see below |
 | gold | `lot_profiles` | date × neighborhood | Every lot in the borough, one row each — whether a building stands on it and how many, its primary and secondary street frontage in metres, the zoning PDF that covers most of it, the zoning envelopes that govern it, the borough's CMHC vacancy and rent grids, and what the ground earns on what it is assessed at (`cap_rate_pct`, `estimated_value_cad`, `assessed_to_estimated_ratio` and each lot's comparables) — as geoparquet and as `gold.lot_profiles`. **Blocked**, see below |
+| gold | `lot_highest_best_use` | date × neighborhood | One row per lot: the `lot_development_programs` candidate of the *governing* envelope — the grid's own pick within a zone, the zone covering most of the lot across zones — with `hbu_status` naming why a lot without one has none. As parquet and as `gold.lot_highest_best_use`. **Blocked**, see below |
+| gold | `lot_redevelopment_gap` | date × neighborhood | One row per lot: the floor area standing on it today (`lot_assessment_comparables`, by residential/commercial/industrial class) against what its envelope could hold, in m² and sqft, and the two incomes on one stated NOI definition — `annual_stabilised_noi_gap_cad` and, separately, the solver's own `hbu_annual_noi_after_construction_cad`. `is_underbuilt` is the screen. As parquet and as `gold.lot_redevelopment_gap`. **Blocked**, see below |
+| gold | `lot_investment_opportunities` | date × neighborhood | The under-built lots worth looking at first, one row per lot. `investment_thesis` is read off the *proposed* program — so a warehouse whose best use is flats is a residential opportunity, and the existing use beside it makes a conversion play one predicate. `yield_on_cost_pct` is the proposed building's stabilised NOI over construction plus the land at its assessed value; `thesis_rank` orders the under-built lots within each thesis on it, breaking ties on the annual NOI gap, and `is_top_opportunity` marks the first `top_n`. Unranked lots keep their row and say why — as parquet and as `gold.lot_investment_opportunities` |
+| gold | `lot_building_massing` | date × neighborhood | The proposed building of every lot, drawn: one rectangle per lot fitted inside that lot's setback envelope so the four margins are respected by construction, in EPSG:4326 and ready to put on a map. A few aspect ratios are tried at the parcel's own axis and its perpendicular, squarest first. `footprint_fit_pct` is the check the table exists for — `solve_program` caps a footprint on the lesser of two *areas* and never asks whether the shape fits, so a fit under 100 is a solved footprint the ground cannot take. Every lot keeps a row in the tree; only the drawn ones reach `gold.lot_building_massing`. **Blocked**, see below |
 | gold | `document_index` | date × neighborhood | Those vectors upserted into the Postgres/pgvector store the query side reads |
 
 The corpus assets are described under [The document
@@ -87,6 +95,29 @@ the same shape of fix: registered, given a job, run by hand with `make
 setbacks`. It sits behind both `lot_frontage` and the envelope pair, since one
 supplies the street edge it sorts a boundary against and the other the margins
 it subtracts, so whoever schedules the three schedules them in that order.
+
+`lot_development_programs`, `lot_highest_best_use` and `lot_redevelopment_gap`
+are blocked the same way, stacked one behind another: `sql/017`, `sql/018` and
+`sql/019` each have to be applied before their asset's upsert will land, and
+none has been yet. Registered, given jobs, run by hand with `make programs`
+and `make hbu`. `lot_development_programs` reads `lot_zoning_envelopes` (and,
+optionally, `lot_buildable_setbacks` — without it every footprint is capped on
+*Taux d'implantation* alone) and is where the CP-SAT solve happens, so it sits
+behind the envelope pair the same way `lot_profiles` does. `lot_highest_best_use`
+is a sort over that asset's own output and needs nothing else.
+`lot_redevelopment_gap` additionally reads `lot_assessment_comparables` — the
+assessment side of the comparison — which *is* scheduled, so once the first
+two land only the envelope lineage is what a schedule for this trio would wait
+behind.
+
+`lot_building_massing` is blocked behind all of them and on `sql/022`. It reads
+`lot_highest_best_use` for the footprint and `lot_buildable_setbacks` for the
+envelope to fit it into, and without the second it draws nothing at all rather
+than a rectangle with the margins ignored — which would look entirely plausible
+on a map, and is the one failure mode a sanity-check asset must not have. Run
+it by hand with `make massing`; it is also the asset most often re-run on its
+own, since a different set of aspect ratios redraws a borough without
+re-solving it. See [massing.md](massing.md).
 
 ## What `lot_buildable_setbacks` measures, and why it is not a rectangle
 

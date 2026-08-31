@@ -296,6 +296,18 @@ TABLES: dict[str, Table] = {
     # name the column has, and the cadastre's own attributes - which arrive on
     # the frame because that table's geometry is read whole - land in the jsonb
     # catch-all beside `comparables`.
+    # Three rows a partition, one per rent class, and no geometry: this is what
+    # a square foot of floor earns in one borough, and the borough is already
+    # the partition key. The two bronze snapshots behind it stay out of
+    # Postgres for the reason every bronze snapshot does - the tree is the
+    # record, and nothing queries a MarketBeat submarket table by SQL.
+    "commercial_rents": Table(
+        asset="commercial_rents",
+        name="commercial_rents",
+        keys=("rent_class",),
+        source="sql/020_silver_commercial_rents.sql",
+        attributes="attributes",
+    ),
     "lot_assessment_comparables": Table(
         asset="lot_assessment_comparables",
         name="lot_assessment_comparables",
@@ -305,12 +317,66 @@ TABLES: dict[str, Table] = {
         geometry="geom",
         attributes="attributes",
     ),
+    # The same key as the envelopes it solves, because it is the same grain:
+    # one candidate program per (lot, zone, column). A losing column keeps its
+    # row - "why not the other column" is a question with an answer, and this
+    # is the table it is in - so the key cannot narrow to the winner.
+    "lot_development_programs": Table(
+        asset="lot_development_programs",
+        name="lot_development_programs",
+        keys=("lot_uid", "feature_id", "column_index"),
+        source="sql/017_silver_lot_development_programs.sql",
+    ),
     # -- gold --------------------------------------------------------------
     "lot_profiles": Table(
         asset="lot_profiles",
         name="lot_profiles",
         keys=("lot_number",),
         source="sql/009_gold_lot_profiles.sql",
+        geometry="geom",
+    ),
+    # Keyed on `lot_uid` and not on `lot_number`, unlike every other per-lot
+    # table here. These two are downstream of `lot_zoning_envelopes`, whose own
+    # grain leads with the cadastre's surrogate key, and a lot the zone layer
+    # reaches but the roll never named has a `lot_uid` and a null lot number -
+    # which is precisely the under-built parcel `lot_redevelopment_gap` exists
+    # to surface, so it cannot be the row the key drops.
+    "lot_highest_best_use": Table(
+        asset="lot_highest_best_use",
+        name="lot_highest_best_use",
+        keys=("lot_uid",),
+        source="sql/018_gold_lot_highest_best_use.sql",
+    ),
+    # The shortlist, keyed the way the gap table it ranks is. No geometry:
+    # a reader who wants the parcel drawn joins gold.lot_profiles on
+    # lot_number, and a second copy of every polygon to serve a screening
+    # query is a copy that can go stale.
+    "lot_investment_opportunities": Table(
+        asset="lot_investment_opportunities",
+        name="lot_investment_opportunities",
+        keys=("lot_uid",),
+        source="sql/021_gold_lot_investment_opportunities.sql",
+        attributes="attributes",
+    ),
+    "lot_redevelopment_gap": Table(
+        asset="lot_redevelopment_gap",
+        name="lot_redevelopment_gap",
+        keys=("lot_uid",),
+        source="sql/019_gold_lot_redevelopment_gap.sql",
+    ),
+    # The same key as the two above, and the one spatial table of the three.
+    # `geometry` is what makes it one, and it has a consequence worth naming
+    # here rather than leaving to be discovered: `_copy_frame` skips a row
+    # whose geometry is null, so the lots this asset could draw no rectangle
+    # for stay in the tree and never reach the table. That is the right rule
+    # for a spatial table and the wrong shape for a status column, which is
+    # why `massing_status` is carried by the parquet and a reader wanting the
+    # undrawn lots in SQL anti-joins `gold.lot_highest_best_use`.
+    "lot_building_massing": Table(
+        asset="lot_building_massing",
+        name="lot_building_massing",
+        keys=("lot_uid",),
+        source="sql/022_gold_lot_building_massing.sql",
         geometry="geom",
     ),
 }

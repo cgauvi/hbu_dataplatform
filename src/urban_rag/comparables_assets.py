@@ -107,6 +107,12 @@ from urban_rag.comparables import (
 )
 from urban_rag.frames import write_frame
 from urban_rag.layers import key_prefix
+from urban_rag.program import (
+    ASSUMED_BUILDING_AGE_YEARS,
+    MAINTENANCE_PREMIUM_PER_YEAR,
+    MAX_MAINTENANCE_PREMIUM,
+)
+from urban_rag.rent_assets import COMMERCIAL_RENTS_FILE, commercial_rents
 from urban_rag.partitions import scrape_partitions
 from urban_rag.rag.pgvector import PostgresUnavailable
 from urban_rag.resources import ParquetStore, PostgisResource
@@ -206,8 +212,31 @@ class ComparablesConfig(Config):
         ge=0.0,
         lt=1.0,
         description=(
-            "Share of gross income that never reaches the owner. Vacancy is "
-            "netted separately and is not in this."
+            "Share of gross income that never reaches the owner, for a NEW "
+            "building. Vacancy is netted separately and is not in this; age "
+            "is added on top by the three maintenance settings below."
+        ),
+    )
+    maintenance_premium_per_year: float = Field(
+        default=MAINTENANCE_PREMIUM_PER_YEAR,
+        ge=0.0,
+        description=(
+            "Share of gross income added to the expense ratio per year of "
+            "building age. 0 charges every building the new-build ratio, "
+            "which is what this asset did before the curve existed."
+        ),
+    )
+    max_maintenance_premium: float = Field(
+        default=MAX_MAINTENANCE_PREMIUM,
+        ge=0.0,
+        description="The most age may add to the expense ratio.",
+    )
+    assumed_building_age_years: float = Field(
+        default=ASSUMED_BUILDING_AGE_YEARS,
+        ge=0.0,
+        description=(
+            "Age charged where the roll states no year built. Not zero - an "
+            "unstated year is likelier to be old stock than new."
         ),
     )
     market_value_factor: float = Field(
@@ -246,6 +275,13 @@ class ComparablesConfig(Config):
         lot_assessed_values,
         vacancy_rates,
         average_rents,
+        # What a square foot of retail, office and warehouse floor earns here,
+        # resolved for this borough's MarketBeat submarket. Partitioned the
+        # same way, so no mapping - and a hard dependency rather than an
+        # optional read, because without it every non-residential income term
+        # falls back to a stated constant and the cap rates quietly change
+        # meaning.
+        commercial_rents,
         # Partitioned by date alone: the roll is one publication for the
         # province. Mapped onto this asset's `date` dimension the same way
         # `lot_assessed_values` maps the same two.
@@ -562,14 +598,87 @@ def _income_assumptions(
             neighborhood,
             scrape_date,
         )
+
+    # The three non-residential rents, from the asset that surveys them. Read
+    # as a partition rather than defaulted: `IncomeAssumptions` falls back to
+    # `urban_rag.program`'s constants when handed nothing, and those overstate
+    # Montreal by roughly two to four times - so a partition that silently took
+    # them would produce cap rates that look computed and are not.
+    commercial = _read_parquet(
+        store.partition_dir(
+            commercial_rents.key.path[-1], scrape_date, neighborhood
+        ),
+        COMMERCIAL_RENTS_FILE,
+        asset_name=commercial_rents.key.path[-1],
+        partition=f"{neighborhood} {scrape_date}",
+    )
+    rates = _rent_rates(commercial, neighborhood=neighborhood, scrape_date=scrape_date)
+    context.log.info(
+        "%s %s: priced at retail $%.2f, office $%.2f, industrial $%.2f psf",
+        neighborhood,
+        scrape_date,
+        rates["retail_rent_per_sqft_cad"],
+        rates["office_rent_per_sqft_cad"],
+        rates["industrial_rent_per_sqft_cad"],
+    )
     return IncomeAssumptions(
         average_rent_cad=rent,
         vacancy_rate_pct=rate,
         operating_expense_ratio=config.operating_expense_ratio,
+        maintenance_premium_per_year=config.maintenance_premium_per_year,
+        max_maintenance_premium=config.max_maintenance_premium,
+        assumed_building_age_years=config.assumed_building_age_years,
+        # Ages are taken against the partition's own year, not against the
+        # wall clock: a partition re-materialized next January must produce the
+        # cap rates its key says it does, and `datetime.now()` here would make
+        # every one of them drift by a year of maintenance.
+        income_reference_year=int(scrape_date[:4]),
         market_value_factor=config.market_value_factor,
         survey_year=_first(rents, "survey_year"),
         survey_period=_first(rents, "survey_period"),
+        **rates,
     )
+
+
+def _rent_rates(frame: pd.DataFrame, *, neighborhood: str, scrape_date: str) -> dict:
+    """The three surveyed rents, keyed as `IncomeAssumptions` takes them.
+
+    Fails on a missing class rather than defaulting to it: `silver/
+    commercial_rents` has already refused a partition it could not resolve all
+    three for, so a gap here means a stale file rather than an unsurveyed
+    market - and a rate quietly falling back to a constant is exactly the thing
+    this whole lineage exists to stop.
+    """
+    if "rent_class" not in frame.columns or "rent_psf_cad" not in frame.columns:
+        raise Failure(
+            f"The commercial_rents partition for {neighborhood} {scrape_date} "
+            "has no rent_class/rent_psf_cad columns - it was not written by "
+            "that asset."
+        )
+    by_class = frame.set_index("rent_class")
+    rates: dict[str, float] = {}
+    provenance: list[tuple[str, str]] = []
+    for name in ("retail", "office", "industrial"):
+        if name not in by_class.index:
+            raise Failure(
+                f"The commercial_rents partition for {neighborhood} "
+                f"{scrape_date} carries no {name!r} rate; it has "
+                f"{sorted(by_class.index)}. Re-materialize commercial_rents."
+            )
+        row = by_class.loc[name]
+        rates[f"{name}_rent_per_sqft_cad"] = float(row["rent_psf_cad"])
+        provenance.append(
+            (
+                name,
+                # Everything needed to read the rate back: who published it,
+                # for which quarter, for which submarket, and whether it was
+                # measured, escalated or merely stated.
+                f"{row.get('source', '?')} {row.get('source_period', '?')}"
+                f" {row.get('submarket') or 'island-wide'}"
+                f" ({row.get('rent_basis', '?')} -> {row.get('index_period', '?')})",
+            )
+        )
+    return {**rates, "rent_provenance": tuple(provenance)}
 
 
 def _overall(frame: pd.DataFrame, column: str, where: dict[str, str]) -> float | None:
@@ -751,6 +860,26 @@ def _result(
             # income_assumptions and comparables; they are here so a run can be
             # read at a glance against the one before it.
             "operating_expense_ratio": config.operating_expense_ratio,
+            # The base above is what a new building is charged; these say what
+            # age actually added on this partition. `num_lots_age_assumed` is
+            # the one to watch - it is how many lots were charged
+            # `assumed_building_age_years` because the roll stated no year, and
+            # a partition where that is most of the borough is one whose cap
+            # rates are being set by the assumption rather than by the roll.
+            "maintenance_premium_per_year": config.maintenance_premium_per_year,
+            "max_maintenance_premium": config.max_maintenance_premium,
+            "assumed_building_age_years": config.assumed_building_age_years,
+            "income_reference_year": assumptions.income_reference_year
+            if assumptions.income_reference_year is not None
+            else "not set (age premium off)",
+            "mean_building_age_years": _rounded(_mean(frame, "building_age_years")),
+            "mean_maintenance_premium": _rounded(
+                _mean(frame, "maintenance_premium"), digits=4
+            ),
+            "mean_effective_operating_expense_ratio": _rounded(
+                _mean(frame, "effective_operating_expense_ratio"), digits=4
+            ),
+            "num_lots_age_assumed": _num_age_assumed(frame),
             "market_value_factor": config.market_value_factor,
             "k": config.k,
             "max_distance_m": config.max_distance_m,
@@ -763,6 +892,27 @@ def _result(
             **published_metadata(loaded),
         }
     )
+
+
+def _mean(frame: pd.DataFrame, column: str) -> float | None:
+    """The column's mean over the rows that have one, or None if none do."""
+    if column not in frame.columns:
+        return None
+    values = pd.to_numeric(frame[column], errors="coerce").dropna()
+    return float(values.mean()) if len(values) else None
+
+
+def _num_age_assumed(frame: pd.DataFrame) -> int:
+    """Lots charged the assumed age because the roll stated no year built.
+
+    Counted off `year_built` rather than off the age column: the age is never
+    null once a reference year is set - that is the whole point of the
+    assumption - so the age alone cannot say which lots were told and which
+    were guessed.
+    """
+    if "year_built" not in frame.columns:
+        return len(frame)
+    return int(pd.to_numeric(frame["year_built"], errors="coerce").isna().sum())
 
 
 def _total(frame: pd.DataFrame, column: str) -> int:

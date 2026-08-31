@@ -50,11 +50,13 @@ from urban_rag.comparables_assets import (
     LOT_COMPARABLES_FILE,
     lot_assessment_comparables,
 )
+from urban_rag.rent_assets import COMMERCIAL_RENTS_FILE, commercial_rents
 from urban_rag.frames import write_frame
 from urban_rag.program import (
     COMMERCIAL_REVENUE_PER_SQFT_CAD,
     COMMERCIAL_VACANCY_PCT,
     M2_PER_SQFT,
+    MAX_MAINTENANCE_PREMIUM,
     MONTHS_PER_YEAR,
 )
 from urban_rag.resources import ParquetStore, PostgisResource
@@ -178,6 +180,47 @@ def test_the_floor_is_split_by_each_units_own_use_code():
     assert row["floor_area_m2"] == 1180.0
 
 
+def test_commerce_splits_into_retail_and_office_and_adds_back_up():
+    """CUBF 4000 is retail and 5000/6000 are offices and services. The two are
+    priced at different surveyed rents and reported as one column."""
+    units = units_frame(
+        [
+            {JOIN_KEY: "A", USE_CODE_COLUMN: "4611", FLOOR_AREA_COLUMN: 95.0},
+            {JOIN_KEY: "B", USE_CODE_COLUMN: "5811", FLOOR_AREA_COLUMN: 120.0},
+            {JOIN_KEY: "C", USE_CODE_COLUMN: "6512", FLOOR_AREA_COLUMN: 40.0},
+        ]
+    )
+    pairs = pd.DataFrame({JOIN_KEY: ["A", "B", "C"], "NO_LOT": ["L1"] * 3})
+
+    row = aggregate_units_by_lot(
+        pairs, units, lot_column="NO_LOT", join_key=JOIN_KEY
+    ).loc["L1"]
+
+    assert row["retail_floor_area_m2"] == 95.0
+    assert row["office_floor_area_m2"] == 160.0
+    assert row["commercial_floor_area_m2"] == pytest.approx(
+        row["retail_floor_area_m2"] + row["office_floor_area_m2"]
+    )
+
+
+@pytest.mark.parametrize(
+    "code, rent_class",
+    [
+        ("1000", "residential"),
+        ("4611", "retail"),
+        ("5811", "office"),
+        ("6512", "office"),
+        ("2311", "industrial"),
+        ("8000", "none"),
+        (None, "none"),
+    ],
+)
+def test_the_rent_class_splits_commerce_where_the_income_class_does_not(
+    code, rent_class
+):
+    assert comparables.rent_class_of(code) == rent_class
+
+
 def test_floor_the_cubf_cannot_place_lands_in_no_class():
     """And so is priced at nothing, rather than at the average of a guess."""
     units = units_frame(
@@ -295,24 +338,58 @@ def test_a_vacancy_rate_is_read_as_the_percentage_it_is_published_as():
 
 
 def test_non_residential_income_is_annual_and_per_square_foot():
-    frame = pd.DataFrame(
-        {"num_dwellings": [0.0], "commercial_floor_area_m2": [1000.0]}
-    )
+    frame = pd.DataFrame({"num_dwellings": [0.0], "retail_floor_area_m2": [1000.0]})
 
     income = annual_income(frame, IncomeAssumptions(average_rent_cad=900.0))
 
-    assert income["commercial_income_cad"].iloc[0] == pytest.approx(
+    assert income["retail_income_cad"].iloc[0] == pytest.approx(
         1000.0 / M2_PER_SQFT
         * COMMERCIAL_REVENUE_PER_SQFT_CAD
         * (1 - COMMERCIAL_VACANCY_PCT / 100)
     )
 
 
-def test_the_three_classes_are_added_rather_than_chosen_between():
+def test_retail_and_office_are_priced_apart_and_reported_together():
+    """The whole point of the rent-class split: C&W survey an office rent and
+    nobody surveys a retail one, and the two are dollars apart."""
+    frame = pd.DataFrame(
+        {
+            "num_dwellings": [0.0],
+            "retail_floor_area_m2": [100.0],
+            "office_floor_area_m2": [100.0],
+        }
+    )
+    assumptions = IncomeAssumptions(
+        retail_rent_per_sqft_cad=26.0, office_rent_per_sqft_cad=22.39
+    )
+
+    income = annual_income(frame, assumptions)
+
+    assert income["retail_income_cad"].iloc[0] > income["office_income_cad"].iloc[0]
+    # `commercial_income_cad` keeps the meaning every reader downstream has:
+    # the two halves added back together.
+    assert income["commercial_income_cad"].iloc[0] == pytest.approx(
+        income["retail_income_cad"].iloc[0] + income["office_income_cad"].iloc[0]
+    )
+
+
+def test_a_lot_with_only_retail_floor_still_earns_a_commercial_income():
+    """`min_count=1` on the commerce sum: no office floor is not a null lot."""
+    frame = pd.DataFrame({"num_dwellings": [0.0], "retail_floor_area_m2": [100.0]})
+
+    income = annual_income(frame, IncomeAssumptions(retail_rent_per_sqft_cad=26.0))
+
+    assert pd.isna(income["office_income_cad"].iloc[0])
+    assert income["commercial_income_cad"].iloc[0] == pytest.approx(
+        income["retail_income_cad"].iloc[0]
+    )
+
+
+def test_the_classes_are_added_rather_than_chosen_between():
     frame = pd.DataFrame(
         {
             "num_dwellings": [3.0],
-            "commercial_floor_area_m2": [100.0],
+            "retail_floor_area_m2": [100.0],
             "industrial_floor_area_m2": [50.0],
         }
     )
@@ -823,6 +900,43 @@ def write_cmhc(store, *, rent: float | None = 1_200.0, vacancy: float | None = 2
     )
 
 
+#: The three surveyed rents the fixture prices commercial floor at, near what
+#: the Q2 2026 reports actually publish for VSMPE's Midtown North submarket:
+#: office $22.39 gross, industrial $12.98 net + $4.09 additional, and the
+#: stated retail base.
+RETAIL_RENT, OFFICE_RENT, INDUSTRIAL_RENT = 26.0, 22.39, 17.07
+
+
+def write_commercial_rents(store, **overrides) -> None:
+    """`silver/commercial_rents` as `lot_assessment_comparables` reads it."""
+    rents = {
+        "retail": RETAIL_RENT,
+        "office": OFFICE_RENT,
+        "industrial": INDUSTRIAL_RENT,
+        **overrides,
+    }
+    write_frame(
+        pd.DataFrame(
+            {
+                "rent_class": list(rents),
+                "rent_psf_cad": list(rents.values()),
+                "submarket": ["Midtown North"] * len(rents),
+                "is_submarket_rate": [True] * len(rents),
+                "source": ["cushman_wakefield_marketbeat"] * len(rents),
+                "source_period": ["2026-Q2"] * len(rents),
+                "rent_basis": ["measured"] * len(rents),
+                "index_period": ["2026-04"] * len(rents),
+            }
+        ),
+        join(
+            store.partition_dir(
+                commercial_rents.key.path[-1], DATE, NEIGHBORHOOD
+            ),
+            COMMERCIAL_RENTS_FILE,
+        ),
+    )
+
+
 @pytest.fixture
 def borough(store):
     """Every upstream this asset reads, for one borough-day."""
@@ -830,6 +944,7 @@ def borough(store):
     write_units(store)
     write_crosswalk(store)
     write_cmhc(store)
+    write_commercial_rents(store)
     return store
 
 
@@ -1013,3 +1128,112 @@ def test_the_run_reports_the_pool_its_neighbours_came_from(borough):
     # The cross-check: this asset re-derives the placement and has to land on
     # the same unit counts the totals it carries were summed over.
     assert metadata["num_units_disagreeing"].value == 0
+
+
+# -- maintenance: an old building keeps less of its rent --------------------
+
+
+def _triplex(year_built) -> pd.DataFrame:
+    """One residential lot, its year built the only thing that varies."""
+    return pd.DataFrame(
+        {
+            "num_dwellings": [3.0],
+            "year_built": [year_built],
+            "residential_floor_area_m2": [200.0],
+            "commercial_floor_area_m2": [0.0],
+            "industrial_floor_area_m2": [0.0],
+            "retail_floor_area_m2": [0.0],
+            "office_floor_area_m2": [0.0],
+        }
+    )
+
+
+def _rented(**kwargs) -> IncomeAssumptions:
+    return IncomeAssumptions(
+        average_rent_cad=1200.0, vacancy_rate_pct=1.0, **kwargs
+    )
+
+
+def test_two_identical_triplexes_of_different_ages_earn_the_same_and_keep_different():
+    # The whole point of the change: the gross is a function of the dwellings
+    # and the rent, and only what the owner keeps depends on the roof.
+    old = annual_income(_triplex(1920), _rented(income_reference_year=2026))
+    new = annual_income(_triplex(2024), _rented(income_reference_year=2026))
+
+    assert old["gross_income_cad"].iloc[0] == new["gross_income_cad"].iloc[0]
+    assert (
+        old["net_operating_income_cad"].iloc[0]
+        < new["net_operating_income_cad"].iloc[0]
+    )
+
+
+def test_a_new_building_is_charged_the_base_ratio_and_nothing_more():
+    income = annual_income(
+        _triplex(2026), _rented(income_reference_year=2026, operating_expense_ratio=0.35)
+    )
+
+    assert income["maintenance_premium"].iloc[0] == 0.0
+    assert income["effective_operating_expense_ratio"].iloc[0] == pytest.approx(0.35)
+
+
+def test_the_premium_is_capped_however_old_the_building():
+    income = annual_income(_triplex(1850), _rented(income_reference_year=2026))
+
+    assert income["maintenance_premium"].iloc[0] == pytest.approx(
+        MAX_MAINTENANCE_PREMIUM
+    )
+
+
+def test_a_lot_with_no_year_built_is_charged_the_assumed_age():
+    # Not the new-build ratio: an unstated year is likelier to be old stock.
+    income = annual_income(
+        _triplex(None),
+        _rented(income_reference_year=2026, assumed_building_age_years=50.0),
+    )
+    stated = annual_income(_triplex(1976), _rented(income_reference_year=2026))
+
+    assert income["building_age_years"].iloc[0] == 50.0
+    assert income["maintenance_premium"].iloc[0] == pytest.approx(
+        stated["maintenance_premium"].iloc[0]
+    )
+
+
+def test_without_a_reference_year_every_lot_is_charged_the_base():
+    # No year, no age - and inventing one from the wall clock would make a
+    # partition's cap rates depend on the day it was materialized.
+    income = annual_income(_triplex(1920), _rented(operating_expense_ratio=0.35))
+
+    assert pd.isna(income["building_age_years"].iloc[0])
+    assert income["maintenance_premium"].iloc[0] == 0.0
+    assert income["effective_operating_expense_ratio"].iloc[0] == pytest.approx(0.35)
+    assert income["net_operating_income_cad"].iloc[0] == pytest.approx(
+        income["gross_income_cad"].iloc[0] * 0.65
+    )
+
+
+def test_a_zero_per_year_curve_reproduces_the_flat_ratio():
+    # The escape hatch: the behaviour this asset had before the curve existed
+    # is still reachable, and is one setting rather than a code path.
+    flat = annual_income(
+        _triplex(1920),
+        _rented(income_reference_year=2026, maintenance_premium_per_year=0.0),
+    )
+
+    assert flat["effective_operating_expense_ratio"].iloc[0] == pytest.approx(0.35)
+
+
+def test_the_curve_and_the_age_travel_in_the_assumptions():
+    # A ratio with no curve beside it cannot be read against another run's:
+    # 0.43 is a 1955 building on the default curve and a 1990 one on a steeper.
+    assumptions = _rented(income_reference_year=2026)
+    payload = assumptions.as_metadata()
+
+    assert payload["income_reference_year"] == 2026
+    assert payload["maintenance_premium_per_year"] > 0
+    assert payload["max_maintenance_premium"] == MAX_MAINTENANCE_PREMIUM
+    assert payload["assumed_building_age_years"] > 0
+
+
+def test_a_negative_premium_is_refused_by_the_assumptions():
+    with pytest.raises(ValueError, match="maintenance_premium_per_year"):
+        IncomeAssumptions(maintenance_premium_per_year=-0.01)

@@ -13,12 +13,22 @@ the asset that calls it is `urban_rag.comparables_assets`.
 **A cap rate is income over value, and the roll supplies only the value.** The
 income side is built from what the roll says stands on the lot - dwellings,
 floor area, and the CUBF use code that says what the floor is *for* - priced
-against CMHC's borough rents for the dwellings and against
-`urban_rag.program`'s stated per-square-foot rates for everything else. Those
-last are assumptions rather than measurements and are imported from `program`
-rather than restated here, so a change to what a retail square foot is thought
-to earn moves the solver and this module together instead of leaving them
-quietly disagreeing.
+against CMHC's borough rents for the dwellings and, for everything else,
+against the surveyed rents `silver/commercial_rents` resolves for the borough:
+Cushman & Wakefield's office and industrial levels for the submarket the
+borough sits in, and a stated retail base, all carried to the current quarter
+by Statistics Canada's rent index. `urban_rag.program`'s constants remain the
+default, so a caller that hands over no rates still computes - but a partition
+that went through the asset carries measured numbers, and `rent_provenance`
+says for each one which publisher, which quarter and whether it was measured,
+escalated or stated.
+
+**Commerce is priced in two halves and reported as one.** The CUBF's 4000s are
+retail and its 5000s and 6000s are offices and services, and the two rent for
+about $4 a square foot apart in Montreal - so `rent_class_of` splits them,
+`annual_income` charges each at its own rate, and `commercial_income_cad` is
+the sum. Every column a reader downstream already had keeps its meaning; the
+split shows up as two extra floor and income columns beside them.
 
 **The floor is split by the unit's own use code, not by the lot's.** A unit is
 one *unite d'evaluation* with one `rl0105a`, so the class its whole floor area
@@ -120,12 +130,17 @@ import numpy as np
 import pandas as pd
 
 from urban_rag.program import (
+    ASSUMED_BUILDING_AGE_YEARS,
     COMMERCIAL_REVENUE_PER_SQFT_CAD,
     COMMERCIAL_VACANCY_PCT,
     INDUSTRIAL_REVENUE_PER_SQFT_CAD,
     INDUSTRIAL_VACANCY_PCT,
     M2_PER_SQFT,
+    MAINTENANCE_PREMIUM_PER_YEAR,
+    MAX_MAINTENANCE_PREMIUM,
     MONTHS_PER_YEAR,
+    building_age_years,
+    effective_operating_expense_ratio,
 )
 from urban_rag.role_foncier import (
     DWELLINGS_COLUMN as _DWELLINGS,
@@ -205,6 +220,13 @@ _SUMMED_COLUMNS: Mapping[str, str] = {
     "residential_floor_area_m2": "residential_floor_area_m2",
     "commercial_floor_area_m2": "commercial_floor_area_m2",
     "industrial_floor_area_m2": "industrial_floor_area_m2",
+    # The commerce split, additive: `commercial_floor_area_m2` above still
+    # means what it did and these two say what it is made of. They exist
+    # because the two halves are priced at different surveyed rents - see
+    # `rent_class_of` - and carrying them makes the income reproducible from
+    # the row rather than only from the code that wrote it.
+    "retail_floor_area_m2": "retail_floor_area_m2",
+    "office_floor_area_m2": "office_floor_area_m2",
 }
 
 #: NAD83 / MTM zone 8 - the projected CRS this platform measures Montreal in.
@@ -226,15 +248,25 @@ METRIC_CRS = "EPSG:32188"
 #: reason. Vacant land and water (8000) is priced as nothing at all - there is
 #: no floor on it to earn anything, and the roll's own floor area for those
 #: units is null or zero.
-CUBF_CLASSES: Mapping[str, tuple[str, str]] = {
-    "1": ("habitation", "residential"),
-    "2": ("industrie_manufacturiere", "industrial"),
-    "3": ("transport_communication_services_publics", "industrial"),
-    "4": ("commerciale", "commercial"),
-    "5": ("services", "commercial"),
-    "6": ("culturelle_recreative_loisirs", "commercial"),
-    "7": ("production_extraction_ressources", "industrial"),
-    "8": ("immeubles_non_exploites_etendues_eau", "none"),
+#:
+#: The third element is the **rent class**, and it is finer than the income
+#: class on purpose. `silver/commercial_rents` prices retail and office
+#: separately - Cushman & Wakefield survey a Montreal office rent and nobody
+#: surveys a retail one - and the two are not close: Midtown North office asks
+#: about $22 gross where neighbourhood retail asks about $26. Charging a
+#: dépanneur an office rent, or the reverse, is a category error worth one
+#: extra column to avoid. The *reported* floor columns stay at the three income
+#: classes, so `commercial_floor_area_m2` still means what it did; the rent
+#: class only decides which rate that floor is multiplied by.
+CUBF_CLASSES: Mapping[str, tuple[str, str, str]] = {
+    "1": ("habitation", "residential", "residential"),
+    "2": ("industrie_manufacturiere", "industrial", "industrial"),
+    "3": ("transport_communication_services_publics", "industrial", "industrial"),
+    "4": ("commerciale", "commercial", "retail"),
+    "5": ("services", "commercial", "office"),
+    "6": ("culturelle_recreative_loisirs", "commercial", "office"),
+    "7": ("production_extraction_ressources", "industrial", "industrial"),
+    "8": ("immeubles_non_exploites_etendues_eau", "none", "none"),
 }
 
 #: What `use_class_of` answers for a code it cannot place - a null `rl0105a`, a
@@ -250,9 +282,22 @@ UNKNOWN_USE_CLASS = "unknown"
 #: much floor that leaves unpriced.
 UNKNOWN_INCOME_CLASS = "none"
 
-#: The three classes floor area is priced under, and the order every payload
-#: and every column group lists them in.
+#: The three classes floor area is *reported* under, and the order every
+#: payload and every column group lists them in. These are the
+#: `*_floor_area_m2` columns and the `*_income_cad` columns downstream reads.
 INCOME_CLASSES: tuple[str, ...] = ("residential", "commercial", "industrial")
+
+#: The classes floor area is *priced* under. Finer than the income classes by
+#: one split - commerce into retail and office - because that is the grain
+#: `silver/commercial_rents` surveys at. `commercial_income_cad` is the two put
+#: back together, so nothing downstream has to know the split exists unless it
+#: wants to.
+RENT_CLASSES: tuple[str, ...] = ("residential", "retail", "office", "industrial")
+
+#: The rent classes whose floor area is charged per square foot per year, in
+#: the order `annual_income` sums them. Residential is absent: CMHC prices a
+#: dwelling per month, not a square foot, and that is a different arithmetic.
+NON_RESIDENTIAL_RENT_CLASSES: tuple[str, ...] = ("retail", "office", "industrial")
 
 #: How `estimated_value_cad` was arrived at, in the order the basis is chosen.
 #: Dollars per dwelling first where the subject has dwellings - it is the ratio
@@ -296,7 +341,7 @@ def use_class_of(code) -> str:
 
 
 def income_class_of(code) -> str:
-    """Which of `residential` / `commercial` / `industrial` prices ``code``.
+    """Which of `residential` / `commercial` / `industrial` reports ``code``.
 
     ``'none'`` for vacant land, for water, and for a code that cannot be
     placed: floor area under one of those earns nothing here rather than being
@@ -306,7 +351,20 @@ def income_class_of(code) -> str:
     return entry[1] if entry else UNKNOWN_INCOME_CLASS
 
 
-def _cubf_entry(code) -> tuple[str, str] | None:
+def rent_class_of(code) -> str:
+    """Which surveyed rent prices ``code`` - the income class, commerce split.
+
+    `income_class_of` answers what a lot's floor is *reported* as and this
+    answers what it is *charged*, and they differ on exactly one thing: a
+    commercial floor is retail or office depending on whether the CUBF puts it
+    in 4000 or in 5000/6000. `silver/commercial_rents` surveys those two apart
+    because the publishers do, and about $4 a square foot separates them.
+    """
+    entry = _cubf_entry(code)
+    return entry[2] if entry else UNKNOWN_INCOME_CLASS
+
+
+def _cubf_entry(code) -> tuple[str, str, str] | None:
     if code is None or (isinstance(code, float) and math.isnan(code)):
         return None
     text = str(code).strip()
@@ -330,16 +388,48 @@ class IncomeAssumptions:
     and are the two that are measured. The rest are not:
 
     ``operating_expense_ratio`` is the share of gross income that never reaches
-    the owner - taxes, insurance, management, maintenance. 0.35 is the
-    conventional figure for a Montreal walk-up and is the single largest lever
-    on every cap rate this module produces. Vacancy is *not* in it: that is
-    netted out of the gross separately, per class, so the two are not applied
-    to each other twice.
+    the owner - taxes, insurance, management, maintenance - **for a building
+    that is new**. 0.35 is the conventional figure for a Montreal walk-up and
+    is the single largest lever on every cap rate this module produces. Vacancy
+    is *not* in it: that is netted out of the gross separately, per class, so
+    the two are not applied to each other twice.
 
-    ``commercial_rent_per_sqft_cad`` and its industrial twin are
-    `urban_rag.program`'s, imported rather than restated. They are annual and
-    gross, as commercial leasing is quoted, and their vacancies are stated for
-    the same reason: there is no CMHC for retail.
+    It is the *base* of the ratio rather than the whole of it. Only maintenance
+    among those four depends on how old the building is, and charging a 1910
+    triplex and a building finished this year the same share of rent for the
+    roof and the risers is the assumption that most flatters standing stock
+    against redeveloping it. ``maintenance_premium_per_year``,
+    ``max_maintenance_premium`` and ``assumed_building_age_years`` are the
+    curve that adds to it - all three stated, all three
+    `urban_rag.program`'s - and ``income_reference_year`` is the year ages are
+    taken against, which the asset sets from its own partition key.
+
+    **The age adjustment is off unless ``income_reference_year`` is set.**
+    Without a year there is no age, and inventing one from the wall clock would
+    make a partition's cap rates depend on the day it was materialized rather
+    than on the date it is keyed by. Off, every lot is charged the base and
+    `effective_operating_expense_ratio` equals it, which is what this module
+    did before the curve existed.
+
+    ``retail_rent_per_sqft_cad``, ``office_rent_per_sqft_cad`` and
+    ``industrial_rent_per_sqft_cad`` are **gross annual rents per square
+    foot**, and are the three `silver/commercial_rents` resolves for the
+    borough - Cushman & Wakefield's surveyed office and industrial levels for
+    the submarket the borough sits in, and a stated retail base, all carried to
+    the current quarter by Statistics Canada's index. They default to
+    `urban_rag.program`'s constants so a caller that hands over nothing still
+    computes, but a partition that went through the asset carries measured
+    numbers and `rent_provenance` says which.
+
+    The old ``commercial_rent_per_sqft_cad`` is gone. It priced retail and
+    office at one rate, and the two are about $4 a square foot apart in
+    Montreal - `rent_class_of` is where the split now lives.
+
+    ``retail_vacancy_pct`` and its two siblings are still stated: the
+    MarketBeats publish a vacancy but it is a *space* vacancy for a whole
+    submarket, which is not the credit-loss allowance a proforma nets off a
+    rent, and conflating them would be borrowing a number for a job it does not
+    do.
 
     ``market_value_factor`` multiplies the assessed value before it becomes the
     denominator. 1.0 reports the yield *on the roll*, which is the honest
@@ -351,19 +441,45 @@ class IncomeAssumptions:
     average_rent_cad: float | None = None
     vacancy_rate_pct: float | None = None
     operating_expense_ratio: float = 0.35
-    commercial_rent_per_sqft_cad: float = COMMERCIAL_REVENUE_PER_SQFT_CAD
+    maintenance_premium_per_year: float = MAINTENANCE_PREMIUM_PER_YEAR
+    max_maintenance_premium: float = MAX_MAINTENANCE_PREMIUM
+    assumed_building_age_years: float = ASSUMED_BUILDING_AGE_YEARS
+    income_reference_year: int | None = None
+    retail_rent_per_sqft_cad: float = COMMERCIAL_REVENUE_PER_SQFT_CAD
+    office_rent_per_sqft_cad: float = COMMERCIAL_REVENUE_PER_SQFT_CAD
     industrial_rent_per_sqft_cad: float = INDUSTRIAL_REVENUE_PER_SQFT_CAD
-    commercial_vacancy_pct: float = COMMERCIAL_VACANCY_PCT
+    retail_vacancy_pct: float = COMMERCIAL_VACANCY_PCT
+    office_vacancy_pct: float = COMMERCIAL_VACANCY_PCT
     industrial_vacancy_pct: float = INDUSTRIAL_VACANCY_PCT
     market_value_factor: float = 1.0
     survey_year: int | None = None
     survey_period: str | None = None
+    #: One entry per rent class, as `silver/commercial_rents` resolved it:
+    #: which publisher, which quarter, which submarket, and whether the figure
+    #: was measured, escalated or stated. Empty when the caller supplied no
+    #: surveyed rates, which is what says the defaults above are in force.
+    rent_provenance: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.operating_expense_ratio < 1.0:
             raise ValueError(
                 "operating_expense_ratio is a share of gross income and must "
                 f"be in [0, 1), got {self.operating_expense_ratio!r}"
+            )
+        if self.maintenance_premium_per_year < 0:
+            raise ValueError(
+                "maintenance_premium_per_year is added to the base ratio with "
+                f"age and cannot be negative, got {self.maintenance_premium_per_year!r}"
+            )
+        if self.max_maintenance_premium < 0:
+            raise ValueError(
+                "max_maintenance_premium is a share of gross income and "
+                f"cannot be negative, got {self.max_maintenance_premium!r}"
+            )
+        if self.assumed_building_age_years < 0:
+            raise ValueError(
+                "assumed_building_age_years is an age in years and cannot be "
+                f"negative, got {self.assumed_building_age_years!r}"
             )
         if self.market_value_factor <= 0:
             raise ValueError(
@@ -399,21 +515,109 @@ class IncomeAssumptions:
         """
         return _occupancy(self.vacancy_rate_pct)
 
+    def expense_ratios(self, year_built: pd.Series) -> pd.DataFrame:
+        """Per-lot age, maintenance premium and effective expense ratio.
+
+        Three columns rather than one, because the ratio a row was charged is
+        not readable back from the ratio alone: 0.43 is a 1955 building at the
+        default curve and a 1990 one at a steeper one, and the assumptions
+        object says which curve without saying which age.
+
+        With no `income_reference_year` there is no age to charge, so the
+        premium is zero everywhere and the effective ratio is the base - see
+        the class docstring. `building_age_years` is null in that case rather
+        than zero: the lots did not all become new, the question was not asked.
+        """
+        index = year_built.index
+        if self.income_reference_year is None:
+            return pd.DataFrame(
+                {
+                    "building_age_years": pd.Series(np.nan, index=index, dtype="float64"),
+                    "maintenance_premium": pd.Series(0.0, index=index, dtype="float64"),
+                    "effective_operating_expense_ratio": pd.Series(
+                        self.operating_expense_ratio, index=index, dtype="float64"
+                    ),
+                },
+                index=index,
+            )
+        age = building_age_years(
+            pd.to_numeric(year_built, errors="coerce").to_numpy(dtype="float64"),
+            reference_year=self.income_reference_year,
+            assumed_age_years=self.assumed_building_age_years,
+        )
+        effective = effective_operating_expense_ratio(
+            age,
+            base_ratio=self.operating_expense_ratio,
+            per_year=self.maintenance_premium_per_year,
+            cap=self.max_maintenance_premium,
+        )
+        return pd.DataFrame(
+            {
+                "building_age_years": pd.Series(age, index=index, dtype="float64"),
+                "maintenance_premium": pd.Series(
+                    effective - self.operating_expense_ratio,
+                    index=index,
+                    dtype="float64",
+                ),
+                "effective_operating_expense_ratio": pd.Series(
+                    effective, index=index, dtype="float64"
+                ),
+            },
+            index=index,
+        )
+
     def as_metadata(self) -> dict[str, object]:
         """The object every row carries, so a rate can be read back."""
         return {
             "average_rent_cad": _plain(self.average_rent_cad),
             "vacancy_rate_pct": _plain(self.vacancy_rate_pct),
             "operating_expense_ratio": self.operating_expense_ratio,
-            "commercial_rent_per_sqft_cad": self.commercial_rent_per_sqft_cad,
+            # The base above is what a *new* building is charged; these four
+            # are the curve that ages it. `urban_rag.hbu` reads the base back
+            # out of this object for the building it proposes, which is new by
+            # construction - see `operating_expense_ratio_of`.
+            "maintenance_premium_per_year": self.maintenance_premium_per_year,
+            "max_maintenance_premium": self.max_maintenance_premium,
+            "assumed_building_age_years": self.assumed_building_age_years,
+            "income_reference_year": _plain(self.income_reference_year),
+            "retail_rent_per_sqft_cad": self.retail_rent_per_sqft_cad,
+            "office_rent_per_sqft_cad": self.office_rent_per_sqft_cad,
             "industrial_rent_per_sqft_cad": self.industrial_rent_per_sqft_cad,
-            "commercial_vacancy_pct": self.commercial_vacancy_pct,
+            "retail_vacancy_pct": self.retail_vacancy_pct,
+            "office_vacancy_pct": self.office_vacancy_pct,
             "industrial_vacancy_pct": self.industrial_vacancy_pct,
             "market_value_factor": self.market_value_factor,
             "months_per_year": MONTHS_PER_YEAR,
             "survey_year": _plain(self.survey_year),
             "survey_period": self.survey_period,
+            # Which publisher, quarter and submarket each of the three
+            # non-residential rates came from, and whether it was measured,
+            # escalated or stated. A rate with no provenance beside it cannot
+            # be read against next quarter's - the rule `construction_costs`
+            # already follows in gold.lot_profiles.
+            "rent_provenance": dict(self.rent_provenance),
         }
+
+    def rate_for(self, rent_class: str) -> float | None:
+        """The gross annual rent per square foot for one rent class.
+
+        None for `residential` and for `none`: a dwelling is priced per month
+        per unit rather than per square foot, and a floor the CUBF could not
+        place is not priced at all.
+        """
+        return {
+            "retail": self.retail_rent_per_sqft_cad,
+            "office": self.office_rent_per_sqft_cad,
+            "industrial": self.industrial_rent_per_sqft_cad,
+        }.get(rent_class)
+
+    def vacancy_for(self, rent_class: str) -> float:
+        """The stated vacancy netted off one rent class, in percent."""
+        return {
+            "retail": self.retail_vacancy_pct,
+            "office": self.office_vacancy_pct,
+            "industrial": self.industrial_vacancy_pct,
+        }.get(rent_class, 0.0)
 
 
 @dataclass(frozen=True)
@@ -582,14 +786,22 @@ def aggregate_units_by_lot(
         if column in joined.columns:
             joined[column] = _numeric(joined, column)
 
+    # Two classifications of the same unit, and they are not redundant: the
+    # first is what the lot's floor is *reported* as and the second what it is
+    # *charged*. They differ only on commerce, which splits into retail and
+    # office because the rent surveys do - see `rent_class_of`.
+    has_code = _USE_CODE in joined.columns
     joined["income_class"] = (
-        joined[_USE_CODE].map(income_class_of)
-        if _USE_CODE in joined.columns
-        else UNKNOWN_INCOME_CLASS
+        joined[_USE_CODE].map(income_class_of) if has_code else UNKNOWN_INCOME_CLASS
+    )
+    joined["rent_class"] = (
+        joined[_USE_CODE].map(rent_class_of) if has_code else UNKNOWN_INCOME_CLASS
     )
     floor = _numeric(joined, _FLOOR_AREA)
     for name in INCOME_CLASSES:
         joined[f"{name}_floor_area_m2"] = floor.where(joined["income_class"] == name)
+    for name in ("retail", "office"):
+        joined[f"{name}_floor_area_m2"] = floor.where(joined["rent_class"] == name)
 
     grouped = joined.groupby(lot_column, sort=False)
     # `min_count=1` on every sum, which is the whole reason this is not one
@@ -689,6 +901,8 @@ def _empty_aggregate(lot_column: str) -> pd.DataFrame:
         "floor_area_m2",
         "roll_land_area_m2",
         *(f"{name}_floor_area_m2" for name in INCOME_CLASSES),
+        "retail_floor_area_m2",
+        "office_floor_area_m2",
         "year_built",
         "num_storeys",
     )
@@ -721,17 +935,24 @@ def annual_income(
     `*_floor_area_m2` columns `aggregate_units_by_lot` produces. Returns four
     income columns plus the NOI, indexed like ``frame``.
 
-    **The three classes are added, not chosen between.** A lot carrying a
-    triplex over a depanneur earns both, because its two assessment units say
-    so - which is the whole reason the floor was split by the unit's own use
-    code one step earlier rather than by a dominant use here.
+    **The classes are added, not chosen between.** A lot carrying a triplex
+    over a depanneur earns both, because its two assessment units say so -
+    which is the whole reason the floor was split by the unit's own use code
+    one step earlier rather than by a dominant use here.
 
-    **Residential is per dwelling per month; the other two are per square foot
-    per year.** That is how each is quoted, and `MONTHS_PER_YEAR` and
-    `M2_PER_SQFT` are the only two conversions between them. Mixing them up is
-    the failure this function is most exposed to - a monthly rent read as
-    annual understates a building twelve-fold, and a square metre priced as a
-    square foot overstates one ten-fold, and both look plausible.
+    **Priced at four rates and reported at three.** Retail and office are
+    charged separately, because `silver/commercial_rents` surveys them
+    separately and about $4 a square foot separates them in Montreal, and then
+    added back into `commercial_income_cad` so the reported columns keep the
+    shape every reader downstream already has. `retail_income_cad` and
+    `office_income_cad` travel beside it for anyone who wants the split.
+
+    **Residential is per dwelling per month; the rest are per square foot per
+    year.** That is how each is quoted, and `MONTHS_PER_YEAR` and `M2_PER_SQFT`
+    are the only two conversions between them. Mixing them up is the failure
+    this function is most exposed to - a monthly rent read as annual
+    understates a building twelve-fold, and a square metre priced as a square
+    foot overstates one ten-fold, and both look plausible.
 
     **Vacancy is netted per class and the expense ratio once at the end.** They
     are different things: vacancy is income never collected, the expense ratio
@@ -755,30 +976,54 @@ def annual_income(
             * assumptions.residential_occupancy
         )
 
-    commercial = _non_residential_income(
-        _numeric(frame, "commercial_floor_area_m2"),
-        rate_per_sqft=assumptions.commercial_rent_per_sqft_cad,
-        vacancy_pct=assumptions.commercial_vacancy_pct,
-    )
-    industrial = _non_residential_income(
-        _numeric(frame, "industrial_floor_area_m2"),
-        rate_per_sqft=assumptions.industrial_rent_per_sqft_cad,
-        vacancy_pct=assumptions.industrial_vacancy_pct,
+    priced = {
+        name: _non_residential_income(
+            _numeric(frame, f"{name}_floor_area_m2"),
+            rate_per_sqft=assumptions.rate_for(name),
+            vacancy_pct=assumptions.vacancy_for(name),
+        )
+        for name in NON_RESIDENTIAL_RENT_CLASSES
+    }
+    # Retail and office put back together under the name the reported columns
+    # use. `min_count=1` again: a lot with retail floor and no office floor
+    # earns its retail income rather than a NaN, and one with neither earns a
+    # NaN rather than a zero.
+    commercial = (
+        pd.concat([priced["retail"], priced["office"]], axis=1)
+        .sum(axis=1, min_count=1)
     )
 
-    parts = pd.concat([residential, commercial, industrial], axis=1)
-    # `min_count=1` is what keeps "nobody could price this" out of "this earns
-    # nothing": a row where all three are NaN sums to NaN rather than to 0.0,
-    # and a row where one was priced sums to that one.
+    parts = pd.concat([residential, commercial, priced["industrial"]], axis=1)
+    # The same rule at the top level: a row where every class is NaN sums to
+    # NaN rather than to 0.0, which is what keeps "nobody could price this" out
+    # of "this earns nothing".
     gross = parts.sum(axis=1, min_count=1)
+    # The expense ratio is per lot, not per partition: only maintenance among
+    # the four things it covers depends on the building's age, and that part is
+    # `assumptions.expense_ratios`. A frame with no `year_built` - a partition
+    # the roll never reached, or a hand-built test frame - charges the assumed
+    # age, which is what that column being absent and being null both mean.
+    year_built = (
+        frame["year_built"]
+        if "year_built" in frame.columns
+        else pd.Series(np.nan, index=frame.index, dtype="float64")
+    )
+    ratios = assumptions.expense_ratios(year_built)
     return pd.DataFrame(
         {
             "residential_income_cad": residential,
+            "retail_income_cad": priced["retail"],
+            "office_income_cad": priced["office"],
             "commercial_income_cad": commercial,
-            "industrial_income_cad": industrial,
+            "industrial_income_cad": priced["industrial"],
             "gross_income_cad": gross,
+            "building_age_years": ratios["building_age_years"],
+            "maintenance_premium": ratios["maintenance_premium"],
+            "effective_operating_expense_ratio": ratios[
+                "effective_operating_expense_ratio"
+            ],
             "net_operating_income_cad": gross
-            * (1.0 - assumptions.operating_expense_ratio),
+            * (1.0 - ratios["effective_operating_expense_ratio"]),
         },
         index=frame.index,
     )
@@ -808,9 +1053,16 @@ def cap_rate_pct(
 
 
 def _non_residential_income(
-    area_m2: pd.Series, *, rate_per_sqft: float, vacancy_pct: float
+    area_m2: pd.Series, *, rate_per_sqft: float | None, vacancy_pct: float
 ) -> pd.Series:
-    """Annual income from a class of floor, at a stated rate and vacancy."""
+    """Annual income from a class of floor, at its rent and stated vacancy.
+
+    A null rate is a class nothing could price - `rate_for` answers None for a
+    class that has no surveyed rent - and returns nulls rather than zeros, the
+    same distinction a suppressed CMHC rent draws on the residential side.
+    """
+    if rate_per_sqft is None:
+        return pd.Series(np.nan, index=area_m2.index, dtype="float64")
     return area_m2 / M2_PER_SQFT * float(rate_per_sqft) * _occupancy(vacancy_pct)
 
 

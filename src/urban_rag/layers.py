@@ -82,10 +82,14 @@ ASSET_LAYERS: dict[str, Layer] = {
     "montreal_residential_costs": Layer.BRONZE,
     "montreal_nonresidential_costs": Layer.BRONZE,
     "property_assessment_roll": Layer.BRONZE,
+    "uniformized_property_wealth": Layer.BRONZE,
+    "montreal_commercial_rents": Layer.BRONZE,
+    "commercial_rent_index": Layer.BRONZE,
     # -- silver: this platform's grain and vocabulary -----------------------
     "assessment_units": Layer.SILVER,
     "lot_assessed_values": Layer.SILVER,
     "lot_assessment_comparables": Layer.SILVER,
+    "commercial_rents": Layer.SILVER,
     "vacancy_rates": Layer.SILVER,
     "average_rents": Layer.SILVER,
     "building_lot_intersections": Layer.SILVER,
@@ -96,8 +100,13 @@ ASSET_LAYERS: dict[str, Layer] = {
     "zoning_grid_columns": Layer.SILVER,
     "lot_zoning_envelopes": Layer.SILVER,
     "lot_buildable_setbacks": Layer.SILVER,
+    "lot_development_programs": Layer.SILVER,
     # -- gold: a question, answered -----------------------------------------
     "lot_profiles": Layer.GOLD,
+    "lot_highest_best_use": Layer.GOLD,
+    "lot_redevelopment_gap": Layer.GOLD,
+    "lot_building_massing": Layer.GOLD,
+    "lot_investment_opportunities": Layer.GOLD,
     "document_index": Layer.GOLD,
 }
 

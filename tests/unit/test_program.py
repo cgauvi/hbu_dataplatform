@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import pytest
 
 from urban_rag.program import (
@@ -54,41 +55,47 @@ from urban_rag.program import (
     ABOVE_GRADE_STALL_AREA_SQFT,
     ABOVE_GRADE_STALL_COST_CAD,
     AMORTIZATION_MONTHS,
+    ASSUMED_BUILDING_AGE_YEARS,
+    BuildingLevel,
     COMMERCIAL_COST_PER_SQFT_CAD,
     COMMERCIAL_REVENUE_PER_SQFT_CAD,
     COMMERCIAL_STOREY_HEIGHT_M,
     COMMERCIAL_VACANCY_PCT,
+    ConstructionCosts,
     DEFAULT_STOREY_HEIGHTS,
     INDUSTRIAL_COST_PER_SQFT_CAD,
     INDUSTRIAL_REVENUE_PER_SQFT_CAD,
     INDUSTRIAL_STOREY_HEIGHT_M,
     INDUSTRIAL_VACANCY_PCT,
+    Lot,
     M2_PER_SQFT,
+    MAINTENANCE_PREMIUM_PER_YEAR,
+    MAX_MAINTENANCE_PREMIUM,
     MONEY_SCALE,
     MONTHS_PER_YEAR,
     NO_CONSTRUCTION_COST,
     NO_NON_RESIDENTIAL,
     NO_PARKING,
+    NonResidentialEconomics,
+    ParkingRules,
+    ProgramError,
     RESIDENTIAL_COST_PER_SQFT_CAD,
     RESIDENTIAL_STOREY_HEIGHT_M,
     STALLS_PER_1000_SQFT,
     STALLS_PER_DWELLING,
+    StoreyHeights,
     UNDERGROUND_LEVEL_HEIGHT_M,
     UNDERGROUND_STALL_AREA_SQFT,
     UNDERGROUND_STALL_COST_CAD,
     UNIT_AREAS_SQFT,
-    BuildingLevel,
-    ConstructionCosts,
-    Lot,
-    NonResidentialEconomics,
-    ParkingRules,
-    ProgramError,
-    StoreyHeights,
     UnitEconomics,
     ZoneColumn,
+    building_age_years,
+    effective_operating_expense_ratio,
     is_commercial_usage,
     is_industrial_usage,
     is_residential_usage,
+    maintenance_premium,
     permitted_floors,
     select_residential_column,
     solve_program,
@@ -1510,3 +1517,88 @@ def test_a_storey_of_no_height_is_refused(overrides):
 def test_a_negative_metric_norm_is_refused(norm):
     with pytest.raises(ProgramError):
         column(**{norm: -1.0})
+
+
+# -- maintenance: what age adds to an operating expense ratio ---------------
+
+
+def test_age_is_the_reference_year_less_the_year_built():
+    assert float(building_age_years(1920, reference_year=2026)) == 106.0
+
+
+def test_an_unstated_year_is_charged_the_assumed_age_not_zero():
+    # Reading a missing year as new would hand the least-documented buildings
+    # in the borough the cheapest maintenance in it.
+    assert float(
+        building_age_years(float("nan"), reference_year=2026, assumed_age_years=50.0)
+    ) == 50.0
+
+
+def test_a_year_in_the_future_is_a_new_building_rather_than_a_negative_age():
+    # The roll carries units permitted but not finished; a building cannot be
+    # newer than new.
+    assert float(building_age_years(2030, reference_year=2026)) == 0.0
+
+
+def test_the_premium_is_zero_for_a_new_building():
+    assert float(maintenance_premium(0)) == 0.0
+
+
+def test_the_premium_rises_with_age_and_then_stops():
+    at_50 = float(maintenance_premium(50))
+    at_100 = float(maintenance_premium(100))
+    at_200 = float(maintenance_premium(200))
+
+    assert 0 < at_50 < at_100
+    # Past the cap an older building is not charged more: an owner who stops
+    # spending stops collecting, and the curve is fitted to nothing that old.
+    assert at_100 == pytest.approx(MAX_MAINTENANCE_PREMIUM)
+    assert at_200 == pytest.approx(MAX_MAINTENANCE_PREMIUM)
+
+
+def test_the_premium_is_linear_in_age_below_the_cap():
+    assert float(maintenance_premium(10)) == pytest.approx(
+        10 * MAINTENANCE_PREMIUM_PER_YEAR
+    )
+    assert float(maintenance_premium(20)) == pytest.approx(
+        2 * float(maintenance_premium(10))
+    )
+
+
+def test_a_whole_borough_is_charged_in_one_pass():
+    # The array form is what `comparables` uses; it must agree with the scalar.
+    ages = np.array([0.0, 25.0, 100.0])
+    charged = maintenance_premium(ages)
+
+    assert charged.shape == (3,)
+    assert list(charged) == [float(maintenance_premium(a)) for a in ages]
+
+
+def test_the_effective_ratio_is_the_base_plus_the_premium():
+    assert float(effective_operating_expense_ratio(0, base_ratio=0.35)) == 0.35
+    assert float(
+        effective_operating_expense_ratio(100, base_ratio=0.35)
+    ) == pytest.approx(0.35 + MAX_MAINTENANCE_PREMIUM)
+
+
+def test_the_effective_ratio_stays_below_one_so_an_noi_stays_positive():
+    # A ratio of 1 is a building whose whole rent leaves again; past it the
+    # income is negative, which is not what a high maintenance bill means.
+    charged = float(
+        effective_operating_expense_ratio(
+            200, base_ratio=0.95, per_year=0.01, cap=0.5
+        )
+    )
+    assert charged < 1.0
+
+
+def test_a_base_ratio_that_is_not_a_share_is_refused_rather_than_clipped():
+    with pytest.raises(ProgramError, match="base operating expense ratio"):
+        effective_operating_expense_ratio(10, base_ratio=1.0)
+
+
+def test_a_negative_premium_is_refused():
+    # This is a premium, not an adjustment: a building cannot be cheaper to
+    # run than new.
+    with pytest.raises(ProgramError, match="cannot be negative"):
+        maintenance_premium(10, per_year=-0.01)

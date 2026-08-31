@@ -48,35 +48,47 @@ The value columns are **carried, not recomputed**. `total_assessed_value` and
 its apportioned twin travel through untouched, so the two silver tables cannot
 end up disagreeing about what a lot is worth.
 
-## The income side, and which two inputs are measured
+## The income side, and what is measured in it
 
 The roll says what stands on the lot. CMHC says what a dwelling rents for here.
-Everything between them is a stated assumption, and every row carries the ones
-that produced it in `income_assumptions`.
+Cushman & Wakefield say what a square foot of office and warehouse rents for in
+this borough's submarket. Every row carries the lot in `income_assumptions`.
 
 | | Where it comes from | Measured? |
 | --- | --- | --- |
 | dwellings, floor area, use code | the roll (`rl0311a`, `rl0308a`, `rl0105a`) | ✅ |
 | average rent, vacancy rate | CMHC, for this borough | ✅ |
-| operating expense ratio | `OPEX`, default 0.35 | stated |
-| commercial / industrial $/sqft/yr | `urban_rag.program`, 80 and 30 | stated |
+| office, industrial $/sqft/yr | C&W MarketBeat, escalated by StatCan — [commercial-rents.md](commercial-rents.md) | ✅ |
+| retail $/sqft/yr | `RETAIL_BASE`, escalated by StatCan's retail index | stated |
 | their vacancies | `urban_rag.program`, 7% | stated |
+| operating expense ratio (new build) | `OPEX`, default 0.35 | stated |
+| maintenance premium for age | the roll's `year_built` on a stated curve — [maintenance.md](maintenance.md) | age measured, curve stated |
 | market value factor | `MARKET_FACTOR`, default 1.0 | stated |
 
 ```
 residential  = num_dwellings × rent × 12 × (1 − vacancy/100)
-commercial   = commercial_floor_m2 / M2_PER_SQFT × 80 × (1 − 0.07)
-industrial   = industrial_floor_m2 / M2_PER_SQFT × 30 × (1 − 0.07)
+retail       = retail_floor_m2     / M2_PER_SQFT × retail_rate     × (1 − 0.07)
+office       = office_floor_m2     / M2_PER_SQFT × office_rate     × (1 − 0.07)
+industrial   = industrial_floor_m2 / M2_PER_SQFT × industrial_rate × (1 − 0.07)
 
+commercial_income_cad    = retail + office
 gross_income_cad         = the classes that could be priced, added
-net_operating_income_cad = gross × (1 − operating_expense_ratio)
+net_operating_income_cad = gross × (1 − effective_operating_expense_ratio)
+                                          └─ OPEX + maintenance_premium(age)
 cap_rate_pct             = 100 × NOI / (assessed_value × market_value_factor)
 ```
 
-The per-square-foot rates are **imported from `urban_rag.program`** rather than
-restated, so a change to what a retail square foot is thought to earn moves the
-development solver and this asset together instead of leaving them quietly
-disagreeing.
+**Commerce is charged in two halves and reported as one.** The CUBF's 4000s are
+retail and its 5000s and 6000s are offices and services, and the two rent
+dollars a square foot apart — so `rent_class_of` splits them where
+`income_class_of` does not. `commercial_floor_area_m2` and
+`commercial_income_cad` keep exactly the meaning they had; `retail_*` and
+`office_*` travel beside them.
+
+`rent_provenance` in `income_assumptions` names, per class, which publisher,
+which quarter, which submarket and whether the figure was measured, escalated or
+stated. A rate with no provenance beside it cannot be read against next
+quarter's.
 
 **The floor is split by each unit's own use code, not by the lot's.** A unit is
 one *unité d'évaluation* with one `rl0105a`, so the class its whole floor

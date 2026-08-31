@@ -31,15 +31,27 @@ from urban_rag.cmhc_assets import (
     vacancy_rates,
 )
 from urban_rag.comparables_assets import lot_assessment_comparables
+from urban_rag.rent_assets import (
+    commercial_rent_index,
+    commercial_rents,
+    montreal_commercial_rents,
+)
 from urban_rag.envelope_assets import lot_zoning_envelopes, zoning_grid_columns
 from urban_rag.estimator_assets import (
     montreal_nonresidential_costs,
     montreal_residential_costs,
 )
 from urban_rag.frontage_assets import lot_frontage
+from urban_rag.opportunity_assets import lot_investment_opportunities
+from urban_rag.hbu_assets import (
+    lot_development_programs,
+    lot_highest_best_use,
+    lot_redevelopment_gap,
+)
 from urban_rag.infolot_assets import neighborhood_lots
 from urban_rag.layers import ASSET_LAYERS
 from urban_rag.lot_profiles_assets import lot_profiles
+from urban_rag.massing_assets import lot_building_massing
 from urban_rag.open_data_assets import reference_neighborhoods, street_network
 from urban_rag.partitions import (
     ENABLED_NEIGHBORHOODS,
@@ -55,17 +67,21 @@ from urban_rag.rag_assets import (
 from urban_rag.resources import (
     BdoiResource,
     CmhcResource,
+    CrspiResource,
     EmbeddingModel,
     EstimatorResource,
     InfolotResource,
+    MarketBeatResource,
     OpenDataResource,
     ParquetStore,
     PdfCache,
     PgVectorResource,
     PostgisResource,
+    RfuResource,
     RoleResource,
     SpectrumResource,
 )
+from urban_rag.rfu_assets import uniformized_property_wealth
 from urban_rag.role_assets import (
     assessment_units,
     lot_assessed_values,
@@ -93,10 +109,14 @@ ASSETS = [
     montreal_residential_costs,
     montreal_nonresidential_costs,
     property_assessment_roll,
+    uniformized_property_wealth,
+    montreal_commercial_rents,
+    commercial_rent_index,
     # silver
     assessment_units,
     lot_assessed_values,
     lot_assessment_comparables,
+    commercial_rents,
     vacancy_rates,
     average_rents,
     building_lot_intersections,
@@ -107,8 +127,13 @@ ASSETS = [
     zoning_grid_columns,
     lot_zoning_envelopes,
     lot_buildable_setbacks,
+    lot_development_programs,
     # gold
     lot_profiles,
+    lot_highest_best_use,
+    lot_redevelopment_gap,
+    lot_investment_opportunities,
+    lot_building_massing,
     document_index,
 ]
 
@@ -214,6 +239,23 @@ lot_assessed_values_job = define_asset_job(
     partitions_def=scrape_partitions,
 )
 
+# Both commercial-rent snapshots in one run, for the reason the two CMHC
+# surveys share one and the two cost snapshots do: neither has a borough axis,
+# and the silver asset behind them needs both. A day where the MarketBeats
+# landed and the index did not is a day whose rents cannot be carried to the
+# quarter being scraped.
+commercial_rent_sources_job = define_asset_job(
+    "commercial_rent_sources_job",
+    selection=AssetSelection.assets(montreal_commercial_rents, commercial_rent_index),
+    partitions_def=date_partitions,
+)
+
+commercial_rents_job = define_asset_job(
+    "commercial_rents_job",
+    selection=AssetSelection.assets(commercial_rents),
+    partitions_def=scrape_partitions,
+)
+
 # Its own job rather than a place in `lot_assessed_values_job`, though it reads
 # that job's output and re-derives the placement behind it: the neighbour
 # search is a borough-wide pass whose whole shape is set by config nothing
@@ -265,6 +307,17 @@ construction_costs_job = define_asset_job(
     partitions_def=date_partitions,
 )
 
+# One row per Quebec organisme municipal, so DATE only - the same posture as
+# the roll and the two CMHC surveys. It is the roll's companion rather than its
+# dependant: the roll says what a lot is worth on paper and this says what to
+# multiply that by, but the two are separate publications on separate cadences
+# and neither run needs the other's output.
+uniformized_property_wealth_job = define_asset_job(
+    "uniformized_property_wealth_job",
+    selection=AssetSelection.assets(uniformized_property_wealth),
+    partitions_def=date_partitions,
+)
+
 vacancy_rates_job = define_asset_job(
     "vacancy_rates_job",
     selection=AssetSelection.assets(vacancy_rates),
@@ -287,6 +340,56 @@ zoning_envelopes_job = define_asset_job(
     partitions_def=scrape_partitions,
 )
 
+
+# The solve, on its own. It is the expensive step of the three - a borough is
+# tens of thousands of CP-SAT models - and it is the one whose config is about
+# the *building* rather than about the data: stalls per dwelling, the cost per
+# square foot, what a storey stands. Re-designing that building should re-solve
+# without re-reading the assessment lineage, and re-reading the assessment
+# lineage should not re-solve. The same split `lot_assessment_comparables_job`
+# makes behind `lot_assessed_values_job`.
+lot_development_programs_job = define_asset_job(
+    "lot_development_programs_job",
+    selection=AssetSelection.assets(lot_development_programs),
+    partitions_def=scrape_partitions,
+)
+
+# The two gold assets in one run, and not with the solve above: choosing among
+# the programs is a sort and comparing them against the roll is a join, so the
+# pair is seconds over what the solve already wrote. Splitting them further
+# would be two jobs to run in sequence for no saving; keeping them with the
+# solve would mean re-solving a borough to re-read it at a different expense
+# ratio, which is `lot_redevelopment_gap`'s single largest lever and is not
+# even this pipeline's config - it is whatever `comparables` was run at.
+lot_hbu_job = define_asset_job(
+    "lot_hbu_job",
+    selection=AssetSelection.assets(lot_highest_best_use, lot_redevelopment_gap),
+    partitions_def=scrape_partitions,
+)
+
+# Its own job rather than a place in `lot_hbu_job`, though it reads that job's
+# output: this one is geometry rather than arithmetic - a rectangle fitted per
+# lot against the setback envelope - and its config is about the *search* (the
+# aspect ratios, how finely to look for a placement) rather than about the
+# building or the money. Re-drawing a borough at a different set of ratios
+# should not re-choose every lot's envelope to do it, and it costs about a
+# minute where the two it sits behind cost seconds.
+lot_massing_job = define_asset_job(
+    "lot_massing_job",
+    selection=AssetSelection.assets(lot_building_massing),
+    partitions_def=scrape_partitions,
+)
+
+# Its own job rather than a place in `lot_hbu_job`, though it reads that
+# job's output: this is a classification and two sorts over one parquet
+# file, and re-screening a borough at a different mixed-use threshold or a
+# different land factor should not re-solve it. The same split
+# `lot_redevelopment_gap` makes behind `lot_highest_best_use`.
+lot_opportunities_job = define_asset_job(
+    "lot_opportunities_job",
+    selection=AssetSelection.assets(lot_investment_opportunities),
+    partitions_def=scrape_partitions,
+)
 
 rag_corpus_job = define_asset_job(
     "rag_corpus_job",
@@ -418,6 +521,43 @@ def daily_lot_assessed_values_schedule(context: ScheduleEvaluationContext):
 
 
 @schedule(
+    job=commercial_rent_sources_job,
+    # Alongside the other sources with no upstream here. Two PDFs and a 14 kB
+    # table, so it costs nothing and can sit early.
+    cron_schedule="47 4 * * *",
+    execution_timezone=TIMEZONE,
+    description="Snapshot the MarketBeats and the commercial rent index for today.",
+)
+def daily_commercial_rent_sources_schedule(
+    context: ScheduleEvaluationContext,
+) -> RunRequest:
+    scrape_date = context.scheduled_execution_time.strftime("%Y-%m-%d")
+    return RunRequest(
+        run_key=f"commercial-rent-sources-{scrape_date}", partition_key=scrape_date
+    )
+
+
+@schedule(
+    job=commercial_rents_job,
+    # Behind the two snapshots above, and ahead of lot_assessment_comparables
+    # at 40 6 which prices every square foot of commercial floor against what
+    # this resolves.
+    cron_schedule="10 6 * * *",
+    execution_timezone=TIMEZONE,
+    description="Resolve each borough's retail, office and industrial rent.",
+)
+def daily_commercial_rents_schedule(context: ScheduleEvaluationContext):
+    scrape_date = context.scheduled_execution_time.strftime("%Y-%m-%d")
+    for neighborhood in ENABLED_NEIGHBORHOODS:
+        yield RunRequest(
+            run_key=f"commercial-rents-{neighborhood}-{scrape_date}",
+            partition_key=MultiPartitionKey(
+                {"date": scrape_date, "neighborhood": neighborhood}
+            ),
+        )
+
+
+@schedule(
     job=lot_assessment_comparables_job,
     # Ten minutes behind lot_assessed_values (30 6), which supplies the lot
     # geometry and the two totals, and well behind the CMHC pair (55 5, 58 5),
@@ -539,6 +679,26 @@ def daily_construction_costs_schedule(context: ScheduleEvaluationContext) -> Run
 
 
 @schedule(
+    job=uniformized_property_wealth_job,
+    # Ahead of the roll (52 4) rather than behind it, though nothing forces the
+    # order: this is a 275 kB CSV against the roll's 572 MB, so a day on which
+    # both are due gets the cheap one out of the way first, and a morning where
+    # the big download stalls still has the factor for that date.
+    cron_schedule="45 4 * * *",
+    execution_timezone=TIMEZONE,
+    description="Snapshot the RFU, and with it the year's facteur comparatif.",
+)
+def daily_uniformized_property_wealth_schedule(
+    context: ScheduleEvaluationContext,
+) -> RunRequest:
+    scrape_date = context.scheduled_execution_time.strftime("%Y-%m-%d")
+    return RunRequest(
+        run_key=f"uniformized-property-wealth-{scrape_date}",
+        partition_key=scrape_date,
+    )
+
+
+@schedule(
     job=vacancy_rates_job,
     # Behind cmhc_survey_job, which is now its upstream: the crosswalk is
     # applied to that day's snapshot rather than to a fresh download.
@@ -628,6 +788,35 @@ def daily_neighborhood_streets_schedule(context: ScheduleEvaluationContext):
 # margins it subtracts. Both of those have to run first and neither is
 # scheduled yet, so the ordering is a matter for whoever adds all three.
 
+# No schedule for the three highest-and-best-use assets either, and for the
+# same two reasons stacked. `silver.lot_development_programs`,
+# `gold.lot_highest_best_use` and `gold.lot_redevelopment_gap` are hbu_infra's
+# to create (sql/017, sql/018, sql/019) and none has been applied yet; and every
+# one of their inputs comes from an asset that has no schedule of its own -
+# `zoning_envelopes_job` supplies the envelopes, `lot_buildable_setbacks_job`
+# the margins, and a nightly run of these would fail behind the ones already
+# failing. All three are registered and have jobs, so they appear in the lineage
+# and can be run by hand - see `lot_development_programs_job`, `lot_hbu_job`,
+# `make programs` and `make hbu`. Add the schedules when the relations and the
+# upstream schedules both land, at 45 7 and 50 7: behind `lot_profiles` at 40 7,
+# because they read the same envelopes it does and there is no reason for two
+# borough-wide passes over them to overlap.
+#
+# `lot_redevelopment_gap` also reads `lot_assessment_comparables`, which *is*
+# scheduled (40 6) - so of its four upstreams that one needs no waiting, and the
+# gap it computes is only as fresh as the envelopes behind the other three.
+
+# No schedule for `lot_building_massing` either, behind all of them:
+# `gold.lot_building_massing` is hbu_infra's sql/022 and has not been applied,
+# and it reads `lot_highest_best_use` for the footprint and
+# `lot_buildable_setbacks` for the envelope to fit it into - neither scheduled.
+# Registered with `lot_massing_job`; run by hand with `make massing`. It is the
+# one asset here whose output is meant to be looked at rather than queried, so
+# it is also the one most often run on its own after a config change: a
+# different set of aspect ratios redraws a borough without re-solving it. Add
+# the schedule at 55 7, last of the lineage, when the relation and the upstream
+# schedules land.
+
 # No schedule for `lot_profiles`, unlike every other asset here, and not an
 # oversight: it reads two relations hbu_infra has to create first.
 # sql/009_gold_lot_profiles.sql creates the table it writes into, and
@@ -663,11 +852,18 @@ defs = Definitions(
         assessment_roll_job,
         lot_assessed_values_job,
         lot_assessment_comparables_job,
+        commercial_rent_sources_job,
+        commercial_rents_job,
         lot_frontage_job,
         zoning_envelopes_job,
         lot_buildable_setbacks_job,
+        lot_development_programs_job,
+        lot_hbu_job,
+        lot_massing_job,
+        lot_opportunities_job,
         cmhc_survey_job,
         construction_costs_job,
+        uniformized_property_wealth_job,
         vacancy_rates_job,
         average_rents_job,
         rag_corpus_job,
@@ -681,11 +877,14 @@ defs = Definitions(
         daily_assessment_roll_schedule,
         daily_lot_assessed_values_schedule,
         daily_lot_assessment_comparables_schedule,
+        daily_commercial_rent_sources_schedule,
+        daily_commercial_rents_schedule,
         daily_lots_schedule,
         daily_buildings_schedule,
         daily_building_lots_schedule,
         daily_cmhc_survey_schedule,
         daily_construction_costs_schedule,
+        daily_uniformized_property_wealth_schedule,
         daily_vacancy_rates_schedule,
         daily_average_rents_schedule,
         daily_neighborhood_streets_schedule,
@@ -714,6 +913,19 @@ defs = Definitions(
         # 16 kB script that its publisher can revise on any day, so each scrape
         # date fetches it again rather than reusing a copy.
         "estimator": EstimatorResource(),
+        # Donnees Quebec rather than the city's portal - see `RfuResource`.
+        "rfu": RfuResource(),
+        "marketbeat": MarketBeatResource(
+            # Same posture as bdoi/cmhc/role: a published quarter is final, so
+            # the two PDFs are fetched once and shared by every scrape date
+            # until the next quarter lands. The landing page they are
+            # discovered from is never cached - it is what says which quarter
+            # is current.
+            cache_dir=str(DATA_ROOT / "cache" / "marketbeat"),
+        ),
+        # No cache_dir, like `estimator`: the CRSPI table is 14 kB and is
+        # revised, so every scrape date reads it again.
+        "crspi": CrspiResource(),
         "cmhc": CmhcResource(
             # Same posture as bdoi/pdf_cache: a published survey year is
             # final, so the workbook is cached once, outside the partition

@@ -32,9 +32,23 @@ from urban_rag.estimator import (
     MONTREAL_CITY_ID,
     EstimatorClient,
 )
+from urban_rag.crspi import (
+    DEFAULT_BASE_URL as CRSPI_BASE_URL,
+    DEFAULT_TABLE_ID as CRSPI_TABLE_ID,
+    CrspiFetcher,
+)
+from urban_rag.marketbeat import (
+    DEFAULT_LANDING_URL as MARKETBEAT_LANDING_URL,
+    MarketBeatFetcher,
+)
 from urban_rag.open_data import (
     DEFAULT_BASE_URL as OPEN_DATA_BASE_URL,
     CkanClient,
+)
+from urban_rag.rfu import (
+    DEFAULT_BASE_URL as RFU_BASE_URL,
+    RFU_YEAR_VAR,
+    default_rfu_year,
 )
 from urban_rag.role_foncier import (
     DEFAULT_BASE_URL as ROLE_BASE_URL,
@@ -137,6 +151,58 @@ class OpenDataResource(ConfigurableResource):
     """
 
     base_url: str = OPEN_DATA_BASE_URL
+    timeout_seconds: float = 60.0
+    request_delay_seconds: float = Field(
+        default=0.25, description="Pause before every request, in seconds."
+    )
+    max_retries: int = 3
+    ca_bundle: str | None = Field(
+        default=None,
+        description=(
+            "PEM bundle to verify TLS against. Defaults to REQUESTS_CA_BUNDLE, "
+            "CURL_CA_BUNDLE or SSL_CERT_FILE, whichever is set."
+        ),
+    )
+
+    def client(self) -> CkanClient:
+        return CkanClient(
+            self.base_url,
+            timeout_seconds=self.timeout_seconds,
+            request_delay_seconds=self.request_delay_seconds,
+            max_retries=self.max_retries,
+            ca_bundle=self.ca_bundle,
+        )
+
+
+class RfuResource(ConfigurableResource):
+    """Which year's *richesse fonciere uniformisee* to read, and from where.
+
+    A second CKAN portal rather than a second client: Donnees Quebec runs the
+    same API as the city's, so this differs from `OpenDataResource` only in its
+    base URL and in carrying a year. Kept apart from it because they are two
+    publishers with two licences and two release cadences, and a run pointed at
+    one should not be able to silently read the other.
+
+    `rfu_year` is config rather than a partition dimension, for the reason
+    `RoleResource.roll_year` and `CmhcResource.survey_year` are: the RFU is
+    annual and this pipeline's date axis is the scrape date. It defaults to
+    $URBAN_RAG_RFU_YEAR and, unset, to whatever year the dataset publishes
+    last - see `urban_rag.rfu.default_rfu_year` for why that is resolved from
+    the catalogue instead of pinned here.
+
+    No cache_dir, unlike `RoleResource`: this is a 275 kB CSV, not a 572 MB
+    archive, and re-fetching it per scrape date costs less than reasoning about
+    when a cached copy went stale.
+    """
+
+    base_url: str = RFU_BASE_URL
+    rfu_year: int | None = Field(
+        default_factory=default_rfu_year,
+        description=(
+            f"Fiscal year of the RFU to read. Defaults to ${RFU_YEAR_VAR}, "
+            "else the latest year the dataset publishes."
+        ),
+    )
     timeout_seconds: float = 60.0
     request_delay_seconds: float = Field(
         default=0.25, description="Pause before every request, in seconds."
@@ -388,6 +454,82 @@ class RoleResource(ConfigurableResource):
     def fetcher(self) -> RoleFetcher:
         return RoleFetcher(
             cache_dir=self.cache_dir,
+            base_url=self.base_url,
+            timeout_seconds=self.timeout_seconds,
+            request_delay_seconds=self.request_delay_seconds,
+            max_retries=self.max_retries,
+            ca_bundle=self.ca_bundle,
+        )
+
+
+class MarketBeatResource(ConfigurableResource):
+    """Connection settings for Cushman & Wakefield's Montreal MarketBeats.
+
+    A download cache like `BdoiResource` and `RoleResource` have, and for the
+    same reason: a published quarter is final, so only the first scrape date of
+    a quarter pays for the two PDFs. The *landing page* is never cached - it is
+    what says which quarter is current, and caching it would pin this pipeline
+    to whichever quarter it first saw.
+
+    `landing_url` is config rather than a constant so a borough outside Montreal
+    could point at another city's MarketBeat page without a code change, the
+    same latitude `EstimatorResource.city` gives. Both assets that read this are
+    named for Montreal, so pointing it elsewhere is a deliberate act.
+    """
+
+    landing_url: str = MARKETBEAT_LANDING_URL
+    cache_dir: str
+    timeout_seconds: float = 120.0
+    request_delay_seconds: float = Field(
+        default=0.25, description="Pause before every request, in seconds."
+    )
+    max_retries: int = 3
+    ca_bundle: str | None = Field(
+        default=None,
+        description=(
+            "PEM bundle to verify TLS against. Defaults to REQUESTS_CA_BUNDLE, "
+            "CURL_CA_BUNDLE or SSL_CERT_FILE, whichever is set."
+        ),
+    )
+
+    def fetcher(self) -> MarketBeatFetcher:
+        return MarketBeatFetcher(
+            cache_dir=self.cache_dir,
+            landing_url=self.landing_url,
+            timeout_seconds=self.timeout_seconds,
+            request_delay_seconds=self.request_delay_seconds,
+            max_retries=self.max_retries,
+            ca_bundle=self.ca_bundle,
+        )
+
+
+class CrspiResource(ConfigurableResource):
+    """Connection settings for Statistics Canada's commercial rent index.
+
+    No `cache_dir`, unlike the MarketBeat resource above and for the reason
+    `EstimatorResource` has none: the table is 14 kB and is *revised*, so every
+    scrape date fetches it again and keeps what it got. What can be revised is
+    re-read; what is published once and never changed is cached.
+    """
+
+    table_id: str = CRSPI_TABLE_ID
+    base_url: str = CRSPI_BASE_URL
+    timeout_seconds: float = 120.0
+    request_delay_seconds: float = Field(
+        default=0.25, description="Pause before every request, in seconds."
+    )
+    max_retries: int = 3
+    ca_bundle: str | None = Field(
+        default=None,
+        description=(
+            "PEM bundle to verify TLS against. Defaults to REQUESTS_CA_BUNDLE, "
+            "CURL_CA_BUNDLE or SSL_CERT_FILE, whichever is set."
+        ),
+    )
+
+    def fetcher(self) -> CrspiFetcher:
+        return CrspiFetcher(
+            table_id=self.table_id,
             base_url=self.base_url,
             timeout_seconds=self.timeout_seconds,
             request_delay_seconds=self.request_delay_seconds,

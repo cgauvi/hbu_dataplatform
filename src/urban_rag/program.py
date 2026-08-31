@@ -163,6 +163,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 
+import numpy as np
 from ortools.sat.python import cp_model
 
 #: Square metres in a square foot, exactly. The grid's areas, widths and
@@ -323,6 +324,52 @@ INDUSTRIAL_REVENUE_PER_SQFT_CAD = 30.0
 COMMERCIAL_VACANCY_PCT = 7.0
 INDUSTRIAL_VACANCY_PCT = 7.0
 
+# -- what a building costs to keep standing ---------------------------------
+#
+# An operating expense ratio is one number covering taxes, insurance,
+# management and *maintenance*, and only the last of those depends on how old
+# the building is. A 1910 triplex and a building finished this year do not
+# spend the same share of their rent on the roof, the pointing, the risers and
+# the wiring, and charging them the same ratio is the single assumption that
+# most flatters standing stock against redeveloping it - which is exactly the
+# comparison `urban_rag.hbu` exists to make.
+#
+# So the ratio is split in two. The base is what a *new* building costs to run
+# and is the caller's `operating_expense_ratio`; the premium below is what age
+# adds to it, and it is the only part that varies per lot.
+
+#: Additional share of gross income lost to maintenance per year of building
+#: age. Stated, not surveyed: Statistics Canada publishes operating expenses
+#: for lessors of residential buildings by geography and industry, and CMHC
+#: publishes rents and vacancies, but neither breaks maintenance out *by age of
+#: building* - so there is no series to read this off, and inventing a
+#: measured-looking one would be worse than saying which it is.
+#:
+#: The figure is set from the span it has to cover rather than from a study of
+#: one year: repair and maintenance conventionally runs about a tenth of
+#: effective gross income for newly built multi-residential and about a fifth
+#: for pre-war walk-ups, so roughly ten points of gross separates the two ends
+#: of Montreal's stock. At 0.0012 a year that ten points is reached at
+#: `MAX_MAINTENANCE_PREMIUM` below, which a building hits at 83 years old.
+MAINTENANCE_PREMIUM_PER_YEAR = 0.0012
+
+#: The most age may add, whatever the year built. Maintenance on an old
+#: building is bounded by the fact that an owner who stops spending on it stops
+#: collecting the rent as well - past a point a building is renewed or it
+#: leaves the stock, and neither of those is "the same building costing ever
+#: more". Without a cap a 1850 stone house would be charged 20 points of gross
+#: on a curve fitted to nothing that old.
+MAX_MAINTENANCE_PREMIUM = 0.10
+
+#: Age charged to a building whose `year_built` the roll does not state. Not
+#: zero: an unstated year is far likelier to be old stock than new - a building
+#: finished recently has a permit, a file and a year - and reading it as new
+#: would hand the least-documented buildings the cheapest maintenance in the
+#: borough. Roughly the median age of Montreal's assessed stock, and the run
+#: reports how many lots took it so the size of the assumption is visible
+#: rather than buried in an average.
+ASSUMED_BUILDING_AGE_YEARS = 50.0
+
 #: Underground levels the model may stack. Not a norm - nothing in the grid
 #: bounds excavation - but a domain has to end somewhere, and a solution
 #: sitting on this one is reported as `max_underground_levels` in `binding`
@@ -397,6 +444,95 @@ class BuildingLevel(str, Enum):
 
     def __str__(self) -> str:
         return self.value
+
+
+def building_age_years(
+    year_built,
+    *,
+    reference_year: float,
+    assumed_age_years: float = ASSUMED_BUILDING_AGE_YEARS,
+):
+    """How old a building is in ``reference_year``, in years.
+
+    Scalar or array; the array form is what `urban_rag.comparables` charges a
+    whole borough's lots with in one pass. A year the roll does not state - or
+    states as something that cannot be a year - becomes ``assumed_age_years``
+    rather than a null, so the lot still gets an income; `ASSUMED_BUILDING_AGE_YEARS`
+    says why that default is not zero.
+
+    A negative age is clipped to zero. The roll carries a handful of units
+    whose stated year is in the future (a building permitted but not finished),
+    and a building cannot be less than new.
+    """
+    year = np.asarray(year_built, dtype="float64")
+    age = float(reference_year) - year
+    age = np.where(np.isnan(age), float(assumed_age_years), age)
+    return np.clip(age, 0.0, None)
+
+
+def maintenance_premium(
+    age_years,
+    *,
+    per_year: float = MAINTENANCE_PREMIUM_PER_YEAR,
+    cap: float = MAX_MAINTENANCE_PREMIUM,
+):
+    """What age adds to a building's operating expense ratio.
+
+    A share of gross income, on the same scale as the base ratio it is added
+    to: 0.04 is four more points of gross going to maintenance than a new
+    building spends. Linear in age to `cap` and flat after it - see the two
+    constants for why each is the number it is.
+
+    Scalar or array, and never negative: this is a *premium*, so a building
+    newer than the reference year costs the base ratio and no less. A model in
+    which a new building were cheaper than new would be one where the base
+    ratio meant something other than what it says.
+    """
+    if per_year < 0:
+        raise ProgramError(
+            f"maintenance premium per year is a share of gross income added "
+            f"with age and cannot be negative, got {per_year!r}"
+        )
+    if cap < 0:
+        raise ProgramError(
+            f"maximum maintenance premium is a share of gross income and "
+            f"cannot be negative, got {cap!r}"
+        )
+    age = np.clip(np.asarray(age_years, dtype="float64"), 0.0, None)
+    return np.minimum(age * float(per_year), float(cap))
+
+
+def effective_operating_expense_ratio(
+    age_years,
+    *,
+    base_ratio: float,
+    per_year: float = MAINTENANCE_PREMIUM_PER_YEAR,
+    cap: float = MAX_MAINTENANCE_PREMIUM,
+):
+    """The base ratio plus what age adds, bounded below 1.
+
+    The one place the two halves are put together, so the solver and the
+    comparables asset cannot end up adding them differently. Bounded strictly
+    below 1.0 because a ratio of 1 is a building whose gross income all leaves
+    again - an NOI of exactly zero - and anything past it is negative income
+    from a positive rent, which is not what a high maintenance bill means.
+
+    A base at or above 1 is the caller's error and is refused rather than
+    clipped: `IncomeAssumptions` already rejects it, and silently repairing one
+    here would let a typo produce a plausible-looking cap rate.
+    """
+    if not 0.0 <= base_ratio < 1.0:
+        raise ProgramError(
+            "base operating expense ratio is a share of gross income and must "
+            f"be in [0, 1), got {base_ratio!r}"
+        )
+    premium = maintenance_premium(age_years, per_year=per_year, cap=cap)
+    return np.minimum(float(base_ratio) + premium, _MAX_EXPENSE_RATIO)
+
+
+#: The most any effective ratio may reach. Strictly below 1 so an NOI stays
+#: positive where a gross income is - see `effective_operating_expense_ratio`.
+_MAX_EXPENSE_RATIO = 0.99
 
 
 def is_residential_usage(usage: str) -> bool:
