@@ -20,13 +20,16 @@ Solving
 ----------------------------------------------------------------------------
 
 `solve_envelopes` is one `solve_program` call per row of
-`lot_zoning_envelopes`, and the interesting part is which rows. A row is solved
-when it `permits_residential` and is `solver_ready` - the first because
-`solve_program` refuses a column authorising no dwelling, the second because
-that flag is the solver's own constructor having already accepted the column.
-Neither is re-decided here: both are written by `envelope_assets` from
-`ZoneColumn.__post_init__`, and a second copy of that rule would be the copy
-that goes stale.
+`lot_zoning_envelopes`, and the interesting part is which rows. A row is
+solved when it authorises at least one of the three families the solver
+prices - `permits_residential`, `permits_commercial` or `permits_industrial`
+- and is `solver_ready`, the latter because that flag is the solver's own
+constructor having already accepted the column. None of this is re-decided
+here: the flags are written by `envelope_assets`, and `ensure_use_flags` is
+the one documented fallback - a partition written before the commercial and
+industrial flags existed gets them recomputed from its own `usages`, by the
+same functions the asset calls, so an old parquet solves without a re-parse
+of the grids.
 
 **A failed solve costs its row, not the borough.** A `ProgramError` - a lot of
 zero area, a grid whose two coverage rows contradict each other - is recorded
@@ -48,28 +51,36 @@ Choosing
 ----------------------------------------------------------------------------
 
 `select_highest_best_use` collapses the candidates onto one row per lot, and
-what it does *not* do is take the largest number.
+the shape of the choice matters: what may be chosen is the *use*, never the
+rules.
 
-A lot can carry several envelope rows for two unrelated reasons, and only one
-of them is a choice. Within one zone, a grid authorises dwellings in more than
-one column and distinguishes them by *Largeur du terrain min*: the column a
-parcel of this width is written for is `select_residential_column`'s to pick,
-`envelope_assets` already marks it `governs_residential`, and taking the
-higher-earning column instead would be reporting a program under rules the
-parcel may not build to. Across zones, a lot on a boundary picks up a sliver of
-its neighbour's zoning because two publishers drew two lines - that is not two
+A lot can carry several envelope rows for three reasons, and only one of them
+is anybody's choice. Within one zone and one usage family, a grid authorises
+dwellings in more than one column and distinguishes them by *Largeur du
+terrain min*: the column a parcel of this width is written for is
+`select_governing_column`'s to pick, `envelope_assets` marks it
+`governs_residential` - and `governs_commercial`, `governs_industrial` for
+the families beside it - and taking a higher-earning column of the *same*
+family instead would be reporting a program under rules the parcel may not
+build to. Across zones, a lot on a boundary picks up a sliver of its
+neighbour's zoning because two publishers drew two lines - that is not two
 sets of rules the owner may choose between, it is one set and a mapping
 disagreement, and `pct_of_lot` is what says which is the real one.
 
-So the answer is: **the governing column of the zone that covers most of the
-lot**. Income breaks a tie between two zones covering it equally and the column
-index breaks a tie after that, so the choice is deterministic. Every candidate
-that lost keeps its own row in `lot_development_programs`, which is where "why
-not the other column" is answered.
+Across *families*, though, the choice is real and it is the owner's: a zone
+whose grid writes an ``H.2`` column and a ``C.4`` column beside it authorises
+either building, and which one to put up is exactly the highest-and-best-use
+question. So the answer is: **among the governing columns of the zone that
+covers most of the lot, the program worth the most discounted net profit**
+(`npv_cad`), the column index breaking a tie, so the choice is deterministic.
+Every candidate that lost keeps its own row in `lot_development_programs`,
+which is where "why not the other column" is answered, and
+`hbu_dominant_use` says in one word what kind of building won.
 
-The maximisation this table is named for is not here at all - it is inside
-`solve_program`, over the mix of dwellings and floor the envelope can hold.
-What is chosen here is only *which envelope*, and the grid is what chooses it.
+The maximisation over the *mix* is still inside `solve_program`, over the
+dwellings and floor one envelope can hold. What is maximised here is only
+which governing envelope - the developer's use decision, priced the way a
+developer prices it.
 
 A lot with candidates but no governing one keeps its row and says so in
 `hbu_status`: `no_governing_column` is almost always a parcel with no measured
@@ -124,11 +135,13 @@ travels beside `hbu_operating_expense_ratio` so the two are readable against
 each other rather than inferred from a gap.
 
 What the development cost buys is not thrown away - it is
-`hbu_annual_noi_after_construction_cad`, the solver's own objective annualised,
-with `hbu_total_capital_cost_cad` beside it. A reader asking "is this worth
-doing" needs both: the first says the redeveloped building earns more, the
-second says what it costs to get there, and this module deliberately stops
-before the discount rate that would turn the pair into a verdict.
+`hbu_annual_noi_after_construction_cad`, the legacy monthly figure annualised,
+with `hbu_total_capital_cost_cad` beside it. And the verdict this module used
+to stop short of is now stated, because the solve carries a discount rate of
+its own: `hbu_npv_cad` prices redeveloping, `existing_present_value_cad`
+prices keeping the standing building at the same `InvestmentAssumptions`, and
+`redevelopment_npv_gain_cad` is the difference - land in neither side, since
+the owner holds it in both futures.
 
 **Gross floor area against a unit schedule.** The roll's `rl0308a` is the
 building's floor area, corridors and cores included. `DevelopmentProgram`
@@ -165,6 +178,7 @@ import pandas as pd
 from urban_rag.comparables import INCOME_CLASSES, IncomeAssumptions
 from urban_rag.program import (
     DEFAULT_CONSTRUCTION,
+    DEFAULT_INVESTMENT,
     DEFAULT_NON_RESIDENTIAL,
     DEFAULT_PARKING,
     DEFAULT_STOREY_HEIGHTS,
@@ -173,6 +187,7 @@ from urban_rag.program import (
     BuildingLevel,
     ConstructionCosts,
     DevelopmentProgram,
+    InvestmentAssumptions,
     Lot,
     NonResidentialEconomics,
     ParkingRules,
@@ -180,6 +195,10 @@ from urban_rag.program import (
     StoreyHeights,
     UnitEconomics,
     ZoneColumn,
+    is_commercial_usage,
+    is_industrial_usage,
+    is_residential_usage,
+    select_governing_column,
     solve_program,
 )
 
@@ -208,22 +227,33 @@ _ALL_DWELLINGS = "all"
 HBU_STATUSES: tuple[str, ...] = (
     # A governing envelope was solved, and the row carries its program.
     "solved",
-    # Every envelope covering the lot authorises something other than housing.
-    # `solve_program` refuses such a column by design - it prices dwellings,
-    # commerce and industry but only ever inside a residential envelope - so
-    # this is a limit of the model rather than a fault in the data, and a pure
-    # `C` or `I` zone is where it shows.
-    "no_residential_column",
-    # Residential columns exist and none governs this parcel. Nearly always a
+    # Every envelope covering the lot authorises none of the usages the
+    # solver prices - Habitation, Commerce or Industrie. What remains is
+    # Équipements collectifs, which is deliberately not a proforma, or a
+    # column with no usages at all. Pure `C` and `I` zones no longer land
+    # here: they solve like everything else now.
+    "no_candidate_column",
+    # Candidate columns exist and none governs this parcel. Nearly always a
     # lot with no measured frontage under a grid stating *Largeur du terrain
     # min*: a missing frontage reads as 0 m and qualifies for nothing.
     "no_governing_column",
-    # The governing column was solved and has no feasible program - a minimum
-    # the parcel cannot meet, or stalls it has nowhere to put.
+    # A governing column was solved and none has a feasible program - a
+    # minimum the parcel cannot meet, or stalls it has nowhere to put.
     "infeasible",
-    # The governing column could not be turned into a model at all;
+    # A governing column could not be turned into a model at all;
     # `solve_error` carries what it said.
     "solver_error",
+)
+
+#: The three usage families the solver prices, in the order the flags are
+#: read: the `permits_*` and `governs_*` column suffixes, and the classes a
+#: chosen program's floor is split into.
+USE_FAMILIES: tuple[str, ...] = ("residential", "commercial", "industrial")
+
+#: The `governs_*` flag columns, one per family. `envelope_assets` writes all
+#: three; `ensure_use_flags` recomputes any a pre-existing parquet lacks.
+GOVERNS_COLUMNS: tuple[str, ...] = tuple(
+    f"governs_{family}" for family in USE_FAMILIES
 )
 
 #: What the solver's answer is called on a row, in reading order: the status,
@@ -235,6 +265,9 @@ PROGRAM_COLUMNS: tuple[str, ...] = (
     "status",
     "solved",
     "solve_error",
+    "npv_cad",
+    "present_value_cad",
+    "annual_stabilised_noi_cad",
     "monthly_net_operating_income_cad",
     "annual_net_operating_income_cad",
     "monthly_gross_revenue_cad",
@@ -271,6 +304,9 @@ PROGRAM_COLUMNS: tuple[str, ...] = (
 #: rather than matched on a suffix so a column added above is a decision here
 #: too, and `height_m` is not mistaken for a length by a `_m` test.
 _PROGRAM_FLOATS: tuple[str, ...] = (
+    "npv_cad",
+    "present_value_cad",
+    "annual_stabilised_noi_cad",
     "monthly_net_operating_income_cad",
     "annual_net_operating_income_cad",
     "monthly_gross_revenue_cad",
@@ -318,9 +354,12 @@ CANDIDATE_COLUMNS: tuple[str, ...] = (
     "grid_zone",
     "pct_of_lot",
     "usages",
+    "permits_residential",
     "permits_commercial",
     "permits_industrial",
     "governs_residential",
+    "governs_commercial",
+    "governs_industrial",
     "lot_area_m2",
     "primary_frontage_m",
     "buildable_area_m2",
@@ -336,8 +375,12 @@ _CHOSEN_COLUMNS: tuple[str, ...] = (
     "grid_zone",
     "pct_of_lot",
     "usages",
+    "permits_residential",
     "permits_commercial",
     "permits_industrial",
+    "governs_residential",
+    "governs_commercial",
+    "governs_industrial",
     "buildable_area_m2",
     *PROGRAM_COLUMNS,
 )
@@ -358,7 +401,14 @@ _HBU_LOT_COLUMNS: tuple[str, ...] = (
 )
 
 #: The whole of a `lot_highest_best_use` row, in reading order.
-HBU_COLUMNS: tuple[str, ...] = (*_HBU_LOT_COLUMNS, *_CHOSEN_COLUMNS)
+#: `hbu_dominant_use` is the one column computed here rather than carried: a
+#: reader's first question about a chosen program is *which kind of building
+#: it is*, and answering it should not take four area columns and a rule.
+HBU_COLUMNS: tuple[str, ...] = (
+    *_HBU_LOT_COLUMNS,
+    *_CHOSEN_COLUMNS,
+    "hbu_dominant_use",
+)
 
 
 @dataclass(frozen=True)
@@ -382,6 +432,7 @@ class ProgramAssumptions:
     construction: ConstructionCosts = DEFAULT_CONSTRUCTION
     non_residential: NonResidentialEconomics = DEFAULT_NON_RESIDENTIAL
     heights: StoreyHeights = DEFAULT_STOREY_HEIGHTS
+    investment: InvestmentAssumptions = DEFAULT_INVESTMENT
     #: Seconds CP-SAT may spend on one envelope. A borough is tens of thousands
     #: of models of fifteen variables each and nearly all of them are solved in
     #: milliseconds; this bounds the handful that are not. A model that runs out
@@ -418,6 +469,13 @@ class ProgramAssumptions:
             "industrial_storey_height_m": self.heights.industrial_m,
             "above_grade_parking_storey_height_m": self.heights.above_grade_parking_m,
             "months_per_year": MONTHS_PER_YEAR,
+            "discount_rate_pct": self.investment.discount_rate_pct,
+            "hold_years": self.investment.hold_years,
+            "terminal_cap_rate_pct": self.investment.terminal_cap_rate_pct,
+            "operating_expense_ratio": self.investment.operating_expense_ratio,
+            "new_build_rent_premium_pct": (
+                self.investment.new_build_rent_premium_pct
+            ),
             "max_seconds": self.max_seconds,
         }
 
@@ -553,6 +611,7 @@ def solve_envelopes(
     parse writes a readable file rather than nothing.
     """
     assumptions = assumptions or ProgramAssumptions()
+    envelopes = ensure_use_flags(envelopes)
     candidates = candidate_envelopes(envelopes)
     rows = [
         {
@@ -570,16 +629,136 @@ def solve_envelopes(
 def candidate_envelopes(envelopes: pd.DataFrame) -> pd.DataFrame:
     """The rows `solve_program` can be asked about.
 
-    Both filters are upstream flags read rather than re-derived - see the module
-    docstring. A frame missing either column is treated as though every row
-    passed it, so a hand-built frame in a test need not carry columns the test
-    is not about.
+    A candidate authorises at least one of the three priced families and
+    parses into a solver input. The flags are upstream columns read rather
+    than re-derived - see the module docstring - with `ensure_use_flags` as
+    the documented fallback for a parquet written before the commercial and
+    industrial ones existed. A frame missing every permits flag is treated as
+    though each row passed, so a hand-built frame in a test need not carry
+    columns the test is not about.
     """
-    mask = pd.Series(True, index=envelopes.index)
-    for flag in ("permits_residential", "solver_ready"):
-        if flag in envelopes.columns:
-            mask &= envelopes[flag].fillna(False).astype(bool)
+    envelopes = ensure_use_flags(envelopes)
+    permits = [
+        envelopes[f"permits_{family}"].fillna(False).astype(bool)
+        for family in USE_FAMILIES
+        if f"permits_{family}" in envelopes.columns
+    ]
+    if permits:
+        mask = permits[0]
+        for flag in permits[1:]:
+            mask |= flag
+    else:
+        mask = pd.Series(True, index=envelopes.index)
+    if "solver_ready" in envelopes.columns:
+        mask &= envelopes["solver_ready"].fillna(False).astype(bool)
     return envelopes[mask]
+
+
+def ensure_use_flags(envelopes: pd.DataFrame) -> pd.DataFrame:
+    """The envelopes, with every permits and governs flag present.
+
+    `envelope_assets` writes all six; a partition written before the
+    commercial and industrial ones existed carries only the residential pair,
+    and this recomputes the missing four from columns every partition has -
+    `usages` for the permits flags, `min_lot_width_m` and the frontage for
+    the governs ones, by the same `select_governing_column` rule the asset
+    itself calls. The same posture `operating_expense_ratio_of` takes to an
+    older parquet: the writer is upstream, the fallback is here and says so.
+
+    Columns already present are left exactly as written - this fills gaps,
+    it does not audit the writer.
+    """
+    frame = envelopes.copy()
+    if frame.empty:
+        for name in (
+            "permits_residential",
+            "permits_commercial",
+            "permits_industrial",
+            *GOVERNS_COLUMNS,
+        ):
+            if name not in frame.columns:
+                frame[name] = pd.Series(dtype="bool")
+        return frame
+
+    if "usages" not in frame.columns:
+        # A hand-built frame with no usage codes states nothing to derive
+        # flags from; the flags it does carry are read as written and the
+        # rest stay absent, which `candidate_envelopes` reads as passing.
+        return frame
+
+    usages = [_json_list(value) for value in frame["usages"]]
+    for family, matches in (
+        ("residential", is_residential_usage),
+        ("commercial", is_commercial_usage),
+        ("industrial", is_industrial_usage),
+    ):
+        name = f"permits_{family}"
+        if name in frame.columns:
+            continue
+        frame[name] = [
+            any(matches(str(usage)) for usage in row_usages) for row_usages in usages
+        ]
+
+    missing_governs = [name for name in GOVERNS_COLUMNS if name not in frame.columns]
+    if missing_governs and not {"lot_uid", "feature_id"} <= set(frame.columns):
+        # A hand-built frame with no grain to group on: nothing can govern,
+        # and saying so beats a KeyError inside a groupby.
+        for name in missing_governs:
+            frame[name] = False
+        missing_governs = []
+    if missing_governs:
+        for name in missing_governs:
+            frame[name] = False
+        eligible = frame
+        if "solver_ready" in frame.columns:
+            eligible = frame[frame["solver_ready"].fillna(False).astype(bool)]
+        for _, group in eligible.groupby(["lot_uid", "feature_id"], sort=False):
+            frontage = 0.0
+            if "primary_frontage_m" in group.columns:
+                frontage = float(
+                    pd.to_numeric(group["primary_frontage_m"], errors="coerce")
+                    .fillna(0.0)
+                    .iloc[0]
+                )
+            columns = {index: _governing_column_of(row) for index, row in group.iterrows()}
+            for name in missing_governs:
+                family = name.removeprefix("governs_")
+                permits = {
+                    "residential": lambda c: c.permits_residential,
+                    "commercial": lambda c: c.permits_commercial,
+                    "industrial": lambda c: c.permits_industrial,
+                }[family]
+                chosen = select_governing_column(
+                    list(columns.values()), frontage, permits=permits
+                )
+                if chosen is None:
+                    continue
+                for index, candidate in columns.items():
+                    # Identity, not equality - two columns of one grid can
+                    # state identical norms, and matching on value would mark
+                    # both. The same rule `envelope_assets._governing` states.
+                    if candidate is chosen:
+                        frame.loc[index, name] = True
+                        break
+    return frame
+
+
+def _governing_column_of(row: pd.Series) -> ZoneColumn:
+    """The two fields `select_governing_column` reads, as a `ZoneColumn`.
+
+    The private counterpart of `envelope_assets._as_zone_column`, here so an
+    older parquet can be read without that asset re-running. `floors_max`
+    falls back to 0 on a row that never parsed - such a row is not
+    `solver_ready` and is filtered before this is called, but a hand-built
+    test frame should not have to state a ceiling to ask about governance.
+    """
+    floors_max = _int_or_none(row.get("floors_max")) or 0
+    return ZoneColumn(
+        usages=tuple(str(usage) for usage in _json_list(row.get("usages"))),
+        floors_max=floors_max,
+        min_lot_width_m=_float_or_none(row.get("min_lot_width_m")),
+        zone=_text_or_none(row.get("feature_id")),
+    )
 
 
 def program_row(program: DevelopmentProgram) -> dict:
@@ -601,6 +780,9 @@ def program_row(program: DevelopmentProgram) -> dict:
         "status": program.status,
         "solved": program.solved,
         "solve_error": None,
+        "npv_cad": program.npv_cad,
+        "present_value_cad": program.present_value_cad,
+        "annual_stabilised_noi_cad": program.annual_stabilised_noi_cad,
         "monthly_net_operating_income_cad": program.net_operating_income,
         "annual_net_operating_income_cad": (
             program.net_operating_income * MONTHS_PER_YEAR
@@ -649,6 +831,7 @@ def _program_row(
             construction=assumptions.construction,
             non_residential=assumptions.non_residential,
             heights=assumptions.heights,
+            investment=assumptions.investment,
             max_seconds=assumptions.max_seconds,
         )
     except (ProgramError, ValueError, KeyError) as exc:
@@ -696,6 +879,7 @@ def select_highest_best_use(
     then by column index. `num_candidates` and `num_zones` travel with it, so a
     lot where the choice was real is distinguishable from one where it was not.
     """
+    envelopes = ensure_use_flags(envelopes)
     lots = _lot_index(envelopes)
     if lots.empty:
         return pd.DataFrame(columns=list(HBU_COLUMNS))
@@ -703,34 +887,88 @@ def select_highest_best_use(
     chosen = _chosen(programs)
     frame = lots.join(chosen, how="left")
     frame["hbu_status"] = _hbu_status(frame, programs)
+    frame["hbu_dominant_use"] = _dominant_use(frame)
     return frame.reset_index()[list(HBU_COLUMNS)]
 
 
+def _governs_any(programs: pd.DataFrame) -> pd.Series:
+    """Whether each candidate row governs its lot for *some* family.
+
+    Any of the three flags: a row that is the grid's own pick for the
+    housing, the commerce or the industry is one the developer may build to.
+    Falls back to the residential flag alone on a frame written before the
+    other two existed, which is exactly what selection did then.
+    """
+    governs = pd.Series(False, index=programs.index)
+    found = False
+    for name in GOVERNS_COLUMNS:
+        if name in programs.columns:
+            governs |= programs[name].fillna(False).astype(bool)
+            found = True
+    if not found and "governs_residential" in programs.columns:
+        governs = programs["governs_residential"].fillna(False).astype(bool)
+    return governs
+
+
 def _chosen(programs: pd.DataFrame) -> pd.DataFrame:
-    """The winning candidate of each lot, indexed by `lot_uid`."""
+    """The winning candidate of each lot, indexed by `lot_uid`.
+
+    This is where the developer's one real choice is made. Within a zone each
+    family's governing column is the grid's pick, not ours - but *which
+    family to build* is nobody's pick but the owner's, and it is made the way
+    an owner makes it: the program worth the most, on discounted net profit.
+    Coverage still comes first, because two zones on one lot are a mapping
+    disagreement rather than a menu - see the module docstring.
+    """
     if programs.empty:
         return pd.DataFrame(columns=list(_CHOSEN_COLUMNS)).rename_axis("lot_uid")
     solved = programs[
-        programs["governs_residential"].fillna(False).astype(bool)
-        & programs["solved"].fillna(False).astype(bool)
+        _governs_any(programs) & programs["solved"].fillna(False).astype(bool)
     ]
-    return (
-        solved.sort_values(
-            [
-                "lot_uid",
-                "pct_of_lot",
-                "monthly_net_operating_income_cad",
-                "column_index",
-            ],
-            # Coverage first and descending: the zone that actually covers the
-            # lot decides, and the income is only what separates two that cover
-            # it equally.
-            ascending=[True, False, False, True],
-            kind="stable",
-        )
-        .drop_duplicates("lot_uid")
-        .set_index("lot_uid")[list(_CHOSEN_COLUMNS)]
+    value = "npv_cad" if "npv_cad" in solved.columns else "monthly_net_operating_income_cad"
+    ranked = solved.sort_values(
+        ["lot_uid", "pct_of_lot", value, "column_index"],
+        # Coverage first and descending: the zone that actually covers the
+        # lot decides, and the profit only ranks the envelopes within it.
+        ascending=[True, False, False, True],
+        kind="stable",
+    ).drop_duplicates("lot_uid")
+    wanted = [name for name in _CHOSEN_COLUMNS if name in ranked.columns]
+    return ranked.set_index("lot_uid")[wanted].reindex(
+        columns=list(_CHOSEN_COLUMNS)
     )
+
+
+#: Share of the proposed usage floor one class must hold for the program to
+#: be called by its name rather than `mixed`. A stated reporting threshold,
+#: not an economics input: nothing in the solve reads it.
+DOMINANT_USE_SHARE = 0.7
+
+
+def _dominant_use(frame: pd.DataFrame) -> pd.Series:
+    """What kind of building each chosen program is, in one word.
+
+    ``residential`` / ``commercial`` / ``industrial`` when one class holds at
+    least `DOMINANT_USE_SHARE` of the proposed usage floor, ``mixed`` when
+    none does, ``none`` for a solved program with no floor at all - nothing
+    pencils - and null wherever there is no program to describe. Parking is
+    not usage floor and is not in the denominator.
+    """
+    areas = {
+        "residential": _numeric(frame, "residential_area_m2"),
+        "commercial": _numeric(frame, "commercial_area_m2"),
+        "industrial": _numeric(frame, "industrial_area_m2"),
+    }
+    total = sum(series.fillna(0.0) for series in areas.values())
+    result = pd.Series(None, index=frame.index, dtype="object")
+    solved = frame["solved"].fillna(False).astype(bool) if "solved" in frame.columns else pd.Series(False, index=frame.index)
+    result[solved] = "none"
+    built = solved & (total > 0)
+    for family, series in areas.items():
+        share = series.fillna(0.0) / total.where(total > 0)
+        result[built & (share >= DOMINANT_USE_SHARE)] = family
+    result[built & result.isin([None, "none"])] = "mixed"
+    return result
 
 
 def _lot_index(envelopes: pd.DataFrame) -> pd.DataFrame:
@@ -758,10 +996,7 @@ def _lot_index(envelopes: pd.DataFrame) -> pd.DataFrame:
     )
     per_lot["num_candidates"] = _count_by_lot(candidates, per_lot.index)
     per_lot["num_governing_candidates"] = _count_by_lot(
-        candidates[candidates["governs_residential"].fillna(False).astype(bool)]
-        if "governs_residential" in candidates.columns
-        else candidates.iloc[0:0],
-        per_lot.index,
+        candidates[_governs_any(candidates)], per_lot.index
     )
     return per_lot
 
@@ -790,11 +1025,11 @@ def _hbu_status(frame: pd.DataFrame, programs: pd.DataFrame) -> pd.Series:
     """
     status = pd.Series("solved", index=frame.index, dtype="object")
     unsolved = frame["status"].isna()
-    status[unsolved & (frame["num_candidates"] == 0)] = "no_residential_column"
+    status[unsolved & (frame["num_candidates"] == 0)] = "no_candidate_column"
     status[unsolved & (frame["num_candidates"] > 0)] = "no_governing_column"
     if programs.empty:
         return status
-    governing = programs[programs["governs_residential"].fillna(False).astype(bool)]
+    governing = programs[_governs_any(programs)]
     lots = frame.index.to_series()
     infeasible = set(
         governing.loc[
@@ -861,6 +1096,7 @@ def use_gap(
     existing: pd.DataFrame,
     *,
     operating_expense_ratio: float,
+    investment: InvestmentAssumptions | None = None,
 ) -> pd.DataFrame:
     """The building that stands, the building that could, and the difference.
 
@@ -938,6 +1174,26 @@ def use_gap(
         frame, "annual_net_operating_income_cad"
     )
     frame["hbu_total_capital_cost_cad"] = _numeric(frame, "total_capital_cost_cad")
+
+    # The verdict this module used to stop short of. The solve now carries a
+    # discount rate, so both futures a lot's owner can choose between are
+    # priced on it: `hbu_npv_cad` is redeveloping - the discounted value of
+    # the new building less what it costs - and `existing_present_value_cad`
+    # is keeping the standing one, its stabilised NOI through the same
+    # `InvestmentAssumptions.annual_pv_factor`. The gain is the difference,
+    # with a missing existing side read as nothing standing - the
+    # `is_underbuilt` rule, because a vacant parcel is exactly the case the
+    # column exists to rank. What neither side prices is the land, and that
+    # is the point: the owner holds it in both futures, so it cancels.
+    investment = investment or DEFAULT_INVESTMENT
+    frame["hbu_npv_cad"] = _numeric(frame, "npv_cad")
+    frame["hbu_present_value_cad"] = _numeric(frame, "present_value_cad")
+    frame["existing_present_value_cad"] = (
+        frame["existing_annual_stabilised_noi_cad"] * investment.annual_pv_factor
+    )
+    frame["redevelopment_npv_gain_cad"] = frame["hbu_npv_cad"] - frame[
+        "existing_present_value_cad"
+    ].fillna(0.0)
     frame["operating_expense_ratio"] = operating_expense_ratio
     # The same number under the name that says which building it applies to,
     # and the standing building's beside it. A reader comparing two NOIs needs
@@ -974,6 +1230,52 @@ def use_gap(
     )
     frame["has_assessment"] = joined.notna().any(axis=1) if len(joined.columns) else False
     return frame
+
+
+def investment_assumptions_of(hbu: pd.DataFrame) -> InvestmentAssumptions:
+    """The `InvestmentAssumptions` the chosen programs were solved with.
+
+    Read off the `program_assumptions` object `lot_development_programs`
+    writes onto every row and `lot_highest_best_use` carries, for the same
+    reason `operating_expense_ratio_of` reads its ratio off the comparables:
+    the PV the gap puts on the *standing* building must be the one stance the
+    solve took, not a second config that drifts apart. Falls back to the
+    module defaults where the column is absent or predates the discounting -
+    a partition that old carries no `npv_cad` either, so the columns built on
+    this stay null rather than wrong.
+    """
+    default = InvestmentAssumptions()
+    if hbu.empty or "program_assumptions" not in hbu.columns:
+        return default
+    values = hbu["program_assumptions"].dropna()
+    if not len(values):
+        return default
+    try:
+        payload = json.loads(values.iloc[0])
+    except (TypeError, ValueError):
+        return default
+    if not isinstance(payload, dict) or "discount_rate_pct" not in payload:
+        return default
+    try:
+        return InvestmentAssumptions(
+            discount_rate_pct=float(payload["discount_rate_pct"]),
+            hold_years=int(payload.get("hold_years", default.hold_years)),
+            terminal_cap_rate_pct=(
+                None
+                if payload.get("terminal_cap_rate_pct") is None
+                else float(payload["terminal_cap_rate_pct"])
+            ),
+            operating_expense_ratio=float(
+                payload.get("operating_expense_ratio", default.operating_expense_ratio)
+            ),
+            new_build_rent_premium_pct=float(
+                payload.get(
+                    "new_build_rent_premium_pct", default.new_build_rent_premium_pct
+                )
+            ),
+        )
+    except (ProgramError, TypeError, ValueError):
+        return default
 
 
 def operating_expense_ratio_of(existing: pd.DataFrame) -> float:

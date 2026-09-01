@@ -126,12 +126,14 @@ class PgSettings:
     """Where the store is, how to authenticate to it, and how hard to search it.
 
     ``host`` may be left unset, in which case libpq's own `PGHOST`/`PGPORT`
-    environment applies; ``dsn`` short-circuits all of it with a full
-    connection string, which is what a local `pgvector/pgvector` container is
-    easiest to reach with.
+    environment applies. ``hostaddr`` can point at a tunnel while ``host`` stays
+    the RDS endpoint used for `verify-full` certificate checks. ``dsn``
+    short-circuits all of it with a full connection string, which is what a
+    local `pgvector/pgvector` container is easiest to reach with.
     """
 
     host: str | None = None
+    hostaddr: str | None = None
     port: int = DEFAULT_PORT
     database: str = DEFAULT_DATABASE
     user: str = DEFAULT_USER
@@ -176,6 +178,7 @@ class PgSettings:
         environment = {
             "dsn": _env("DSN"),
             "host": _env("HOST"),
+            "hostaddr": _env("HOSTADDR") or os.environ.get("PGHOSTADDR"),
             "port": _int(_env("PORT")),
             "database": _env("DATABASE"),
             "user": _env("USER"),
@@ -214,6 +217,7 @@ class PgSettings:
         self._check_root_cert()
         keywords = {
             "host": self.host,
+            "hostaddr": self.hostaddr,
             "port": self.port,
             "dbname": self.database,
             "user": user,

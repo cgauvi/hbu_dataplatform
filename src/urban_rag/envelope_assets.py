@@ -62,8 +62,10 @@ from urban_rag.partitions import scrape_partitions
 from urban_rag.program import (
     ProgramError,
     ZoneColumn,
+    is_commercial_usage,
+    is_industrial_usage,
     permitted_floors,
-    select_residential_column,
+    select_governing_column,
 )
 from urban_rag.rag.documents import DOCUMENT_SOURCES
 from urban_rag.rag.pgvector import PostgresUnavailable
@@ -384,7 +386,8 @@ def lot_zoning_envelopes(
     envelopes["meets_min_lot_width"] = envelopes["min_lot_width_m"].isna() | (
         envelopes["min_lot_width_m"] <= envelopes["primary_frontage_m"].fillna(0.0)
     )
-    envelopes["governs_residential"] = _governing(envelopes)
+    for family, flags in _governing(envelopes).items():
+        envelopes[f"governs_{family}"] = flags
 
     frame = envelopes[list(_OUTPUT_COLUMNS)].sort_values(
         ["lot_uid", "feature_id", "column_index"], kind="stable"
@@ -431,7 +434,11 @@ def lot_zoning_envelopes(
             "num_lots_unzoned": num_lots - int(frame["lot_uid"].nunique()),
             "num_envelopes": len(frame),
             "num_residential_envelopes": int(frame["permits_residential"].sum()),
+            "num_commercial_envelopes": int(frame["permits_commercial"].sum()),
+            "num_industrial_envelopes": int(frame["permits_industrial"].sum()),
             "num_governing_envelopes": int(frame["governs_residential"].sum()),
+            "num_governing_commercial": int(frame["governs_commercial"].sum()),
+            "num_governing_industrial": int(frame["governs_industrial"].sum()),
             "num_solvable_envelopes": len(solvable),
             "num_lots_solvable": int(solvable["lot_uid"].nunique()),
             "num_rows_with_frontage": with_frontage,
@@ -479,11 +486,15 @@ _OUTPUT_COLUMNS = (
     "usages",
     *(f"usage_{category}" for category in USAGE_CATEGORIES),
     "permits_residential",
+    "permits_commercial",
+    "permits_industrial",
     "levels",
     "residential_floors",
     *NORM_FIELDS,
     "meets_min_lot_width",
     "governs_residential",
+    "governs_commercial",
+    "governs_industrial",
     "solver_ready",
     "solver_error",
     "parse_notes",
@@ -513,6 +524,16 @@ def _column_row(column: GridColumn) -> dict:
             for category in USAGE_CATEGORIES
         },
         "permits_residential": column.permits_residential,
+        # The two families beside Habitation, read off the same usage codes
+        # with the same anchored matchers the solver itself uses - so a
+        # column's flags here and its `ZoneColumn.permits_*` downstream
+        # cannot disagree.
+        "permits_commercial": any(
+            is_commercial_usage(str(usage)) for usage in column.usages
+        ),
+        "permits_industrial": any(
+            is_industrial_usage(str(usage)) for usage in column.usages
+        ),
         "levels": json.dumps(
             sorted(str(level) for level in column.levels), ensure_ascii=False
         ),
@@ -563,49 +584,61 @@ def _frontage_by_lot(frontage: pd.DataFrame) -> pd.DataFrame:
     return wide.reset_index()
 
 
-def _governing(envelopes: pd.DataFrame) -> pd.Series:
-    """Which row of each (lot, zone) is the column that governs the lot.
+def _governing(envelopes: pd.DataFrame) -> dict[str, pd.Series]:
+    """Which row of each (lot, zone) governs the lot, per usage family.
 
-    `select_residential_column` is the rule, and it is called rather than
-    reimplemented: a grid authorises dwellings in more than one column and
+    `select_governing_column` is the rule, and it is called rather than
+    reimplemented: a grid authorises a family in more than one column and
     distinguishes them by *Largeur du terrain min*, so the column that governs
-    a parcel is the widest minimum it still satisfies. The choice is made
-    within one zone at a time, because two zones covering the same lot are two
-    separate readings of it and `pct_of_lot` is what says which is the real
-    one.
+    a parcel is the widest minimum it still satisfies - decided once per
+    family, because a zone's Habitation rule and its Commerce rule are two
+    rules and a lot is governed by each. The choice is made within one zone at
+    a time, because two zones covering the same lot are two separate readings
+    of it and `pct_of_lot` is what says which is the real one.
 
     False on every row of a lot with no measured frontage and a width minimum -
     the missing frontage reads as 0, which excludes the column rather than
     assuming it qualifies.
     """
-    governs = pd.Series(False, index=envelopes.index)
-    residential = envelopes[envelopes["permits_residential"] & envelopes["solver_ready"]]
-    for _, group in residential.groupby(["lot_uid", "feature_id"], sort=False):
+    families: dict[str, object] = {
+        "residential": lambda column: column.permits_residential,
+        "commercial": lambda column: column.permits_commercial,
+        "industrial": lambda column: column.permits_industrial,
+    }
+    governs = {
+        family: pd.Series(False, index=envelopes.index) for family in families
+    }
+    ready = envelopes[envelopes["solver_ready"]]
+    for _, group in ready.groupby(["lot_uid", "feature_id"], sort=False):
         frontage_m = float(group["primary_frontage_m"].fillna(0.0).iloc[0])
         by_index = {
             index: _as_zone_column(row)
             for index, row in group.iterrows()
         }
-        chosen = select_residential_column(list(by_index.values()), frontage_m)
-        if chosen is None:
-            continue
-        # Identity, not equality: two columns of one grid can state identical
-        # norms (a zone printing the same envelope for H and for C), and
-        # matching on value would mark both.
-        for index, candidate in by_index.items():
-            if candidate is chosen:
-                governs[index] = True
-                break
+        for family, permits in families.items():
+            chosen = select_governing_column(
+                list(by_index.values()), frontage_m, permits=permits
+            )
+            if chosen is None:
+                continue
+            # Identity, not equality: two columns of one grid can state
+            # identical norms (a zone printing the same envelope for H and
+            # for C), and matching on value would mark both.
+            for index, candidate in by_index.items():
+                if candidate is chosen:
+                    governs[family][index] = True
+                    break
     return governs
 
 
 def _as_zone_column(row: pd.Series) -> ZoneColumn:
     """Rebuild the solver's input from a row of the table.
 
-    Only the two fields `select_residential_column` reads are filled in, which
-    is why this is private to `_governing` and not the table's public inverse.
-    A row is turned back into a full `ZoneColumn` by whoever solves it, from
-    the columns this asset wrote.
+    Only the fields `select_governing_column` reads are filled in - the
+    usages, which its `permits` predicate tests, and the width minimum -
+    which is why this is private to `_governing` and not the table's public
+    inverse. A row is turned back into a full `ZoneColumn` by whoever solves
+    it, from the columns this asset wrote.
     """
     return ZoneColumn(
         usages=tuple(json.loads(row["usages"])),

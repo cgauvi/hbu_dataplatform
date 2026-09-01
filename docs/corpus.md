@@ -234,6 +234,7 @@ else that opens the store agree without an endpoint being committed:
 | Variable | |
 | --- | --- |
 | `URBAN_RAG_PG_HOST` | RDS endpoint. Unset means libpq's own `PGHOST` |
+| `URBAN_RAG_PG_HOSTADDR` | optional tunnel address; `HOST` remains the name verified by TLS |
 | `URBAN_RAG_PG_PORT`, `_DATABASE`, `_USER` | default `5432`, `urban_rag`, `urban_rag` |
 | `URBAN_RAG_PG_PASSWORD` | a literal password; prefer either of the next two |
 | `URBAN_RAG_PG_SECRET_ID` | Secrets Manager secret holding `{"username", "password"}` |
@@ -264,6 +265,11 @@ encrypts without authenticating the server; `disable` is for a local
 `pgvector/pgvector` container, which is also the easiest thing to point
 `URBAN_RAG_PG_DSN` at.
 
+Through an SSM tunnel, do not set `URBAN_RAG_PG_HOST=localhost` with
+`verify-full`: the RDS certificate is issued to the RDS endpoint, not to
+`localhost`. Use the RDS endpoint as `HOST`, the tunnel port as `PORT`, and
+`URBAN_RAG_PG_HOSTADDR=127.0.0.1` for native runs.
+
 An RDS instance is only reachable from inside its VPC, so a run from a laptop
 needs the VPN or a tunnel; the connection failure says so rather than repeating
 libpq's one-liner.
@@ -281,4 +287,3 @@ Search widens pgvector's candidate list (`hnsw.ef_search`, 40 by default) to
 `max(100, 4k)`: the index returns its candidates and the `WHERE` clause is
 applied to them *afterwards*, so filtering by neighborhood or scrape date is a
 reason to ask for more of them, not fewer.
-

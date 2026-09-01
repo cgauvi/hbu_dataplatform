@@ -85,19 +85,39 @@ is measured from grade up. It is the same exclusion article 38 1° gives the
 parking against *Densité*, arriving from a different article and pointing the
 same way, and it is why a tight envelope digs.
 
-**The objective is net operating income.** Revenue is `rent x (1 - vacancy)`
-a month, and against it stand the two things the building costs to put up:
-the dwellings at `ConstructionCosts.residential_cost_per_sqft` over the
-schedule in `UNIT_AREAS_SQFT`, and the stalls at `ParkingRules`' per-stall
-prices. Both are capital and the revenue is monthly, so both are converted at
-`AMORTIZATION_MONTHS` - straight line, undiscounted, no financing. That
-horizon is a *stated assumption* rather than a measurement, and it is the
-first number to change when the answer looks wrong.
+**The objective is discounted net profit.** The question a land developer
+actually asks of a parcel is not "what earns the most a month" but "what is
+worth the most to build": the present value of the income the building will
+throw off, less what it costs to put up. Revenue is `rent x (1 - vacancy)` a
+month; `InvestmentAssumptions.operating_expense_ratio` takes off the share of
+it that never reaches the owner, and the stabilised NOI that remains is
+discounted at `discount_rate_pct` over `hold_years`, with the building sold on
+at `terminal_cap_rate_pct` at the end of the hold. Against that present value
+stand the capital costs in full and undiscounted - the dwellings at
+`ConstructionCosts.residential_cost_per_sqft` over the schedule in
+`UNIT_AREAS_SQFT`, the non-residential floors per gross square foot, and the
+stalls at `ParkingRules`' per-stall prices - because they are spent at the
+start where a dollar is worth a dollar. Every term is linear in the same
+decision variables the old monthly objective was, so the model is the same
+shape; only the prices changed. `UNDISCOUNTED_INVESTMENT` is the old
+objective's exact prices - zero discount, zero expenses, no terminal value -
+under which the argmax is what it always was, and the tests that pin cap
+arithmetic use it so they stay about the caps.
 
-What NOI here does **not** net out is everything nobody handed this module:
-land, soft costs, municipal taxes, insurance, management, maintenance, and
-any revenue the stalls themselves might earn. It is income less the cost of
-building the thing that earns it, and no further.
+CMHC surveys the *standing stock's* average rent, and a proforma is priced at
+what a new building leases for; `new_build_rent_premium_pct` is the stated
+gap between the two, applied to the dwelling rents only - the non-residential
+rates are already market quotes. Set it to zero to price the proposal at the
+stock average, which is the conservative reading and the one the module gave
+before the premium existed.
+
+What the objective does **not** net out is everything nobody handed this
+module: land, soft costs, demolition, financing during construction, and any
+revenue the stalls themselves might earn. It is the value of the completed
+building less the cost of building it, and no further. `AMORTIZATION_MONTHS`
+survives for one purpose: `DevelopmentProgram.net_operating_income` still
+reports the straight-line monthly figure the platform's other tables read,
+computed from the chosen program rather than maximised.
 
 **Why the revenue is not scaled by area.** An earlier objective maximised
 `area_sqft x rent x (1 - vacancy)`, which is dollars-times-square-feet and
@@ -258,11 +278,50 @@ ABOVE_GRADE_STALL_COST_CAD = 48_125.0
 
 #: Months a capital cost is spread over to be comparable with a monthly rent.
 #: Straight line, undiscounted, 25 years, and shared by the stalls and the
-#: dwellings so the two are charged on the same footing. See the module
-#: docstring: this is the assumption that lets a one-time cost be subtracted
-#: from a recurring revenue at all, and the first number to change if the
-#: answer looks wrong.
+#: dwellings so the two are charged on the same footing. No longer the
+#: objective's horizon - `InvestmentAssumptions` is that - but still what
+#: `DevelopmentProgram.net_operating_income` reports the legacy monthly figure
+#: at, so a table written before the discounting existed reads unchanged.
 AMORTIZATION_MONTHS = 300
+
+# -- what a dollar of income is worth to a developer -------------------------
+#
+# The four numbers that turn a rent roll into a verdict, and none of them is a
+# norm or a survey: they are the stance an investor takes towards time, risk
+# and running costs, stated here and configurable at every call site. The
+# defaults describe a patient Montreal multifamily developer of the mid-2020s;
+# a lender's committee would argue with each of them, which is the point of
+# them being fields.
+
+#: Annual rate a future dollar of NOI is discounted at. The opportunity cost
+#: of the capital, unlevered - no construction loan is modelled, so this is
+#: the whole of the time value in the objective.
+DISCOUNT_RATE_PCT = 5.0
+
+#: Years the completed building is held and its NOI collected before the sale.
+HOLD_YEARS = 25
+
+#: Cap rate the stabilised NOI is sold at when the hold ends - the reversion,
+#: discounted like everything else. Montreal multifamily has traded between 4
+#: and 5.5 in recent memory; `None` drops the sale and values the income
+#: stream alone, which reads as a hold to worthlessness and is deliberately
+#: not the default.
+TERMINAL_CAP_RATE_PCT = 4.5
+
+#: Share of gross income that never reaches the owner - taxes, insurance,
+#: management, maintenance - for a building that is NEW, which the proposal is
+#: by construction. The same conventional 0.35 `comparables.IncomeAssumptions`
+#: states for the same reason, restated rather than imported so this module
+#: keeps owing that one nothing.
+OPERATING_EXPENSE_RATIO = 0.35
+
+#: What a new dwelling leases for over the stock average CMHC surveys, in
+#: percent. CMHC's grid averages a borough's standing stock - most of it old,
+#: much of it rent-controlled in practice - and nobody underwrites a proforma
+#: at that number; new construction in Villeray asks 25 to 40 percent over it.
+#: Applied to the dwelling rents only: the commercial and industrial rates are
+#: already quotes for space a tenant would sign today.
+NEW_BUILD_RENT_PREMIUM_PCT = 30.0
 
 #: Dollars per square foot of dwelling, Montreal, from the Altus Group
 #: Canadian Cost Guide as `urban_rag.estimator` publishes it: the midpoint of
@@ -1162,6 +1221,125 @@ NO_NON_RESIDENTIAL = NonResidentialEconomics(
 
 
 @dataclass(frozen=True)
+class InvestmentAssumptions:
+    """What a stream of rent is worth to the developer being modelled.
+
+    The objective's price list, the way `ParkingRules` is the parking's: four
+    stated assumptions that turn a monthly effective gross rent into a present
+    value, and one that says what rent a *new* building actually leases at.
+    None is a norm and none is surveyed, so every one is a field.
+
+    The arithmetic is a plain unlevered proforma. A dollar of monthly gross
+    becomes ``12 x (1 - operating_expense_ratio)`` dollars of annual
+    stabilised NOI; that NOI is collected for `hold_years` and discounted at
+    `discount_rate_pct`, and the building is sold at the end at
+    `terminal_cap_rate_pct` - the reversion, discounted like the rents before
+    it. `pv_per_monthly_gross` is the whole pipeline as one multiplier, which
+    is what lets the objective stay linear: value in, capital out, per
+    dwelling, per square foot and per stall.
+    """
+
+    #: Annual discount rate, in percent.
+    discount_rate_pct: float = DISCOUNT_RATE_PCT
+    #: Years of NOI collected before the sale.
+    hold_years: int = HOLD_YEARS
+    #: Cap rate of the sale that ends the hold, in percent. ``None`` values
+    #: the income stream alone - a hold to worthlessness, for a caller who
+    #: wants the conservative floor rather than a market answer.
+    terminal_cap_rate_pct: float | None = TERMINAL_CAP_RATE_PCT
+    #: Share of gross income spent running the building, for a building that
+    #: is new - which the proposal is by construction.
+    operating_expense_ratio: float = OPERATING_EXPENSE_RATIO
+    #: What a new dwelling leases for over CMHC's stock average, in percent.
+    #: Dwellings only; the non-residential rates are already market quotes.
+    new_build_rent_premium_pct: float = NEW_BUILD_RENT_PREMIUM_PCT
+
+    def __post_init__(self) -> None:
+        if self.discount_rate_pct < 0:
+            raise ProgramError(
+                f"discount_rate_pct must not be negative, "
+                f"got {self.discount_rate_pct}"
+            )
+        if self.hold_years <= 0:
+            raise ProgramError(f"hold_years must be positive, got {self.hold_years}")
+        if self.terminal_cap_rate_pct is not None and self.terminal_cap_rate_pct <= 0:
+            # A cap rate of zero prices the sale at infinity; the way to have
+            # no sale is None, which says so rather than dividing by it.
+            raise ProgramError(
+                f"terminal_cap_rate_pct must be positive or None, "
+                f"got {self.terminal_cap_rate_pct}"
+            )
+        if not 0.0 <= self.operating_expense_ratio < 1.0:
+            raise ProgramError(
+                "operating_expense_ratio is a share of gross income and must "
+                f"be in [0, 1), got {self.operating_expense_ratio!r}"
+            )
+        if self.new_build_rent_premium_pct < 0:
+            raise ProgramError(
+                f"new_build_rent_premium_pct must not be negative, "
+                f"got {self.new_build_rent_premium_pct}"
+            )
+
+    @property
+    def rent_premium_factor(self) -> float:
+        """What a surveyed dwelling rent is multiplied by on the proforma."""
+        return 1.0 + self.new_build_rent_premium_pct / 100.0
+
+    @property
+    def annual_pv_factor(self) -> float:
+        """Present value of one dollar a year of stabilised NOI.
+
+        The annuity over the hold plus the discounted reversion: at the
+        defaults - 5% over 25 years, sold at a 4.5 cap - a dollar a year is
+        worth $20.66 today, against the $25.00 the old undiscounted
+        amortisation implicitly paid for it.
+        """
+        rate = self.discount_rate_pct / 100.0
+        years = self.hold_years
+        annuity = (
+            float(years) if rate == 0.0 else (1.0 - (1.0 + rate) ** -years) / rate
+        )
+        reversion = 0.0
+        if self.terminal_cap_rate_pct is not None:
+            reversion = (100.0 / self.terminal_cap_rate_pct) / (1.0 + rate) ** years
+        return annuity + reversion
+
+    @property
+    def pv_per_monthly_gross(self) -> float:
+        """Present value of one dollar a month of effective gross rent.
+
+        The whole proforma as one multiplier: twelve months, the expense
+        ratio off, then `annual_pv_factor`. The objective is this times the
+        gross, less the capital - so a program's `present_value_cad` is
+        exactly its monthly gross times this number.
+        """
+        return (
+            MONTHS_PER_YEAR
+            * (1.0 - self.operating_expense_ratio)
+            * self.annual_pv_factor
+        )
+
+
+#: The proforma the module constants describe.
+DEFAULT_INVESTMENT = InvestmentAssumptions()
+
+#: The objective the module maximised before it discounted: zero discount,
+#: zero expenses, no reversion, no rent premium, held for the amortisation's
+#: own 25 years. Under these prices the objective is exactly
+#: `AMORTIZATION_MONTHS` times the old monthly NOI, so the argmax - the mix,
+#: the storeys, where the stalls go - is what it always was. The tests that
+#: pin cap arithmetic pass this so they stay about the caps rather than about
+#: the price of money.
+UNDISCOUNTED_INVESTMENT = InvestmentAssumptions(
+    discount_rate_pct=0.0,
+    hold_years=AMORTIZATION_MONTHS // MONTHS_PER_YEAR,
+    terminal_cap_rate_pct=None,
+    operating_expense_ratio=0.0,
+    new_build_rent_premium_pct=0.0,
+)
+
+
+@dataclass(frozen=True)
 class DevelopmentProgram:
     """The mix the solver settled on, and the envelope it fills."""
 
@@ -1179,9 +1357,10 @@ class DevelopmentProgram:
     gross_floor_area_m2: float
     #: Floor area the dwellings actually occupy; at most the gross above.
     unit_area_m2: float
-    #: The objective: monthly net operating income. Revenue over the mix,
-    #: less the amortised cost of building the dwellings and the stalls. See
-    #: the module docstring for the long list of things it does *not* net out.
+    #: The legacy monthly figure: revenue over the mix less the capital
+    #: amortised at `AMORTIZATION_MONTHS`. No longer the objective - that is
+    #: `npv_cad` - but computed from the chosen program and reported so every
+    #: table that reads a monthly NOI keeps meaning what it meant.
     net_operating_income: float
     status: str
     #: The building's height above grade, in metres: the storey split below
@@ -1222,9 +1401,26 @@ class DevelopmentProgram:
     #: schedule, because there is none for them.
     commercial_cost_cad: float = 0.0
     industrial_cost_cad: float = 0.0
-    #: Effective gross income a month, before either cost is taken off it.
-    #: The objective above is this, less the two of them amortised.
+    #: Effective gross income a month, before any cost is taken off it. The
+    #: dwelling side is priced at the proforma rent - CMHC's average times
+    #: `InvestmentAssumptions.rent_premium_factor` - because that is the rent
+    #: every dollar figure on this object is built from.
     gross_revenue_cad: float = 0.0
+    #: The objective: discounted net profit, in dollars. The present value of
+    #: the stabilised income (`present_value_cad`) less the capital in
+    #: `total_capital_cost_cad`. Negative means the best program the envelope
+    #: allows still does not pay for itself at these prices - a real answer,
+    #: and the mix reported alongside is the one that loses least... except
+    #: that the solver never builds a loss, so a negative here only appears
+    #: when a *minimum* forced floor to be built.
+    npv_cad: float = 0.0
+    #: What the completed building is worth: the stabilised NOI discounted
+    #: over the hold plus the discounted sale. `npv_cad` plus the capital.
+    present_value_cad: float = 0.0
+    #: Gross revenue annualised with the operating expense ratio off - the
+    #: figure the discounting was applied to, and the one to put beside the
+    #: comparables' stabilised NOI for a standing building.
+    annual_stabilised_noi_cad: float = 0.0
     #: Which cap the answer is sitting against, for whoever asks why it is not
     #: bigger. More than one can bind at once.
     binding: tuple[str, ...] = ()
@@ -1276,12 +1472,15 @@ class DevelopmentProgram:
         return self.status in ("OPTIMAL", "FEASIBLE")
 
 
-def select_residential_column(
-    columns: Sequence[ZoneColumn], frontage_m: float
+def select_governing_column(
+    columns: Sequence[ZoneColumn],
+    frontage_m: float,
+    *,
+    permits,
 ) -> ZoneColumn | None:
-    """The Habitation column that governs a lot of this width.
+    """The column of one usage family that governs a lot of this width.
 
-    A grid can authorise dwellings in more than one column, and the columns are
+    A grid can authorise a family in more than one column, and the columns are
     then distinguished by the parcel they apply to: *Largeur du terrain min*
     rises across them, so the widest minimum the lot still satisfies is the
     column written for a lot of its size. Columns the lot is too narrow for are
@@ -1291,18 +1490,54 @@ def select_residential_column(
     test is ``min_lot_width_m <= frontage_m``. A column printing ``-`` has no
     minimum and is the fallback every lot qualifies for.
 
-    Returns ``None`` when the grid authorises no dwelling at all, or when every
-    residential column demands more frontage than the lot has.
+    ``permits`` is which family is being asked about - one of the three
+    `ZoneColumn.permits_*` properties, passed as a callable so the rule is
+    written once for all of them. Returns ``None`` when the grid authorises
+    the family nowhere, or when every one of its columns demands more frontage
+    than the lot has.
+
+    One winner per family, and the winners can disagree: a lot can be governed
+    by an ``H.2`` column for its housing and a ``C.4`` one for its commerce,
+    and *which of those two to build* is the developer's choice - the one
+    `urban_rag.hbu.select_highest_best_use` now makes on discounted net
+    profit, across the governing column of each family.
     """
     eligible = [
         column
         for column in columns
-        if column.permits_residential
+        if permits(column)
         and (column.min_lot_width_m is None or column.min_lot_width_m <= frontage_m)
     ]
     if not eligible:
         return None
     return max(eligible, key=lambda column: column.min_lot_width_m or 0.0)
+
+
+def select_residential_column(
+    columns: Sequence[ZoneColumn], frontage_m: float
+) -> ZoneColumn | None:
+    """The Habitation column that governs a lot of this width."""
+    return select_governing_column(
+        columns, frontage_m, permits=lambda column: column.permits_residential
+    )
+
+
+def select_commercial_column(
+    columns: Sequence[ZoneColumn], frontage_m: float
+) -> ZoneColumn | None:
+    """The Commerce column that governs a lot of this width."""
+    return select_governing_column(
+        columns, frontage_m, permits=lambda column: column.permits_commercial
+    )
+
+
+def select_industrial_column(
+    columns: Sequence[ZoneColumn], frontage_m: float
+) -> ZoneColumn | None:
+    """The Industrie column that governs a lot of this width."""
+    return select_governing_column(
+        columns, frontage_m, permits=lambda column: column.permits_industrial
+    )
 
 
 def solve_program(
@@ -1315,9 +1550,10 @@ def solve_program(
     construction: ConstructionCosts = DEFAULT_CONSTRUCTION,
     non_residential: NonResidentialEconomics = DEFAULT_NON_RESIDENTIAL,
     heights: StoreyHeights = DEFAULT_STOREY_HEIGHTS,
+    investment: InvestmentAssumptions = DEFAULT_INVESTMENT,
     max_seconds: float = 10.0,
 ) -> DevelopmentProgram:
-    """The program maximising monthly net operating income on ``lot``.
+    """The program maximising discounted net profit on ``lot``.
 
     The model, in square metres:
 
@@ -1396,23 +1632,33 @@ def solve_program(
     counts. A mixed-use column with a tight *Densité* is where the model digs
     first.
 
-    **What is being maximised.** Each dwelling contributes
-    ``rent x (1 - vacancy)`` a month less its share of what it cost to build,
-    ``area_sqft x residential_cost_per_sqft / amortization_months``; each
-    stall subtracts its own price on the same footing. Both costs are per
-    dwelling and per stall respectively, so they fold into the objective's
-    coefficients and the program stays the same shape it was.
+    **What is being maximised.** Discounted net profit: each dwelling
+    contributes its effective proforma rent through
+    `InvestmentAssumptions.pv_per_monthly_gross` - twelve months, the expense
+    ratio off, the annuity over the hold, the discounted sale - less its build
+    cost in full; each stall subtracts its capital outright, because it earns
+    nothing to discount. Every cost and every value is per dwelling, per
+    square foot or per stall, so they fold into the objective's coefficients
+    and the program stays the same shape it was. Under
+    `UNDISCOUNTED_INVESTMENT` the coefficients are exactly the old monthly
+    ones times `AMORTIZATION_MONTHS`, so the argmax is what it always was.
 
     A square foot of commerce or of industry folds in the same way, one step
     further out: its rent and its build cost are both per square foot, so the
     pair collapses to a single coefficient on the *area* variable rather than
-    on a count. At the module's own rates a square foot of commerce nets
-    ``80/12 - 300/300`` = $5.67 a month and a square foot of industry
-    ``30/12 - 200/300`` = $1.83, against a one-bedroom's $470 a month over
-    600 square feet, or $0.78 a foot. Commerce therefore outbids housing for a
-    storey wherever the grid allows it, industry does not, and both answers
-    are the arithmetic rather than a preference - which is the reason to be
-    able to change all four rates from the call site.
+    on a count. Whether commerce outbids housing for a storey is now entirely
+    a question of the rates: at the module's stated $80 a foot it does, at
+    the ~$27 the borough's surveyed retail rent resolves to it rarely covers
+    its own build, and both answers are the arithmetic rather than a
+    preference - which is the reason to be able to change all four rates from
+    the call site.
+
+    **A column with no Habitation at its head now solves too.** A pure ``C``
+    or ``I`` column is the same model with the dwelling counts pinned at
+    zero: commerce and industry compete for the storeys, owe their stalls,
+    and answer to every printed cap. *En étage min* is then owed by those
+    storeys - the parking is not allowed to pay it there either. Only a
+    column authorising none of the three priced families is refused.
 
     **Where the non-residential storeys go.** Nowhere in particular: they are
     plates in the same stack, and the model has no notion of *which* storey a
@@ -1440,10 +1686,15 @@ def solve_program(
     about the parcel rather than a bug, and `NO_PARKING` is how to ask the
     question without it. The status says which.
     """
-    if not column.permits_residential:
+    if not (
+        column.permits_residential
+        or column.permits_commercial
+        or column.permits_industrial
+    ):
         raise ProgramError(
-            f"{column.usages} authorises no dwelling; "
-            "select_residential_column is what picks a column that does"
+            f"{column.usages} authorises none of the usages this module "
+            "prices (Habitation, Commerce, Industrie); an Equipements "
+            "collectifs column is deliberately not a proforma"
         )
 
     # *Hauteur en mètre*, as centimetres. Rounded the way each bound wants to
@@ -1468,9 +1719,23 @@ def solve_program(
             status="INFEASIBLE",
             binding=("height_range",),
         )
+    # The cheapest storey the column's own usages can spend the metric cap
+    # on: three metres where dwellings are among them, four where only
+    # commerce or industry is. What *En étage min* is priced at in the check
+    # below, because the minimum is met by usage storeys and not by parking.
+    usage_heights_cm = [
+        cm
+        for cm, permitted in (
+            (heights.residential_cm, column.permits_residential),
+            (heights.commercial_cm, column.permits_commercial),
+            (heights.industrial_cm, column.permits_industrial),
+        )
+        if permitted
+    ]
+    cheapest_usage_cm = min(usage_heights_cm)
     if (
         height_cap_cm is not None
-        and heights.residential_cm * column.floors_min > height_cap_cm
+        and cheapest_usage_cm * column.floors_min > height_cap_cm
     ):
         # *En étage min* demands storeys that *Hauteur max* has no room for.
         # Named apart from the level-row contradiction below because it is a
@@ -1484,28 +1749,41 @@ def solve_program(
             binding=("height_max_below_floors_min",),
         )
 
-    # The metric cap, read as the storey count it allows *this* usage. Read
-    # per usage rather than once for the building because the storey types are
-    # different heights: the same 15 m is five residential storeys and three
-    # commercial ones.
-    height_floors_cap = (
-        None if height_cap_cm is None else height_cap_cm // heights.residential_cm
-    )
-    floors_allowed = column.residential_floors
-    if height_floors_cap is not None:
-        floors_allowed = min(floors_allowed, height_floors_cap)
-    if floors_allowed < column.floors_min:
+    # The storeys the level rows allow this column's usages, jointly - the
+    # grid marks the rows per column, not per usage, so the three families
+    # share one bound.
+    permitted_count = column.permitted_floors_count
+    if permitted_count < column.floors_min:
         # Not an empty solution but a contradiction between two rows of the
         # same column, so it is named rather than returned as a bare
-        # INFEASIBLE the caller would have to diagnose. *En étage min* is read
-        # as a minimum on the *dwellings* storeys, not on the building's, so a
-        # parking floor is not allowed to talk the grid out of it.
+        # INFEASIBLE the caller would have to diagnose. The height cannot be
+        # the cause here - the check above already priced the minimum at the
+        # cheapest storey the column can build - so this is the level rows'
+        # own doing. *En étage min* is read as a minimum on the *usage*
+        # storeys, not on the building's, so a parking floor is not allowed
+        # to talk the grid out of it.
         return _empty_program(
             column,
             lot,
             status="INFEASIBLE",
             binding=("floors_min_exceeds_permitted_levels",),
         )
+
+    # The metric cap, read as the storey count it allows *each* usage. Read
+    # per usage rather than once for the building because the storey types are
+    # different heights: the same 15 m is five residential storeys and three
+    # commercial ones.
+    height_floors_cap = (
+        None if height_cap_cm is None else height_cap_cm // heights.residential_cm
+    )
+    res_floors_allowed = permitted_count if column.permits_residential else 0
+    if height_floors_cap is not None:
+        res_floors_allowed = min(res_floors_allowed, height_floors_cap)
+    # What the dwellings must supply of *En étage min*, and therefore claim
+    # out of the stack before anything else is placed. A column with no
+    # Habitation at its head owes the minimum from its commercial and
+    # industrial storeys instead - the constraint below the variables.
+    res_floors_min = column.floors_min if column.permits_residential else 0
 
     unpriced = tuple(
         sorted(
@@ -1519,7 +1797,11 @@ def solve_program(
         for unit_type, area_sqft in unit_areas_sqft.items()
         if unit_type not in unpriced
     }
-    if not priced:
+    if not priced and not (column.permits_commercial or column.permits_industrial):
+        # No dwelling can be priced and nothing else is authorised, so there
+        # is no model to build. A column that also authorises commerce or
+        # industry keeps solving: CMHC suppressing a borough's rents says
+        # nothing about what a retail floor earns.
         return _empty_program(
             column,
             lot,
@@ -1573,22 +1855,22 @@ def solve_program(
     # stack `floors_max` storeys of any kind; the *dwellings* may only occupy
     # the storeys the level rows allow. The first sizes the area variables,
     # the second sizes the unit counts.
-    residential_hi = footprint_hi * floors_allowed
+    residential_hi = footprint_hi * res_floors_allowed
     if density_cap is not None:
         residential_hi = min(residential_hi, density_cap)
 
     # A storey that is not dwellings has to fit inside `floors_max` alongside
-    # them, and the dwellings already claim `floors_min` of them. Commerce and
-    # industry are bounded by the level rows on top of that, the same way the
-    # dwellings are - they are usages of this column, and the rows are the
-    # column's.
-    spare_floors = max(column.floors_max - column.floors_min, 0)
+    # them, and the dwellings already claim what they owe *En étage min* -
+    # nothing, on a column that authorises none. Commerce and industry are
+    # bounded by the level rows on top of that, the same way the dwellings
+    # are - they are usages of this column, and the rows are the column's.
+    spare_floors = max(column.floors_max - res_floors_min, 0)
     parking_floors_hi = spare_floors
     commercial_floors_hi = (
-        min(spare_floors, floors_allowed) if column.permits_commercial else 0
+        min(spare_floors, permitted_count) if column.permits_commercial else 0
     )
     industrial_floors_hi = (
-        min(spare_floors, floors_allowed) if column.permits_industrial else 0
+        min(spare_floors, permitted_count) if column.permits_industrial else 0
     )
     if height_cap_cm is not None:
         # Same reading of the same cap, for the storey types that are not the
@@ -1609,10 +1891,17 @@ def solve_program(
     # reason a lot whose *Hauteur* binds digs rather than stops.
     underground_levels_hi = parking.max_underground_levels if parking.required else 0
 
-    smallest_unit_area = min(
-        _scale_area(area_sqft * M2_PER_SQFT) for area_sqft in priced.values()
+    # 0 where no dwelling can be priced at all - a pure Commerce or Industrie
+    # column, or a borough CMHC suppressed entirely. The counts then have
+    # empty domains rather than the arithmetic dividing by nothing.
+    smallest_unit_area = (
+        min(_scale_area(area_sqft * M2_PER_SQFT) for area_sqft in priced.values())
+        if priced
+        else 0
     )
-    dwellings_hi = int(residential_hi // smallest_unit_area)
+    dwellings_hi = (
+        int(residential_hi // smallest_unit_area) if smallest_unit_area else 0
+    )
     if column.max_dwellings is not None:
         dwellings_hi = min(dwellings_hi, column.max_dwellings)
 
@@ -1649,7 +1938,7 @@ def solve_program(
 
     footprint = model.NewIntVar(footprint_lo, footprint_hi, "footprint")
     residential_floors = model.NewIntVar(
-        column.floors_min, floors_allowed, "residential_floors"
+        res_floors_min, res_floors_allowed, "residential_floors"
     )
     parking_floors = model.NewIntVar(0, parking_floors_hi, "parking_floors")
     commercial_floors = model.NewIntVar(0, commercial_floors_hi, "commercial_floors")
@@ -1681,15 +1970,24 @@ def solve_program(
     # grid marks these rows for, and the storey it sits in is bounded by
     # *En etage max* alone - which is the constraint above.
     model.Add(
-        residential_floors + commercial_floors + industrial_floors <= floors_allowed
+        residential_floors + commercial_floors + industrial_floors <= permitted_count
     )
+    # And the same sum owes *En étage min*, which the parking is likewise not
+    # allowed to pay. Implied where dwellings are authorised - their own
+    # domain already starts at the minimum - and the whole of the rule on a
+    # column whose minimum must be met with commerce or industry instead.
+    if column.floors_min:
+        model.Add(
+            residential_floors + commercial_floors + industrial_floors
+            >= column.floors_min
+        )
 
     # The products that rule out an LP: every floor type is a footprint the
     # model chooses, stacked a number of times the model also chooses. All
     # three share `footprint`, which is the "every floor is the same plate"
     # assumption stated as algebra.
     residential_area = model.NewIntVar(
-        0, max(footprint_hi * floors_allowed, 0), "residential_area"
+        0, max(footprint_hi * res_floors_allowed, 0), "residential_area"
     )
     model.AddMultiplicationEquality(residential_area, [footprint, residential_floors])
 
@@ -1721,7 +2019,7 @@ def solve_program(
     height = model.NewIntVar(
         0,
         max(
-            heights.residential_cm * floors_allowed
+            heights.residential_cm * res_floors_allowed
             + heights.above_grade_parking_cm * parking_floors_hi
             + heights.commercial_cm * commercial_floors_hi
             + heights.industrial_cm * industrial_floors_hi,
@@ -1808,21 +2106,26 @@ def solve_program(
     model.Add(parking_floors <= above_grade_stalls)
     model.Add(underground_levels <= underground_stalls)
 
-    underground_monthly = round(
-        parking.underground_cost_cad / parking.amortization_months * MONEY_SCALE
-    )
-    above_grade_monthly = round(
-        parking.above_grade_cost_cad / parking.amortization_months * MONEY_SCALE
-    )
-    # Revenue less build cost, per dwelling, folded into one coefficient a
-    # class. Rounded once, at the coefficient, rather than separately on each
-    # side - two roundings of a cent apiece would show up as a tie broken the
-    # wrong way between classes this close together.
-    net_monthly = {
+    # Discounted net profit, folded to one coefficient per decision variable.
+    # `pv_per_monthly_gross` is the whole proforma - twelve months, the
+    # expense ratio off, the annuity over the hold, the discounted sale - so a
+    # dwelling's value is its effective proforma rent through that multiplier
+    # less its build cost in full, and a stall is simply its capital: it earns
+    # nothing, so nothing of it survives to offset the price. Rounded once, at
+    # the coefficient, rather than separately on each side - two roundings
+    # apiece would show up as a tie broken the wrong way between classes this
+    # close together.
+    pv_per_monthly_gross = investment.pv_per_monthly_gross
+    rent_premium = investment.rent_premium_factor
+    underground_value = round(parking.underground_cost_cad * MONEY_SCALE)
+    above_grade_value = round(parking.above_grade_cost_cad * MONEY_SCALE)
+    net_value = {
         unit_type: round(
             (
                 economics.monthly_revenue(unit_type)
-                - construction.monthly_cost(area_sqft)
+                * rent_premium
+                * pv_per_monthly_gross
+                - construction.capital_cost(area_sqft)
             )
             * MONEY_SCALE
         )
@@ -1831,21 +2134,22 @@ def solve_program(
     # The same fold, one level of aggregation up: rent and build cost are both
     # per square foot for these, so the pair is a single coefficient on the
     # area variable. `_area_coefficient` is where the per-square-foot figure
-    # meets the hundredths of a square metre the area is held in.
-    commercial_net = _area_coefficient(
-        non_residential.commercial_effective_per_sqft_month
-        - construction.commercial_monthly_cost(1.0)
+    # meets the hundredths of a square metre the area is held in. No rent
+    # premium: these rates are already quotes for new space.
+    commercial_value = _area_coefficient(
+        non_residential.commercial_effective_per_sqft_month * pv_per_monthly_gross
+        - construction.commercial_cost_per_sqft
     )
-    industrial_net = _area_coefficient(
-        non_residential.industrial_effective_per_sqft_month
-        - construction.industrial_monthly_cost(1.0)
+    industrial_value = _area_coefficient(
+        non_residential.industrial_effective_per_sqft_month * pv_per_monthly_gross
+        - construction.industrial_cost_per_sqft
     )
     model.Maximize(
-        sum(net_monthly[unit_type] * count for unit_type, count in counts.items())
-        + commercial_net * commercial_area
-        + industrial_net * industrial_area
-        - underground_monthly * underground_stalls
-        - above_grade_monthly * above_grade_stalls
+        sum(net_value[unit_type] * count for unit_type, count in counts.items())
+        + commercial_value * commercial_area
+        + industrial_value * industrial_area
+        - underground_value * underground_stalls
+        - above_grade_value * above_grade_stalls
     )
 
     solver = cp_model.CpSolver()
@@ -1876,6 +2180,34 @@ def solve_program(
         for unit_type, quantity in units.items()
     )
 
+    # The money, from the chosen program rather than from the objective, so
+    # every figure is exact where the objective's coefficients were rounded.
+    # The dwelling side of the gross is the proforma rent - the survey times
+    # the premium - because that is the rent every dollar below is built from.
+    parking_cost = parking.capital_cost(
+        underground=chosen_underground_stalls,
+        above_grade=chosen_above_grade_stalls,
+    )
+    construction_cost = sum(
+        construction.capital_cost(priced[unit_type]) * quantity
+        for unit_type, quantity in units.items()
+    )
+    commercial_cost = construction.commercial_capital_cost(commercial_sqft)
+    industrial_cost = construction.industrial_capital_cost(industrial_sqft)
+    total_capital = construction_cost + commercial_cost + industrial_cost + parking_cost
+    gross_revenue = (
+        sum(
+            economics.monthly_revenue(unit_type) * rent_premium * quantity
+            for unit_type, quantity in units.items()
+        )
+        + non_residential.commercial_monthly_revenue(commercial_sqft)
+        + non_residential.industrial_monthly_revenue(industrial_sqft)
+    )
+    present_value = gross_revenue * pv_per_monthly_gross
+    annual_stabilised_noi = (
+        gross_revenue * MONTHS_PER_YEAR * (1.0 - investment.operating_expense_ratio)
+    )
+
     return DevelopmentProgram(
         units=units,
         floors=solver.Value(floors),
@@ -1883,7 +2215,14 @@ def solve_program(
         footprint_m2=_unscale(solver.Value(footprint)),
         gross_floor_area_m2=_unscale(solver.Value(gross)),
         unit_area_m2=_unscale(unit_area),
-        net_operating_income=solver.ObjectiveValue() / MONEY_SCALE,
+        # The legacy monthly figure, restated from the chosen program - not
+        # the objective, which is `npv_cad` below.
+        net_operating_income=(
+            gross_revenue - total_capital / construction.amortization_months
+        ),
+        npv_cad=present_value - total_capital,
+        present_value_cad=present_value,
+        annual_stabilised_noi_cad=annual_stabilised_noi,
         status=status_name,
         residential_floors=solver.Value(residential_floors),
         above_grade_parking_floors=solver.Value(parking_floors),
@@ -1895,22 +2234,11 @@ def solve_program(
         underground_stalls=chosen_underground_stalls,
         above_grade_stalls=chosen_above_grade_stalls,
         underground_area_m2=_unscale(solver.Value(underground_area)),
-        parking_cost_cad=parking.capital_cost(
-            underground=chosen_underground_stalls,
-            above_grade=chosen_above_grade_stalls,
-        ),
-        construction_cost_cad=sum(
-            construction.capital_cost(priced[unit_type]) * quantity
-            for unit_type, quantity in units.items()
-        ),
-        commercial_cost_cad=construction.commercial_capital_cost(commercial_sqft),
-        industrial_cost_cad=construction.industrial_capital_cost(industrial_sqft),
-        gross_revenue_cad=sum(
-            economics.monthly_revenue(unit_type) * quantity
-            for unit_type, quantity in units.items()
-        )
-        + non_residential.commercial_monthly_revenue(commercial_sqft)
-        + non_residential.industrial_monthly_revenue(industrial_sqft),
+        parking_cost_cad=parking_cost,
+        construction_cost_cad=construction_cost,
+        commercial_cost_cad=commercial_cost,
+        industrial_cost_cad=industrial_cost,
+        gross_revenue_cad=gross_revenue,
         binding=_binding_caps(
             column,
             lot,
@@ -1920,9 +2248,16 @@ def solve_program(
             commercial_area=chosen_commercial_area,
             industrial_area=chosen_industrial_area,
             residential_floors=solver.Value(residential_floors),
+            commercial_floors=solver.Value(commercial_floors),
+            industrial_floors=solver.Value(industrial_floors),
             density_cap=density_cap,
             footprint_hi=footprint_hi,
-            floors_allowed=floors_allowed,
+            permits_residential=column.permits_residential and bool(priced),
+            res_floors_allowed=res_floors_allowed,
+            usage_floors_cap=min(
+                permitted_count,
+                max(commercial_floors_hi, industrial_floors_hi, res_floors_allowed),
+            ),
             smallest_unit_area=smallest_unit_area,
             underground_levels=chosen_underground_levels,
             underground_levels_hi=underground_levels_hi,
@@ -1987,9 +2322,13 @@ def _binding_caps(
     commercial_area: int,
     industrial_area: int,
     residential_floors: int,
+    commercial_floors: int,
+    industrial_floors: int,
     density_cap: int | None,
     footprint_hi: int,
-    floors_allowed: int,
+    permits_residential: bool,
+    res_floors_allowed: int,
+    usage_floors_cap: int,
     smallest_unit_area: int,
     underground_levels: int,
     underground_levels_hi: int,
@@ -2043,7 +2382,7 @@ def _binding_caps(
     if column.max_dwellings is not None and total_dwellings >= column.max_dwellings:
         binding.append("max_dwellings")
 
-    envelope_cap = footprint_hi * floors_allowed
+    envelope_cap = footprint_hi * res_floors_allowed
     non_residential_area = parking_area + commercial_area + industrial_area
     remaining_density = (
         None if density_cap is None else density_cap - non_residential_area
@@ -2053,7 +2392,7 @@ def _binding_caps(
         if remaining_density is None
         else min(envelope_cap, remaining_density)
     )
-    if residential_cap - unit_area < smallest_unit_area:
+    if permits_residential and residential_cap - unit_area < smallest_unit_area:
         # No further dwelling of any priced class fits in the largest envelope
         # the grid allows, so the envelope is what stops the mix. Which norm
         # produced that envelope is the useful half of the answer.
@@ -2068,18 +2407,37 @@ def _binding_caps(
             # this line said before that cap existed.
             binding.append(_footprint_cap_norm(column, lot))
             binding.append("floors")
-            if height_floors_cap is not None and height_floors_cap <= floors_allowed:
-                # `floors_allowed` is the storey row and the metric cap
+            if (
+                height_floors_cap is not None
+                and height_floors_cap <= res_floors_allowed
+            ):
+                # `res_floors_allowed` is the storey row and the metric cap
                 # whichever is smaller, so this is the metric one being at
                 # least as tight - the storeys the envelope was built from are
                 # the ones *Hauteur* left room for.
                 binding.append("height_max")
 
-    if residential_floors < floors_allowed:
+    if permits_residential and residential_floors < res_floors_allowed:
         if commercial_area > 0:
             binding.append("commercial_floor_area")
         if industrial_area > 0:
             binding.append("industrial_floor_area")
+
+    if not permits_residential and (commercial_area > 0 or industrial_area > 0):
+        # A column with no dwelling in the question: what stopped the commerce
+        # or the industry is the envelope's own arithmetic, read from the caps
+        # the way the residential branch reads them. A column whose floors sit
+        # at every storey the rows and the height leave is 'floors'; one whose
+        # remaining *Densité* cannot hold another plate at any footprint the
+        # coverage allows is 'density_max'; and the footprint norm names which
+        # of the two ceilings built the plate.
+        used_floors = commercial_floors + industrial_floors
+        gross_above = non_residential_area  # residential is zero here
+        if density_cap is not None and density_cap - gross_above < footprint_hi:
+            binding.append("density_max")
+        if used_floors >= usage_floors_cap:
+            binding.append(_footprint_cap_norm(column, lot))
+            binding.append("floors")
 
     if underground_levels_hi and underground_levels >= underground_levels_hi:
         binding.append("max_underground_levels")
@@ -2149,6 +2507,6 @@ def _area_coefficient(per_sqft_month: float) -> int:
     a rate a leasing agent would quote and a number CP-SAT can multiply. Signed
     on purpose: a rate whose build cost exceeds its rent comes through negative
     and the solver declines the storey, which is the same behaviour a dwelling
-    class gets from `net_monthly`.
+    class gets from `net_value`.
     """
     return round(per_sqft_month / M2_PER_SQFT / AREA_SCALE * MONEY_SCALE)

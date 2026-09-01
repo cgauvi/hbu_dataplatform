@@ -10,6 +10,8 @@ from collections.abc import MutableMapping
 from pathlib import Path
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
+from dotenv import load_dotenv
+
 DEFAULT_SCHEMA = "dagster"
 DEFAULT_DATABASE = "urban_rag"
 DEFAULT_USER = "urban_rag"
@@ -23,6 +25,7 @@ _VALID_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
+    load_dotenv(Path.cwd() / ".env")
     configure_dagster_home(Path(os.environ.get("DAGSTER_HOME", "/dagster_home")))
     if not args:
         return 0
@@ -63,26 +66,38 @@ def postgres_url_from_env(env: MutableMapping[str, str]) -> str | None:
     if not host:
         return None
 
+    hostaddr = _first(env, "DAGSTER_PG_HOSTADDR", "URBAN_RAG_PG_HOSTADDR", "PGHOSTADDR")
     user = _first(env, "DAGSTER_PG_USER", "DAGSTER_PG_USERNAME", "URBAN_RAG_PG_USER")
     database = _first(
         env, "DAGSTER_PG_DATABASE", "DAGSTER_PG_DB", "URBAN_RAG_PG_DATABASE"
     )
-    port = _first(env, "DAGSTER_PG_PORT", "URBAN_RAG_PG_PORT") or DEFAULT_PORT
+    port = _first(env, "DAGSTER_PG_PORT", "URBAN_RAG_PG_PORT")
     password = _first(env, "DAGSTER_PG_PASSWORD", "URBAN_RAG_PG_PASSWORD", "PGPASSWORD")
     secret_id = _first(env, "DAGSTER_PG_SECRET_ID", "URBAN_RAG_PG_SECRET_ID")
 
     if secret_id and not password:
         secret = _load_secret(secret_id, env)
-        user = str(secret.get("username") or user or DEFAULT_USER)
         password = str(secret["password"])
-        host = str(secret.get("host") or host)
-        port = str(secret.get("port") or port)
+        # Only the credentials come from the secret; the environment wins for
+        # everything that says *where* to connect. An RDS secret records the
+        # address the database answers on in its own network, which is not the
+        # address we reach it at: through the SSM tunnel that is a local port,
+        # and only URBAN_RAG_PG_HOST knows it. Letting the secret win here
+        # silently replaced the configured host, which both reintroduced the
+        # localhost -> ::1 stall that addressing the tunnel as 127.0.0.1 exists
+        # to avoid and, under sslmode=verify-full, failed the hostname check
+        # against the RDS certificate. PgVectorSettings.credentials() reads the
+        # same secret this way: username and password, nothing else.
+        user = str(user or secret.get("username") or DEFAULT_USER)
+        port = str(port or secret.get("port") or "")
         database = str(
-            secret.get("dbname")
+            database
+            or secret.get("dbname")
             or secret.get("database")
-            or database
             or DEFAULT_DATABASE
         )
+
+    port = port or DEFAULT_PORT
 
     if not password:
         if _flag(_first(env, "DAGSTER_PG_IAM_AUTH", "URBAN_RAG_PG_IAM_AUTH")):
@@ -111,6 +126,8 @@ def postgres_url_from_env(env: MutableMapping[str, str]) -> str | None:
     )
     if sslrootcert:
         query["sslrootcert"] = sslrootcert
+    if hostaddr:
+        query["hostaddr"] = hostaddr
 
     netloc = (
         f"{quote(user or DEFAULT_USER, safe='')}:{quote(password, safe='')}"
@@ -140,6 +157,9 @@ def _with_search_path(url: str, schema: str, env: MutableMapping[str, str]) -> s
     )
     if sslrootcert:
         query.setdefault("sslrootcert", sslrootcert)
+    hostaddr = _first(env, "DAGSTER_PG_HOSTADDR", "URBAN_RAG_PG_HOSTADDR", "PGHOSTADDR")
+    if hostaddr:
+        query.setdefault("hostaddr", hostaddr)
     return urlunsplit(
         (
             parts.scheme or "postgresql",

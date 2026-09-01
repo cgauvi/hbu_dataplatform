@@ -629,6 +629,10 @@ class PgVectorResource(ConfigurableResource):
     host: str | None = Field(
         default=None, description="RDS endpoint, e.g. <name>.<id>.<region>.rds.amazonaws.com."
     )
+    hostaddr: str | None = Field(
+        default=None,
+        description="Optional tunnel address; host is still used for TLS verification.",
+    )
     port: int | None = None
     database: str | None = None
     user: str | None = None
@@ -670,6 +674,7 @@ class PgVectorResource(ConfigurableResource):
     def settings(self) -> PgSettings:
         return PgSettings.from_env(
             host=self.host,
+            hostaddr=self.hostaddr,
             port=self.port,
             database=self.database,
             user=self.user,
@@ -703,6 +708,7 @@ class PostgisResource(ConfigurableResource):
     """
 
     host: str | None = None
+    hostaddr: str | None = None
     port: int | None = None
     database: str | None = None
     user: str | None = None
@@ -723,6 +729,7 @@ class PostgisResource(ConfigurableResource):
     def settings(self) -> PgSettings:
         return PgSettings.from_env(
             host=self.host,
+            hostaddr=self.hostaddr,
             port=self.port,
             database=self.database,
             user=self.user,

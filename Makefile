@@ -14,6 +14,26 @@ endif
 
 export DAGSTER_HOME := $(CURDIR)/.dagster_home
 
+# The pipeline's AWS resources live behind this profile by default. Read the
+# same .env that the Python entrypoints load, then export the resolved value so
+# Dagster's subprocesses, boto3, fsspec and DuckDB agree on one credential
+# source. Command-line overrides still win: `make dagster_run AWS_PROFILE=...`.
+DEFAULT_AWS_PROFILE := charles_gauvin_east_1
+DOTENV_AWS_PROFILE := $(shell awk -F= '/^[[:space:]]*AWS_PROFILE[[:space:]]*=/ {gsub(/^[[:space:]]+|[[:space:]]+$$/, "", $$2); print $$2; exit}' .env 2>/dev/null)
+ifeq (,$(strip $(AWS_PROFILE)))
+AWS_PROFILE := $(if $(strip $(DOTENV_AWS_PROFILE)),$(strip $(DOTENV_AWS_PROFILE)),$(DEFAULT_AWS_PROFILE))
+endif
+export AWS_PROFILE
+
+# botocore checks raw key environment variables before AWS_PROFILE. Keep a
+# stale shell from silently outranking the profile pin; CI that intentionally
+# uses environment credentials can opt back in with AWS_USE_ENV_CREDS=1.
+ifneq (1,$(AWS_USE_ENV_CREDS))
+unexport AWS_ACCESS_KEY_ID
+unexport AWS_SECRET_ACCESS_KEY
+unexport AWS_SESSION_TOKEN
+endif
+
 # Touched after a successful `uv sync` (see the environment section). Every
 # target that shells out to `uv` takes it as an order-only prerequisite, so a
 # fresh checkout, or an edit to pyproject.toml / uv.lock, re-syncs before the
@@ -115,6 +135,17 @@ STALLS_PER_DWELLING ?= 0.5
 # Altus wood-frame condo midpoint, which under-costs a lot zoned for a tower -
 # see urban_rag.hbu_assets.ProgramConfig.
 RES_COST_SQFT ?= 257.5
+# The proforma `make programs` optimises: discounted net profit. DISCOUNT_PCT
+# discounts each year of stabilised NOI, TERMINAL_CAP_PCT prices the sale that
+# ends the HOLD_YEARS hold, and RENT_PREMIUM_PCT is what a new dwelling leases
+# for over the stock average CMHC surveys - dwellings only, the commercial
+# rents are already market quotes. OPEX above is shared with `comparables` so
+# both sides of the redevelopment gap stay netted with one number. All stated
+# assumptions - see urban_rag.program.InvestmentAssumptions.
+DISCOUNT_PCT ?= 5.0
+HOLD_YEARS ?= 25
+TERMINAL_CAP_PCT ?= 4.5
+RENT_PREMIUM_PCT ?= 30.0
 # Width-to-depth ratios `make massing` tries when drawing a building, squarest
 # first, as a JSON list; the first that fits the lot's setback envelope at the
 # solved footprint wins. Each is tried at the parcel's own axis and at the
@@ -133,6 +164,8 @@ TOP_N ?= 25
 
 IMAGE ?= urban-rag
 TAG ?= latest
+TUNNEL_PORT ?= 5433
+TUNNEL_DB_HOST ?= $(shell awk -F= '/^[[:space:]]*URBAN_RAG_PG_HOST[[:space:]]*=/ {gsub(/^[[:space:]]+|[[:space:]]+$$/, "", $$2); gsub(/\r/, "", $$2); print $$2; exit}' .env 2>/dev/null)
 DOCKER_RUN := docker run --rm -it \
 	-v $(CURDIR)/data:/data \
 	-v $(CURDIR)/.dagster_home:/dagster_home \
@@ -145,7 +178,7 @@ DOCKER_RUN := docker run --rm -it \
 	rent-sources commercial-rents \
 	frontage corpus publish index search ask status \
 	require-q validate_defs clean clean-data clean-silver \
-	docker-build docker-build-slim docker-run docker-shell docker-test up down logs
+	docker-build docker-build-slim docker-run docker-shell docker-test up up-tunnel down logs
 
 help: ## Show this help
 	@echo "Targets:"
@@ -249,12 +282,16 @@ lot-profiles: | $(UV_SYNC_STAMP) ## Materialize lot_profiles for DATE x NEIGHBOR
 # `envelopes` run first for the same partition - the CP-SAT model in
 # urban_rag.program is run once per candidate row it wrote. `setbacks` is
 # read too if it has run, and is optional: without it the footprint is capped
-# on Taux d'implantation alone. STALLS_PER_DWELLING and RES_COST_SQFT are the
-# two levers most worth moving; see urban_rag.hbu_assets.ProgramConfig for the
-# rest.
+# on Taux d'implantation alone. `commercial-rents` likewise: with it the
+# commerce and industry are priced at the borough's surveyed rents, without
+# it at urban_rag.program's stated constants, which flatter retail badly.
+# The objective is discounted net profit - DISCOUNT_PCT / HOLD_YEARS /
+# TERMINAL_CAP_PCT / OPEX / RENT_PREMIUM_PCT above are its levers, and
+# STALLS_PER_DWELLING and RES_COST_SQFT remain the heaviest two on the cost
+# side; see urban_rag.hbu_assets.ProgramConfig for the rest.
 programs: | $(UV_SYNC_STAMP) ## Materialize lot_development_programs for DATE x NEIGHBORHOOD
 	$(DAGSTER) asset materialize --select silver/lot_development_programs --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE) \
-		--config-json '{"ops":{"silver__lot_development_programs":{"config":{"stalls_per_dwelling":$(STALLS_PER_DWELLING),"residential_cost_per_sqft_cad":$(RES_COST_SQFT)}}}}'
+		--config-json '{"ops":{"silver__lot_development_programs":{"config":{"stalls_per_dwelling":$(STALLS_PER_DWELLING),"residential_cost_per_sqft_cad":$(RES_COST_SQFT),"operating_expense_ratio":$(OPEX),"discount_rate_pct":$(DISCOUNT_PCT),"hold_years":$(HOLD_YEARS),"terminal_cap_rate_pct":$(TERMINAL_CAP_PCT),"new_build_rent_premium_pct":$(RENT_PREMIUM_PCT)}}}}'
 
 # Needs gold.lot_highest_best_use and gold.lot_redevelopment_gap (hbu_infra
 # sql/018, sql/019) applied, and `programs` run first for the same partition.
@@ -426,6 +463,25 @@ docker-test: ## Run the test suite inside the image
 		bash -c "uv sync --locked --extra dev --extra rag && uv run pytest"
 
 up: ## Start webserver + daemon via compose
+	docker compose up --build -d
+
+up-tunnel: ## Start compose through an open hbu_infra db-tunnel
+	@test -n "$(TUNNEL_DB_HOST)" || { \
+	  echo "TUNNEL_DB_HOST is empty; set it to the RDS endpoint, not localhost"; \
+	  exit 1; \
+	}
+	@case "$(TUNNEL_DB_HOST)" in \
+	  localhost|127.*|::1) \
+	    echo "TUNNEL_DB_HOST must be the RDS endpoint, not $(TUNNEL_DB_HOST), when sslmode=verify-full"; \
+	    exit 1 ;; \
+	esac
+	URBAN_RAG_PG_HOST="$(TUNNEL_DB_HOST)" \
+	URBAN_RAG_PG_HOSTADDR= \
+	URBAN_RAG_PG_PORT="$(TUNNEL_PORT)" \
+	URBAN_RAG_PG_SSLMODE=verify-full \
+	URBAN_RAG_PG_SSLROOTCERT=/home/app/.postgresql/root.crt \
+	URBAN_RAG_PG_DSN= \
+	DAGSTER_POSTGRES_URL= \
 	docker compose up --build -d
 
 down: ## Stop the compose stack

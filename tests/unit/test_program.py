@@ -23,9 +23,10 @@ tests that are about something else - the rent arithmetic, the vacancy
 factor - pass `NO_PARKING` and `NO_CONSTRUCTION_COST`, so a change to a
 published rate cannot move a number those tests exist to pin.
 
-The objective is net operating income, and the fifth group is about the one
-thing that makes it more than the rent roll with a subtraction on the end.
-Per dwelling, per month, at the module's own constants:
+The objective is discounted net profit; the tables below are computed under
+`UNDISCOUNTED_INVESTMENT`, which reprices it back to the old monthly NOI
+exactly (see that constant), and the discounting itself has its own group at
+the bottom of the file. Per dwelling, per month, at the module's constants:
 
 =================  =========  =========  =========  ==========
 class              revenue    build      net        net/sq ft
@@ -56,6 +57,10 @@ from urban_rag.program import (
     ABOVE_GRADE_STALL_COST_CAD,
     AMORTIZATION_MONTHS,
     ASSUMED_BUILDING_AGE_YEARS,
+    DEFAULT_INVESTMENT,
+    DEFAULT_NON_RESIDENTIAL,
+    InvestmentAssumptions,
+    UNDISCOUNTED_INVESTMENT,
     BuildingLevel,
     COMMERCIAL_COST_PER_SQFT_CAD,
     COMMERCIAL_REVENUE_PER_SQFT_CAD,
@@ -116,6 +121,13 @@ VACANCY = {
     "3_bedroom_plus": 0.5,
 }
 ECONOMICS = UnitEconomics(average_rent_cad=RENTS, vacancy_rate_pct=VACANCY)
+
+#: The objective the docstring tables at the head of this file were computed
+#: under: the old undiscounted amortisation, no expenses, no premium. The
+#: tests that pin a *mix* or a hand-computed dollar figure pass it, so they
+#: stay about the caps and the rent arithmetic rather than about the price of
+#: money - which has its own test group at the bottom of the file.
+UNDISCOUNTED = UNDISCOUNTED_INVESTMENT
 
 
 def column(**overrides) -> ZoneColumn:
@@ -240,6 +252,7 @@ def test_the_dwelling_ceiling_binds():
         column(max_dwellings=12, density_max=None),
         Lot(area_m2=2000.0, frontage_m=25.0),
         ECONOMICS,
+        investment=UNDISCOUNTED,
     )
     assert program.solved
     assert program.total_dwellings == 12
@@ -257,6 +270,7 @@ def test_the_most_valuable_class_wins_when_only_the_count_is_capped():
         Lot(area_m2=5000.0, frontage_m=40.0),
         ECONOMICS,
         parking=NO_PARKING,
+        investment=UNDISCOUNTED,
     )
     assert program.units == {"3_bedroom_plus": 1}
     assert program.net_operating_income == pytest.approx(661.50)
@@ -273,6 +287,7 @@ def test_the_best_square_foot_wins_when_the_envelope_is_what_binds():
         Lot(area_m2=400.0, frontage_m=12.0),
         ECONOMICS,
         parking=NO_PARKING,
+        investment=UNDISCOUNTED,
     )
     assert program.units == {"1_bedroom": 25}
     assert program.net_operating_income == pytest.approx(25 * 470.00)
@@ -338,7 +353,11 @@ def test_the_margins_bind_when_they_leave_less_than_the_coverage_allows():
     # trade the module docstring's last two columns describe.
     lot = Lot(area_m2=400.0, frontage_m=12.0, buildable_area_m2=240.0)
     program = solve_program(
-        column(density_max=None), lot, ECONOMICS, parking=NO_PARKING
+        column(density_max=None),
+        lot,
+        ECONOMICS,
+        parking=NO_PARKING,
+        investment=UNDISCOUNTED,
     )
     assert program.solved
     assert program.footprint_m2 <= 240.0 + 1e-9
@@ -434,6 +453,7 @@ def test_fewer_storeys_when_the_level_rows_say_ground_floor_only():
         ),
         lot,
         ECONOMICS,
+        investment=UNDISCOUNTED,
     )
     assert program.residential_floors == 1
     # One storey of at most 70% of 400 m2: five 55.74 m2 one-bedrooms, 278.7 m2
@@ -502,6 +522,7 @@ def test_vacancy_is_read_as_a_percentage():
         economics,
         parking=NO_PARKING,
         construction=NO_CONSTRUCTION_COST,
+        investment=UNDISCOUNTED,
     )
     assert program.net_operating_income == pytest.approx(1000 * 0.9)
 
@@ -514,6 +535,7 @@ def test_a_missing_vacancy_is_treated_as_full_occupancy():
         economics,
         parking=NO_PARKING,
         construction=NO_CONSTRUCTION_COST,
+        investment=UNDISCOUNTED,
     )
     assert program.net_operating_income == pytest.approx(1000)
 
@@ -538,11 +560,51 @@ def test_the_answer_is_reported_against_the_zone_and_lot_it_was_asked_about():
     assert program.lot_number == "1425926"
 
 
-def test_a_column_authorising_no_dwelling_is_refused():
-    with pytest.raises(ProgramError, match="authorises no dwelling"):
+def test_a_column_authorising_no_priced_use_is_refused():
+    # A pure Commerce or Industrie column solves now; only a column with none
+    # of the three priced families - Équipements collectifs, in practice -
+    # has no proforma to state.
+    with pytest.raises(ProgramError, match="authorises none"):
         solve_program(
-            column(usages=("C.4",)), Lot(area_m2=400.0, frontage_m=12.0), ECONOMICS
+            column(usages=("E.1",)), Lot(area_m2=400.0, frontage_m=12.0), ECONOMICS
         )
+
+
+def test_a_pure_commerce_column_solves_without_a_dwelling():
+    # The former no_residential_column gap: a C column is the same model with
+    # the dwelling counts pinned at zero. The commerce fills the storeys the
+    # level rows spare it, pays its build cost, and owes its stalls.
+    program = solve_program(
+        column(usages=("C.4",), levels=frozenset({BuildingLevel.ALL}), floors_min=0),
+        Lot(area_m2=400.0, frontage_m=12.0),
+        ECONOMICS,
+        parking=NO_PARKING,
+    )
+    assert program.solved
+    assert program.total_dwellings == 0
+    assert program.residential_floors == 0
+    assert program.commercial_floors > 0
+    assert program.commercial_area_m2 > 0
+    assert program.npv_cad > 0
+    assert program.gross_revenue_cad == pytest.approx(
+        DEFAULT_NON_RESIDENTIAL.commercial_monthly_revenue(
+            program.commercial_area_sqft
+        )
+    )
+
+
+def test_a_pure_industry_column_owes_en_etage_min_from_its_own_storeys():
+    # *En étage min* is met by usage storeys on a column with no Habitation at
+    # its head - the parking is not allowed to pay it there either.
+    program = solve_program(
+        column(usages=("I.1",), levels=frozenset({BuildingLevel.ALL}), floors_min=2),
+        Lot(area_m2=400.0, frontage_m=12.0),
+        ECONOMICS,
+        parking=NO_PARKING,
+    )
+    assert program.solved
+    assert program.industrial_floors >= 2
+    assert program.residential_floors == 0
 
 
 def test_a_percentage_outside_zero_to_a_hundred_is_refused():
@@ -661,6 +723,7 @@ def test_more_stalls_a_dwelling_stack_more_underground_levels():
         Lot(area_m2=400.0, frontage_m=12.0),
         ECONOMICS,
         parking=ParkingRules(stalls_per_dwelling=2.0),
+        investment=UNDISCOUNTED,
     )
     assert program.total_dwellings == 9
     assert program.underground_stalls == 18
@@ -740,6 +803,7 @@ def test_the_objective_nets_the_build_off_the_rent():
         Lot(area_m2=5000.0, frontage_m=40.0),
         ECONOMICS,
         parking=NO_PARKING,
+        investment=UNDISCOUNTED,
     )
     assert program.gross_revenue_cad == pytest.approx(1700 * 0.995)
     assert program.construction_cost_cad == pytest.approx(1200 * 257.5)
@@ -759,6 +823,7 @@ def test_the_stalls_are_charged_on_the_same_footing_as_the_dwellings():
         column(max_dwellings=1, density_max=None),
         Lot(area_m2=5000.0, frontage_m=40.0),
         ECONOMICS,
+        investment=UNDISCOUNTED,
     )
     assert program.above_grade_stalls == 1
     dwelling = round((1700 * 0.995 - 1200 * 257.5 / 300) * MONEY_SCALE) / MONEY_SCALE
@@ -815,12 +880,13 @@ def test_a_cheaper_structure_is_worth_more_on_the_same_envelope():
     # same mix on the same lot, costed as wood frame against `condo_12`'s
     # mtl midpoint of $305. Same building, less of it spent.
     lot = Lot(area_m2=650.0, frontage_m=18.0)
-    wood = solve_program(column(), lot, ECONOMICS)
+    wood = solve_program(column(), lot, ECONOMICS, investment=UNDISCOUNTED)
     concrete = solve_program(
         column(),
         lot,
         ECONOMICS,
         construction=ConstructionCosts(residential_cost_per_sqft=305.0),
+        investment=UNDISCOUNTED,
     )
     assert wood.net_operating_income > concrete.net_operating_income
     assert wood.construction_cost_cad < concrete.construction_cost_cad
@@ -990,6 +1056,7 @@ def test_the_commercial_floors_are_priced_and_rented_by_the_square_foot():
         Lot(area_m2=400.0, frontage_m=12.0),
         ECONOMICS,
         parking=NO_PARKING,
+        investment=UNDISCOUNTED,
     )
     sqft = program.commercial_area_sqft
     assert program.commercial_cost_cad == pytest.approx(
@@ -1149,6 +1216,7 @@ def test_the_reported_revenue_is_net_of_the_vacancy():
         Lot(area_m2=400.0, frontage_m=12.0),
         ECONOMICS,
         parking=NO_PARKING,
+        investment=UNDISCOUNTED,
     )
     dwellings = sum(
         RENTS[unit_type] * (1 - VACANCY[unit_type] / 100.0) * quantity
@@ -1602,3 +1670,158 @@ def test_a_negative_premium_is_refused():
     # run than new.
     with pytest.raises(ProgramError, match="cannot be negative"):
         maintenance_premium(10, per_year=-0.01)
+
+
+# -- discounted net profit: what a dollar of rent is worth --------------------
+#
+# The objective's price list. Every figure below is arrived at by hand from
+# the proforma the InvestmentAssumptions docstring states: a dollar a month of
+# gross becomes 12 x (1 - opex) dollars a year of stabilised NOI, collected
+# over the hold at the discount rate, plus the sale at the terminal cap.
+
+
+def test_the_pv_factor_is_the_annuity_plus_the_discounted_reversion():
+    stance = InvestmentAssumptions(
+        discount_rate_pct=5.0,
+        hold_years=25,
+        terminal_cap_rate_pct=4.5,
+        operating_expense_ratio=0.35,
+    )
+    annuity = (1 - 1.05**-25) / 0.05
+    reversion = (100 / 4.5) / 1.05**25
+    assert stance.annual_pv_factor == pytest.approx(annuity + reversion)
+    assert stance.pv_per_monthly_gross == pytest.approx(
+        12 * 0.65 * (annuity + reversion)
+    )
+
+
+def test_no_terminal_cap_values_the_income_stream_alone():
+    with_sale = InvestmentAssumptions(terminal_cap_rate_pct=4.5)
+    without = InvestmentAssumptions(terminal_cap_rate_pct=None)
+    assert without.annual_pv_factor < with_sale.annual_pv_factor
+    rate = without.discount_rate_pct / 100.0
+    assert without.annual_pv_factor == pytest.approx(
+        (1 - (1 + rate) ** -without.hold_years) / rate
+    )
+
+
+def test_the_undiscounted_stance_reprices_the_old_objective_exactly():
+    # Zero discount, zero expenses, no sale, no premium, held for the
+    # amortisation's own 25 years: a dollar a month is worth the 300 dollars
+    # the straight-line amortisation always implied, so the argmax is what it
+    # always was.
+    assert UNDISCOUNTED_INVESTMENT.pv_per_monthly_gross == pytest.approx(300.0)
+    assert UNDISCOUNTED_INVESTMENT.rent_premium_factor == 1.0
+
+
+def test_the_objective_is_the_present_value_less_the_capital():
+    # One dwelling, no parking, so every identity is a single multiplication:
+    # the objective is the proforma rent through the PV multiplier, less the
+    # build in full - not amortised.
+    stance = InvestmentAssumptions(new_build_rent_premium_pct=0.0)
+    program = solve_program(
+        column(max_dwellings=1, density_max=None),
+        Lot(area_m2=5000.0, frontage_m=40.0),
+        ECONOMICS,
+        parking=NO_PARKING,
+        investment=stance,
+    )
+    assert program.total_dwellings == 1
+    assert program.present_value_cad == pytest.approx(
+        program.gross_revenue_cad * stance.pv_per_monthly_gross
+    )
+    assert program.npv_cad == pytest.approx(
+        program.present_value_cad - program.total_capital_cost_cad
+    )
+    assert program.annual_stabilised_noi_cad == pytest.approx(
+        program.gross_revenue_cad * 12 * (1 - stance.operating_expense_ratio)
+    )
+    # And the legacy monthly figure is restated beside it, unchanged in
+    # meaning: gross less the amortised capital.
+    assert program.net_operating_income == pytest.approx(
+        program.gross_revenue_cad
+        - program.total_capital_cost_cad / AMORTIZATION_MONTHS
+    )
+
+
+def test_the_rent_premium_reaches_the_dwelling_revenue_and_nothing_else():
+    # 30 percent over the survey, dwellings only. One priced class, so the
+    # premium cannot also move the mix and the comparison is one
+    # multiplication: the reported gross is the proforma rent, because every
+    # dollar figure on the program is built from it.
+    one_class = UnitEconomics(
+        average_rent_cad={"1_bedroom": 1000.0},
+        vacancy_rate_pct={"1_bedroom": 1.5},
+    )
+    plain = solve_program(
+        column(max_dwellings=1, density_max=None),
+        Lot(area_m2=5000.0, frontage_m=40.0),
+        one_class,
+        parking=NO_PARKING,
+        investment=InvestmentAssumptions(new_build_rent_premium_pct=0.0),
+    )
+    boosted = solve_program(
+        column(max_dwellings=1, density_max=None),
+        Lot(area_m2=5000.0, frontage_m=40.0),
+        one_class,
+        parking=NO_PARKING,
+        investment=InvestmentAssumptions(new_build_rent_premium_pct=30.0),
+    )
+    assert plain.units == boosted.units == {"1_bedroom": 1}
+    assert boosted.gross_revenue_cad == pytest.approx(
+        plain.gross_revenue_cad * 1.3
+    )
+
+
+def test_discounting_reprices_the_classes_against_their_build_cost():
+    # The docstring table's two rankings are the undiscounted ones. Under the
+    # default stance the capital weighs roughly twice as much against the
+    # rent, and the per-dwelling winner moves: the three-bedroom's extra rent
+    # no longer pays for its extra square feet.
+    program = solve_program(
+        column(max_dwellings=1, density_max=None),
+        Lot(area_m2=5000.0, frontage_m=40.0),
+        ECONOMICS,
+        parking=NO_PARKING,
+        investment=DEFAULT_INVESTMENT,
+    )
+    assert program.total_dwellings == 1
+    assert program.units == {"2_bedroom": 1}
+
+
+def test_a_program_that_does_not_pencil_discounted_is_not_built():
+    # Every class under water once the discounting weighs the capital: no
+    # premium, no reversion, and a short hold. The solver declines to build
+    # rather than reporting a loss - the same posture the halved-rent test
+    # pins for the undiscounted objective.
+    thin = InvestmentAssumptions(
+        discount_rate_pct=8.0,
+        hold_years=10,
+        terminal_cap_rate_pct=None,
+        new_build_rent_premium_pct=0.0,
+    )
+    program = solve_program(
+        column(density_max=None),
+        Lot(area_m2=400.0, frontage_m=12.0),
+        ECONOMICS,
+        parking=NO_PARKING,
+        investment=thin,
+    )
+    assert program.solved
+    assert program.units == {}
+    assert program.npv_cad == 0.0
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"discount_rate_pct": -1.0},
+        {"hold_years": 0},
+        {"terminal_cap_rate_pct": 0.0},
+        {"operating_expense_ratio": 1.0},
+        {"new_build_rent_premium_pct": -5.0},
+    ],
+)
+def test_an_investment_stance_that_cannot_be_priced_is_refused(overrides):
+    with pytest.raises(ProgramError):
+        InvestmentAssumptions(**overrides)

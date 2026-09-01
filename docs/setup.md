@@ -250,3 +250,25 @@ its instance-storage connections open indefinitely, so a durable password or a
 Secrets Manager id is required here — `dagster_home.py` says so rather than
 failing later.
 
+When a laptop reaches RDS through `make db-tunnel`, keep TLS and the tunnel's
+address separate. With `sslmode=verify-full`, `URBAN_RAG_PG_HOST` must stay as
+the RDS endpoint, because that is the name in the server certificate. Point the
+socket at the local tunnel with `URBAN_RAG_PG_HOSTADDR`:
+
+```bash
+URBAN_RAG_PG_HOST=hbu-dev.cedzstv1bm7z.us-east-1.rds.amazonaws.com
+URBAN_RAG_PG_HOSTADDR=127.0.0.1
+URBAN_RAG_PG_PORT=5433
+URBAN_RAG_PG_SSLMODE=verify-full
+```
+
+For Docker Compose, leave the bastion tunnel open on the host and let Compose
+map the RDS hostname to Docker's host gateway instead:
+
+```bash
+cd ../hbu_infra
+make db-tunnel ENV=dev LOCAL_PORT=5433
+
+cd ../hbu_dataplatform
+make up-tunnel TUNNEL_DB_HOST=hbu-dev.cedzstv1bm7z.us-east-1.rds.amazonaws.com TUNNEL_PORT=5433
+```

@@ -77,6 +77,7 @@ from urban_rag.frames import write_frame
 from urban_rag.hbu import (
     HBU_STATUSES,
     ProgramAssumptions,
+    investment_assumptions_of,
     operating_expense_ratio_of,
     select_highest_best_use,
     solve_envelopes,
@@ -87,10 +88,12 @@ from urban_rag.layers import key_prefix
 from urban_rag.partitions import scrape_partitions
 from urban_rag.program import (
     ConstructionCosts,
+    InvestmentAssumptions,
     NonResidentialEconomics,
     ParkingRules,
     StoreyHeights,
 )
+from urban_rag.rent_assets import COMMERCIAL_RENTS_FILE, commercial_rents
 from urban_rag.rag.pgvector import PostgresUnavailable
 from urban_rag.resources import ParquetStore, PostgisResource
 from urban_rag.setback_assets import LOT_SETBACKS_FILE, lot_buildable_setbacks
@@ -180,6 +183,11 @@ _GAP_OUTPUT_COLUMNS = (
     "annual_stabilised_noi_gap_cad",
     "hbu_annual_noi_after_construction_cad",
     "hbu_total_capital_cost_cad",
+    # The discounted pair, and the verdict between them - see `hbu.use_gap`.
+    "hbu_npv_cad",
+    "hbu_present_value_cad",
+    "existing_present_value_cad",
+    "redevelopment_npv_gain_cad",
     "existing_num_assessment_units",
     "existing_total_assessed_value",
     "existing_cap_rate_pct",
@@ -252,19 +260,27 @@ class ProgramConfig(Config):
             "monthly rent. Straight line, undiscounted, no financing."
         ),
     )
-    commercial_rent_per_sqft_year_cad: float = Field(
-        default=NonResidentialEconomics().commercial_per_sqft_year,
+    commercial_rent_per_sqft_year_cad: float | None = Field(
+        default=None,
         ge=0.0,
         description=(
             "Asking rent per square foot per YEAR, gross. Annual because that "
             "is how commercial leasing is quoted; the dwelling rent beside it "
-            "is monthly because that is how CMHC surveys one."
+            "is monthly because that is how CMHC surveys one. None - the "
+            "default - reads the borough's own surveyed retail rate off "
+            "silver/commercial_rents for the partition, falling back to "
+            "urban_rag.program's stated constant where that asset has not "
+            "run; a number here overrides both."
         ),
     )
-    industrial_rent_per_sqft_year_cad: float = Field(
-        default=NonResidentialEconomics().industrial_per_sqft_year,
+    industrial_rent_per_sqft_year_cad: float | None = Field(
+        default=None,
         ge=0.0,
-        description="Asking rent per square foot per YEAR of industrial floor.",
+        description=(
+            "Asking rent per square foot per YEAR of industrial floor. None "
+            "reads the surveyed industrial rate the way the commercial field "
+            "does; a number overrides it."
+        ),
     )
     commercial_vacancy_pct: float = Field(
         default=NonResidentialEconomics().commercial_vacancy_pct,
@@ -299,6 +315,50 @@ class ProgramConfig(Config):
             "metric height cap ranks the two differently from a storey cap."
         ),
     )
+    discount_rate_pct: float = Field(
+        default=InvestmentAssumptions().discount_rate_pct,
+        ge=0.0,
+        description=(
+            "Annual rate a future dollar of NOI is discounted at, unlevered. "
+            "The price of time in the objective, and with the terminal cap "
+            "the largest lever on whether anything pencils at all."
+        ),
+    )
+    hold_years: int = Field(
+        default=InvestmentAssumptions().hold_years,
+        gt=0,
+        description="Years of NOI collected before the sale ends the hold.",
+    )
+    terminal_cap_rate_pct: float | None = Field(
+        default=InvestmentAssumptions().terminal_cap_rate_pct,
+        gt=0.0,
+        description=(
+            "Cap rate the stabilised NOI is sold at when the hold ends. None "
+            "drops the sale and values the income stream alone."
+        ),
+    )
+    operating_expense_ratio: float = Field(
+        default=InvestmentAssumptions().operating_expense_ratio,
+        ge=0.0,
+        lt=1.0,
+        description=(
+            "Share of gross income spent running the NEW building the solver "
+            "proposes - taxes, insurance, management, maintenance. The same "
+            "convention (and default) as the comparables asset's base ratio; "
+            "run both at one OPEX so the two sides of the gap stay netted "
+            "alike."
+        ),
+    )
+    new_build_rent_premium_pct: float = Field(
+        default=InvestmentAssumptions().new_build_rent_premium_pct,
+        ge=0.0,
+        description=(
+            "What a new dwelling leases for over the stock average CMHC "
+            "surveys, in percent. 0 prices the proposal at the stock average, "
+            "which is the conservative reading and understates every new "
+            "building's proforma."
+        ),
+    )
     max_seconds: float = Field(
         default=ProgramAssumptions().max_seconds,
         gt=0.0,
@@ -309,7 +369,9 @@ class ProgramConfig(Config):
         ),
     )
 
-    def assumptions(self) -> ProgramAssumptions:
+    def assumptions(
+        self, *, surveyed_rents: dict[str, float] | None = None
+    ) -> ProgramAssumptions:
         """This run's config as the object `urban_rag.hbu` is handed.
 
         The storey heights collapse four fields to three on purpose: commerce
@@ -319,7 +381,24 @@ class ProgramConfig(Config):
         residential figure because a garage carries no plenum at all. Both are
         `urban_rag.program`'s own defaults, stated here rather than silently
         inherited.
+
+        ``surveyed_rents`` is the borough's `commercial_rents` partition as a
+        ``{rent_class: rent_psf_cad}`` map. Retail stands in for the solver's
+        one commercial rate - the ground-floor space a mixed-use column in
+        this borough actually means, not an office tower - and industrial for
+        industrial. A rate stated in the config wins over the survey; the
+        module constant is the floor under both.
         """
+        commercial_rent = self.commercial_rent_per_sqft_year_cad
+        if commercial_rent is None:
+            commercial_rent = (surveyed_rents or {}).get(
+                "retail", NonResidentialEconomics().commercial_per_sqft_year
+            )
+        industrial_rent = self.industrial_rent_per_sqft_year_cad
+        if industrial_rent is None:
+            industrial_rent = (surveyed_rents or {}).get(
+                "industrial", NonResidentialEconomics().industrial_per_sqft_year
+            )
         return ProgramAssumptions(
             parking=ParkingRules(
                 stalls_per_dwelling=self.stalls_per_dwelling,
@@ -333,8 +412,8 @@ class ProgramConfig(Config):
                 amortization_months=self.amortization_months,
             ),
             non_residential=NonResidentialEconomics(
-                commercial_per_sqft_year=self.commercial_rent_per_sqft_year_cad,
-                industrial_per_sqft_year=self.industrial_rent_per_sqft_year_cad,
+                commercial_per_sqft_year=commercial_rent,
+                industrial_per_sqft_year=industrial_rent,
                 commercial_vacancy_pct=self.commercial_vacancy_pct,
                 industrial_vacancy_pct=self.industrial_vacancy_pct,
             ),
@@ -344,6 +423,13 @@ class ProgramConfig(Config):
                 industrial_m=self.commercial_storey_height_m,
                 above_grade_parking_m=self.residential_storey_height_m,
             ),
+            investment=InvestmentAssumptions(
+                discount_rate_pct=self.discount_rate_pct,
+                hold_years=self.hold_years,
+                terminal_cap_rate_pct=self.terminal_cap_rate_pct,
+                operating_expense_ratio=self.operating_expense_ratio,
+                new_build_rent_premium_pct=self.new_build_rent_premium_pct,
+            ),
             max_seconds=self.max_seconds,
         )
 
@@ -351,24 +437,34 @@ class ProgramConfig(Config):
 @asset(
     key_prefix=key_prefix("lot_development_programs"),
     partitions_def=scrape_partitions,
-    deps=[lot_zoning_envelopes, lot_buildable_setbacks, vacancy_rates, average_rents],
+    deps=[
+        lot_zoning_envelopes,
+        lot_buildable_setbacks,
+        vacancy_rates,
+        average_rents,
+        commercial_rents,
+    ],
     group_name=SILVER_GROUP,
     kinds={"ortools", "postgres", "parquet"},
     description=(
         "What may profitably be built under every zoning envelope of one "
-        "borough: one row per (lot, grid column) that authorises dwellings and "
-        "that the grid parser could turn into a solver input, each the answer "
-        "to one urban_rag.program CP-SAT run. Carries the mix of dwellings by "
-        "CMHC bedroom class, the storeys split into residential, commercial, "
-        "industrial and above-grade parking, the underground levels, the "
-        "footprint and gross floor area, the stalls by where they were put, "
-        "what each part costs to build, and the monthly net operating income "
-        "that is the objective - annualised beside it, because the assessment "
-        "side of this platform is annual. binding names the caps the answer is "
-        "pressed against and unpriced_types the bedroom classes CMHC "
-        "suppressed. A candidate the solver refuses keeps its row with its "
-        "status; one whose model could not be built keeps its row with "
-        "solve_error. Written to silver/lot_development_programs/"
+        "borough: one row per (lot, grid column) that authorises dwellings, "
+        "commerce or industry and that the grid parser could turn into a "
+        "solver input, each the answer to one urban_rag.program CP-SAT run. "
+        "Carries the mix of dwellings by CMHC bedroom class, the storeys "
+        "split into residential, commercial, industrial and above-grade "
+        "parking, the underground levels, the footprint and gross floor "
+        "area, the stalls by where they were put, what each part costs to "
+        "build, and the discounted net profit (npv_cad) that is the "
+        "objective - the stabilised NOI discounted over the hold plus the "
+        "discounted sale, less the capital - with the legacy monthly NOI "
+        "restated beside it. Commerce and industry are priced at the "
+        "borough's surveyed rents (silver/commercial_rents) where that "
+        "partition exists. binding names the caps the answer is pressed "
+        "against and unpriced_types the bedroom classes CMHC suppressed. A "
+        "candidate the solver refuses keeps its row with its status; one "
+        "whose model could not be built keeps its row with solve_error. "
+        "Written to silver/lot_development_programs/"
         f"<YYYY-MM-DD>/<neighborhood>/{LOT_PROGRAMS_FILE} and upserted into "
         "silver.lot_development_programs on (scrape_date, neighborhood, "
         "lot_uid, feature_id, column_index)."
@@ -432,7 +528,8 @@ def lot_development_programs(
             "them" if len(suppressed) > 1 else "it",
         )
 
-    assumptions = config.assumptions()
+    surveyed = _surveyed_commercial_rents(context, store, neighborhood, scrape_date)
+    assumptions = config.assumptions(surveyed_rents=surveyed)
     frame = solve_envelopes(envelopes, economics, assumptions=assumptions)
     if frame.empty:
         raise Failure(
@@ -517,6 +614,7 @@ def lot_development_programs(
             "total_gross_floor_area_ha": round(
                 float(solved["gross_floor_area_m2"].sum()) / 10_000.0, 2
             ),
+            "total_npv_millions": round(float(solved["npv_cad"].sum()) / 1e6, 2),
             "total_monthly_noi_millions": round(
                 float(solved["monthly_net_operating_income_cad"].sum()) / 1e6, 2
             ),
@@ -537,18 +635,21 @@ def lot_development_programs(
     kinds={"parquet", "postgres"},
     description=(
         "The highest and best use of every lot in one borough, one row each: "
-        "the program of the zoning envelope that governs the parcel, with the "
-        "envelope named beside it. Within a zone the governing column is the "
-        "grid's own pick on Largeur du terrain min - "
-        "select_residential_column's, carried through lot_zoning_envelopes as "
-        "governs_residential - and across zones the one covering most of the "
-        "lot wins, so the choice made here is which envelope rather than which "
-        "answer; the maximisation is inside the solver, over the mix. Carries "
-        "the dwellings by bedroom class, the storey split, the footprint and "
-        "floor area, the stalls, what it costs to build and the monthly and "
-        "annual net operating income, plus num_candidates and num_zones so a "
-        "real choice is distinguishable from none. Every lot the envelopes "
-        "reach keeps a row: hbu_status is one of "
+        "the most profitable of the zoning envelopes that govern the parcel, "
+        "with the envelope named beside it. Within a zone each usage family's "
+        "governing column is the grid's own pick on Largeur du terrain min - "
+        "select_governing_column's, carried through lot_zoning_envelopes as "
+        "governs_residential / governs_commercial / governs_industrial - "
+        "across zones the one covering most of the lot wins, and among the "
+        "governing columns the developer's choice is made on discounted net "
+        "profit (npv_cad): which use to build is the one real choice, and it "
+        "is priced the way a land developer prices it. hbu_dominant_use says "
+        "in one word what kind of building won. Carries the dwellings by "
+        "bedroom class, the storey split, the footprint and floor area, the "
+        "stalls, what it costs to build, the npv and present value, and the "
+        "monthly and annual net operating income, plus num_candidates and "
+        "num_zones so a real choice is distinguishable from none. Every lot "
+        "the envelopes reach keeps a row: hbu_status is one of "
         f"{', '.join(HBU_STATUSES)}. Written to gold/lot_highest_best_use/"
         f"<YYYY-MM-DD>/<neighborhood>/{LOT_HBU_FILE} and upserted into "
         "gold.lot_highest_best_use on (scrape_date, neighborhood, lot_uid)."
@@ -638,6 +739,21 @@ def lot_highest_best_use(
             "total_commercial_area_ha": round(
                 float(answered["commercial_area_m2"].sum()) / 10_000.0, 2
             ),
+            "total_industrial_area_ha": round(
+                float(answered["industrial_area_m2"].sum()) / 10_000.0, 2
+            ),
+            "total_npv_millions": round(float(answered["npv_cad"].sum()) / 1e6, 2),
+            # What kind of building the borough's answers are, at a glance: a
+            # borough of `residential` rows and one of `mixed` rows are two
+            # different findings about the by-law and the rents together.
+            "dominant_use_counts": MetadataValue.json(
+                {
+                    str(name): int(count)
+                    for name, count in frame["hbu_dominant_use"]
+                    .value_counts(dropna=True)
+                    .items()
+                }
+            ),
             "total_annual_noi_millions": round(
                 float(answered["annual_net_operating_income_cad"].sum()) / 1e6, 2
             ),
@@ -671,9 +787,12 @@ def lot_highest_best_use(
         "subtraction of like from like. The solver's own objective - income "
         "after the amortised cost of building, before operating expenses - is "
         "kept separately as hbu_annual_noi_after_construction_cad with "
-        "hbu_total_capital_cost_cad beside it, because what a redevelopment "
-        "earns and what it costs are two numbers and this asset states both "
-        "rather than discounting them into one. is_underbuilt is the screen: "
+        "hbu_total_capital_cost_cad beside it. The discounted verdict is "
+        "stated too, at the same InvestmentAssumptions the solve ran with: "
+        "hbu_npv_cad is redeveloping, existing_present_value_cad is keeping "
+        "the standing building, and redevelopment_npv_gain_cad is the "
+        "difference - the land cancels, since the owner holds it either way. "
+        "is_underbuilt is the screen: "
         "an envelope that holds more floor than the roll says stands on it. "
         "This table is the comparison and not a second copy of the envelope: "
         "the floors, stalls, binding caps and dollar figures of the program "
@@ -712,7 +831,13 @@ def lot_redevelopment_gap(
     # Read off the comparables rather than configured here, so both sides of
     # every NOI subtraction are netted with one number - see `hbu.use_gap`.
     opex = operating_expense_ratio_of(existing)
-    computed = use_gap(hbu, existing, operating_expense_ratio=opex)
+    # And the investment stance off the programs, for the same reason: the PV
+    # put on the standing building must be the one the solve priced the
+    # proposal at, or the npv gain compares two different ideas of money.
+    investment = investment_assumptions_of(hbu)
+    computed = use_gap(
+        hbu, existing, operating_expense_ratio=opex, investment=investment
+    )
     # Narrowed to the comparison itself - see `_GAP_OUTPUT_COLUMNS`. `use_gap`
     # carries the whole hbu frame along for a caller holding it in memory; a
     # reader of the table wants gold.lot_highest_best_use for the envelope and
@@ -790,6 +915,22 @@ def lot_redevelopment_gap(
             "hbu_annual_noi_after_construction_millions": _sum_millions(
                 frame, "hbu_annual_noi_after_construction_cad"
             ),
+            # The discounted verdict, summed where it is positive: what
+            # redeveloping every lot it pays to redevelop would be worth, over
+            # keeping what stands. The signed total is not reported because it
+            # answers "what if every lot were redeveloped including the ones
+            # that should not be", which nobody is asking.
+            "redevelopment_npv_gain_positive_millions": round(
+                float(
+                    frame["redevelopment_npv_gain_cad"].clip(lower=0).sum(min_count=1)
+                    or 0.0
+                )
+                / 1e6,
+                2,
+            ),
+            "num_npv_gain_positive": int(
+                (frame["redevelopment_npv_gain_cad"] > 0).sum()
+            ),
             "hbu_total_capital_cost_billions": round(
                 float(frame["hbu_total_capital_cost_cad"].sum(min_count=1) or 0.0)
                 / 1e9,
@@ -808,6 +949,53 @@ def lot_redevelopment_gap(
 # --------------------------------------------------------------------------
 # the partition handling every one of the three shares
 # --------------------------------------------------------------------------
+
+
+def _surveyed_commercial_rents(
+    context: AssetExecutionContext,
+    store: ParquetStore,
+    neighborhood: str,
+    scrape_date: str,
+) -> dict[str, float]:
+    """The borough's resolved commercial rents, as `{rent_class: rent_psf_cad}`.
+
+    Optional the way the setbacks are: `commercial_rents` has its own chain
+    (the MarketBeats and the rent index) and a partition without it is
+    ordinary rather than broken. What it costs is the rates - the solver then
+    prices commerce and industry at `urban_rag.program`'s stated constants,
+    which flatter retail by a factor of three - so the fallback is warned
+    about rather than silent, and the resolved rates travel on every row in
+    `program_assumptions` either way.
+    """
+    partition_dir = store.partition_dir(
+        commercial_rents.key.path[-1], scrape_date, neighborhood
+    )
+    path = join(partition_dir, COMMERCIAL_RENTS_FILE)
+    if not filesystem(path).exists(path):
+        context.log.warning(
+            "%s is missing, so commerce and industry are priced at the stated "
+            "module constants - materialize %s for this partition to price "
+            "them at the borough's surveyed rents",
+            path,
+            commercial_rents.key.path[-1],
+        )
+        return {}
+    frame = pd.read_parquet(path, storage_options=storage_options(path))
+    if "rent_class" not in frame.columns or "rent_psf_cad" not in frame.columns:
+        return {}
+    rates = {
+        str(row["rent_class"]): float(row["rent_psf_cad"])
+        for _, row in frame.iterrows()
+        if pd.notna(row["rent_psf_cad"])
+    }
+    if rates:
+        context.log.info(
+            "%s %s: pricing non-residential floor at the surveyed rents (%s)",
+            neighborhood,
+            scrape_date,
+            ", ".join(f"{name} ${rate:.2f}/sqft/yr" for name, rate in rates.items()),
+        )
+    return rates
 
 
 def _with_buildable_area(

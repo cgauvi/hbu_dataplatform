@@ -38,6 +38,7 @@ services:
       # asset is unaffected. Prefer SECRET_ID or IAM_AUTH over PASSWORD - see
       # docs/corpus.md, "The shared vector store".
       URBAN_RAG_PG_HOST: ${URBAN_RAG_PG_HOST:-}
+      URBAN_RAG_PG_HOSTADDR: ${URBAN_RAG_PG_HOSTADDR:-}
       URBAN_RAG_PG_DATABASE: ${URBAN_RAG_PG_DATABASE:-}
       URBAN_RAG_PG_USER: ${URBAN_RAG_PG_USER:-}
       URBAN_RAG_PG_PASSWORD: ${URBAN_RAG_PG_PASSWORD:-}
@@ -60,6 +61,8 @@ services:
       #   curl -o ~/.postgresql/root.crt --create-dirs \
       #        https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
       - ${HOME}/.postgresql:/home/app/.postgresql:ro
+    extra_hosts:
+      - "${URBAN_RAG_PG_HOST:-host.docker.internal}:host-gateway"
     restart: unless-stopped
 
   daemon:
@@ -79,6 +82,7 @@ services:
       # asset is unaffected. Prefer SECRET_ID or IAM_AUTH over PASSWORD - see
       # docs/corpus.md, "The shared vector store".
       URBAN_RAG_PG_HOST: ${URBAN_RAG_PG_HOST:-}
+      URBAN_RAG_PG_HOSTADDR: ${URBAN_RAG_PG_HOSTADDR:-}
       URBAN_RAG_PG_DATABASE: ${URBAN_RAG_PG_DATABASE:-}
       URBAN_RAG_PG_USER: ${URBAN_RAG_PG_USER:-}
       URBAN_RAG_PG_PASSWORD: ${URBAN_RAG_PG_PASSWORD:-}
@@ -101,6 +105,8 @@ services:
       #   curl -o ~/.postgresql/root.crt --create-dirs \
       #        https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
       - ${HOME}/.postgresql:/home/app/.postgresql:ro
+    extra_hosts:
+      - "${URBAN_RAG_PG_HOST:-host.docker.internal}:host-gateway"
     restart: unless-stopped
     # Not a real dependency - the two are peers. It only staggers the first
     # start so one process, not both, creates the SQLite schema in
