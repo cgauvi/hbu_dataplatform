@@ -597,3 +597,32 @@ def test_vsmpe_is_mapped_to_a_submarket_at_all():
     """The crosswalk is what makes any of the above a borough rent."""
     assert submarket_for(NEIGHBORHOOD) == "Midtown North"
     assert submarket_for("not-a-borough") is None
+
+
+# ---------------------------------------------------------------------------
+# What the asset CDN requires of a request
+# ---------------------------------------------------------------------------
+
+
+def test_the_fetcher_sends_a_browser_agent_and_a_referer(tmp_path):
+    """Both headers, because the CDN refuses the PDF without either.
+
+    A browser User-Agent alone stopped being enough: on 2026-08-31 the asset
+    host answered 403 to a request carrying one but no `Referer`, and served
+    the identical URL when the landing page was named as the referrer. The
+    failure is a plain 403 on a public PDF, so nothing in the retry logic gets
+    past it and nothing in the message says which header is missing.
+    """
+    fetcher = marketbeat.MarketBeatFetcher(cache_dir=tmp_path)
+    headers = fetcher._session.headers
+
+    assert headers["User-Agent"] == marketbeat.BROWSER_USER_AGENT
+    assert headers["Referer"] == fetcher.landing_url
+
+
+def test_the_referer_follows_a_custom_landing_page(tmp_path):
+    """It is the page the PDF was actually linked from, not a fixed constant."""
+    fetcher = marketbeat.MarketBeatFetcher(
+        cache_dir=tmp_path, landing_url="https://example.test/reports"
+    )
+    assert fetcher._session.headers["Referer"] == "https://example.test/reports"

@@ -232,10 +232,14 @@ class MarketBeatFetcher:
         self.landing_url = landing_url
         self.timeout_seconds = timeout_seconds
         self.request_delay_seconds = request_delay_seconds
-        self._session = session or self._build_session(max_retries, ca_bundle)
+        self._session = session or self._build_session(
+            max_retries, ca_bundle, referer=landing_url
+        )
 
     @staticmethod
-    def _build_session(max_retries: int, ca_bundle: str | None) -> requests.Session:
+    def _build_session(
+        max_retries: int, ca_bundle: str | None, *, referer: str | None = None
+    ) -> requests.Session:
         session = requests.Session()
         bundle = ca_bundle or default_ca_bundle()
         if bundle:
@@ -251,6 +255,13 @@ class MarketBeatFetcher:
         # answers 403 to an unrecognised agent, which is a refusal to serve a
         # public PDF rather than a rate limit, and no retry gets past it.
         session.headers["User-Agent"] = BROWSER_USER_AGENT
+        # And a Referer, because the agent string alone stopped being enough:
+        # the asset CDN now answers 403 to a request that arrives without one,
+        # while serving the same URL with it. The landing page is the honest
+        # value - it is the page the PDF is linked from, and the page this
+        # fetcher genuinely read to find the link.
+        if referer:
+            session.headers["Referer"] = referer
         return session
 
     def landing_html(self) -> str:

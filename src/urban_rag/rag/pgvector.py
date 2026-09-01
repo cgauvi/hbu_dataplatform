@@ -152,6 +152,14 @@ class PgSettings:
     table: str = DEFAULT_TABLE
     connect_timeout: int = 10
     #: Generous: a rebuild's index build runs inside one statement.
+    #:
+    #: Raise it with ``URBAN_RAG_PG_STATEMENT_TIMEOUT_SECONDS`` for the spatial
+    #: assets, whose heavy step is one server-side statement rather than a bulk
+    #: write: `compute_lot_buildable_setbacks` classifies every boundary
+    #: segment of every lot in a borough in a single ``CREATE TEMP TABLE AS``,
+    #: and on a small instance a borough of 25,000 lots takes longer than the
+    #: half hour below. The cap is a guard against a runaway query, not a
+    #: statement about how long the work legitimately takes.
     statement_timeout_seconds: int = 1800
     maintenance_work_mem: str = "512MB"
     ef_search: int = DEFAULT_EF_SEARCH
@@ -182,6 +190,9 @@ class PgSettings:
             "db_schema": _env("SCHEMA"),
             "table": _env("TABLE"),
             "ef_search": _int(_env("EF_SEARCH")),
+            "statement_timeout_seconds": _int(
+                _env("STATEMENT_TIMEOUT_SECONDS")
+            ),
         }
         settings = {k: v for k, v in environment.items() if v is not None}
         settings.update({k: v for k, v in overrides.items() if v is not None})
