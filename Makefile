@@ -77,16 +77,30 @@ K ?= 5
 BACKEND ?= duckdb
 # How much geobase street line must run inside a parcel before `make frontage`
 # reads that parcel as the roadway itself. It decides which parcels are street,
-# not what any lot then measures - the frontage is an exact shared boundary and
-# has no setting. Replaces BUFFER_M, which did decide what every lot measured.
+# not what any lot then measures - the frontage is the boundary a lot shares
+# with a street parcel, taken exactly, and has no setting of its own. Replaces
+# BUFFER_M, which did decide what every lot measured. The road lots in the test
+# slice carry 105-325 m of street line and every other parcel carries none, so
+# anything from a decimetre to a hundred metres gives the same table.
 # See docs/street-frontage.md.
 MIN_STREET_M ?= 1.0
 # How far off a lot boundary a measured street edge still counts as lying on
-# it, for `make setbacks`. A much smaller judgement than MIN_STREET_M above:
-# the frontage geometry was cut from that very boundary, so this only absorbs
-# the round trip through EPSG:4326. See
+# it, for `make setbacks`. Note this is a tolerance and MIN_STREET_M above is
+# not: frontage needs none, because abutting parcels in this cadastre share
+# their vertices exactly, while the street edge reaching `setbacks` has been
+# through EPSG:4326 and back and this absorbs that round trip. See
 # docs/assets.md, under silver/lot_buildable_setbacks.
 TOLERANCE_M ?= 0.05
+# How many lots `make setbacks` carves and commits per transaction, and whether
+# a re-run skips what a previous one already committed. Durability rather than
+# speed: the work is identical either way, and what this decides is how much of
+# it a dropped connection costs. A borough over an SSM tunnel is the case it
+# exists for - the session is rebuilt periodically, a transaction spanning that
+# rolls back whole, and unbatched runs could therefore fail to finish at all.
+# SETBACK_BATCH=0 does the partition in one transaction, which is only safe on
+# a stable link. See urban_rag.postgis.DEFAULT_SETBACK_BATCH_LOTS.
+SETBACK_BATCH ?= 2000
+SETBACK_RESUME ?= true
 # Which municipalities' assessment rolls `make roll` keeps out of the
 # province-wide archive, as a JSON list of five-digit `code_mun` values.
 # Defaults to Ville de Montréal, which is every borough this pipeline has; `[]`
@@ -273,7 +287,7 @@ envelopes: | $(UV_SYNC_STAMP) ## Materialize the zoning envelopes for DATE x NEI
 # to subtract. TOLERANCE_M overrides the 0.05 m default.
 setbacks: | $(UV_SYNC_STAMP) ## Materialize lot_buildable_setbacks for DATE x NEIGHBORHOOD
 	$(DAGSTER) asset materialize --select silver/lot_buildable_setbacks --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE) \
-		--config-json '{"ops":{"silver__lot_buildable_setbacks":{"config":{"edge_tolerance_m":$(TOLERANCE_M)}}}}'
+		--config-json '{"ops":{"silver__lot_buildable_setbacks":{"config":{"edge_tolerance_m":$(TOLERANCE_M),"batch_lots":$(SETBACK_BATCH),"resume":$(SETBACK_RESUME)}}}}'
 
 # Needs gold.lot_profiles and the rag.lot_documents view (hbu_infra sql/009,
 # sql/006) applied, and 006 only lands on a db.py init run *after* a corpus has

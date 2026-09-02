@@ -28,7 +28,10 @@ from shapely.geometry import Polygon
 
 from asset_helpers import materialization_metadata
 
-from urban_rag.postgis import DEFAULT_SETBACK_EDGE_TOLERANCE_M
+from urban_rag.postgis import (
+    DEFAULT_SETBACK_BATCH_LOTS,
+    DEFAULT_SETBACK_EDGE_TOLERANCE_M,
+)
 from urban_rag.resources import ParquetStore, PostgisResource
 from urban_rag.setback_assets import LOT_SETBACKS_FILE, lot_buildable_setbacks
 
@@ -65,12 +68,28 @@ def stub_postgis(
         yield object()
 
     def compute_lot_buildable_setbacks(
-        connection, *, neighborhood, scrape_date, edge_tolerance_m
+        connection,
+        *,
+        neighborhood,
+        scrape_date,
+        edge_tolerance_m,
+        batch_lots=None,
+        resume=None,
+        progress=None,
     ):
-        calls["compute"] = (neighborhood, scrape_date, edge_tolerance_m)
+        calls["compute"] = (
+            neighborhood,
+            scrape_date,
+            edge_tolerance_m,
+            batch_lots,
+            resume,
+        )
         return {
             "rows": rows,
             "pruned": 0,
+            "num_batches": 1,
+            "batch_lots": batch_lots or 0,
+            "num_lots_resumed": 0,
             "num_lots": num_lots,
             "num_lots_sorted": lots_sorted,
             "num_lots_measured": lots_measured,
@@ -302,3 +321,19 @@ def test_a_previous_run_is_cleared_before_the_new_file_lands(
     files = sorted(path.name for path in output_dir.glob("*.parquet"))
     assert files == [LOT_SETBACKS_FILE]
     assert len(gpd.read_parquet(output_dir / LOT_SETBACKS_FILE)) == 2
+
+
+def test_the_asset_hands_the_batching_config_to_the_compute(store, monkeypatch):
+    """Config that never reaches the statement is config that does nothing.
+
+    The two settings that decide how much a dropped connection costs, so a
+    default that silently stopped being passed would look exactly like the
+    unbatched behaviour this replaced.
+    """
+    calls = stub_postgis(monkeypatch)
+
+    assert materialize_partition(store).success
+
+    _, _, _, batch_lots, resume = calls["compute"]
+    assert batch_lots == DEFAULT_SETBACK_BATCH_LOTS
+    assert resume is True

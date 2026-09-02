@@ -118,9 +118,15 @@ def road_lot_numbers(connection):
     return [row[0] for row in cursor.fetchall()]
 
 
-def lots_without_frontage(connection):
-    """Non-road lots that got no row. A road lot is not one: it is the street."""
-    roads = set(road_lot_numbers(connection))
+def lots_without_frontage(connection, *, exclude_roads=True):
+    """Lots that got no row.
+
+    Road lots are left out by default: one is not a parcel that failed to find
+    a street, it *is* the street. `exclude_roads=False` is for the tests that
+    run at a cutoff where nothing is a road lot, since the exclusion below is
+    computed at the shipped default and would not match.
+    """
+    roads = set(road_lot_numbers(connection)) if exclude_roads else set()
     cursor = connection.cursor()
     cursor.execute(
         """
@@ -159,6 +165,58 @@ def test_the_road_lots_are_the_ones_the_street_runs_through(connection, measured
     # right-of-way parcels look like. The subject lot is not among them.
     assert all(number.startswith("3 946") for number in roads), roads
     assert LOT_NUMBER not in roads
+
+
+def test_no_parcel_is_a_sliver_away_from_the_street(connection, measured):
+    """The assumption the zero tolerance rests on, asserted rather than hoped.
+
+    Measuring the shared edge exactly is right only because this cadastre is a
+    topological survey: abutting parcels reference the same points rather than
+    coming close, so two neighbours sit at distance exactly 0 and everything
+    else sits metres away. Nothing is supposed to land in between.
+
+    A parcel a few millimetres off a road lot would be the failure that hurts,
+    and it would be quiet: `ST_Intersects` drops it from the join and the lot
+    comes out looking like an interior parcel rather than like a bug. This is
+    the band that would catch it, and it is empty.
+    """
+    assert measured["num_lots_near_road_without_frontage"] == 0
+
+
+def test_neighbouring_parcels_share_their_vertices_exactly(connection, measured):
+    """Why no tolerance is needed: the shared edge is shared, not adjacent.
+
+    The subject lot and the strip of Chabot it fronts on carry the two
+    endpoints of their common boundary as the *same* coordinates, so the
+    intersection of the two boundaries is exact rather than approximate - and
+    stays exact through `ST_Transform`, which maps one input coordinate to one
+    output coordinate whichever parcel it is reached from.
+    """
+    cursor = connection.cursor()
+    cursor.execute(
+        """
+        SELECT ST_Distance(
+                   ST_Transform(lot.geom, 32188), ST_Transform(road.geom, 32188)
+               ),
+               ST_NPoints(ST_Intersection(
+                   ST_Boundary(ST_Transform(lot.geom, 32188)),
+                   ST_Boundary(ST_Transform(road.geom, 32188))
+               ))
+        FROM rag.lots lot, rag.lots road
+        WHERE lot.neighborhood = %s AND lot.scrape_date = %s::date
+          AND road.neighborhood = lot.neighborhood
+          AND road.scrape_date = lot.scrape_date
+          AND lot.lot_number = %s AND road.lot_number = %s
+        """,
+        [NEIGHBORHOOD, SCRAPE_DATE, LOT_NUMBER, ROAD_LOT_NUMBER],
+    )
+    distance_m, num_points = cursor.fetchone()
+
+    # Exactly zero, not merely small - that is the difference between a shared
+    # vertex and a near miss, and it is what a tolerance would be papering over.
+    assert distance_m == 0.0
+    # And the intersection is a real line, not a degenerate point.
+    assert num_points >= 2
 
 
 def test_a_road_lot_does_not_front_on_itself(connection, measured):
@@ -350,16 +408,18 @@ def test_the_run_reports_the_lots_it_could_not_place(connection, loaded):
         )
 
     sample = result["lots_without_frontage"]
+    every = lots_without_frontage(connection, exclude_roads=False)
 
     assert result["num_road_lots"] == 0, "no parcel holds 10 km of street line"
     assert result["lots_matched"] == 0
     assert sample, "with no road lots, nothing in the slice can be placed"
-    # The subject of this module is one of them, at that cutoff.
-    assert LOT_NUMBER in sample or sample == sorted(sample)[: len(sample)]
-    # `sample` is capped and ordered - see _LOTS_WITHOUT_FRONTAGE_SAMPLE - so
-    # it is the head of the real set rather than all of it. It is a place to
-    # start looking; the count is what says how much there is to look at.
-    assert len(sample) <= result["num_lots"] - result["lots_matched"]
+    # `sample` is capped and ordered - see _LOTS_WITHOUT_FRONTAGE_SAMPLE - so it
+    # is the *head* of the real set rather than all of it, and that is the
+    # assertion worth making: it is a place to start looking, and the count is
+    # what says how much there is to look at.
+    assert len(sample) < len(every), "the sample is capped, so it is not the set"
+    assert sample == every[: len(sample)]
+    assert len(every) == result["num_lots"] - result["lots_matched"]
 
 
 def test_no_lot_is_given_more_frontage_than_it_has_boundary(connection, measured):

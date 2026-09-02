@@ -65,6 +65,7 @@ from urban_rag.frontage_assets import lot_frontage
 from urban_rag.layers import key_prefix
 from urban_rag.partitions import scrape_partitions
 from urban_rag.postgis import (
+    DEFAULT_SETBACK_BATCH_LOTS,
     DEFAULT_SETBACK_EDGE_TOLERANCE_M,
     MissingRelation,
     compute_lot_buildable_setbacks,
@@ -102,6 +103,26 @@ class SetbackConfig(Config):
         description=(
             "Distance within which a measured frontage linestring counts as "
             "lying on the lot boundary, in metres."
+        ),
+    )
+    # Not a tuning knob for how fast this runs - the work is the same either
+    # way - but for how much of it a dropped connection costs. See
+    # `postgis.DEFAULT_SETBACK_BATCH_LOTS`; over an SSM tunnel the unbatched
+    # version could not finish a borough at all.
+    batch_lots: int = Field(
+        default=DEFAULT_SETBACK_BATCH_LOTS,
+        ge=0,
+        description=(
+            "Lots to sort, carve and commit per transaction. 0 does the whole "
+            "partition in one, which is only safe on a stable connection."
+        ),
+    )
+    resume: bool = Field(
+        default=True,
+        description=(
+            "Skip lots already published for this partition at this "
+            "edge_tolerance_m, so a retry after a dropped connection costs "
+            "only what was lost. False recomputes the whole partition."
         ),
     )
 
@@ -148,6 +169,13 @@ def lot_buildable_setbacks(
                 neighborhood=neighborhood,
                 scrape_date=scrape_date,
                 edge_tolerance_m=config.edge_tolerance_m,
+                batch_lots=config.batch_lots,
+                resume=config.resume,
+                # A borough is tens of batches over the better part of an hour,
+                # and each one is a commit. Logging them is what makes a run
+                # that dies halfway legible as "it kept 14 of 13,000 lots"
+                # rather than as silence.
+                progress=context.log.info,
             )
             num_lots = int(result["num_lots"])
             if num_lots == 0:

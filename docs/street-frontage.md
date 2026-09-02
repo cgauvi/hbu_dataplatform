@@ -16,9 +16,10 @@ length of the boundary it *shares* with one of those:
 ST_Length(ST_Intersection(ST_Boundary(lot), ST_Boundary(road_lot)))
 ```
 
-That is the whole measure. Adjacent parcels in this cadastre are topologically
-clean, so the intersection is the shared edge exactly — no buffer, no
-tolerance, no angle test, and nothing to tune.
+That is the whole measure. The intersection is the shared edge *exactly* — no
+buffer, no tolerance, no angle test, nothing to tune — because abutting parcels
+in this cadastre share their vertices rather than merely coming close. See
+[why zero tolerance is safe](#why-zero-tolerance-is-safe-and-why-a-small-buffer-is-not).
 
 The street layer is still needed, and the *géobase double*, not the plain
 géobase:
@@ -150,16 +151,62 @@ complaint was about. It also credited lot 3 790 483, an interior parcel served
 off a ruelle that touches the street at a single point, with frontage it does
 not have.
 
-**A tolerance would make the new measure worse, not safer.** Snapping the two
-boundaries together by 5 cm adds a uniform 0.10 m to every lot in the fixture
-and invents 0.1 m for that corner-touch parcel. Exact is both simpler and
-right.
+## Why zero tolerance is safe, and why a small buffer is not
+
+The obvious worry about an exact intersection is that two polygons might not
+quite meet. They do, and not by luck: **the cadastre is a topological survey**,
+so abutting parcels reference the same points rather than coming close. Lot
+3 790 556 and lot 3 946 200 carry the two endpoints of their common edge as
+*bitwise-identical* coordinates in the stored EPSG:4326, and `ST_Transform`
+carries that through to EPSG:32188 unchanged, since one input coordinate maps
+to one output coordinate whichever parcel it is reached from.
+
+Across the fixture, all 150 ordinary parcels sit at a distance of **exactly
+0.0** from their nearest road lot — not a small distance, zero — with nothing
+in the millimetre, centimetre or decimetre bands where a sliver would show.
+
+A positive buffer would therefore be a tax on every lot to insure against a
+problem the data does not have. A shared edge grows by the tolerance at *each
+end*, so buffering by `t` adds `2t` everywhere while recovering no frontage
+that is really there:
+
+| tolerance | subject lot | added to every lot | corner-touch parcel |
+| --- | --- | --- | --- |
+| **0** | **15.2404 m** | — | **0** |
+| 1 mm | 15.2424 m | +0.002 m | 0.002 m |
+| 1 cm | 15.2604 m | +0.020 m | 0.020 m |
+| 5 cm | 15.3404 m | +0.100 m | 0.100 m |
+
+The last column is the other cost. Lot 3 790 483 touches a road lot at a single
+*point* and has no street edge at all; every tolerance credits it with exactly
+twice itself. So the only parcel a buffer "recovers" is one that should not
+have a row.
+
+### The failure mode is watched rather than padded
+
+If a partition ever did arrive with slivers, the damage would be quiet: a
+parcel a few millimetres off a road lot touches nothing, `ST_Intersects` drops
+it from the join, and it comes out looking like an interior parcel rather than
+like a bug. So the run counts that band — parcels within `_SLIVER_GAP_M`
+(0.5 m) of a road lot that abut none — and reports it:
+
+```
+num_lots_near_road_without_frontage    0
+```
+
+Zero is the assertion that the survey is still topological and the measure is
+still exact. Anything else is frontage being lost, is warned about in the run
+log, and is a different problem from an interior parcel with a different fix —
+`ST_Snap`, which pulls near-coincident vertices onto the reference and leaves
+already-coincident ones alone, so it costs a clean partition nothing. A buffer
+is the wrong tool for it either way.
 
 ## `buffer_m` is now written as 0
 
 The column stays, and 0 is the truthful reading of it: "how far from the street
 a lot boundary counted as facing it" is nothing at all, because the boundary
-has to *be* the road lot's edge. It also dates a partition — rows saying 3.0 or
+has to *be* the road lot's edge — and that is a statement about the survey, not
+a tolerance someone tuned to zero. It also dates a partition — rows saying 3.0 or
 10.0 were measured the old way and are reporting a different quantity from rows
 saying 0.
 
@@ -180,11 +227,16 @@ the share **and a sample of the lot numbers**, and publishes them as asset
 metadata:
 
 ```
-num_road_lots                  14
-num_lots_without_frontage       1
-pct_lots_without_frontage    0.67
-lots_without_frontage     3 790 483
+num_road_lots                          14
+num_lots_without_frontage               1
+pct_lots_without_frontage            0.67
+lots_without_frontage           3 790 483
+num_lots_near_road_without_frontage     0
 ```
+
+The last one is the separate question: of the parcels with no frontage, how
+many are a *survey gap* rather than an interior parcel. See
+[the failure mode](#the-failure-mode-is-watched-rather-than-padded).
 
 **Road lots are out of the denominator**, not counted among the failures — a
 street facing no street is the definition, not a finding. It is a warning

@@ -259,6 +259,24 @@ def lot_frontage(
     # to go and look at. A warning rather than a Failure - see
     # `test_no_lot_matching_is_not_a_failure`: a borough measuring badly is a
     # number to read, not a partition to refuse.
+    # The measure is an exact shared boundary, which is right because the
+    # cadastre is a topological survey - abutting parcels reference the same
+    # points rather than coming close. This is the count that says so is still
+    # true: parcels lying a sliver's width off a road lot and touching none.
+    # On a clean partition it is 0. Anything else is frontage being lost to a
+    # survey gap, and it is called out separately from the interior parcels
+    # because it is a different problem with a different fix.
+    slivers = int(result.get("num_lots_near_road_without_frontage", 0))
+    if slivers:
+        context.log.warning(
+            "%s %s: %d parcel(s) lie within a sliver of a road lot without "
+            "touching one - the cadastre is not topologically clean here and "
+            "their frontage is being dropped, not measured as zero",
+            neighborhood,
+            scrape_date,
+            slivers,
+        )
+
     unmatched = num_candidates - lots_matched
     sample = [str(number) for number in result.get("lots_without_frontage", [])]
     if unmatched > 0:
@@ -290,6 +308,12 @@ def lot_frontage(
             # snapshot stops short of it. Under a few percent is the first two;
             # a third of the borough is the last.
             "num_lots_without_frontage": max(unmatched, 0),
+            # Of those, the ones that are a survey gap rather than an interior
+            # parcel: within a sliver of a road lot and abutting none, so the
+            # exact intersection drops them instead of measuring them. 0 says
+            # the cadastre is still the topological survey this measure
+            # assumes; see postgis._SLIVER_GAP_M.
+            "num_lots_near_road_without_frontage": slivers,
             # Which ones, up to a sample's worth - the count says how bad, this
             # says where to start. Empty when every lot faced a street.
             "lots_without_frontage": MetadataValue.text(", ".join(sample)),

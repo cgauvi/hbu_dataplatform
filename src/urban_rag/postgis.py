@@ -76,7 +76,7 @@ from __future__ import annotations
 import json
 from contextlib import contextmanager
 from datetime import date
-from typing import TYPE_CHECKING, Any, Iterator, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Sequence
 
 import geopandas as gpd
 import pandas as pd
@@ -677,7 +677,56 @@ FRONTAGE_METRIC_SRID = 32188
 #: which method produced a row: a partition whose rows say 3.0 or 10.0 was
 #: measured by the old buffer-and-angle assignment against a linestring, and is
 #: reporting a different quantity from one whose rows say 0.
+#:
+#: **Zero is safe here because the cadastre is a topological survey, not
+#: because the tolerance was never needed.** Two abutting parcels do not merely
+#: come close: they reference the same points. Lot 3 790 556 and lot 3 946 200,
+#: the strip of Chabot it fronts on, share the two endpoints of their common
+#: edge as *bitwise-identical* coordinates in the stored EPSG:4326, and
+#: `ST_Transform` carries that through to EPSG:32188 unchanged, since the same
+#: input coordinate maps to the same output coordinate for both parcels.
+#: Measured across the fixture, all 150 ordinary parcels sit at a distance of
+#: exactly 0.0 from their nearest road lot - not a small distance, zero - with
+#: nothing in the millimetre, centimetre or decimetre bands where a sliver
+#: would show.
+#:
+#: **A positive tolerance would be a tax on every lot to insure against that.**
+#: It recovers no real frontage and adds twice itself to every parcel in the
+#: borough, because the shared edge grows by the tolerance at each end:
+#:
+#:     tolerance   subject lot   added to every lot   corner-touch parcel
+#:          0 m       15.2404 m                    -                   0 m
+#:          1 mm      15.2424 m               +0.002 m             0.002 m
+#:          1 cm      15.2604 m               +0.020 m             0.020 m
+#:          5 cm      15.3404 m               +0.100 m             0.100 m
+#:
+#: The last column is the other cost: lot 3 790 483 touches a road lot at a
+#: single *point* and has no street edge at all, and every tolerance invents
+#: exactly twice itself of frontage for it. So the only parcel a tolerance
+#: "recovers" is one that should not have a row.
+#:
+#: If a future partition ever does arrive with slivers, the fix is `ST_Snap`
+#: rather than a buffer - it pulls near-coincident vertices onto the reference
+#: and leaves already-coincident ones alone, so it costs a clean partition
+#: nothing - and `_SLIVER_GAP_M` below is what would say so first.
 FRONTAGE_NO_BUFFER = 0.0
+
+#: How far apart two parcels have to be to be a survey gap rather than a
+#: neighbour, in metres. Nothing is measured with this: it is the detector for
+#: the one way the exact intersection above could fail quietly.
+#:
+#: A parcel that abuts a road lot sits at distance exactly 0. A parcel that is
+#: genuinely elsewhere sits metres away. A parcel a few millimetres off a road
+#: lot is neither - it is a cadastre that has stopped being topologically
+#: clean, and `ST_Intersects` would drop it from the join and leave the lot
+#: with no row, indistinguishable from an interior parcel. So the run counts
+#: them and hands the count back as `num_lots_near_road_without_frontage`.
+#:
+#: Half a metre, because the failure being watched for is survey noise and the
+#: nearest genuine non-neighbour in the fixture is orders of magnitude beyond
+#: it. On VSMPE's committed slice this count is **0**, which is the assertion
+#: `test_no_parcel_is_a_sliver_away_from_the_street` pins.
+_SLIVER_GAP_M = 0.5
 
 #: How many of the lots that faced no street a run names. The count is the
 #: measure of how bad a partition is; this sample is only where to start
@@ -718,11 +767,17 @@ def compute_lot_frontage(
 
         ST_Length(ST_Intersection(ST_Boundary(lot), ST_Boundary(road_lot)))
 
-    taken in `FRONTAGE_METRIC_SRID`. Adjacent parcels in this cadastre are
-    topologically clean, so that intersection is the shared edge exactly and
-    the measure needs no tolerance at all. Lot 3 790 556 on avenue Chabot comes
-    out at 15.24 m, which is what its front boundary measures in the polygon
-    and twice the 7.62 m of the single-width lots either side of it.
+    taken in `FRONTAGE_METRIC_SRID`. That intersection is the shared edge
+    *exactly*, because the cadastre is a topological survey: two abutting
+    parcels reference the same points rather than merely coming close, and the
+    two endpoints of this lot's street edge are bitwise-identical coordinates
+    in both polygons. Lot 3 790 556 on avenue Chabot comes out at 15.24 m,
+    which is what its front boundary measures in the polygon and twice the
+    7.62 m of the single-width lots either side of it.
+
+    So there is no tolerance, and `_SLIVER_GAP_M` is the guard on the one
+    assumption that buys - see it, and `FRONTAGE_NO_BUFFER`, for the
+    measurements behind both.
 
     **It is no longer a buffered street line.** The old measure clipped the lot
     boundary against a buffered geobase side, then chopped the boundary into
@@ -736,10 +791,13 @@ def compute_lot_frontage(
     apparatus - there is no reach to tune, so there is nothing for a partition
     to be sensitive to.
 
-    A **tolerance would make it worse, not safer.** Snapping the two boundaries
-    together by 5 cm adds a uniform 0.10 m to every lot in the fixture and
-    invents 0.1 m of frontage for a parcel that touches a road lot at a single
-    corner and has no street edge at all. Exact is both simpler and right.
+    A **tolerance would make it worse, not safer.** A shared edge grows by the
+    tolerance at each end, so buffering the road lot by `t` adds `2t` to every
+    parcel in the borough - 0.10 m each at 5 cm - while recovering no frontage
+    that is really there. The only parcel it gains is lot 3 790 483, which
+    touches a road lot at a single *point*, has no street edge, and is credited
+    with exactly `2t` of one. Exact is both simpler and right; see
+    `FRONTAGE_NO_BUFFER` for the table.
 
     **The geobase still names the street, and only names it.** A cadastral
     parcel carries no street name, so each shared edge is labelled with the
@@ -1012,6 +1070,40 @@ def compute_lot_frontage(
     )
     lots_without_frontage = [row[0] for row in cursor.fetchall()]
 
+    # The one way the exact intersection above can fail quietly, counted so it
+    # cannot. A parcel that abuts a road lot sits at distance 0 and gets its
+    # edge; a parcel that is genuinely elsewhere sits metres away and correctly
+    # gets nothing. A parcel a few millimetres off a road lot is neither - it
+    # is a survey gap, `ST_Intersects` drops it from the join, and the lot ends
+    # up looking exactly like an interior parcel. This is that band, and on a
+    # topologically clean cadastre it is empty. See `_SLIVER_GAP_M`.
+    cursor.execute(
+        """
+        WITH roads AS (
+            SELECT DISTINCT l.lot_uid, l.geom
+            FROM _frontage_road_sides r
+            JOIN _frontage_lots l ON l.lot_uid = r.road_lot_uid
+        )
+        SELECT count(*)
+        FROM _frontage_lots l
+        WHERE NOT EXISTS (SELECT 1 FROM roads s WHERE s.lot_uid = l.lot_uid)
+          -- Near one ...
+          AND EXISTS (
+              SELECT 1 FROM roads road
+              WHERE ST_DWithin(road.geom, l.geom, %(gap_m)s::double precision)
+          )
+          -- ... but abutting none. A corner parcel touching one road lot and
+          -- lying a little off a second is not a sliver, which is why this is
+          -- "intersects nothing" rather than "some road lot it misses".
+          AND NOT EXISTS (
+              SELECT 1 FROM roads road
+              WHERE ST_Intersects(road.geom, l.geom)
+          )
+        """,
+        {"gap_m": float(_SLIVER_GAP_M)},
+    )
+    (num_lots_near_road_without_frontage,) = cursor.fetchone()
+
     return {
         "frontages": result["upserted"],
         "pruned": result["pruned"],
@@ -1024,6 +1116,14 @@ def compute_lot_frontage(
         # The parcels that *are* the street. Not candidates for frontage, so
         # `num_lots` minus this is the denominator coverage is read against.
         "num_road_lots": int(num_road_lots),
+        # Parcels that lie within `_SLIVER_GAP_M` of a road lot and abut none.
+        # 0 on a topologically clean cadastre, which is what makes measuring
+        # the shared edge exactly the right thing to do; anything else is a
+        # survey gap swallowing frontage, and the number to act on before
+        # reading the coverage below.
+        "num_lots_near_road_without_frontage": int(
+            num_lots_near_road_without_frontage
+        ),
         # A sample, not the whole set - see the query. `num_lots` minus
         # `num_road_lots` minus `lots_matched` is the true count.
         "lots_without_frontage": lots_without_frontage,
@@ -1068,6 +1168,25 @@ SETBACK_MAX_SIN = 0.7071
 #: `SETBACK_SEGMENT_M`, and therefore under the resolution of the sort it
 #: feeds.
 DEFAULT_SETBACK_EDGE_TOLERANCE_M = 0.05
+
+#: How many lots `compute_lot_buildable_setbacks` sorts, carves and publishes
+#: per committed transaction.
+#:
+#: This is a *durability* setting, not a performance one. The work is the same
+#: either way; what the batch size decides is how much of it a dropped
+#: connection costs. Over an SSM port-forward that is the whole question: a
+#: borough is roughly an hour of ST_Difference in one statement, the tunnel's
+#: session is rebuilt every so often, and a transaction that spans a rebuild
+#: rolls back entirely - so the unbatched version could not finish at all on
+#: some days, whatever it did on others.
+#:
+#: 2,000 lots is about two minutes a slice on VSMPE's 24,952. Small enough to
+#: land between two reconnects, large enough that the per-batch overhead - a
+#: staging table, an ANALYZE of the leaf, one scan of the partition's envelopes
+#: - stays a few per cent of the batch rather than most of it. Lower it on a
+#: link that drops more often; a batch that never commits is worse than one
+#: that is inefficient.
+DEFAULT_SETBACK_BATCH_LOTS = 2000
 
 #: The side setback each reading of *Mode d'implantation* produces, as a
 #: multiple of the *Latérale min* the grid printed.
@@ -1116,6 +1235,12 @@ WITH parcels AS (
       FROM rag.lots
      WHERE neighborhood = %(neighborhood)s
        AND scrape_date = %(scrape_date)s::date
+       -- One batch's lots. `compute_lot_buildable_setbacks` drives this in
+       -- slices rather than over the borough at once - see its docstring on
+       -- why the whole borough in one statement is not survivable over a
+       -- tunnel. Always present, so the batched and unbatched paths are one
+       -- statement rather than two that can drift.
+       AND lot_uid = ANY(%(lot_uids)s)
 ),
 -- The street edges, as `lot_frontage` measured them rather than as anything
 -- guessed at from the parcel's shape. Rank 1 is the street the lot mostly
@@ -1204,12 +1329,96 @@ SELECT p.lot_uid,
 """
 
 
+def _empty_setback_result(
+    tolerance: float,
+    *,
+    num_lots: int,
+    num_envelopes: int,
+    num_lots_with_envelopes: int,
+) -> dict[str, object]:
+    """The result shape for a partition there was nothing to compute from.
+
+    Every key the full return carries, so a caller reads one contract rather
+    than two - `setback_assets` reaches straight into `num_lots` and
+    `num_envelopes` to decide which gap to name, and a missing key would be a
+    KeyError in the middle of reporting a failure.
+    """
+    return {
+        "rows": 0,
+        "pruned": 0,
+        "num_batches": 0,
+        "batch_lots": 0,
+        "num_lots_resumed": 0,
+        "num_lots": num_lots,
+        "num_lots_sorted": 0,
+        "num_lots_measured": 0,
+        "lots_without_frontage": num_lots,
+        "num_envelopes": num_envelopes,
+        "num_lots_with_envelopes": num_lots_with_envelopes,
+        "num_bound_by_setbacks": 0,
+        "num_bound_by_site_coverage": 0,
+        "num_unbuildable": 0,
+        "total_buildable_area_m2": 0.0,
+        "mean_buildable_pct_of_lot": 0.0,
+        "by_side_setback_rule": {},
+        "edge_tolerance_m": tolerance,
+        "max_sin": float(SETBACK_MAX_SIN),
+        "segment_m": float(SETBACK_SEGMENT_M),
+    }
+
+
+def _setback_lot_uids(
+    cursor: "Cursor", neighborhood: str, scrape_date: str
+) -> list[str]:
+    """Every lot of the partition, in a stable order.
+
+    The set `compute_lot_buildable_setbacks` slices into batches and, at the
+    end, prunes against. Ordered so two runs cut the same borough at the same
+    places: a resumed run then continues where the last one stopped instead of
+    re-carving lots it has already published under a different batching.
+    """
+    cursor.execute(
+        """
+        SELECT lot_uid FROM rag.lots
+        WHERE neighborhood = %s AND scrape_date = %s::date
+        ORDER BY lot_uid
+        """,
+        [neighborhood, scrape_date],
+    )
+    return [row[0] for row in cursor.fetchall()]
+
+
+def _setback_lots_already_published(
+    cursor: "Cursor", neighborhood: str, scrape_date: str, tolerance: float
+) -> set[str]:
+    """Lots this partition already holds rows for, at ``tolerance``.
+
+    Keyed on `edge_tolerance_m` and not on the partition alone, which is the
+    difference between a resume and a silent half-answer: the tolerance
+    travels on every row precisely so a run at a new one can tell its own work
+    from the previous setting's, and redo the borough rather than leave two
+    settings mixed in one table.
+    """
+    cursor.execute(
+        """
+        SELECT DISTINCT lot_uid FROM silver.lot_buildable_setbacks
+        WHERE neighborhood = %s AND scrape_date = %s::date
+          AND edge_tolerance_m = %s
+        """,
+        [neighborhood, scrape_date, tolerance],
+    )
+    return {row[0] for row in cursor.fetchall()}
+
+
 def compute_lot_buildable_setbacks(
     connection: "Connection",
     *,
     neighborhood: str,
     scrape_date: str,
     edge_tolerance_m: float = DEFAULT_SETBACK_EDGE_TOLERANCE_M,
+    batch_lots: int = DEFAULT_SETBACK_BATCH_LOTS,
+    resume: bool = True,
+    progress: "Callable[[str], None] | None" = None,
 ) -> dict[str, object]:
     """(Re)compute `silver.lot_buildable_setbacks` for one partition.
 
@@ -1285,6 +1494,34 @@ def compute_lot_buildable_setbacks(
     the SQL can check: a borough whose envelopes were never computed yields no
     rows and looks exactly like a borough whose grids all failed to parse,
     which is why the caller gets `num_envelopes` back to tell them apart.
+
+    **The borough is done in committed slices, and that is a durability
+    decision rather than a performance one.** ``batch_lots`` lots are sorted,
+    carved and published per transaction, and each one commits before the next
+    begins. The work is identical either way; what the slice size decides is
+    how much of it a dropped connection costs.
+
+    That matters because of where this runs from. The whole borough in one
+    statement is the better part of an hour of `ST_Difference`, and a laptop
+    reaches the database through an SSM port-forward whose session is torn
+    down and rebuilt periodically - `hbu_infra/scripts/tunnel.sh` reconnects in
+    about half a minute, but a transaction open across that gap does not
+    survive it, and rolls back *everything*. Unbatched, this asset was not slow
+    on a bad day, it was unable to finish at all: two consecutive VSMPE runs
+    died at 11 and 47 minutes having committed nothing. Sliced, a drop costs
+    the batch in flight.
+
+    ``resume`` is what makes the retry cheap rather than merely possible. A
+    re-run skips the lots already published for this partition **at this
+    ``edge_tolerance_m``** - the tolerance is on every row, so a run at a
+    different one correctly redoes the borough instead of silently mixing two
+    settings in one table. Pass ``resume=False`` to force the whole partition.
+
+    The prune that makes a partition a snapshot still happens, once, after the
+    last batch: `warehouse.upsert_select` is called with ``prune=False`` per
+    slice, and the rows for lots that no longer exist are deleted at the end
+    against the full set this run expected. So the table is only ever a whole
+    answer or the previous one, the same guarantee the single statement gave.
     """
     tolerance = float(edge_tolerance_m)
     if tolerance <= 0:
@@ -1304,203 +1541,7 @@ def compute_lot_buildable_setbacks(
         "tolerance_m": tolerance,
     }
 
-    # Dropped rather than declared ON COMMIT DROP, for the reason
-    # `_frontage_sides` is: this runs inside the caller's transaction, and
-    # session scope is what makes a second call on one connection work whether
-    # or not that connection is in autocommit.
-    cursor.execute(f"DROP TABLE IF EXISTS {_SETBACK_EDGES}")
-    cursor.execute(
-        f"CREATE TEMP TABLE {_SETBACK_EDGES} AS {_SETBACK_EDGES_SQL}", parameters
-    )
-    cursor.execute(f"CREATE INDEX ON {_SETBACK_EDGES} (lot_uid)")
-    # Without stats the planner costs the join below against a default row
-    # estimate and can pick a scan over the index it was just handed - the
-    # same reason `compute_lot_frontage` analyzes `_frontage_sides`.
-    cursor.execute(f"ANALYZE {_SETBACK_EDGES}")
-    cursor.execute(f"SELECT count(*) FROM {_SETBACK_EDGES}")
-    (lots_sorted,) = cursor.fetchone()
-
-    result = warehouse.upsert_select(
-        cursor,
-        "lot_buildable_setbacks",
-        (
-            "scrape_date", "neighborhood", "lot_uid", "feature_id",
-            "column_index", "lot_number", "source_table", "lot_area_m2",
-            "front_edge_m", "secondary_front_edge_m", "side_edge_m",
-            "rear_edge_m",
-            "implantation_mode", "side_setback_rule", "side_margin_min_m",
-            "front_setback_m", "secondary_front_setback_m", "side_setback_m",
-            "rear_setback_m",
-            "buildable_area_m2", "buildable_pct_of_lot",
-            "coverage_cap_m2", "footprint_cap_m2", "footprint_cap_binding",
-            "pct_of_lot", "governs_residential", "solver_ready",
-            "max_sin", "segment_m", "edge_tolerance_m",
-            "geom",
-        ),
-        """
-        WITH norms AS (
-            -- The margins as the grid states them, and the mode read off the
-            -- text it prints. `strpos` rather than LIKE throughout: a literal
-            -- per-cent sign anywhere in this statement is read by psycopg as
-            -- the start of a placeholder, and the accents are avoided by
-            -- matching the stems 'isol', 'jumel' and 'contigu' - none of which
-            -- carries one - so no unaccent extension is needed either.
-            --
-            -- Two spellings are handled because two exist: a borough printing
-            -- the modes as words, and VSMPE's own template printing them as
-            -- hyphenated letter codes ('I-J', 'I-J-C'). Most permissive wins,
-            -- which is why contiguous is tested first.
-            SELECT
-                e.lot_uid, e.feature_id, e.column_index, e.lot_number,
-                e.source_table, e.implantation_mode, e.side_margin_min_m,
-                e.site_coverage_max_pct, e.pct_of_lot, e.governs_residential,
-                e.solver_ready,
-                CASE
-                    WHEN e.implantation_mode IS NULL THEN 'unknown'
-                    WHEN strpos(lower(e.implantation_mode), 'contigu') > 0
-                      OR 'C' = ANY(string_to_array(
-                             upper(translate(e.implantation_mode, ' .', '')), '-'))
-                        THEN 'contigu'
-                    WHEN strpos(lower(e.implantation_mode), 'jumel') > 0
-                      OR 'J' = ANY(string_to_array(
-                             upper(translate(e.implantation_mode, ' .', '')), '-'))
-                        THEN 'jumele'
-                    WHEN strpos(lower(e.implantation_mode), 'isol') > 0
-                      OR 'I' = ANY(string_to_array(
-                             upper(translate(e.implantation_mode, ' .', '')), '-'))
-                        THEN 'isole'
-                    ELSE 'unknown'
-                END AS side_setback_rule,
-                COALESCE(e.front_margin_min_m, 0.0) AS front_setback_m,
-                -- *Avant secondaire* where the grid states one, *Avant
-                -- principale* where it states only that, 0 where it states
-                -- neither. See the docstring.
-                COALESCE(
-                    e.secondary_front_margin_min_m, e.front_margin_min_m, 0.0
-                ) AS secondary_front_setback_m,
-                COALESCE(e.rear_margin_min_m, 0.0) AS rear_setback_m
-              FROM silver.lot_zoning_envelopes e
-             WHERE e.neighborhood = %(neighborhood)s
-               AND e.scrape_date = %(scrape_date)s::date
-        ),
-        applied AS (
-            SELECT n.*,
-                   CASE n.side_setback_rule
-                       WHEN 'contigu' THEN 0.0
-                       WHEN 'jumele' THEN COALESCE(n.side_margin_min_m, 0.0) / 2.0
-                       ELSE COALESCE(n.side_margin_min_m, 0.0)
-                   END AS side_setback_m
-              FROM norms n
-        ),
-        carved AS (
-            -- One ST_Difference against the union of the four buffers, rather
-            -- than four nested differences: the cuts overlap at every corner
-            -- of the parcel, and unioning them first is what keeps that from
-            -- being counted twice.
-            --
-            -- ST_Buffer of an empty geometry, and of any geometry at distance
-            -- 0, is an empty polygon - so a lot with no second street edge and
-            -- a column stating no rear margin both cut nothing, without either
-            -- needing a branch of its own. The COALESCEs are only to keep a
-            -- NULL out of the array.
-            SELECT a.*,
-                   b.lot_number AS cadastre_lot_number,
-                   b.lot_area_m2,
-                   b.front_edge_m, b.secondary_front_edge_m,
-                   b.side_edge_m, b.rear_edge_m,
-                   ST_CollectionExtract(
-                       ST_Difference(
-                           b.lot_geom,
-                           ST_UnaryUnion(ST_Collect(ARRAY[
-                               ST_Buffer(b.front_geom, a.front_setback_m),
-                               ST_Buffer(
-                                   COALESCE(b.secondary_geom, blank.geom),
-                                   a.secondary_front_setback_m
-                               ),
-                               ST_Buffer(
-                                   COALESCE(b.rear_geom, blank.geom),
-                                   a.rear_setback_m
-                               ),
-                               ST_Buffer(
-                                   COALESCE(b.side_geom, blank.geom),
-                                   a.side_setback_m
-                               )
-                           ]))
-                       ),
-                       3
-                   ) AS buildable_geom
-              FROM applied a
-              JOIN {setback_edges} b ON b.lot_uid = a.lot_uid
-              CROSS JOIN (
-                  SELECT ST_SetSRID('LINESTRING EMPTY'::geometry, %(srid)s) AS geom
-              ) blank
-        ),
-        measured AS (
-            SELECT c.*,
-                   ST_Area(c.buildable_geom) AS buildable_area_m2,
-                   CASE WHEN c.site_coverage_max_pct IS NOT NULL
-                             AND c.lot_area_m2 IS NOT NULL
-                        THEN c.lot_area_m2 * c.site_coverage_max_pct / 100.0
-                   END AS coverage_cap_m2
-              FROM carved c
-        )
-        SELECT
-            %(scrape_date)s::date,
-            %(neighborhood)s,
-            m.lot_uid,
-            m.feature_id,
-            m.column_index,
-            -- The envelope's own lot number where it has one; older envelope
-            -- files predate `lot_features` carrying it, and the cadastre side
-            -- of the join always does.
-            COALESCE(m.lot_number, m.cadastre_lot_number),
-            m.source_table,
-            m.lot_area_m2,
-            m.front_edge_m,
-            m.secondary_front_edge_m,
-            m.side_edge_m,
-            m.rear_edge_m,
-            m.implantation_mode,
-            m.side_setback_rule,
-            m.side_margin_min_m,
-            m.front_setback_m,
-            m.secondary_front_setback_m,
-            m.side_setback_m,
-            m.rear_setback_m,
-            m.buildable_area_m2,
-            CASE WHEN m.lot_area_m2 > 0
-                 THEN 100.0 * m.buildable_area_m2 / m.lot_area_m2
-            END,
-            m.coverage_cap_m2,
-            -- LEAST ignores a NULL argument, which is exactly wrong here: a
-            -- column stating no coverage maximum should leave the setback
-            -- answer standing, not be silently dropped from a comparison a
-            -- reader thinks happened. Spelled out instead.
-            CASE WHEN m.coverage_cap_m2 IS NULL
-                 THEN m.buildable_area_m2
-                 ELSE LEAST(m.buildable_area_m2, m.coverage_cap_m2)
-            END,
-            -- Ties go to 'setbacks': it is the cap that also constrains the
-            -- shape, so when the two agree on the area it is still the one
-            -- doing the work.
-            CASE WHEN m.coverage_cap_m2 IS NOT NULL
-                      AND m.coverage_cap_m2 < m.buildable_area_m2
-                 THEN 'site_coverage'
-                 ELSE 'setbacks'
-            END,
-            m.pct_of_lot,
-            m.governs_residential,
-            m.solver_ready,
-            %(max_sin)s::double precision,
-            %(step_m)s::double precision,
-            %(tolerance_m)s::double precision,
-            ST_Multi(ST_Transform(m.buildable_geom, 4326))
-        FROM measured m
-        """.replace("{setback_edges}", _SETBACK_EDGES),
-        parameters,
-        neighborhood=neighborhood,
-        scrape_date=scrape_date,
-    )
+    expected = _setback_lot_uids(cursor, neighborhood, scrape_date)
 
     # The denominators, and the two gaps worth telling apart: a lot with no
     # frontage row could not be sorted, and a lot with no envelope row has no
@@ -1522,6 +1563,289 @@ def compute_lot_buildable_setbacks(
         [neighborhood, scrape_date],
     )
     num_envelopes, lots_with_envelopes = cursor.fetchone()
+
+    # Both counts are taken *before* anything is written, which the single
+    # statement did not have to care about and this does. A batch deletes its
+    # own lots before rewriting them and commits; on a partition whose
+    # envelopes never landed, `carved` is empty, so that sequence would delete
+    # a good answer and commit nothing in its place. Returning early instead
+    # leaves the table untouched and lets the caller raise naming the asset to
+    # run - which is the same failure it reported before, minus the damage.
+    if int(num_lots) == 0 or int(num_envelopes) == 0:
+        return _empty_setback_result(
+            tolerance,
+            num_lots=int(num_lots),
+            num_envelopes=int(num_envelopes),
+            num_lots_with_envelopes=int(lots_with_envelopes),
+        )
+
+    done = (
+        _setback_lots_already_published(cursor, neighborhood, scrape_date, tolerance)
+        if resume
+        else set()
+    )
+    pending = [uid for uid in expected if uid not in done]
+    size = max(int(batch_lots), 1) if batch_lots else max(len(pending), 1)
+    batches = [pending[i : i + size] for i in range(0, len(pending), size)]
+
+    if done and progress:
+        progress(
+            f"resuming: {len(done)} of {len(expected)} lot(s) already published "
+            f"at edge_tolerance_m={tolerance}, {len(pending)} to go"
+        )
+
+    lots_sorted = len(done)
+    upserted = 0
+    for number, batch in enumerate(batches, start=1):
+        # A fresh mapping per slice rather than one rebound in place: psycopg
+        # reads it at execute time either way, but a shared dict makes every
+        # statement of the run appear to have carried the *last* batch, which
+        # is a trap for anything that inspects them afterwards.
+        batch_parameters = {**parameters, "lot_uids": batch}
+
+        # Dropped rather than declared ON COMMIT DROP, for the reason
+        # `_frontage_sides` is: this runs inside the caller's transaction, and
+        # session scope is what makes a second call on one connection work
+        # whether or not that connection is in autocommit.
+        cursor.execute(f"DROP TABLE IF EXISTS {_SETBACK_EDGES}")
+        cursor.execute(
+            f"CREATE TEMP TABLE {_SETBACK_EDGES} AS {_SETBACK_EDGES_SQL}",
+            batch_parameters,
+        )
+        cursor.execute(f"CREATE INDEX ON {_SETBACK_EDGES} (lot_uid)")
+        # Without stats the planner costs the join below against a default row
+        # estimate and can pick a scan over the index it was just handed - the
+        # same reason `compute_lot_frontage` analyzes `_frontage_sides`.
+        cursor.execute(f"ANALYZE {_SETBACK_EDGES}")
+        cursor.execute(f"SELECT count(*) FROM {_SETBACK_EDGES}")
+        (sorted_here,) = cursor.fetchone()
+        lots_sorted += int(sorted_here)
+
+        # The batch's own rows, cleared before they are rewritten. The upsert
+        # below conflicts on (lot_uid, feature_id, column_index) and so would
+        # leave behind a row for a column the grid no longer states - which the
+        # single-statement version pruned at the end and this one cannot, since
+        # its prune only ever sees one slice. Deleting the slice first makes a
+        # batch a replace of exactly its own lots, inside its own transaction.
+        cursor.execute(
+            "DELETE FROM silver.lot_buildable_setbacks "
+            "WHERE neighborhood = %s AND scrape_date = %s::date "
+            "AND lot_uid = ANY(%s)",
+            [neighborhood, scrape_date, batch],
+        )
+
+        result = warehouse.upsert_select(
+            cursor,
+            "lot_buildable_setbacks",
+            (
+                "scrape_date", "neighborhood", "lot_uid", "feature_id",
+                "column_index", "lot_number", "source_table", "lot_area_m2",
+                "front_edge_m", "secondary_front_edge_m", "side_edge_m",
+                "rear_edge_m",
+                "implantation_mode", "side_setback_rule", "side_margin_min_m",
+                "front_setback_m", "secondary_front_setback_m", "side_setback_m",
+                "rear_setback_m",
+                "buildable_area_m2", "buildable_pct_of_lot",
+                "coverage_cap_m2", "footprint_cap_m2", "footprint_cap_binding",
+                "pct_of_lot", "governs_residential", "solver_ready",
+                "max_sin", "segment_m", "edge_tolerance_m",
+                "geom",
+            ),
+            """
+            WITH norms AS (
+                -- The margins as the grid states them, and the mode read off the
+                -- text it prints. `strpos` rather than LIKE throughout: a literal
+                -- per-cent sign anywhere in this statement is read by psycopg as
+                -- the start of a placeholder, and the accents are avoided by
+                -- matching the stems 'isol', 'jumel' and 'contigu' - none of which
+                -- carries one - so no unaccent extension is needed either.
+                --
+                -- Two spellings are handled because two exist: a borough printing
+                -- the modes as words, and VSMPE's own template printing them as
+                -- hyphenated letter codes ('I-J', 'I-J-C'). Most permissive wins,
+                -- which is why contiguous is tested first.
+                SELECT
+                    e.lot_uid, e.feature_id, e.column_index, e.lot_number,
+                    e.source_table, e.implantation_mode, e.side_margin_min_m,
+                    e.site_coverage_max_pct, e.pct_of_lot, e.governs_residential,
+                    e.solver_ready,
+                    CASE
+                        WHEN e.implantation_mode IS NULL THEN 'unknown'
+                        WHEN strpos(lower(e.implantation_mode), 'contigu') > 0
+                          OR 'C' = ANY(string_to_array(
+                                 upper(translate(e.implantation_mode, ' .', '')), '-'))
+                            THEN 'contigu'
+                        WHEN strpos(lower(e.implantation_mode), 'jumel') > 0
+                          OR 'J' = ANY(string_to_array(
+                                 upper(translate(e.implantation_mode, ' .', '')), '-'))
+                            THEN 'jumele'
+                        WHEN strpos(lower(e.implantation_mode), 'isol') > 0
+                          OR 'I' = ANY(string_to_array(
+                                 upper(translate(e.implantation_mode, ' .', '')), '-'))
+                            THEN 'isole'
+                        ELSE 'unknown'
+                    END AS side_setback_rule,
+                    COALESCE(e.front_margin_min_m, 0.0) AS front_setback_m,
+                    -- *Avant secondaire* where the grid states one, *Avant
+                    -- principale* where it states only that, 0 where it states
+                    -- neither. See the docstring.
+                    COALESCE(
+                        e.secondary_front_margin_min_m, e.front_margin_min_m, 0.0
+                    ) AS secondary_front_setback_m,
+                    COALESCE(e.rear_margin_min_m, 0.0) AS rear_setback_m
+                  FROM silver.lot_zoning_envelopes e
+                 WHERE e.neighborhood = %(neighborhood)s
+                   AND e.scrape_date = %(scrape_date)s::date
+            ),
+            applied AS (
+                SELECT n.*,
+                       CASE n.side_setback_rule
+                           WHEN 'contigu' THEN 0.0
+                           WHEN 'jumele' THEN COALESCE(n.side_margin_min_m, 0.0) / 2.0
+                           ELSE COALESCE(n.side_margin_min_m, 0.0)
+                       END AS side_setback_m
+                  FROM norms n
+            ),
+            carved AS (
+                -- One ST_Difference against the union of the four buffers, rather
+                -- than four nested differences: the cuts overlap at every corner
+                -- of the parcel, and unioning them first is what keeps that from
+                -- being counted twice.
+                --
+                -- ST_Buffer of an empty geometry, and of any geometry at distance
+                -- 0, is an empty polygon - so a lot with no second street edge and
+                -- a column stating no rear margin both cut nothing, without either
+                -- needing a branch of its own. The COALESCEs are only to keep a
+                -- NULL out of the array.
+                SELECT a.*,
+                       b.lot_number AS cadastre_lot_number,
+                       b.lot_area_m2,
+                       b.front_edge_m, b.secondary_front_edge_m,
+                       b.side_edge_m, b.rear_edge_m,
+                       ST_CollectionExtract(
+                           ST_Difference(
+                               b.lot_geom,
+                               ST_UnaryUnion(ST_Collect(ARRAY[
+                                   ST_Buffer(b.front_geom, a.front_setback_m),
+                                   ST_Buffer(
+                                       COALESCE(b.secondary_geom, blank.geom),
+                                       a.secondary_front_setback_m
+                                   ),
+                                   ST_Buffer(
+                                       COALESCE(b.rear_geom, blank.geom),
+                                       a.rear_setback_m
+                                   ),
+                                   ST_Buffer(
+                                       COALESCE(b.side_geom, blank.geom),
+                                       a.side_setback_m
+                                   )
+                               ]))
+                           ),
+                           3
+                       ) AS buildable_geom
+                  FROM applied a
+                  JOIN {setback_edges} b ON b.lot_uid = a.lot_uid
+                  CROSS JOIN (
+                      SELECT ST_SetSRID('LINESTRING EMPTY'::geometry, %(srid)s) AS geom
+                  ) blank
+            ),
+            measured AS (
+                SELECT c.*,
+                       ST_Area(c.buildable_geom) AS buildable_area_m2,
+                       CASE WHEN c.site_coverage_max_pct IS NOT NULL
+                                 AND c.lot_area_m2 IS NOT NULL
+                            THEN c.lot_area_m2 * c.site_coverage_max_pct / 100.0
+                       END AS coverage_cap_m2
+                  FROM carved c
+            )
+            SELECT
+                %(scrape_date)s::date,
+                %(neighborhood)s,
+                m.lot_uid,
+                m.feature_id,
+                m.column_index,
+                -- The envelope's own lot number where it has one; older envelope
+                -- files predate `lot_features` carrying it, and the cadastre side
+                -- of the join always does.
+                COALESCE(m.lot_number, m.cadastre_lot_number),
+                m.source_table,
+                m.lot_area_m2,
+                m.front_edge_m,
+                m.secondary_front_edge_m,
+                m.side_edge_m,
+                m.rear_edge_m,
+                m.implantation_mode,
+                m.side_setback_rule,
+                m.side_margin_min_m,
+                m.front_setback_m,
+                m.secondary_front_setback_m,
+                m.side_setback_m,
+                m.rear_setback_m,
+                m.buildable_area_m2,
+                CASE WHEN m.lot_area_m2 > 0
+                     THEN 100.0 * m.buildable_area_m2 / m.lot_area_m2
+                END,
+                m.coverage_cap_m2,
+                -- LEAST ignores a NULL argument, which is exactly wrong here: a
+                -- column stating no coverage maximum should leave the setback
+                -- answer standing, not be silently dropped from a comparison a
+                -- reader thinks happened. Spelled out instead.
+                CASE WHEN m.coverage_cap_m2 IS NULL
+                     THEN m.buildable_area_m2
+                     ELSE LEAST(m.buildable_area_m2, m.coverage_cap_m2)
+                END,
+                -- Ties go to 'setbacks': it is the cap that also constrains the
+                -- shape, so when the two agree on the area it is still the one
+                -- doing the work.
+                CASE WHEN m.coverage_cap_m2 IS NOT NULL
+                          AND m.coverage_cap_m2 < m.buildable_area_m2
+                     THEN 'site_coverage'
+                     ELSE 'setbacks'
+                END,
+                m.pct_of_lot,
+                m.governs_residential,
+                m.solver_ready,
+                %(max_sin)s::double precision,
+                %(step_m)s::double precision,
+                %(tolerance_m)s::double precision,
+                ST_Multi(ST_Transform(m.buildable_geom, 4326))
+            FROM measured m
+            """.replace("{setback_edges}", _SETBACK_EDGES),
+            batch_parameters,
+            neighborhood=neighborhood,
+            scrape_date=scrape_date,
+            # The snapshot prune happens once, after the loop: this slice's
+            # staging table knows only its own lots, and pruning against it
+            # would delete every batch before it.
+            prune=False,
+        )
+        upserted += int(result["upserted"])
+
+        # What the whole change is for. Until this returns, the batch can still
+        # be lost; after it, no later failure can take it back and a re-run
+        # skips it. Committing the caller's transaction from inside is
+        # deliberate and is why the docstring says so - `connect()` commits
+        # again on a clean exit, which is a no-op, and rolls back only whatever
+        # slice was open when something broke.
+        connection.commit()
+        if progress:
+            progress(
+                f"batch {number}/{len(batches)}: {len(batch)} lot(s), "
+                f"{result['upserted']} row(s) committed"
+            )
+
+    # The prune the single statement used to do as part of its merge. Against
+    # the full set this run expected rather than against a staging table, so a
+    # lot that has left the cadastre loses its rows while every committed batch
+    # keeps them.
+    cursor.execute(
+        "DELETE FROM silver.lot_buildable_setbacks "
+        "WHERE neighborhood = %s AND scrape_date = %s::date "
+        "AND NOT (lot_uid = ANY(%s))",
+        [neighborhood, scrape_date, expected],
+    )
+    pruned = max(cursor.rowcount, 0)
+    connection.commit()
 
     cursor.execute(
         """
@@ -1561,8 +1885,15 @@ def compute_lot_buildable_setbacks(
     by_side_rule = {str(rule): int(count) for rule, count in cursor.fetchall()}
 
     return {
-        "rows": result["upserted"],
-        "pruned": result["pruned"],
+        "rows": upserted,
+        "pruned": pruned,
+        # What the run actually did, against what it found already done. A
+        # `num_batches` of 0 with a full `num_lots_measured` is a re-run that
+        # had nothing left to do, which is what a resumed retry looks like once
+        # it has caught up.
+        "num_batches": len(batches),
+        "batch_lots": int(size),
+        "num_lots_resumed": len(done),
         "num_lots": int(num_lots),
         # Sorted but not necessarily measured: a lot whose boundary was sorted
         # and whose zone published no readable grid has no envelope to

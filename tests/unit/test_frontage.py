@@ -80,6 +80,7 @@ def stub_postgis(
     num_lots=4,
     num_streets=2,
     num_road_lots=0,
+    num_lots_near_road_without_frontage=0,
     total_frontage_m=60.0,
     max_frontage_m=30.0,
     lots_without_frontage=("3 790 556", "3 790 557"),
@@ -105,6 +106,10 @@ def stub_postgis(
             # count of lots that faced nothing is num_lots - num_road_lots -
             # lots_matched, and this sample is which ones.
             "num_road_lots": num_road_lots,
+            # Parcels a sliver off a road lot and touching none. 0 on a
+            # topologically clean cadastre, which is what lets the measure be
+            # an exact shared edge with no tolerance at all.
+            "num_lots_near_road_without_frontage": num_lots_near_road_without_frontage,
             "lots_without_frontage": list(lots_without_frontage),
             "min_street_m": min_street_m,
             "pruned": 0,
@@ -370,3 +375,30 @@ def test_a_rerun_replaces_the_previous_partition(store, monkeypatch, tmp_path):
 
     assert not stale.exists()
     assert (partition / LOT_FRONTAGE_FILE).exists()
+
+
+def test_a_cadastre_with_slivers_is_warned_about(store, monkeypatch, caplog):
+    """A survey gap swallows frontage silently, so the run says so out loud.
+
+    The measure is an exact shared boundary, which is right only while
+    abutting parcels really do share their vertices. A parcel lying a
+    millimetre off a road lot touches nothing, is dropped from the join, and
+    comes out looking like an interior parcel - so the count is surfaced
+    separately from the parcels that genuinely face nothing.
+    """
+    stub_postgis(monkeypatch, num_lots_near_road_without_frontage=7)
+    write_streets(store)
+
+    metadata = materialization_metadata(materialize_partition(store), lot_frontage)
+
+    assert metadata["num_lots_near_road_without_frontage"].value == 7
+
+
+def test_a_clean_cadastre_reports_no_slivers(store, monkeypatch):
+    """The normal case, and the one that says the zero tolerance is still safe."""
+    stub_postgis(monkeypatch)
+    write_streets(store)
+
+    metadata = materialization_metadata(materialize_partition(store), lot_frontage)
+
+    assert metadata["num_lots_near_road_without_frontage"].value == 0

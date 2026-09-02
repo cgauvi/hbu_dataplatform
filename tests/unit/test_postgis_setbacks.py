@@ -58,6 +58,8 @@ class FakeCursor:
         lots_with_envelopes: int = 9,
         measured: tuple[object, ...] = (8, 11, 3, 1, 4_800.0, 41.5),
         by_rule: tuple[tuple[str, int], ...] = (("contigu", 9), ("isole", 5)),
+        lot_uids: tuple[str, ...] | None = None,
+        published: tuple[str, ...] = (),
     ):
         self.missing = missing
         self.num_lots = num_lots
@@ -68,6 +70,14 @@ class FakeCursor:
         #: with nowhere to build, total buildable area, mean share of a lot.
         self.measured = measured
         self.by_rule = by_rule
+        #: The partition's lots, which the compute slices into batches, and
+        #: the ones a previous run already committed - what `resume` skips.
+        self.lot_uids = (
+            list(lot_uids)
+            if lot_uids is not None
+            else [f"L{n:04d}" for n in range(num_lots)]
+        )
+        self.published = list(published)
         self.statements: list[tuple[str, object]] = []
         self.rowcount = 0
         self._result: object = None
@@ -97,6 +107,10 @@ class FakeCursor:
             self.rowcount = 14
         elif text.startswith("DELETE FROM silver.lot_buildable_setbacks"):
             self.rowcount = 2
+        elif text.startswith("SELECT lot_uid FROM rag.lots"):
+            self._result = [(uid,) for uid in self.lot_uids]
+        elif "SELECT DISTINCT lot_uid FROM silver.lot_buildable_setbacks" in text:
+            self._result = [(uid,) for uid in self.published]
         elif "GROUP BY side_setback_rule" in text:
             self._result = list(self.by_rule)
         elif "FROM silver.lot_buildable_setbacks" in text and "FILTER" in text:
@@ -119,20 +133,33 @@ class FakeCursor:
 
 
 class FakeConnection:
+    """Counts commits: batching is only worth anything if they happen."""
+
     def __init__(self, cursor):
         self._cursor = cursor
+        self.commits = 0
 
     def cursor(self):
         return self._cursor
 
+    def commit(self):
+        self.commits += 1
+
 
 def compute(cursor, **kwargs):
-    return compute_lot_buildable_setbacks(
-        FakeConnection(cursor),
+    return run(cursor, **kwargs)[0]
+
+
+def run(cursor, **kwargs):
+    """The result and the connection it was computed on, for the commit count."""
+    connection = FakeConnection(cursor)
+    result = compute_lot_buildable_setbacks(
+        connection,
         neighborhood=NEIGHBORHOOD,
         scrape_date=DATE,
         **kwargs,
     )
+    return result, connection
 
 
 # -- what the driver will accept -------------------------------------------
@@ -416,3 +443,144 @@ def test_an_unstated_mode_takes_the_full_margin_on_both_sides():
     """The conservative reading. A column stating no mode must not quietly
     hand a lot more buildable area than its grid allows."""
     assert SIDE_SETBACK_FACTORS["unknown"] == SIDE_SETBACK_FACTORS["isole"] == 1.0
+
+
+# -- the batching ----------------------------------------------------------
+
+
+def test_the_borough_is_cut_into_batches_that_each_commit():
+    """The whole point: a dropped connection costs a batch, not the run.
+
+    Ten lots at four a batch is three slices, and each has to reach the
+    database on its own - plus one commit for the prune that follows them.
+    A batch that only commits at the end is the behaviour this replaced.
+    """
+    cursor = FakeCursor(num_lots=10)
+
+    result, connection = run(cursor, batch_lots=4)
+
+    assert result["num_batches"] == 3
+    assert result["batch_lots"] == 4
+    assert connection.commits == 4
+
+
+def test_each_batch_carves_only_its_own_lots():
+    """The slice reaches the SQL, or every batch would redo the borough."""
+    cursor = FakeCursor(num_lots=10)
+
+    compute(cursor, batch_lots=4)
+
+    # The edges build alone: each batch also carries the slice into its
+    # upsert, and counting both would double every batch.
+    slices = [
+        params["lot_uids"]
+        for text, params in cursor.statements
+        if " ".join(text.split()).startswith("CREATE TEMP TABLE _setback_edges")
+    ]
+    assert [len(s) for s in slices] == [4, 4, 2]
+    # Every lot exactly once, and in the order `_setback_lot_uids` fixed.
+    assert [uid for s in slices for uid in s] == cursor.lot_uids
+
+
+def test_a_resumed_run_skips_what_a_previous_one_committed():
+    """What makes the retry cheap rather than merely possible."""
+    cursor = FakeCursor(num_lots=10, published=[f"L{n:04d}" for n in range(6)])
+
+    result = compute(cursor, batch_lots=4)
+
+    assert result["num_lots_resumed"] == 6
+    # Four left, so one batch rather than three.
+    assert result["num_batches"] == 1
+
+
+def test_resume_is_keyed_on_the_tolerance_so_a_new_one_redoes_the_borough():
+    """Two settings mixed in one table is the failure resume must not cause.
+
+    The published rows are read back at the tolerance being run, so a run at a
+    different one finds none of them and recomputes - which is why
+    `edge_tolerance_m` travels on every row.
+    """
+    cursor = FakeCursor(num_lots=10, published=[f"L{n:04d}" for n in range(10)])
+
+    compute(cursor, batch_lots=4, edge_tolerance_m=0.2)
+
+    lookup = [
+        params
+        for text, params in cursor.statements
+        if "SELECT DISTINCT lot_uid FROM silver.lot_buildable_setbacks"
+        in " ".join(text.split())
+    ]
+    assert lookup and lookup[0][-1] == 0.2
+
+
+def test_resume_off_recomputes_everything_already_published():
+    cursor = FakeCursor(num_lots=10, published=[f"L{n:04d}" for n in range(10)])
+
+    result = compute(cursor, batch_lots=4, resume=False)
+
+    assert result["num_lots_resumed"] == 0
+    assert result["num_batches"] == 3
+
+
+def test_a_batch_clears_its_own_lots_before_rewriting_them():
+    """The upsert conflicts on (lot, feature, column) and cannot drop a column
+    the grid stopped stating; the single statement pruned those at the end and
+    a per-slice prune cannot see them. So each slice replaces its own lots."""
+    cursor = FakeCursor(num_lots=4)
+
+    compute(cursor, batch_lots=4)
+
+    deletes = [
+        params
+        for text, params in cursor.statements
+        if " ".join(text.split()).startswith("DELETE FROM silver.lot_buildable_setbacks")
+    ]
+    # One per batch, scoped to that batch's lots, plus the final prune.
+    assert deletes[0][-1] == cursor.lot_uids
+
+
+def test_the_partition_is_still_pruned_against_the_whole_expected_set():
+    """A lot that has left the cadastre loses its rows, and every committed
+    batch keeps them - which a staging-table prune could not do here."""
+    cursor = FakeCursor(num_lots=4)
+
+    result = compute(cursor, batch_lots=2)
+
+    prunes = [
+        (text, params)
+        for text, params in cursor.statements
+        if "NOT (lot_uid = ANY" in " ".join(text.split())
+    ]
+    assert len(prunes) == 1
+    assert prunes[0][1][-1] == cursor.lot_uids
+    assert result["pruned"] == 2
+
+
+def test_a_partition_with_no_envelopes_writes_nothing_at_all():
+    """The guard has to run *before* the first batch commits.
+
+    A batch deletes its own lots and then rewrites them; on a partition whose
+    envelopes never landed there is nothing to rewrite, so that sequence would
+    delete a good answer and commit nothing in its place.
+    """
+    cursor = FakeCursor(num_lots=10, num_envelopes=0)
+
+    result, connection = run(cursor, batch_lots=4)
+
+    assert result["num_envelopes"] == 0
+    assert result["num_batches"] == 0
+    assert connection.commits == 0
+    assert not [
+        text
+        for text, _ in cursor.statements
+        if " ".join(text.split()).startswith("DELETE FROM silver.lot_buildable_setbacks")
+    ]
+
+
+def test_batch_lots_zero_does_the_whole_partition_in_one_transaction():
+    """The old behaviour, kept reachable for a connection that cannot drop."""
+    cursor = FakeCursor(num_lots=10)
+
+    result = compute(cursor, batch_lots=0)
+
+    assert result["num_batches"] == 1
