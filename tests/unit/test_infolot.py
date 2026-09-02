@@ -27,7 +27,7 @@ from urban_rag.open_data_assets import QUARTIERS_FILE, reference_neighborhoods
 from urban_rag.resources import InfolotResource, ParquetStore
 from urban_rag.storage import join
 
-DATE = "2026-08-20"
+DATE = "2026-08-01"
 NEIGHBORHOOD = "VSMPE"
 #: The borough code `VSMPE` maps to in the reference layer.
 BOROUGH_CODE = "25"

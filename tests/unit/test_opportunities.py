@@ -46,7 +46,7 @@ from urban_rag.opportunity_assets import (
 from urban_rag.resources import ParquetStore, PostgisResource
 from urban_rag.storage import join
 
-DATE = "2026-08-26"
+DATE = "2026-08-01"
 NEIGHBORHOOD = "VSMPE"
 
 

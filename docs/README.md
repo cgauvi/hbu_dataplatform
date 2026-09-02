@@ -7,7 +7,7 @@ it, and what is blocked. Everything else lives here.
 
 | | |
 | --- | --- |
-| [architecture.md](architecture.md) | The medallion contract each layer owes a reader, the single writer behind every silver and gold table, and the shape of the output tree |
+| [architecture.md](architecture.md) | The medallion contract each layer owes a reader, the single writer behind every silver and gold table, the statistics a load has to leave behind, and the shape of the output tree |
 | [assets.md](assets.md) | Every asset, its partitions and its output — plus which ones are blocked on hbu_infra SQL, and what `lot_buildable_setbacks` measures |
 | [setup.md](setup.md) | Installing, the certificate traps on a managed laptop, the devcontainer, WSL, the images, S3 output, compose, and Dagster's own storage |
 | [running.md](running.md) | Materializing a partition, the schedules, adding a borough, the Feature Service's quirks, and the tests |

@@ -236,7 +236,7 @@ def test_undecodable_bytes_are_reported_with_the_filename():
 
 
 def materialize_partition(
-    tmp_path, monkeypatch, *, scrape_date="2026-08-05", session=None
+    tmp_path, monkeypatch, *, scrape_date="2026-08-01", session=None
 ):
     """Run the asset against a temp directory, with the portal stubbed out.
 
@@ -265,9 +265,9 @@ def materialize_partition(
 
 
 def test_asset_writes_both_files_under_the_date_partition(tmp_path, monkeypatch):
-    materialize_partition(tmp_path, monkeypatch, scrape_date="2026-08-05")
+    materialize_partition(tmp_path, monkeypatch, scrape_date="2026-08-01")
 
-    partition = tmp_path / "bronze" / "reference_neighborhoods" / "2026-08-05"
+    partition = tmp_path / "bronze" / "reference_neighborhoods" / "2026-08-01"
     assert sorted(p.name for p in partition.glob("*.parquet")) == [
         "nombre_logements.parquet",
         "quartiers.parquet",
@@ -280,7 +280,7 @@ def test_asset_writes_both_files_under_the_date_partition(tmp_path, monkeypatch)
     assert "nom_arr" in layer.columns and "Nom_arr" not in layer.columns
     assert layer["no_qr"].tolist() == ["01", "02"]
     # The prefix carries bare values, so the date has to travel as a column.
-    assert layer["scrape_date"].tolist() == ["2026-08-05", "2026-08-05"]
+    assert layer["scrape_date"].tolist() == ["2026-08-01", "2026-08-01"]
     assert {"source_file", "scraped_at"} <= set(layer.columns)
 
     counts = pd.read_parquet(partition / "nombre_logements.parquet")
@@ -300,12 +300,12 @@ def test_metadata_reports_the_counts_and_the_licence(tmp_path, monkeypatch):
 
 
 def test_a_rerun_replaces_the_previous_snapshot(tmp_path, monkeypatch):
-    partition = tmp_path / "bronze" / "reference_neighborhoods" / "2026-08-05"
+    partition = tmp_path / "bronze" / "reference_neighborhoods" / "2026-08-01"
     partition.mkdir(parents=True)
     stale = partition / "quartiers_retired.parquet"
     pd.DataFrame({"a": [1]}).to_parquet(stale)
 
-    materialize_partition(tmp_path, monkeypatch, scrape_date="2026-08-05")
+    materialize_partition(tmp_path, monkeypatch, scrape_date="2026-08-01")
 
     assert not stale.exists()
 
@@ -315,7 +315,7 @@ def test_a_broken_dwellings_file_does_not_cost_the_layer(tmp_path, monkeypatch):
 
     result = materialize_partition(tmp_path, monkeypatch, session=session)
 
-    partition = tmp_path / "bronze" / "reference_neighborhoods" / "2026-08-05"
+    partition = tmp_path / "bronze" / "reference_neighborhoods" / "2026-08-01"
     assert (partition / "quartiers.parquet").exists()
     assert not (partition / "nombre_logements.parquet").exists()
     metadata = materialization_metadata(result, reference_neighborhoods)

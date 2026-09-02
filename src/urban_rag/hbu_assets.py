@@ -20,7 +20,19 @@ a maximisation over the candidates: the maximisation is inside `solve_program`,
 over the mix, and picking the highest-earning *column* would be reporting a
 building under rules the parcel may not be built to. Every lot the envelopes
 reach keeps a row, and `hbu_status` says why the ones without a program have
-none.
+none - including the two kinds of parcel that are not development sites at
+all: `road_parcel`, which the roll files under a CUBF road code, and
+`equipment_zone`, whose governing zone authorises only *Équipements
+collectifs*.
+
+It is the road gate that gives this asset its one non-zoning input,
+`lot_assessment_comparables`, and reading the roll here rather than one asset
+earlier is the whole of the reason the gate is a *choice* and not a filter on
+the solve. `dominant_use_code` is a column of the comparables lineage, and
+putting it upstream would make `ComparablesConfig.operating_expense_ratio`
+re-solve a borough - exactly what the split below exists to prevent. A road
+parcel is therefore solved and then not chosen, which costs one CP-SAT run per
+street and keeps the two lineages apart.
 
 **`lot_redevelopment_gap`** compares. One row per lot: the floor area standing
 on it by class against the floor area its envelope could hold, in square metres
@@ -79,6 +91,7 @@ from urban_rag.hbu import (
     ProgramAssumptions,
     investment_assumptions_of,
     operating_expense_ratio_of,
+    road_parcel_lots,
     select_highest_best_use,
     solve_envelopes,
     unit_economics,
@@ -192,6 +205,7 @@ _GAP_OUTPUT_COLUMNS = (
     "existing_total_assessed_value",
     "existing_cap_rate_pct",
     "existing_dominant_use_code",
+    "existing_dominant_use_description",
     "existing_dominant_income_class",
 )
 
@@ -454,7 +468,9 @@ class ProgramConfig(Config):
         "Carries the mix of dwellings by CMHC bedroom class, the storeys "
         "split into residential, commercial, industrial and above-grade "
         "parking, the underground levels, the footprint and gross floor "
-        "area, the stalls by where they were put, what each part costs to "
+        "area, the stalls by where they were put, floor_stack saying what "
+        "stands on each storey as runs of identical levels, what each part "
+        "costs to "
         "build, and the discounted net profit (npv_cad) that is the "
         "objective - the stabilised NOI discounted over the hold plus the "
         "discounted sale, less the capital - with the legacy monthly NOI "
@@ -630,7 +646,16 @@ def lot_development_programs(
 @asset(
     key_prefix=key_prefix("lot_highest_best_use"),
     partitions_def=scrape_partitions,
-    deps=[lot_development_programs, lot_zoning_envelopes],
+    deps=[
+        lot_development_programs,
+        lot_zoning_envelopes,
+        # The roll, and one column of it: `dominant_use_code`, which is what
+        # says a parcel is a street rather than a site. It is a dependency of
+        # the *choice* and not of the solve on purpose - see the module
+        # docstring - so a change to ComparablesConfig re-runs a join and a
+        # sort here rather than a borough of CP-SAT models upstream.
+        lot_assessment_comparables,
+    ],
     group_name=GOLD_GROUP,
     kinds={"parquet", "postgres"},
     description=(
@@ -644,11 +669,18 @@ def lot_development_programs(
         "governing columns the developer's choice is made on discounted net "
         "profit (npv_cad): which use to build is the one real choice, and it "
         "is priced the way a land developer prices it. hbu_dominant_use says "
-        "in one word what kind of building won. Carries the dwellings by "
+        "in one word what kind of building won, and floor_stack what stands "
+        "on each storey - one entry per run of identical levels, bottom "
+        "upwards, with the stalls and the dwelling mix on the runs holding "
+        "them. Carries the dwellings by "
         "bedroom class, the storey split, the footprint and floor area, the "
         "stalls, what it costs to build, the npv and present value, and the "
         "monthly and annual net operating income, plus num_candidates and "
-        "num_zones so a real choice is distinguishable from none. Every lot "
+        "num_zones so a real choice is distinguishable from none. Two kinds "
+        "of parcel keep their row and get no program: one the roll files "
+        "under a CUBF road code (4510-4599 - a street, a lane, a right of "
+        "way), and one whose governing zone authorises only Equipements "
+        "collectifs (a park, a school, a cemetery). Every lot "
         "the envelopes reach keeps a row: hbu_status is one of "
         f"{', '.join(HBU_STATUSES)}. Written to gold/lot_highest_best_use/"
         f"<YYYY-MM-DD>/<neighborhood>/{LOT_HBU_FILE} and upserted into "
@@ -680,8 +712,15 @@ def lot_highest_best_use(
             f"{lot_zoning_envelopes.key.path[-1]} holds no envelope for "
             f"{neighborhood} {scrape_date}; there is no lot to answer for."
         )
+    assessments = _read(
+        store,
+        lot_assessment_comparables,
+        LOT_COMPARABLES_FILE,
+        neighborhood=neighborhood,
+        scrape_date=scrape_date,
+    )
 
-    frame = select_highest_best_use(programs, envelopes)
+    frame = select_highest_best_use(programs, envelopes, assessments=assessments)
     # Carried from the programs rather than recomputed: the assumptions that
     # produced a chosen program are the ones that produced the candidate it was
     # chosen from, and a second copy would be the one that goes stale.
@@ -724,6 +763,13 @@ def lot_highest_best_use(
             "num_unanswered": len(frame) - by_status["solved"],
             **{f"num_{name}": count for name, count in by_status.items()},
             "num_candidates": int(frame["num_candidates"].sum()),
+            # What the road gate actually took away rather than what it merely
+            # labelled: parcels the roll calls a street that the solver had
+            # produced a building for. Zero means the roll reached no roadway
+            # in this borough, which is a fact about the roll worth seeing.
+            "num_road_programs_withheld": _road_programs_withheld(
+                programs, assessments
+            ),
             # A lot two zones reach is a lot on a zoning boundary, where the
             # answer depends on which line is believed. pct_of_lot decides it
             # and travels on every row, so a pick made off a 2 percent sliver
@@ -1091,6 +1137,25 @@ def _sum_ha(frame: pd.DataFrame, column: str) -> float:
     """A column of square metres, summed and reported in hectares."""
     total = pd.to_numeric(frame[column], errors="coerce").sum(min_count=1)
     return round(float(total) / 10_000.0, 2) if pd.notna(total) else 0.0
+
+
+def _road_programs_withheld(
+    programs: pd.DataFrame, assessments: pd.DataFrame
+) -> int:
+    """How many road parcels the solver had already built a program for.
+
+    The count the gate is worth judging on. `num_road_parcel` says how many
+    parcels the roll calls a street; this says how many of them the zoning
+    would otherwise have put a building on, which is the number that was wrong
+    before and is the number to watch if the roll's coverage changes. Counted
+    over lot numbers, which is the key `road_parcel_lots` answers in.
+    """
+    roads = road_parcel_lots(assessments)
+    if not roads or programs.empty or "lot_number" not in programs.columns:
+        return 0
+    solved = programs["solved"].fillna(False).astype(bool)
+    numbers = programs.loc[solved, "lot_number"]
+    return int(numbers[numbers.isin(roads)].nunique())
 
 
 def _sum_millions(frame: pd.DataFrame, column: str) -> float:

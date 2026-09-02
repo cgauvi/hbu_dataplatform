@@ -125,6 +125,48 @@ its own frame alone, so a unit that moved across a borough line between scrapes
 leaves the partition it left and not the one it joined. See
 [`src/urban_rag/warehouse.py`](../src/urban_rag/warehouse.py).
 
+## A load ends by refreshing the statistics it invalidated
+
+Every write path above closes with an `ANALYZE`, and it is there for a reader
+rather than for the writer.
+
+A load rewrites most of a partition. `warehouse` upserts the whole thing and
+prunes what the staging table did not hold; `postgis._replace_partition`, which
+loads the three `rag` working-set tables, deletes the borough's rows and COPYs
+them back. Either way the planner's statistics are left describing whatever was
+there before the load. Autovacuum gets to them eventually, and *eventually* is
+the problem: the window between a load finishing and the statistics catching up
+is exactly when somebody opens the map to look at what was loaded.
+
+What goes wrong in that window does not look like a statistics problem, which
+is why it is worth writing down. `hbu_rag_map` draws the cadastre, the
+footprints, the zoning layer, the utilisation shading and the proposed massing
+as **vector tiles** — one query per 256-pixel tile, several dozen per pan, each
+one a GiST lookup narrowed by `(neighborhood, scrape_date)`. Handed stale row
+counts the planner mis-estimates that filter's selectivity, drops the index
+scan for a sequential one, and every tile becomes a scan of the borough. The
+map does not fail. It stops answering, on precisely the partition that was most
+recently loaded.
+
+Two details of how it is done:
+
+**The leaf, not the parent.** `ANALYZE` on a partitioned table walks every
+partition under it, which for a table holding a year of boroughs is most of the
+load's runtime again for statistics no query needed refreshed. So
+`warehouse.ensure_partition` now returns the leaf name hbu_infra's function has
+always handed back, and `_merge` analyzes that. The three `rag` tables are not
+partitioned, so `postgis.analyze` takes the table itself.
+
+**Inside the load's transaction.** `ANALYZE` is permitted in a transaction
+block — unlike `VACUUM` — and takes only a `ShareUpdateExclusiveLock`, so it
+blocks other maintenance and no reader. A load that rolls back rolls its
+statistics back with it, which is the right outcome: the rows it would have
+described are not there either.
+
+An emptied partition is analyzed too. A borough that loaded nothing this time
+is as much a change of shape as one that loaded everything, and the planner is
+as wrong about it.
+
 ## Output layout
 
 Layer first, then one prefix per asset, keyed by scrape date and then by
@@ -137,63 +179,63 @@ borough:
 ```
 data/
 ├── bronze/
-│   ├── spectrum_table_catalog/2026-08-18/
+│   ├── spectrum_table_catalog/2026-09-01/
 │   │   └── tables.parquet
-│   ├── neighborhood_features/2026-08-18/VSMPE/
+│   ├── neighborhood_features/2026-09-01/VSMPE/
 │   │   ├── Apaisement__VSP_TRA_AFFICHEUR.parquet
 │   │   ├── Reglement_urbanisme__VSP_REG_ZONE.parquet
 │   │   └── ...
-│   ├── reference_neighborhoods/2026-08-18/
+│   ├── reference_neighborhoods/2026-09-01/
 │   │   ├── quartiers.parquet
 │   │   └── nombre_logements.parquet
-│   ├── neighborhood_lots/2026-08-18/VSMPE/
+│   ├── neighborhood_lots/2026-09-01/VSMPE/
 │   │   └── lots.parquet
-│   ├── neighborhood_buildings/2026-08-18/VSMPE/
+│   ├── neighborhood_buildings/2026-09-01/VSMPE/
 │   │   └── buildings.parquet
-│   ├── cmhc_vacancy_survey/2026-08-18/
+│   ├── cmhc_vacancy_survey/2026-09-01/
 │   │   └── quartier_vacancy_rates.parquet
-│   ├── cmhc_rent_survey/2026-08-18/
+│   ├── cmhc_rent_survey/2026-09-01/
 │   │   └── quartier_average_rents.parquet
-│   ├── street_network/2026-08-18/
+│   ├── street_network/2026-09-01/
 │   │   └── street_sides.parquet
-│   ├── montreal_residential_costs/2026-08-18/
+│   ├── montreal_residential_costs/2026-09-01/
 │   │   └── residential_costs.parquet
-│   ├── montreal_nonresidential_costs/2026-08-18/
+│   ├── montreal_nonresidential_costs/2026-09-01/
 │   │   └── non_residential_costs.parquet
-│   ├── property_assessment_roll/2026-08-18/
+│   ├── property_assessment_roll/2026-09-01/
 │   │   ├── rol_unite_p.parquet       # one point per assessment unit
 │   │   ├── unite_evaln.parquet       # what the roll says about each
 │   │   └── lot_cadst.parquet         # one row per (unit, lot it covers)
-│   └── linked_documents/2026-08-18/VSMPE/
+│   └── linked_documents/2026-09-01/VSMPE/
 │       └── documents.parquet
 ├── silver/
-│   ├── assessment_units/2026-08-18/
+│   ├── assessment_units/2026-09-01/
 │   │   └── assessment_units.parquet
-│   ├── lot_assessed_values/2026-08-18/VSMPE/
+│   ├── lot_assessed_values/2026-09-01/VSMPE/
 │   │   └── lot_assessed_values.parquet
-│   ├── vacancy_rates/2026-08-18/VSMPE/
+│   ├── vacancy_rates/2026-09-01/VSMPE/
 │   │   ├── vacancy_rates.parquet
 │   │   └── quartier_vacancy_rates.parquet
-│   ├── average_rents/2026-08-18/VSMPE/
+│   ├── average_rents/2026-09-01/VSMPE/
 │   │   ├── average_rents.parquet
 │   │   └── quartier_average_rents.parquet
-│   ├── building_lot_intersections/2026-08-18/VSMPE/
+│   ├── building_lot_intersections/2026-09-01/VSMPE/
 │   │   ├── building_lots.parquet
 │   │   └── lot_features.parquet
-│   ├── neighborhood_streets/2026-08-18/VSMPE/
+│   ├── neighborhood_streets/2026-09-01/VSMPE/
 │   │   └── neighborhood_streets.parquet
-│   ├── lot_frontage/2026-08-18/VSMPE/
+│   ├── lot_frontage/2026-09-01/VSMPE/
 │   │   └── lot_frontage.parquet
-│   ├── zoning_grid_columns/2026-08-18/VSMPE/
+│   ├── zoning_grid_columns/2026-09-01/VSMPE/
 │   │   └── zone_columns.parquet
-│   ├── lot_zoning_envelopes/2026-08-18/VSMPE/
+│   ├── lot_zoning_envelopes/2026-09-01/VSMPE/
 │   │   └── lot_zoning_envelopes.parquet
-│   ├── document_chunks/2026-08-18/VSMPE/
+│   ├── document_chunks/2026-09-01/VSMPE/
 │   │   └── chunks.parquet
-│   └── document_embeddings/2026-08-18/VSMPE/
+│   └── document_embeddings/2026-09-01/VSMPE/
 │       └── embeddings.parquet
 └── gold/
-    └── lot_profiles/2026-08-18/VSMPE/
+    └── lot_profiles/2026-09-01/VSMPE/
         └── lot_profiles.parquet
 ```
 
@@ -216,7 +258,7 @@ belongs to:
 ```python
 import geopandas as gpd
 
-zones = gpd.read_parquet("data/neighborhood_features/2026-08-18/VSMPE/Reglement_urbanisme__VSP_REG_ZONE.parquet")
+zones = gpd.read_parquet("data/neighborhood_features/2026-09-01/VSMPE/Reglement_urbanisme__VSP_REG_ZONE.parquet")
 zones.crs        # EPSG:4326
 zones.columns    # source table attributes + source_table + neighborhood
                  #   + scrape_date + scraped_at

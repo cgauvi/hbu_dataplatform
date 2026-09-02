@@ -41,11 +41,19 @@ DSN_ENV = "URBAN_RAG_TEST_PG_URL"
 #: Where hbu_infra's `sql/` tree is, when it is not beside this checkout.
 INFRA_ENV = "URBAN_RAG_INFRA_SQL"
 
+#: The schemas the files below put their tables in. `000_roles.sql` is what
+#: creates these in a real deployment, and it is deliberately not applied here
+#: - it declares them `AUTHORIZATION urban_rag`, and that role does not exist
+#: on a throwaway database. Creating them unowned is the one thing that file
+#: does which these tests still need; its grants are not, because each table's
+#: grant block already degrades to a notice when the role is absent.
+SCHEMAS = ("rag", "silver", "gold", "warehouse")
+
 #: The files that create what `compute_lot_frontage` reads and writes. Applied
 #: in order and idempotent - every one is `CREATE ... IF NOT EXISTS`. The roles
 #: file is not among them: each table's grant block already degrades to a
 #: notice when `urban_rag` does not exist, which on a throwaway database it
-#: does not.
+#: does not. `SCHEMAS` above is what stands in for the rest of it.
 SCHEMA_FILES = (
     "002_spatial.sql",
     "003_warehouse.sql",
@@ -90,6 +98,8 @@ def connection():
 
     with psycopg.connect(dsn, autocommit=True) as conn:
         conn.execute("CREATE EXTENSION IF NOT EXISTS postgis")
+        for schema in SCHEMAS:
+            conn.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
         for name in SCHEMA_FILES:
             conn.execute((sql_dir / name).read_text(encoding="utf-8"))
         yield conn

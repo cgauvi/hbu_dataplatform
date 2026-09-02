@@ -22,66 +22,66 @@ $env:DAGSTER_HOME = "$PWD\.dagster_home"
 uv run dagster dev
 
 # or headless, one partition at a time
-uv run dagster asset materialize --select bronze/spectrum_table_catalog --partition 2026-08-18 -m urban_rag.definitions
-uv run dagster asset materialize --select bronze/neighborhood_features --partition "2026-08-18|VSMPE" -m urban_rag.definitions
+uv run dagster asset materialize --select bronze/spectrum_table_catalog --partition 2026-09-01 -m urban_rag.definitions
+uv run dagster asset materialize --select bronze/neighborhood_features --partition "2026-09-01|VSMPE" -m urban_rag.definitions
 
 # the open-data neighborhoods, date-partitioned only
-uv run dagster asset materialize --select bronze/reference_neighborhoods --partition 2026-08-18 -m urban_rag.definitions
+uv run dagster asset materialize --select bronze/reference_neighborhoods --partition 2026-09-01 -m urban_rag.definitions
 
 # the cadastral lots for that borough, which read the snapshot above
-uv run dagster asset materialize --select bronze/neighborhood_lots --partition "2026-08-18|VSMPE" -m urban_rag.definitions
+uv run dagster asset materialize --select bronze/neighborhood_lots --partition "2026-09-01|VSMPE" -m urban_rag.definitions
 
 # the CMHC vacancy rates for that borough, which depend on nothing upstream
-uv run dagster asset materialize --select silver/vacancy_rates --partition "2026-08-18|VSMPE" -m urban_rag.definitions
+uv run dagster asset materialize --select silver/vacancy_rates --partition "2026-09-01|VSMPE" -m urban_rag.definitions
 
 # the CMHC average rents for that borough, also independent
-uv run dagster asset materialize --select silver/average_rents --partition "2026-08-18|VSMPE" -m urban_rag.definitions
+uv run dagster asset materialize --select silver/average_rents --partition "2026-09-01|VSMPE" -m urban_rag.definitions
 
 # the island-wide street network, date-partitioned only
-uv run dagster asset materialize --select bronze/street_network --partition 2026-08-18 -m urban_rag.definitions
+uv run dagster asset materialize --select bronze/street_network --partition 2026-09-01 -m urban_rag.definitions
 
 # the Montreal construction cost rates, date-partitioned only
-uv run dagster asset materialize --select bronze/montreal_residential_costs,bronze/montreal_nonresidential_costs --partition 2026-08-18 -m urban_rag.definitions
+uv run dagster asset materialize --select bronze/montreal_residential_costs,bronze/montreal_nonresidential_costs --partition 2026-09-01 -m urban_rag.definitions
 
 # that borough's sides of street, cut out of it
-uv run dagster asset materialize --select silver/neighborhood_streets --partition "2026-08-18|VSMPE" -m urban_rag.definitions
+uv run dagster asset materialize --select silver/neighborhood_streets --partition "2026-09-01|VSMPE" -m urban_rag.definitions
 
 # the province-wide assessment roll and the merge that makes it readable, both
 # date-partitioned only. The first run of a roll year downloads 572 MB and
 # unpacks a 2.8 GB GeoPackage into data/cache/role/; later dates reuse both.
 # Needs reference_neighborhoods for the same date: the merge is also cut into
 # one silver.assessment_units partition per borough against those outlines
-uv run dagster asset materialize --select bronze/property_assessment_roll,silver/assessment_units --partition 2026-08-18 -m urban_rag.definitions
+uv run dagster asset materialize --select bronze/property_assessment_roll,silver/assessment_units --partition 2026-09-01 -m urban_rag.definitions
 
 # what every lot in that borough is assessed at — needs the two above for the
 # same date and neighborhood_lots for the same partition
-uv run dagster asset materialize --select silver/lot_assessed_values --partition "2026-08-18|VSMPE" -m urban_rag.definitions
+uv run dagster asset materialize --select silver/lot_assessed_values --partition "2026-09-01|VSMPE" -m urban_rag.definitions
 
 # what each lot yields on that, and which lots are like it — needs the line
 # above plus vacancy_rates and average_rents for the same partition. Run it
 # with the same BY_POINT as lot_assessed_values above: that flag decides which
 # units reach a lot at all
-uv run dagster asset materialize --select silver/lot_assessment_comparables --partition "2026-08-18|VSMPE" -m urban_rag.definitions
+uv run dagster asset materialize --select silver/lot_assessment_comparables --partition "2026-09-01|VSMPE" -m urban_rag.definitions
 
 # how much street each lot faces — needs building_lot_intersections first, for
 # the rag.lots this reads, and hbu_infra's sql/007 + sql/008 applied
-uv run dagster asset materialize --select silver/lot_frontage --partition "2026-08-18|VSMPE" -m urban_rag.definitions
+uv run dagster asset materialize --select silver/lot_frontage --partition "2026-09-01|VSMPE" -m urban_rag.definitions
 
 # then the corpus over that snapshot's linked PDFs
-uv run dagster asset materialize --select "bronze/linked_documents,silver/document_chunks,silver/document_embeddings" --partition "2026-08-18|VSMPE" -m urban_rag.definitions
+uv run dagster asset materialize --select "bronze/linked_documents,silver/document_chunks,silver/document_embeddings" --partition "2026-09-01|VSMPE" -m urban_rag.definitions
 
 # and publish those vectors to the Postgres/pgvector store
-uv run dagster asset materialize --select gold/document_index --partition "2026-08-18|VSMPE" -m urban_rag.definitions
+uv run dagster asset materialize --select gold/document_index --partition "2026-09-01|VSMPE" -m urban_rag.definitions
 
 # the zoning grids read as tables, and the envelope per (lot, grid column)
-uv run dagster asset materialize --select "silver/zoning_grid_columns,silver/lot_zoning_envelopes" --partition "2026-08-18|VSMPE" -m urban_rag.definitions
+uv run dagster asset materialize --select "silver/zoning_grid_columns,silver/lot_zoning_envelopes" --partition "2026-09-01|VSMPE" -m urban_rag.definitions
 
 # finally the gold row per lot, which reads the three silver parquet
 # partitions above as well as rag.lots — needs hbu_infra's sql/009 + sql/006
-uv run dagster asset materialize --select gold/lot_profiles --partition "2026-08-18|VSMPE" -m urban_rag.definitions
+uv run dagster asset materialize --select gold/lot_profiles --partition "2026-09-01|VSMPE" -m urban_rag.definitions
 ```
 
-Schedules run daily in `America/Toronto`: the catalog at 04:00, the features
+Schedules run monthly in `America/Toronto`, all on the 1st: the catalog at 04:00, the features
 at 04:20, the reference neighborhoods at 04:40, the vacancy rates at 04:45 and
 the average rents at 04:50 (the CMHC assets are independent of the Spectrum
 assets — the minutes only keep them from overlapping), then the lots at 05:40,
@@ -92,10 +92,11 @@ that have no upstream here. The assessment lineage runs on its own chain: the
 province-wide roll and its merge at 04:52, the per-lot totals at 06:30 behind
 the cadastre, and the cap rates and comparables at 06:40 behind those and the
 CMHC pair. `lot_frontage`, the envelope pair and `lot_profiles` have no schedule yet — see
-[Assets](assets.md). All target *today's*
-partition — `end_offset=1` on the daily partitions exists for that reason,
-since "scrape date" means the day the fetch happened, not a closed event
-window.
+[Assets](assets.md). All target *this month's*
+partition — `end_offset=1` on the monthly partitions exists for that reason,
+since "scrape date" means the month the fetch happened in, not a closed event
+window. A partition key is always the first of its month (`2026-09-01`), and a
+run started on any other day of the month lands on that same key.
 
 ## Adding neighborhoods
 
@@ -135,7 +136,9 @@ function that issues it.
 Stubbing PostGIS tests the asset's plumbing and not the measure, which is how a
 `buffer_m` too small to reach 90 % of a borough's lots survived in
 `compute_lot_frontage`: every unit test passed, because none of them ever
-intersected a lot with a street. `tests/integration` runs the real SQL against
+intersected a lot with a street. That measure is gone — frontage is now the
+boundary a lot shares with the street's own cadastral parcel — but the lesson
+stands, and the tests that would have caught it are these. `tests/integration` runs the real SQL against
 a real PostGIS on a committed slice of VSMPE — 164 lots around lot 3 790 556,
 see [tests/fixtures/frontage](../tests/fixtures/frontage/README.md). It is opt-in
 and skips when `URBAN_RAG_TEST_PG_URL` is unset, so `make test` stays offline.

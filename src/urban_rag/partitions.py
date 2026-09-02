@@ -1,9 +1,9 @@
-"""Partition definitions: one axis per neighborhood, one per scrape date."""
+"""Partition definitions: one axis per neighborhood, one per scrape month."""
 
 from __future__ import annotations
 
 from dagster import (
-    DailyPartitionsDefinition,
+    MonthlyPartitionsDefinition,
     MultiPartitionsDefinition,
     StaticPartitionsDefinition,
 )
@@ -137,12 +137,18 @@ MARKETBEAT_SUBMARKETS: dict[str, str] = {
 #: partition set; existing partitions are untouched by the addition.
 ENABLED_NEIGHBORHOODS: tuple[str, ...] = ("VSMPE",)
 
-#: First date the pipeline may scrape. `end_offset=1` makes *today* a valid
-#: partition, which is what "date of scrape" means here - unlike the usual
-#: event-time reading, where the latest complete partition is yesterday.
+#: First month the pipeline may scrape. Must be the first of a month: a
+#: `MonthlyPartitionsDefinition` cuts its windows on month boundaries and
+#: rejects a start date that does not sit on one.
+#:
+#: `end_offset=1` makes the *current* month a valid partition, which is what
+#: "month of scrape" means here - unlike the usual event-time reading, where
+#: the latest complete partition would be last month. Partition keys are still
+#: `YYYY-MM-DD`, always the first of the month, so nothing downstream that
+#: reads a scrape date as a plain ISO date has to change.
 SCRAPE_START_DATE = "2026-08-01"
 
-date_partitions = DailyPartitionsDefinition(
+date_partitions = MonthlyPartitionsDefinition(
     start_date=SCRAPE_START_DATE,
     timezone="America/Toronto",
     end_offset=1,

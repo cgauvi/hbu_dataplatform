@@ -52,7 +52,7 @@ from urban_rag.resources import ParquetStore, PostgisResource
 from urban_rag.setback_assets import LOT_SETBACKS_FILE, lot_buildable_setbacks
 from urban_rag.storage import join
 
-DATE = "2026-08-24"
+DATE = "2026-08-01"
 NEIGHBORHOOD = "VSMPE"
 ZONE_TABLE = "Reglement_urbanisme__VSP_REG_ZONE"
 
@@ -71,8 +71,8 @@ ENVELOPE = {
     "grid_zone": "C01-001",
     "pct_of_lot": 100.0,
     "overlap_area_m2": 500.0,
-    "usages": json.dumps(["H.2", "C.2"]),
-    "usage_habitation": "H.2",
+    "usages": json.dumps(["H", "C.2"]),
+    "usage_habitation": "H",
     "usage_commerce": "C.2",
     "permits_residential": True,
     "permits_commercial": True,
@@ -206,7 +206,7 @@ def test_unit_economics_reports_a_suppressed_class():
 def test_zone_column_of_round_trips_every_norm():
     """A row of the table is turned back into the object it was written from."""
     column = hbu.zone_column_of(ENVELOPE)
-    assert column.usages == ("H.2", "C.2")
+    assert column.usages == ("H", "C.2")
     assert (column.floors_min, column.floors_max) == (2, 6)
     assert column.density_max == 3.0
     assert column.site_coverage_max_pct == 70.0
@@ -234,10 +234,16 @@ def test_solve_envelopes_answers_a_real_envelope(economics):
     row = programs.iloc[0]
     assert row["status"] == "OPTIMAL"
     assert row["solved"]
-    assert row["num_dwellings"] > 0
+    assert row["gross_floor_area_m2"] > 0
     assert row["footprint_m2"] <= 350.0  # 70% of 500
     assert row["gross_floor_area_m2"] <= 1500.0 + 1e-6  # density 3 x 500
     assert json.loads(row["binding"])
+    # At the module's $80 retail rent the commerce outearns the housing by a
+    # wide margin on this parcel, and nothing in the envelope holds a storey
+    # back for the dwellings, so it takes the whole building. That the *mix*
+    # is what was solved for rather than chosen in advance is what
+    # `test_retail_at_grade_carries_housing_above` pins.
+    assert row["commercial_area_m2"] > 0
 
 
 def test_solve_envelopes_solves_a_pure_commerce_column(economics):
@@ -309,7 +315,7 @@ def test_the_buildable_area_caps_the_footprint(economics):
     `binding` is `program._footprint_cap_norm` saying the margins produced the
     envelope, not *Taux d'implantation*.
     """
-    residential = {"usages": json.dumps(["H.2"]), "permits_commercial": False}
+    residential = {"usages": json.dumps(["H"]), "permits_commercial": False}
     # The undiscounted stance, so what stops the last dwelling is the envelope
     # and not the price of its stall - under the default discounting a stall
     # can cost more than the dwelling that owes it earns, and `binding` then
@@ -360,6 +366,31 @@ def test_residential_area_is_the_plate_and_not_the_unit_schedule(economics):
     assert row["unit_area_m2"] <= row["residential_area_m2"] + 1e-6
 
 
+def test_the_floor_stack_travels_as_json_beside_the_counts(economics):
+    """The storeys re-cut by level, on the row that already counts them."""
+    row = hbu.solve_envelopes(envelopes(), economics).iloc[0]
+    stack = json.loads(row["floor_stack"])
+    above = [entry for entry in stack if entry["position"] == "above_grade"]
+    below = [entry for entry in stack if entry["position"] == "below_grade"]
+    assert sum(entry["floors"] for entry in above) == row["floors"]
+    assert sum(entry["floors"] for entry in below) == row["underground_levels"]
+    assert sum(entry["floor_area_m2"] for entry in above) == pytest.approx(
+        row["gross_floor_area_m2"], abs=0.05
+    )
+    assert sum(entry["stalls"] for entry in stack) == row["total_stalls"]
+    assert sum(entry["dwellings"] for entry in stack) == row["num_dwellings"]
+
+
+def test_the_chosen_lot_keeps_the_stack_of_the_envelope_that_won(economics):
+    """`lot_highest_best_use` carries it through the choice, unchanged."""
+    frame = envelopes()
+    programs = hbu.solve_envelopes(frame, economics)
+    chosen = hbu.select_highest_best_use(programs, frame).iloc[0]
+    assert "floor_stack" in hbu.HBU_COLUMNS
+    assert chosen["floor_stack"] == programs.iloc[0]["floor_stack"]
+    assert json.loads(chosen["floor_stack"])
+
+
 # --------------------------------------------------------------------------
 # choosing
 # --------------------------------------------------------------------------
@@ -368,7 +399,8 @@ def test_residential_area_is_the_plate_and_not_the_unit_schedule(economics):
 def test_the_governing_column_wins_even_when_it_earns_less(economics):
     """The grid picks each family's column, not the income - see the module
     docstring. The richer column of the *same* families governs neither, so
-    choosing it would be building under rules the parcel may not build to."""
+    the envelope is built without it and the parcel is held to three storeys
+    rather than the six the richer column would have allowed."""
     frame = envelopes(
         envelope(column_index=0, governs_residential=True, floors_max=3),
         envelope(
@@ -379,8 +411,12 @@ def test_the_governing_column_wins_even_when_it_earns_less(economics):
         ),
     )
     programs = hbu.solve_envelopes(frame, economics)
-    richer = programs.sort_values("npv_cad").iloc[-1]
-    assert not richer["governs_residential"]
+    # One row per zone now, not one per column: the columns are a single
+    # envelope and the non-governing one contributes nothing to it.
+    assert len(programs) == 1
+    row = programs.iloc[0]
+    assert row["column_index"] == 0
+    assert row["floors"] == 3
 
     chosen = hbu.select_highest_best_use(programs, frame)
     assert len(chosen) == 1
@@ -391,15 +427,15 @@ def test_the_governing_column_wins_even_when_it_earns_less(economics):
     assert row["num_governing_candidates"] == 1
 
 
-def test_the_richest_governing_family_wins_across_columns(economics):
-    """The one real choice: a zone writing an H column and a C column beside
-    it authorises either building, and the developer picks the one worth
-    more discounted. At the module's stated $80 retail rent the commerce
-    outearns the housing on the same parcel, so the C column wins."""
+def test_an_h_column_and_a_c_column_are_one_building(economics):
+    """A zone writing an H column and a C column beside it authorises *both*
+    in one building, and that is a mix rather than a choice between two pure
+    programs. The two columns become one envelope and one solve, and the floor
+    area between the families is what the model decides."""
     frame = envelopes(
         envelope(
             column_index=0,
-            usages=json.dumps(["H.2"]),
+            usages=json.dumps(["H"]),
             permits_commercial=False,
             governs_commercial=False,
         ),
@@ -411,17 +447,57 @@ def test_the_richest_governing_family_wins_across_columns(economics):
         ),
     )
     programs = hbu.solve_envelopes(frame, economics)
-    assert len(programs) == 2
+    assert len(programs) == 1
+    row = programs.iloc[0]
+    # Both families reached the model: the row governs each of them, and its
+    # usages are the two columns' put together.
+    assert row["governs_residential"] and row["governs_commercial"]
+    assert set(json.loads(row["usages"])) == {"H", "C.2"}
+
+    # And the answer is the same one the single mixed column of `ENVELOPE`
+    # gives, which is the point: whether the zone prints its two usages in one
+    # column or in two is a fact about the PDF, not about what may be built.
+    together = hbu.solve_envelopes(envelopes(), economics).iloc[0]
+    assert row["npv_cad"] == pytest.approx(float(together["npv_cad"]))
+    assert row["floors"] == together["floors"]
+
     chosen = hbu.select_highest_best_use(programs, frame)
-    row = chosen.iloc[0]
-    assert row["hbu_status"] == "solved"
-    assert row["num_governing_candidates"] == 2
-    by_column = programs.set_index("column_index")
-    assert row["npv_cad"] == pytest.approx(float(by_column["npv_cad"].max()))
-    assert row["column_index"] == int(by_column["npv_cad"].idxmax())
-    if row["column_index"] == 1:
-        assert row["hbu_dominant_use"] == "commercial"
-        assert row["num_dwellings"] == 0
+    assert chosen.iloc[0]["hbu_status"] == "solved"
+
+
+def test_retail_at_grade_carries_housing_above(economics):
+    """The building the old per-column solve could not propose at all.
+
+    The C column is marked *Rez-de-chaussee* and the H column *Tous les
+    niveaux*, so the commerce may take one storey and the housing may take
+    any. Solved apart, the answer was the better of "six storeys of housing"
+    and "one storey of retail"; solved together it is the one the zone
+    actually describes - retail at grade with dwellings over it.
+    """
+    frame = envelopes(
+        envelope(
+            column_index=0,
+            usages=json.dumps(["H"]),
+            levels=json.dumps(["tous_les_niveaux"]),
+            permits_commercial=False,
+            governs_commercial=False,
+        ),
+        envelope(
+            column_index=1,
+            usages=json.dumps(["C.2"]),
+            levels=json.dumps(["rez_de_chaussee"]),
+            permits_residential=False,
+            governs_residential=False,
+        ),
+    )
+    row = hbu.solve_envelopes(frame, economics).iloc[0]
+    assert row["solved"]
+    # The level rows are read per column, so the commerce is held to the one
+    # storey its own column allows while the housing fills what is left.
+    assert row["commercial_floors"] == 1
+    assert row["residential_floors"] > 0
+    assert row["num_dwellings"] > 0
+    assert row["floors"] == row["commercial_floors"] + row["residential_floors"]
 
 
 def test_the_zone_covering_most_of_the_lot_decides(economics):
@@ -438,7 +514,7 @@ def test_the_zone_covering_most_of_the_lot_decides(economics):
 
 
 def test_a_lot_with_no_priced_use_keeps_its_row(economics):
-    """A pure Equipements collectifs zone has no proforma and says so."""
+    """A pure Equipements collectifs zone has no proforma and says which."""
     frame = envelopes(
         envelope(
             usages=json.dumps(["E.1"]),
@@ -450,9 +526,64 @@ def test_a_lot_with_no_priced_use_keeps_its_row(economics):
     )
     chosen = hbu.select_highest_best_use(hbu.solve_envelopes(frame, economics), frame)
     row = chosen.iloc[0]
-    assert row["hbu_status"] == "no_candidate_column"
+    assert row["hbu_status"] == "equipment_zone"
     assert row["num_candidates"] == 0
     assert pd.isna(row["status"])
+
+
+def test_a_column_with_no_usage_at_all_is_not_an_equipment_zone(economics):
+    """The distinction `equipment_zone` exists to draw: a park is a use this
+    module will not price, an unreadable usage row is a grid it could not
+    read, and the two are different things to tell a reader."""
+    frame = envelopes(
+        envelope(
+            usages=json.dumps([]),
+            permits_residential=False,
+            permits_commercial=False,
+            governs_residential=False,
+            governs_commercial=False,
+        )
+    )
+    chosen = hbu.select_highest_best_use(hbu.solve_envelopes(frame, economics), frame)
+    assert chosen.iloc[0]["hbu_status"] == "no_candidate_column"
+
+
+def test_an_equipment_parcel_is_not_answered_by_the_zone_next_door(economics):
+    """Parc Jarry, in miniature: a parcel almost wholly inside an Equipements
+    zone clips a residential one, and used to be reported as a development
+    site on the strength of the sliver."""
+    frame = envelopes(
+        envelope(
+            feature_id="E04-019",
+            pct_of_lot=98.3,
+            usages=json.dumps(["E.1"]),
+            permits_residential=False,
+            permits_commercial=False,
+            governs_residential=False,
+            governs_commercial=False,
+        ),
+        envelope(feature_id="H02-002", pct_of_lot=1.7, column_index=1),
+    )
+    programs = hbu.solve_envelopes(frame, economics)
+    assert programs.empty
+    row = hbu.select_highest_best_use(programs, frame).iloc[0]
+    assert row["hbu_status"] == "equipment_zone"
+    assert row["num_candidates"] == 0
+    # The other zone is still on the record - it covers part of the parcel and
+    # the table says so - it just does not get to answer for it.
+    assert row["num_zones"] == 2
+
+
+def test_the_governing_zone_still_answers_where_it_has_a_program(economics):
+    """The gate is about which zone speaks, not about excluding slivers: a lot
+    whose dominant zone permits housing is answered by that zone as before."""
+    frame = envelopes(
+        envelope(feature_id="H02-002", pct_of_lot=97.0, floors_max=2),
+        envelope(feature_id="C01-001", pct_of_lot=3.0, column_index=1, floors_max=6),
+    )
+    row = hbu.select_highest_best_use(hbu.solve_envelopes(frame, economics), frame).iloc[0]
+    assert row["hbu_status"] == "solved"
+    assert row["feature_id"] == "H02-002"
 
 
 def test_a_pure_commerce_zone_is_solved_not_skipped(economics):
@@ -479,6 +610,65 @@ def test_a_lot_with_no_governing_column_says_so(economics):
     )
     chosen = hbu.select_highest_best_use(hbu.solve_envelopes(frame, economics), frame)
     assert chosen.iloc[0]["hbu_status"] == "no_governing_column"
+
+
+def test_a_road_parcel_loses_the_program_its_zoning_would_have_allowed(economics):
+    """A lane inside a residential zone. The grid permits a building on the
+    block; the roll says this particular parcel is the roadway."""
+    frame = envelopes()
+    programs = hbu.solve_envelopes(frame, economics)
+    # The zoning alone would have built here, which is the point.
+    assert programs.iloc[0]["solved"]
+
+    chosen = hbu.select_highest_best_use(
+        programs,
+        frame,
+        assessments=comparables_frame(dominant_use_code="4550"),
+    )
+    row = chosen.iloc[0]
+    assert row["hbu_status"] == "road_parcel"
+    assert pd.isna(row["status"])
+    assert pd.isna(row["num_dwellings"])
+    # The lot keeps its row and its own facts - this is an inventory, and a
+    # street is a thing the borough has.
+    assert row["lot_area_m2"] == 500.0
+
+
+def test_the_roll_overrules_the_zoning_only_for_the_road_codes(economics):
+    """4550 is a street; 4551 would be too; 1000 is a triplex and builds."""
+    frame = envelopes()
+    programs = hbu.solve_envelopes(frame, economics)
+    for code, expected in (("4550", "road_parcel"), ("4599", "road_parcel"),
+                           ("4500", "road_parcel"), ("1000", "solved"),
+                           ("4611", "solved"), ("4000", "solved")):
+        chosen = hbu.select_highest_best_use(
+            programs, frame, assessments=comparables_frame(dominant_use_code=code)
+        )
+        assert chosen.iloc[0]["hbu_status"] == expected, code
+
+
+def test_a_lot_the_roll_never_reached_is_not_a_road(economics):
+    """No assessment unit is not evidence of anything. The 3,090 VSMPE lots
+    the roll never reached keep whatever their zoning says."""
+    frame = envelopes()
+    programs = hbu.solve_envelopes(frame, economics)
+    chosen = hbu.select_highest_best_use(
+        programs, frame, assessments=comparables_frame(NO_LOT="9 999 999")
+    )
+    assert chosen.iloc[0]["hbu_status"] == "solved"
+
+
+def test_no_roll_at_all_leaves_the_answer_as_it_was(economics):
+    """`assessments` is optional, and omitting it is not the same as an empty
+    one - both leave the zoning to answer alone."""
+    frame = envelopes()
+    programs = hbu.solve_envelopes(frame, economics)
+    without = hbu.select_highest_best_use(programs, frame)
+    empty = hbu.select_highest_best_use(
+        programs, frame, assessments=pd.DataFrame()
+    )
+    assert without.iloc[0]["hbu_status"] == "solved"
+    assert empty.iloc[0]["hbu_status"] == "solved"
 
 
 def test_an_infeasible_governing_column_is_distinguished_from_an_absent_one(
@@ -896,7 +1086,7 @@ def test_hbu_asset_answers_every_lot(store, stub_publish):
             permits_residential=False,
             governs_residential=False,
         ),
-        # A pure Equipements zone - the one kind of lot with no proforma.
+        # A pure Equipements zone - a park, a school, a cemetery.
         envelope(
             lot_uid=4,
             lot_number="2 216 004",
@@ -906,8 +1096,21 @@ def test_hbu_asset_answers_every_lot(store, stub_publish):
             governs_residential=False,
             governs_commercial=False,
         ),
+        # A lane under the same residential grid as lot 1, which the roll
+        # files as roadway below.
+        envelope(lot_uid=5, lot_number="2 216 005"),
     ]
-    write_upstreams(store, rows=rows)
+    write_upstreams(
+        store,
+        rows=rows,
+        comparables=pd.concat(
+            [
+                comparables_frame(),
+                comparables_frame(NO_LOT="2 216 005", dominant_use_code="4550"),
+            ],
+            ignore_index=True,
+        ),
+    )
     assert run(store, lot_development_programs).success
     result = run(store, lot_highest_best_use)
     assert result.success
@@ -918,19 +1121,25 @@ def test_hbu_asset_answers_every_lot(store, stub_publish):
             LOT_HBU_FILE,
         )
     )
-    assert len(frame) == 4
+    assert len(frame) == 5
     assert dict(zip(frame["lot_uid"], frame["hbu_status"])) == {
         1: "solved",
         2: "no_governing_column",
         3: "solved",
-        4: "no_candidate_column",
+        4: "equipment_zone",
+        5: "road_parcel",
     }
     by_lot = frame.set_index("lot_uid")
     assert by_lot.loc[3, "hbu_dominant_use"] == "commercial"
     assert by_lot.loc[3, "num_dwellings"] == 0
     metadata = materialization_metadata(result, lot_highest_best_use)
-    assert metadata["num_lots"].value == 4
+    assert metadata["num_lots"].value == 5
     assert metadata["num_answered"].value == 2
+    assert metadata["num_equipment_zone"].value == 1
+    assert metadata["num_road_parcel"].value == 1
+    # The count worth watching: lot 5 solved and was then not chosen, which is
+    # the answer this gate actually took away.
+    assert metadata["num_road_programs_withheld"].value == 1
     assert stub_publish["datasets"].keys() == {"lot_highest_best_use"}
 
 
@@ -975,3 +1184,29 @@ def test_gap_asset_keeps_a_lot_the_roll_never_reached(store):
     metadata = materialization_metadata(result, lot_redevelopment_gap)
     assert metadata["num_with_assessment"].value == 0
     assert metadata["num_without_assessment"].value == 1
+
+
+def test_a_road_parcel_is_never_under_built(store):
+    """The gate is applied once, at the choice, and the tables downstream
+    inherit it: no program means no gap, and no gap means no shortlist."""
+    write_upstreams(store, comparables=comparables_frame(dominant_use_code="4550"))
+    assert run(store, lot_development_programs).success
+    assert run(store, lot_highest_best_use).success
+    result = run(store, lot_redevelopment_gap)
+    assert result.success
+
+    frame = pd.read_parquet(
+        join(
+            store.partition_dir(lot_redevelopment_gap.key.path[-1], DATE, NEIGHBORHOOD),
+            LOT_GAP_FILE,
+        )
+    )
+    row = frame.iloc[0]
+    assert row["hbu_status"] == "road_parcel"
+    assert not row["is_underbuilt"]
+    assert pd.isna(row["hbu_residential_floor_area_m2"])
+    # It keeps its row and the roll's side of it - the borough still has a
+    # street here, and the table is an inventory.
+    assert row["has_assessment"]
+    metadata = materialization_metadata(result, lot_redevelopment_gap)
+    assert metadata["num_underbuilt"].value == 0

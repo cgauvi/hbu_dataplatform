@@ -50,7 +50,7 @@ from urban_rag.partitions import CMHC_QUARTIERS, quartiers_for
 from urban_rag.resources import CmhcResource, ParquetStore, PostgisResource
 from urban_rag.storage import join
 
-DATE = "2026-08-20"
+DATE = "2026-08-01"
 NEIGHBORHOOD = "VSMPE"
 SURVEY_YEAR = 2023
 

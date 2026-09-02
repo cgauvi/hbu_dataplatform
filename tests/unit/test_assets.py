@@ -21,7 +21,7 @@ from urban_rag.assets import (
 from urban_rag.resources import ParquetStore, SpectrumResource
 from urban_rag.spectrum import Column, TableMetadata
 
-DATE = "2026-08-20"
+DATE = "2026-08-01"
 NEIGHBORHOOD = "VSMPE"
 
 ZONE_TABLE = "/19_VSMPE/Reglement_urbanisme/VSP_REG_ZONE"
@@ -131,7 +131,9 @@ def test_features_land_under_asset_date_and_neighborhood(tmp_path, store, spectr
 def test_features_read_the_catalog_written_for_their_own_date(
     tmp_path, store, spectrum
 ):
-    materialize_catalog(store, scrape_date="2026-08-19")
+    # A different *month*, not a different day: the scrape partition is
+    # monthly, so a key that is not the first of a month is not a key at all.
+    materialize_catalog(store, scrape_date="2026-09-01")
 
     with pytest.raises(Failure, match="spectrum_table_catalog"):
         materialize_features(store, scrape_date=DATE)

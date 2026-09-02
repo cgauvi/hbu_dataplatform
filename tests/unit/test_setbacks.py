@@ -32,7 +32,7 @@ from urban_rag.postgis import DEFAULT_SETBACK_EDGE_TOLERANCE_M
 from urban_rag.resources import ParquetStore, PostgisResource
 from urban_rag.setback_assets import LOT_SETBACKS_FILE, lot_buildable_setbacks
 
-DATE = "2026-08-24"
+DATE = "2026-08-01"
 NEIGHBORHOOD = "VSMPE"
 
 

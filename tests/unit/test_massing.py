@@ -33,7 +33,7 @@ from urban_rag.resources import ParquetStore, PostgisResource
 from urban_rag.setback_assets import LOT_SETBACKS_FILE, lot_buildable_setbacks
 from urban_rag.storage import join
 
-DATE = "2026-08-24"
+DATE = "2026-08-01"
 NEIGHBORHOOD = "VSMPE"
 
 #: A spread of buildable envelopes, each a shape worth covering rather than a

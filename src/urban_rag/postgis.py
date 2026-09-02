@@ -33,15 +33,17 @@ by necessity rather than by choice - see `compute_lot_features`, and
 hbu_infra's sql/005_silver_lot_features.sql for the table.
 
 `silver.lot_frontage` is the third derived join, and the one that answers "how
-much of this lot faces a street". Its right-hand side is
-`silver.neighborhood_streets`, the city's *geobase double* - one line per side
-of street, drawn along the curb - and the measure is taken on the lot's
-`ST_Boundary`, not on the lot itself: a lot is a polygon, and `ST_Length` of a
-polygon is zero, so intersecting the two solids and measuring the result would
-report nothing at all. See `compute_lot_frontage` for how a boundary is matched
-to a street side - and for why that is no longer a clip against a buffered one,
-which could not be both wide enough to reach a borough's lot lines and narrow
-enough to leave what it reached undistorted. hbu_infra's
+much of this lot faces a street". Its right-hand side is the cadastre itself:
+in the renewed cadastre a roadway is a lot with a lot number, so a parcel's
+frontage is the boundary it *shares* with one of those - an exact shared edge,
+with no buffer, no tolerance and nothing to tune. `silver.neighborhood_streets`,
+the city's *geobase double*, is what says which parcels are the roadway, since
+the assessment roll does not reach Montreal's street lots at all; it then names
+the street, which a cadastral parcel cannot do for itself. The measure is still
+taken on `ST_Boundary` rather than on the lot - a lot is a polygon, and
+`ST_Length` of a polygon is zero, so intersecting the two solids would report
+nothing. See `compute_lot_frontage`, and `DEFAULT_ROAD_LOT_MIN_STREET_M` for
+why the roll cannot identify a road lot here. hbu_infra's
 sql/007_silver_streets.sql and sql/008_silver_lot_frontage.sql have the two
 tables.
 
@@ -153,6 +155,35 @@ def require_working_set(connection: "Connection") -> None:
     can be read.
     """
     _require_relations(connection.cursor(), WORKING_SET_RELATIONS)
+
+
+def analyze(connection: "Connection", table: str) -> None:
+    """Refresh the planner's statistics for a `rag` working-set table.
+
+    Called at the end of each of the three loads below, and the reason is a
+    reader rather than a writer. `_replace_partition` deletes a borough's rows
+    and COPYs them back, which leaves the statistics describing the partition
+    as it was before the load. Autovacuum notices in its own time, and the
+    window between a load finishing and the stats catching up is exactly when
+    somebody opens the map to look at what was loaded.
+
+    What goes wrong in that window does not look like a statistics problem.
+    hbu_rag_map draws the cadastre and the footprints as vector tiles - one
+    query per tile, several dozen per pan, each a GiST lookup narrowed by
+    `(neighborhood, scrape_date)`. Handed stale counts the planner
+    mis-estimates that filter and drops the index scan for a sequential one,
+    so every tile becomes a scan of the borough. The map does not fail; it
+    stops answering, on the partition that was most recently loaded.
+
+    ANALYZE is permitted inside a transaction - unlike VACUUM - and takes a
+    ShareUpdateExclusiveLock, which blocks other maintenance and no reader. A
+    load that rolls back rolls its statistics back with it.
+
+    `urban_rag.warehouse._analyze` is the same step for the silver and gold
+    tables, where it runs against the leaf rather than the whole table because
+    those are partitioned and these three are not.
+    """
+    connection.cursor().execute(f"ANALYZE {table}")
 
 
 def load_lots(
@@ -323,6 +354,7 @@ def load_features(
         [neighborhood, scrape_date, source_table],
     )
     if frame.empty:
+        analyze(connection, "rag.features")
         return 0
     if feature_id_column not in frame.columns:
         raise ValueError(
@@ -394,6 +426,7 @@ def load_features(
         ON CONFLICT (source_table, feature_id, neighborhood, scrape_date) DO NOTHING
         """
     )
+    analyze(connection, "rag.features")
     return inserted
 
 
@@ -594,65 +627,57 @@ def compute_lot_features(
     }
 
 
-#: How far from a street side a lot boundary may be and still count as facing
-#: it, in metres. The geobase double is drawn along the roadway, a lot line
-#: sits behind the sidewalk and the service strip, and the city publishes the
-#: layer "à titre indicatif" rather than to survey accuracy, so the gap is
-#: several metres before any survey disagreement is added to it.
+#: How much geobase double street line has to run *inside* a parcel before
+#: that parcel is taken to be the roadway itself, in metres.
 #:
-#: Ten, not the three this used to be. Three was chosen as "wide enough to
-#: cross a sidewalk", but measured against VSMPE it is not: the median lot in
-#: that borough sits 4.85 m from its nearest street side, and at 3 m **90 % of
-#: the borough's 24 952 lots got no row at all**. Running the measure over that
-#: borough at each cutoff is what this value now follows -
+#: This is what identifies a road lot, and identifying one is the whole of the
+#: measure below: in Quebec's renewed cadastre a street is a lot like any other
+#: - Infolot draws avenue Chabot as parcels 3 946 199, 3 946 200 and their
+#: neighbours, some 13.5 m wide - so a lot's frontage is the length of boundary
+#: it shares with one of them, and nothing has to be buffered, chopped or
+#: matched by angle to find it.
 #:
-#:     cutoff   lots with no frontage
-#:        3 m   22 545 of 24 952   (90.4 %)
-#:        6 m    5 121             (20.5 %)
-#:        8 m    1 316             ( 5.3 %)
-#:       10 m      698             ( 2.8 %)
-#:       12 m      673             ( 2.7 %)
+#: **The assessment roll cannot do this identifying, though it is the obvious
+#: place to look.** The roll files the public way under CUBF 45xx, and on the
+#: 2026 roll Montreal states 859 such units among 437,192 - 55 autoroutes, two
+#: boulevards, two arterials, 152 local streets, 557 lanes and paths, 91
+#: others. The city's own street parcels are not among them: of the fourteen
+#: road lots in the Villeray fixture, **none appears in `b05v_lot_cadst` at
+#: all**, because Montreal does not enter its roadways on the roll. The roll
+#: reaching a parcel is a fact about tenure; it is not a map of the street
+#: network, and `hbu.road_parcel_lots` says the same thing from the other side.
 #:
-#: - and coverage plateaus at ten. What is left there is the right residual
-#: rather than a shortfall: those 698 lots have a median area of 56 m2 and sit
-#: a median 26.5 m from the nearest street side, which is an interior remnant
-#: and not a lot the cutoff is hiding.
+#: So the street network identifies the street, which is what it is for. A
+#: geobase double side is drawn along the roadway, so it runs *within* the
+#: parcel that is the roadway and enters no other. Measured over the fixture,
+#: the separation is total rather than marginal: the fourteen road lots carry
+#: between 105 m and 325 m of street line each, every other parcel carries
+#: none, and the rule picks out all fourteen with no false positive and no
+#: false negative. One metre is therefore a guard against a side clipping the
+#: corner of an ordinary parcel where the two publishers disagree, not a
+#: threshold anything real sits near.
 #:
-#: Widening it used to cost accuracy, which is why it was kept small. It no
-#: longer does: `compute_lot_frontage` measures only the boundary that runs
-#: *along* a street side, so the corner over-count that grew with this number
-#: is gone and the measure is flat in it. See that function.
-DEFAULT_FRONTAGE_BUFFER_M = 10.0
-
-#: How finely a lot boundary is chopped before each piece is matched to a
-#: street, in metres. It sets the resolution of the measure - a corner lot's
-#: frontage is right to within about this much - and the cost of it: halving it
-#: doubles the rows the assignment runs over. One metre against parcels whose
-#: median frontage is 8.6 m is roughly a tenth of the thing being measured.
-FRONTAGE_SEGMENT_M = 1.0
-
-#: How far from parallel a piece of lot boundary may run and still be counted
-#: as facing the street it was matched to, as the sine of the angle between
-#: them. 0.7071 is 45°.
-#:
-#: This is what makes the measure independent of `buffer_m`. A boundary piece
-#: of length L whose ends sit d1 and d2 from the street side has
-#: ``|d1 - d2| / L`` equal to the sine of the angle between the two: 0 for a
-#: piece running along the street, 1 for one running straight at it. A lot's
-#: *side* boundaries run at the street, and it is their first `buffer_m` that
-#: the old buffer-clip counted as frontage - which is why widening the buffer
-#: used to add two metres of phantom frontage per metre of buffer to every lot
-#: in the borough. Dropping them costs nothing real: a lot line perpendicular
-#: to the street is the neighbour's party line, not street edge.
-FRONTAGE_MAX_SIN = 0.7071
+#: It also settles the lanes without a second rule. The geobase double draws
+#: the public roadway and no ruelle, so the borough's lane parcels - three of
+#: them in the fixture, 3.6 to 4.5 m wide - are not road lots, and a lot
+#: backing onto one gets no frontage from it. That is the intended reading: a
+#: lane is access, not street edge.
+DEFAULT_ROAD_LOT_MIN_STREET_M = 1.0
 
 #: Where the frontage geometry is measured. NAD83 / MTM zone 8 is the projected
 #: system the island is surveyed in, the same one `street_assets.METRIC_CRS`
-#: measures street length in. The measure needs a planar CRS rather than
-#: `geography`: the assignment compares point-to-line distances across
-#: thousands of candidate sides per lot, and `geography` has no index-backed
-#: nearest-neighbour operator to do it with.
+#: measures street length in. A planar CRS rather than `geography`, which has
+#: no index-backed nearest-neighbour operator for the naming step below.
 FRONTAGE_METRIC_SRID = 32188
+
+#: What is written to `silver.lot_frontage.buffer_m` now that there is no
+#: buffer. Zero is the truthful reading of that column - "how far from the
+#: street a lot boundary counted as facing it" is nothing at all, because the
+#: boundary has to *be* the road lot's edge - and it is also the marker saying
+#: which method produced a row: a partition whose rows say 3.0 or 10.0 was
+#: measured by the old buffer-and-angle assignment against a linestring, and is
+#: reporting a different quantity from one whose rows say 0.
+FRONTAGE_NO_BUFFER = 0.0
 
 #: How many of the lots that faced no street a run names. The count is the
 #: measure of how bad a partition is; this sample is only where to start
@@ -676,111 +701,154 @@ def compute_lot_frontage(
     *,
     neighborhood: str,
     scrape_date: str,
-    buffer_m: float = DEFAULT_FRONTAGE_BUFFER_M,
+    min_street_m: float = DEFAULT_ROAD_LOT_MIN_STREET_M,
 ) -> dict[str, object]:
     """(Re)compute `silver.lot_frontage` for one (neighborhood, scrape_date).
 
-    How much of a lot faces a street, and which street. A lot with 30 m on a
+    How much street each lot faces, and which street. A lot with 30 m on a
     boulevard is a different development site from the one behind it with 6 m
-    on a lane, and neither the cadastre nor the street network says so on its
-    own: Infolot publishes the parcel, the geobase double publishes the sides
-    of the roadway, and the relationship between them is geometric.
+    on a lane, and no publisher records it: Infolot draws the parcel, the
+    geobase double draws the sides of the roadway, and the relation between the
+    two is geometric.
 
-    **The measure is taken on the lot's boundary, not on the lot.** The
-    obvious statement of the question -
+    **The street is a lot, and that is the whole measure.** In the renewed
+    cadastre a roadway is a parcel with a lot number like any other - avenue
+    Chabot is 3 946 199, 3 946 200 and their neighbours - so a lot's frontage
+    is the length of the boundary it *shares* with one of them:
 
-        ST_Length(ST_Intersection(lot.geom, street_buffer.geom))
+        ST_Length(ST_Intersection(ST_Boundary(lot), ST_Boundary(road_lot)))
 
-    - intersects two polygons, gets a polygon back, and `ST_Length` of a
-    polygon is 0 in PostGIS: every row would report no frontage at all.
-    Frontage is a length along the parcel's edge, so the left-hand side is the
-    lot's boundary.
+    taken in `FRONTAGE_METRIC_SRID`. Adjacent parcels in this cadastre are
+    topologically clean, so that intersection is the shared edge exactly and
+    the measure needs no tolerance at all. Lot 3 790 556 on avenue Chabot comes
+    out at 15.24 m, which is what its front boundary measures in the polygon
+    and twice the 7.62 m of the single-width lots either side of it.
 
-    **It is not a buffer clip.** It was, and the two things that were wrong
-    with clipping the boundary to a buffered street side are the same thing
-    seen from both ends. Making the buffer small enough not to distort the
-    measure made it too small to reach the lots: at the 3 m this defaulted to,
-    90 % of VSMPE's lots matched no street at all, because the geobase double
-    is drawn along the roadway and the median lot line in that borough sits
-    4.85 m behind it. Making it wide enough to reach them distorted the
-    measure: a lot's two *side* boundaries run at the street, their first
-    `buffer_m` falls inside the buffer too, and every lot in the borough gains
-    two metres of frontage it does not have per metre of buffer. There is no
-    value that is both, which is why this now measures something else.
+    **It is no longer a buffered street line.** The old measure clipped the lot
+    boundary against a buffered geobase side, then chopped the boundary into
+    1 m pieces, matched each to the nearest side within `buffer_m` and kept the
+    ones running within 45 degrees of parallel. Every part of that was
+    compensation for the street being a line rather than a polygon: a lot line
+    does not sit on the roadway, so the reach had to be widened until it found
+    the lots (at 3 m, 90 % of Villeray matched nothing; the default ended at
+    10 m), and once widened it caught the lot's *side* boundaries too, which
+    the angle test then had to throw back out. The road lot removes the whole
+    apparatus - there is no reach to tune, so there is nothing for a partition
+    to be sensitive to.
 
-    What it measures is the boundary that runs *along* a street side. Each lot
-    boundary is chopped into `FRONTAGE_SEGMENT_M` pieces; each piece is matched
-    to the single nearest street side within `buffer_m`; and a piece counts as
-    frontage only if it runs within `FRONTAGE_MAX_SIN` of parallel to that
-    side. The parallel test needs no trigonometry - for a piece of length L
-    whose ends sit d1 and d2 from the side, ``|d1 - d2| / L`` *is* the sine of
-    the angle between them - and it is what drops the side boundaries the
-    buffer clip counted. The result is flat in `buffer_m`: lot 3 790 556
-    measures 15.24 m on cote_rue_id 11000531 at a cutoff of 6, 8, 10 or 12 m,
-    where the buffer clip reported 20.3, 24.3, 28.3 and 32.3 m for the same
-    lot. So `buffer_m` is free to be wide enough to actually reach the lots.
+    A **tolerance would make it worse, not safer.** Snapping the two boundaries
+    together by 5 cm adds a uniform 0.10 m to every lot in the fixture and
+    invents 0.1 m of frontage for a parcel that touches a road lot at a single
+    corner and has no street edge at all. Exact is both simpler and right.
 
-    Matching each piece to the *nearest* side, rather than to every side within
-    reach, is also what keeps a lot off the far side of its own street. The two
-    sides of one roadway are only 5 to 8 m apart in this geobase, well inside a
-    useful cutoff, but a lot's front boundary is always nearer its own side.
+    **The geobase still names the street, and only names it.** A cadastral
+    parcel carries no street name, so each shared edge is labelled with the
+    nearest geobase side *that runs inside the road lot the edge came from* -
+    the restriction matters, because a corner lot's two edges belong to two
+    road lots, and the nearest side overall labels both with whichever street
+    happens to be closer. With it, lot 3 790 549 reads 31.2 m on Jarry and
+    13.1 m on Chabot; without it, both edges come back Chabot. The side sits a
+    median 3.7 m from the edge it names, and naming is all it does: a label
+    that lands on the wrong side of a corner costs a name, never a metre.
 
-    Done in `FRONTAGE_METRIC_SRID` rather than through `geography`: the
-    assignment is a nearest-neighbour search, and `<->` on the GiST index is
-    what makes it one search per piece instead of a scan of every side in the
-    borough. `buffer_m` is still metres - metres in MTM zone 8 are metres on
-    the ground - and it is written onto every row so a table can always be read
-    back against the cutoff that produced it.
+    **A street is several road lots, so the rows are summed per side.** The
+    cadastre cuts a roadway at each intersection, so a lot running the length
+    of a block can meet one street through two parcels. Those are one frontage
+    and are grouped back to (lot, `cote_rue_id`), which is also this table's
+    key - so `envelopes` and `lot_profiles`, which pivot on `cote_rue_id` and
+    `street_name`, read exactly what they read before.
 
     ``frontage_rank`` is 1 for the longest frontage a lot has, which is the
     column to filter on when a question wants *the* street a lot fronts on
     rather than every street it touches. A corner lot legitimately has two.
 
-    A lot with no row here faced no street side within `buffer_m` - a genuine
-    interior parcel, or a street snapshot that stops short of it. The caller
-    gets the count and a sample of them back; see the `lots_without_frontage`
-    key in the returned dict, which `frontage_assets` surfaces as metadata.
+    A road lot gets no row of its own and is not counted among the lots facing
+    nothing - a street does not front on itself. A lot with no row shares no
+    boundary with any road lot: a genuine interior parcel, one reached only by
+    a lane, or a street snapshot that stops short of it. The caller gets the
+    count and a sample; see the `lots_without_frontage` key in the returned
+    dict, which `frontage_assets` surfaces as metadata.
 
     Assumes `load_lots` and `load_streets` have already landed this partition's
     rows - both sides are filtered to (`neighborhood`, `scrape_date`) before
-    anything is measured, so a street side from another date cannot match a lot
-    from this one. `rag.lots` is loaded by `building_lot_intersections`, not here:
-    two assets loading the same table from the same file in two transactions is
-    the race that asset's docstring exists to describe.
+    anything is measured, so a street side from another date cannot identify a
+    road lot from this one. `rag.lots` is loaded by `building_lot_intersections`
+    and not here: two assets loading the same table from the same file in two
+    transactions is the race that asset's docstring exists to describe.
     """
     cursor = connection.cursor()
     _require_relations(cursor, _FRONTAGE_RELATIONS)
+    srid = int(FRONTAGE_METRIC_SRID)
 
-    # The street sides, projected once and indexed, in a temp table rather than
-    # a CTE. This is not tidiness: the assignment below is a nearest-neighbour
-    # search per boundary piece, and there are some 2.6 million of them in a
-    # borough. Against a CTE, `<->` has no index to walk and every piece scans
-    # every side in the borough; against this, each piece is an index probe.
-    # Measured on VSMPE, that is the difference between a query that does not
-    # finish and one that takes about a minute.
+    # Both sides of the join, projected once and indexed, in temp tables rather
+    # than CTEs. The projection is what every predicate below runs against, and
+    # doing it inline would reproject each parcel once per candidate pair; the
+    # indexes are what turn the road-lot test and the adjacency join into index
+    # probes instead of scans of the borough.
     #
     # Dropped first rather than declared ON COMMIT DROP. This runs inside the
     # caller's transaction - `connect` above commits on a clean exit - so
     # ON COMMIT DROP would be the tidier declaration, and would also silently
-    # destroy the table between the CREATE and the SELECT if a caller ever
+    # destroy the tables between the CREATE and the SELECT if a caller ever
     # handed this an autocommit connection. Session scope survives that, a
-    # rollback still takes the table with it because DDL is transactional here,
-    # and this makes a second call on one connection work either way.
-    cursor.execute("DROP TABLE IF EXISTS _frontage_sides")
+    # rollback still takes them with it because DDL is transactional here, and
+    # this makes a second call on one connection work either way.
+    for table in ("_frontage_sides", "_frontage_lots", "_frontage_road_sides"):
+        cursor.execute(f"DROP TABLE IF EXISTS {table}")
+
     cursor.execute(
         f"""
         CREATE TEMP TABLE _frontage_sides AS
-        SELECT cote_rue_id, street_name,
-               ST_Transform(geom, {int(FRONTAGE_METRIC_SRID)}) AS geom
+        SELECT cote_rue_id, street_name, ST_Transform(geom, {srid}) AS geom
         FROM silver.neighborhood_streets
         WHERE neighborhood = %s AND scrape_date = %s::date
         """,
         [neighborhood, scrape_date],
     )
     cursor.execute("CREATE INDEX ON _frontage_sides USING gist (geom)")
-    # Without stats the planner costs the LATERAL against a default row
+
+    cursor.execute(
+        f"""
+        CREATE TEMP TABLE _frontage_lots AS
+        SELECT lot_uid, lot_number, neighborhood, scrape_date,
+               ST_Transform(geom, {srid}) AS geom,
+               -- A property of the lot, so it is carried from here rather than
+               -- recomputed per road lot the parcel happens to touch.
+               ST_Perimeter(ST_Transform(geom, {srid})) AS lot_perimeter_m
+        FROM rag.lots
+        WHERE neighborhood = %s AND scrape_date = %s::date
+        """,
+        [neighborhood, scrape_date],
+    )
+    cursor.execute("CREATE INDEX ON _frontage_lots USING gist (geom)")
+    cursor.execute("CREATE INDEX ON _frontage_lots (lot_uid)")
+
+    # Which parcels are the roadway, and which sides run down each of them.
+    # One table for both questions because they are one question: a road lot is
+    # a parcel some side runs inside, and that same side is what names the
+    # edges the parcel produces. See `DEFAULT_ROAD_LOT_MIN_STREET_M` for why
+    # the length test separates roads from everything else so cleanly.
+    cursor.execute(
+        """
+        CREATE TEMP TABLE _frontage_road_sides AS
+        SELECT l.lot_uid AS road_lot_uid, s.cote_rue_id, s.street_name, s.geom
+        FROM _frontage_lots l
+        JOIN _frontage_sides s ON s.geom && l.geom
+        WHERE ST_Length(ST_Intersection(s.geom, l.geom))
+              >= %(min_street_m)s::double precision
+        """,
+        {"min_street_m": float(min_street_m)},
+    )
+    cursor.execute("CREATE INDEX ON _frontage_road_sides (road_lot_uid)")
+    cursor.execute("CREATE INDEX ON _frontage_road_sides USING gist (geom)")
+    # Without stats the planner costs the LATERAL below against a default row
     # estimate and can still choose a scan over the index it was just handed.
     cursor.execute("ANALYZE _frontage_sides")
+    cursor.execute("ANALYZE _frontage_lots")
+    cursor.execute("ANALYZE _frontage_road_sides")
+
+    cursor.execute("SELECT count(DISTINCT road_lot_uid) FROM _frontage_road_sides")
+    (num_road_lots,) = cursor.fetchone()
 
     result = warehouse.upsert_select(
         cursor,
@@ -800,88 +868,79 @@ def compute_lot_frontage(
             "geom",
         ),
         """
-        WITH parcels AS (
-            SELECT lot_uid, lot_number, neighborhood, scrape_date,
-                   ST_Transform(geom, %(srid)s) AS geom,
-                   -- Carried from here rather than recomputed per street side:
-                   -- the perimeter is a property of the lot, and the GROUP BY
-                   -- below would otherwise have to group by a geometry.
-                   ST_Perimeter(ST_Transform(geom, %(srid)s)) AS lot_perimeter_m
-            FROM rag.lots
-            WHERE neighborhood = %(neighborhood)s
-              AND scrape_date = %(scrape_date)s::date
+        WITH roads AS (
+            SELECT DISTINCT r.road_lot_uid AS lot_uid, l.geom
+            FROM _frontage_road_sides r
+            JOIN _frontage_lots l ON l.lot_uid = r.road_lot_uid
         ),
-        -- Every lot boundary chopped into pieces of at most `step_m`, one row
-        -- each. ST_Segmentize only ever adds vertices, so a boundary shorter
-        -- than the step survives whole rather than being rounded away.
-        pieces AS (
-            SELECT p.lot_uid, (seg).geom AS geom
-            FROM parcels p
-            CROSS JOIN LATERAL ST_DumpSegments(
-                ST_Segmentize(
-                    ST_Boundary(p.geom), %(step_m)s::double precision
-                )
-            ) AS seg
+        -- The shared boundary itself. Two parcels that abut in this cadastre
+        -- share their edge exactly, so this is the frontage with nothing
+        -- approximated - and `ST_CollectionExtract(..., 2)` keeps only the
+        -- linear part, which is what drops a parcel meeting a road lot at a
+        -- single corner rather than crediting it with a point of street.
+        edges AS (
+            SELECT p.lot_uid, r.lot_uid AS road_lot_uid,
+                   ST_CollectionExtract(
+                       ST_Intersection(ST_Boundary(p.geom), ST_Boundary(r.geom)), 2
+                   ) AS geom
+            FROM _frontage_lots p
+            JOIN roads r
+              ON r.geom && p.geom AND ST_Intersects(p.geom, r.geom)
+            -- A road lot fronts on nothing: it is the street.
+            WHERE NOT EXISTS (
+                SELECT 1 FROM roads self WHERE self.lot_uid = p.lot_uid
+            )
         ),
-        -- Winner takes all: the single nearest side within `buffer_m`, found
-        -- through the GiST index rather than by scanning the borough's sides.
-        -- Matching every side within reach instead would put a lot on both
-        -- sides of its own street, which are 5 to 8 m apart in this geobase.
-        assigned AS (
-            SELECT c.lot_uid, c.geom, near.cote_rue_id, near.street_name,
-                   ST_Distance(ST_StartPoint(c.geom), near.geom) AS d_start,
-                   ST_Distance(ST_EndPoint(c.geom), near.geom) AS d_end,
-                   ST_Length(c.geom) AS piece_m
-            FROM pieces c
+        -- Named by the nearest side running inside *that* road lot, not the
+        -- nearest side anywhere - see the docstring on lot 3 790 549. The
+        -- restriction is also what makes this an index probe per edge.
+        named AS (
+            SELECT e.lot_uid, e.geom, ST_Length(e.geom) AS edge_m,
+                   near.cote_rue_id, near.street_name
+            FROM edges e
             CROSS JOIN LATERAL (
-                SELECT s.cote_rue_id, s.street_name, s.geom
-                FROM _frontage_sides s
-                WHERE ST_DWithin(s.geom, c.geom, %(buffer_m)s::double precision)
-                ORDER BY s.geom <-> c.geom
+                SELECT s.cote_rue_id, s.street_name
+                FROM _frontage_road_sides s
+                WHERE s.road_lot_uid = e.road_lot_uid
+                ORDER BY s.geom <-> e.geom
                 LIMIT 1
             ) AS near
+            WHERE ST_Length(e.geom) > 0
         ),
-        -- The parallel test. |d_start - d_end| / length is the sine of the
-        -- angle between the piece and the side it was matched to: 0 along the
-        -- street, 1 straight at it. This is what the old buffer clip had no
-        -- way to express, and why its answer grew with the buffer.
-        facing AS (
-            SELECT lot_uid, cote_rue_id, street_name, geom, piece_m
-            FROM assigned
-            WHERE piece_m > 0
-              AND abs(d_start - d_end) / piece_m <= %(max_sin)s::double precision
-        ),
+        -- One row per (lot, street side). The cadastre cuts a roadway at every
+        -- intersection, so a lot can meet one street through two road lots;
+        -- that is one frontage, and this is where the two become it.
         measured AS (
             SELECT
                 p.scrape_date,
                 p.neighborhood,
                 p.lot_uid,
                 p.lot_number,
-                f.cote_rue_id,
-                max(f.street_name) AS street_name,
-                sum(f.piece_m) AS frontage_m,
+                n.cote_rue_id,
+                max(n.street_name) AS street_name,
+                sum(n.edge_m) AS frontage_m,
                 p.lot_perimeter_m,
                 row_number() OVER (
                     PARTITION BY p.lot_uid
                     -- cote_rue_id only to make the order total, so a re-run
                     -- ranks two exactly equal frontages the same way twice.
-                    ORDER BY sum(f.piece_m) DESC, f.cote_rue_id
+                    ORDER BY sum(n.edge_m) DESC, n.cote_rue_id
                 ) AS frontage_rank,
-                -- Merged back into as few linestrings as the pieces allow -
-                -- one per run of contiguous edge - and returned to 4326, the
-                -- CRS every geometry in this database is stored in. A corner
-                -- lot's frontage on one street is contiguous; a lot that meets
-                -- the same side twice is legitimately two strands.
-                ST_Transform(ST_LineMerge(ST_Collect(f.geom)), 4326) AS geom
-            FROM facing f
-            JOIN parcels p ON p.lot_uid = f.lot_uid
+                -- Merged back into as few linestrings as the edges allow, and
+                -- returned to 4326, the CRS every geometry in this database is
+                -- stored in. A lot meeting one street through two road lots
+                -- merges into one run; a lot meeting the same side at two
+                -- separate places is legitimately two strands.
+                ST_Transform(ST_LineMerge(ST_Collect(n.geom)), 4326) AS geom
+            FROM named n
+            JOIN _frontage_lots p ON p.lot_uid = n.lot_uid
             GROUP BY p.scrape_date, p.neighborhood, p.lot_uid, p.lot_number,
-                     p.lot_perimeter_m, f.cote_rue_id
+                     p.lot_perimeter_m, n.cote_rue_id
         )
         SELECT
             scrape_date, neighborhood, lot_uid, cote_rue_id, lot_number,
             street_name,
-            %(buffer_m)s::double precision, frontage_m, lot_perimeter_m,
+            %(no_buffer)s::double precision, frontage_m, lot_perimeter_m,
             CASE WHEN lot_perimeter_m > 0
                  THEN 100.0 * frontage_m / lot_perimeter_m
                  ELSE 0.0
@@ -891,14 +950,7 @@ def compute_lot_frontage(
         FROM measured
         WHERE frontage_m > 0
         """,
-        {
-            "neighborhood": neighborhood,
-            "scrape_date": scrape_date,
-            "buffer_m": float(buffer_m),
-            "step_m": float(FRONTAGE_SEGMENT_M),
-            "max_sin": float(FRONTAGE_MAX_SIN),
-            "srid": int(FRONTAGE_METRIC_SRID),
-        },
+        {"no_buffer": float(FRONTAGE_NO_BUFFER)},
         neighborhood=neighborhood,
         scrape_date=scrape_date,
     )
@@ -930,12 +982,14 @@ def compute_lot_frontage(
     (num_streets,) = cursor.fetchone()
 
     # Which lots those are, not only how many. Every lot in a Montreal borough
-    # is expected to face at least one street side; the ones that do not are
-    # either genuine interior parcels or the symptom of a street snapshot that
-    # stops short of them, and either way they are the rows to go and look at.
-    # Capped because a partition that has gone wrong produces thousands of
-    # them, and the count above is what says how wrong - the sample only says
-    # where to start. Ordered so a re-run names the same lots.
+    # that is not itself a road is expected to face at least one street side;
+    # the ones that do not are either genuine interior parcels or the symptom
+    # of a street snapshot that stops short of them, and either way they are
+    # the rows to go and look at. Road lots are excluded rather than reported
+    # as landlocked - a street facing no street is the definition, not a
+    # finding. Capped because a partition that has gone wrong produces
+    # thousands of them, and the count is what says how wrong; the sample only
+    # says where to start. Ordered so a re-run names the same lots.
     cursor.execute(
         f"""
         SELECT lot_number
@@ -946,6 +1000,10 @@ def compute_lot_frontage(
               WHERE f.lot_uid = l.lot_uid
                 AND f.neighborhood = l.neighborhood
                 AND f.scrape_date = l.scrape_date
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM _frontage_road_sides r
+              WHERE r.road_lot_uid = l.lot_uid
           )
         ORDER BY lot_number
         LIMIT {_LOTS_WITHOUT_FRONTAGE_SAMPLE}
@@ -963,10 +1021,13 @@ def compute_lot_frontage(
         "max_frontage_m": float(max_frontage_m),
         "num_lots": int(num_lots),
         "num_streets": int(num_streets),
+        # The parcels that *are* the street. Not candidates for frontage, so
+        # `num_lots` minus this is the denominator coverage is read against.
+        "num_road_lots": int(num_road_lots),
         # A sample, not the whole set - see the query. `num_lots` minus
-        # `lots_matched` is the true count.
+        # `num_road_lots` minus `lots_matched` is the true count.
         "lots_without_frontage": lots_without_frontage,
-        "buffer_m": float(buffer_m),
+        "min_street_m": float(min_street_m),
     }
 
 
@@ -976,14 +1037,26 @@ def compute_lot_frontage(
 
 #: Where the buildable envelope is carved, how finely the boundary is chopped
 #: to sort it, and how near parallel a piece has to run to count as the rear
-#: rather than a side. All three are `compute_lot_frontage`'s values, aliased
-#: rather than restated: the rear/side test *is* that function's parallel test
-#: pointed at the lot's front edge instead of at a street side, so the two
-#: moving apart should be a decision someone makes here rather than a drift
-#: nobody notices. See `FRONTAGE_MAX_SIN` for the derivation.
+#: rather than a side.
+#:
+#: The first is `FRONTAGE_METRIC_SRID`, and for the same reason: metres in MTM
+#: zone 8 are metres on the ground. The other two used to be aliases of
+#: `compute_lot_frontage`'s values, because that function classified boundary
+#: pieces by angle exactly as this one does. It no longer classifies anything -
+#: a road lot's shared edge *is* the frontage, with nothing to chop or sort -
+#: so the two constants live here now, where the only reader of them is.
+#:
+#: `SETBACK_SEGMENT_M` sets the resolution of the sort: a corner is placed to
+#: within about a metre, and halving it doubles the rows the classification
+#: runs over. `SETBACK_MAX_SIN` is how far from parallel a piece may run and
+#: still count as the rear rather than a side, as the sine of the angle
+#: between them - 0.7071 is 45 degrees. The test needs no trigonometry: for a
+#: piece of length L whose ends sit d1 and d2 from the front edge,
+#: ``|d1 - d2| / L`` *is* that sine, 0 for a piece parallel to the front and 1
+#: for one running straight at it.
 SETBACK_METRIC_SRID = FRONTAGE_METRIC_SRID
-SETBACK_SEGMENT_M = FRONTAGE_SEGMENT_M
-SETBACK_MAX_SIN = FRONTAGE_MAX_SIN
+SETBACK_SEGMENT_M = 1.0
+SETBACK_MAX_SIN = 0.7071
 
 #: How far off the lot's boundary a `silver.lot_frontage` linestring may sit
 #: and still be subtracted from it as street edge, in metres.
@@ -1766,7 +1839,7 @@ def compute_lot_profiles(
             "commercial_floor_area_m2", "industrial_floor_area_m2",
             "retail_floor_area_m2", "office_floor_area_m2",
             "retail_income_cad", "office_income_cad",
-            "dominant_use_code", "year_built",
+            "dominant_use_code", "dominant_use_description", "year_built",
             "gross_income_cad", "net_operating_income_cad",
             "cap_rate_pct", "comparable_cap_rate_pct", "income_assumptions",
             "estimated_value_cad", "estimated_value_basis",
@@ -1804,6 +1877,11 @@ def compute_lot_profiles(
             SELECT f.lot_uid,
                    count(*) AS num_frontages,
                    sum(f.frontage_m) AS total_frontage_m,
+                   -- 0 on anything measured against the road lot, which is
+                   -- every partition computed since - there is no buffer, so
+                   -- the column that carried one now dates the row instead:
+                   -- 3.0 or 10.0 here is a profile built on the old
+                   -- buffer-and-angle frontage. See `compute_lot_frontage`.
                    max(f.buffer_m) AS frontage_buffer_m,
                    (array_agg(f.frontage_m
                         ORDER BY f.frontage_rank, f.cote_rue_id))[1] AS primary_frontage_m,
@@ -2035,6 +2113,13 @@ def compute_lot_profiles(
             comparables.retail_income_cad,
             comparables.office_income_cad,
             comparables.dominant_use_code,
+            -- What that code says, in the MEFQ's words. Carried up from
+            -- sql/016 rather than looked up here: the description a lot
+            -- is profiled with should be the one its silver partition was
+            -- described with, not whatever edition of the manual a later
+            -- reader holds. NULL is normal - a lane with no unit on it, a
+            -- blank rl0105a, or a code the manual does not number.
+            comparables.dominant_use_description,
             comparables.year_built,
             comparables.gross_income_cad,
             comparables.net_operating_income_cad,
@@ -2573,6 +2658,7 @@ _LOT_PROFILE_COLUMNS = (
     "retail_income_cad",
     "office_income_cad",
     "dominant_use_code",
+    "dominant_use_description",
     "year_built",
     "gross_income_cad",
     "net_operating_income_cad",
@@ -2834,6 +2920,9 @@ def _replace_partition(
         [neighborhood, scrape_date],
     )
     if frame.empty:
+        # A borough emptied is as much a change of shape as a borough loaded,
+        # and the planner is as wrong about it either way.
+        analyze(connection, table)
         return 0
 
     _psycopg()  # raises PostgresUnavailable with a clear message if missing
@@ -2907,4 +2996,5 @@ def _replace_partition(
         {conflict}
         """
     )
+    analyze(connection, table)
     return inserted

@@ -37,7 +37,7 @@ from urban_rag.storage import join
 from urban_rag import street_assets
 from urban_rag.street_assets import STREETS_FILE_OUT, neighborhood_streets
 
-DATE = "2026-08-24"
+DATE = "2026-08-01"
 NEIGHBORHOOD = "VSMPE"
 #: `partitions.NEIGHBORHOOD_BOROUGH_CODES["VSMPE"]` - what `borough_boundary`
 #: cuts the reference layer on.

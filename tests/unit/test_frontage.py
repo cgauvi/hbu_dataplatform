@@ -1,16 +1,16 @@
 """Offline test for `lot_frontage`.
 
 `urban_rag.postgis.load_streets`/`compute_lot_frontage` are Postgres-only in
-substance - they issue COPY and INSERT ... ST_Intersection statements against
-a buffered `geography` - so nothing here touches a real database, the same
-posture `test_building_lots.py` takes for the two joins it covers.
+substance - they issue COPY and INSERT ... ST_Intersection statements over
+projected parcel boundaries - so nothing here touches a real database, the
+same posture `test_building_lots.py` takes for the two joins it covers.
 
 What is worth testing without one is the asset's own logic: which partition it
 reads, that it loads `rag.streets` and *only* `rag.streets` (the cadastre is
 `building_lot_intersections`'s to load, and loading it twice is the race that
-asset's docstring describes), that the configured buffer reaches the SQL and
-the row it produced, and how the compute function's return value turns into
-`MaterializeResult` metadata.
+asset's docstring describes), that the configured road-lot cutoff reaches the
+SQL while the rows it produced record no buffer at all, and how the compute
+function's return value turns into `MaterializeResult` metadata.
 
 The SQL itself is covered by neither this nor `postgis.py`'s own tests, for the
 same reason `rag/pgvector.py`'s `load_partition` has none: PostGIS is what
@@ -30,12 +30,12 @@ from asset_helpers import materialization_metadata
 
 from urban_rag.frames import write_frame
 from urban_rag.frontage_assets import LOT_FRONTAGE_FILE, lot_frontage
-from urban_rag.postgis import DEFAULT_FRONTAGE_BUFFER_M
+from urban_rag.postgis import DEFAULT_ROAD_LOT_MIN_STREET_M, FRONTAGE_NO_BUFFER
 from urban_rag.resources import ParquetStore, PostgisResource
 from urban_rag.storage import join
 from urban_rag.street_assets import STREETS_FILE_OUT, neighborhood_streets
 
-DATE = "2026-08-24"
+DATE = "2026-08-01"
 NEIGHBORHOOD = "VSMPE"
 
 
@@ -79,6 +79,7 @@ def stub_postgis(
     streets_matched=2,
     num_lots=4,
     num_streets=2,
+    num_road_lots=0,
     total_frontage_m=60.0,
     max_frontage_m=30.0,
     lots_without_frontage=("3 790 556", "3 790 557"),
@@ -90,8 +91,8 @@ def stub_postgis(
     def connect(self):
         yield object()
 
-    def compute_lot_frontage(connection, *, neighborhood, scrape_date, buffer_m):
-        calls["compute"] = (neighborhood, scrape_date, buffer_m)
+    def compute_lot_frontage(connection, *, neighborhood, scrape_date, min_street_m):
+        calls["compute"] = (neighborhood, scrape_date, min_street_m)
         return {
             "frontages": frontages,
             "lots_matched": lots_matched,
@@ -100,10 +101,12 @@ def stub_postgis(
             "max_frontage_m": max_frontage_m,
             "num_lots": num_lots,
             "num_streets": num_streets,
-            # A sample of the lots that faced nothing, as the real one returns
-            # it - the count is num_lots - lots_matched, this is which ones.
+            # The parcels that are the street. Out of the denominator: the
+            # count of lots that faced nothing is num_lots - num_road_lots -
+            # lots_matched, and this sample is which ones.
+            "num_road_lots": num_road_lots,
             "lots_without_frontage": list(lots_without_frontage),
-            "buffer_m": buffer_m,
+            "min_street_m": min_street_m,
             "pruned": 0,
         }
 
@@ -123,7 +126,8 @@ def stub_postgis(
                 "street_name": ["Jarry"] * frontages,
                 "neighborhood": [neighborhood] * frontages,
                 "scrape_date": [scrape_date] * frontages,
-                "buffer_m": [calls["compute"][2]] * frontages,
+                # Always 0 now: there is no buffer, and the column says so.
+                "buffer_m": [FRONTAGE_NO_BUFFER] * frontages,
                 # Descending, the way the real ORDER BY returns them.
                 "frontage_m": [30.0 - i for i in range(frontages)],
                 "frontage_rank": [1] * frontages,
@@ -152,8 +156,10 @@ def materialize_partition(store, *, run_config=None):
     )
 
 
-def config_for(buffer_m: float) -> dict:
-    return {"ops": {"silver__lot_frontage": {"config": {"buffer_m": buffer_m}}}}
+def config_for(min_street_m: float) -> dict:
+    return {
+        "ops": {"silver__lot_frontage": {"config": {"min_street_m": min_street_m}}}
+    }
 
 
 def test_the_partition_is_loaded_measured_and_written(store, monkeypatch, tmp_path):
@@ -207,37 +213,46 @@ def test_the_written_rows_are_ordered_longest_frontage_first(
     assert frame["frontage_m"].is_monotonic_decreasing
 
 
-def test_the_default_buffer_is_the_one_postgis_declares(store, monkeypatch):
+def test_the_default_road_lot_cutoff_is_the_one_postgis_declares(store, monkeypatch):
     calls = stub_postgis(monkeypatch)
     write_streets(store)
 
     materialize_partition(store)
 
-    assert calls["compute"][2] == DEFAULT_FRONTAGE_BUFFER_M
+    assert calls["compute"][2] == DEFAULT_ROAD_LOT_MIN_STREET_M
 
 
-def test_a_configured_buffer_reaches_the_query_and_the_rows(
-    store, monkeypatch, tmp_path
-):
-    """It is a judgement about the street section, not a property of the data,
-    so it is config - and it travels on every row, so a table can be read back
-    against the cutoff that produced it."""
+def test_a_configured_road_lot_cutoff_reaches_the_query(store, monkeypatch):
+    """It is a judgement about how far two publishers may disagree, not a
+    property of the data, so it is config."""
     calls = stub_postgis(monkeypatch)
     write_streets(store)
 
     materialize_partition(store, run_config=config_for(5.0))
 
     assert calls["compute"][2] == 5.0
+
+
+def test_the_rows_record_that_no_buffer_was_used(store, monkeypatch, tmp_path):
+    """`buffer_m` is 0 whatever the run was configured with, because there is
+    no buffer: the lot boundary has to *be* the road lot's edge. A partition
+    whose rows say 3.0 or 10.0 was measured the old way and is reporting a
+    different quantity."""
+    stub_postgis(monkeypatch)
+    write_streets(store)
+
+    materialize_partition(store, run_config=config_for(5.0))
+
     frame = gpd.read_parquet(
         tmp_path / "store" / "silver" / "lot_frontage" / DATE / NEIGHBORHOOD
         / LOT_FRONTAGE_FILE
     )
-    assert set(frame["buffer_m"]) == {5.0}
+    assert set(frame["buffer_m"]) == {0.0}
 
 
-def test_a_buffer_of_zero_is_refused(store, monkeypatch):
-    """Every lot boundary would have to fall exactly on the curb line, which
-    would report no frontage anywhere rather than an unbuffered measurement."""
+def test_a_road_lot_cutoff_of_zero_is_refused(store, monkeypatch):
+    """Every parcel a street side so much as touches would be read as roadway,
+    including the ones it clips at a corner."""
     stub_postgis(monkeypatch)
     write_streets(store)
 
@@ -247,7 +262,12 @@ def test_a_buffer_of_zero_is_refused(store, monkeypatch):
 
 def test_metadata_reports_the_coverage_and_the_cutoff(store, monkeypatch):
     stub_postgis(
-        monkeypatch, frontages=3, lots_matched=2, num_lots=4, total_frontage_m=60.0
+        monkeypatch,
+        frontages=3,
+        lots_matched=2,
+        num_lots=4,
+        num_road_lots=1,
+        total_frontage_m=60.0,
     )
     write_streets(store)
 
@@ -257,12 +277,15 @@ def test_metadata_reports_the_coverage_and_the_cutoff(store, monkeypatch):
     assert metadata["num_frontages"].value == 3
     assert metadata["num_streets"].value == 2
     assert metadata["num_lots"].value == 4
+    assert metadata["num_road_lots"].value == 1
     assert metadata["num_lots_with_frontage"].value == 2
-    # The symptom worth seeing: a lot facing nothing is either a true interior
-    # parcel or a street snapshot that stops short of it.
-    assert metadata["num_lots_without_frontage"].value == 2
+    # The symptom worth seeing: a lot facing nothing is a true interior parcel,
+    # one reached only by a lane, or a street snapshot that stops short of it.
+    # One of the four lots here is the street itself and is not counted.
+    assert metadata["num_lots_without_frontage"].value == 1
+    assert metadata["pct_lots_without_frontage"].value == round(100.0 / 3, 2)
     assert metadata["mean_frontage_m"].value == 30.0
-    assert metadata["buffer_m"].value == DEFAULT_FRONTAGE_BUFFER_M
+    assert metadata["min_street_m"].value == DEFAULT_ROAD_LOT_MIN_STREET_M
 
 
 def test_a_borough_with_no_lots_loaded_is_a_failure(store, monkeypatch):

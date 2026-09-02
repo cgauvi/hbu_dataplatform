@@ -15,6 +15,24 @@ unaccounted for.
 what the publisher splits them by: the geometry is in one file and everything
 true of the property is in the other, and neither is usable alone.
 
+**It also gives the use code its words back.** The roll states `rl0105a` as
+four digits and stops - a unit says ``4611`` and nothing published with it says
+that is a parking garage. The MEFQ's own list of *codes d'utilisation des
+biens-fonds* does, and `urban_rag.cubf_assets` snapshots it, so
+`use_description` is looked up onto every unit here and carried from there into
+the comparables, the lot profiles and the redevelopment gap. Only the
+description: the codebook also publishes a SCIAN correspondence and the
+manual's remarks, and repeating a paragraph of assessment instruction onto 437
+thousand units would be carrying the manual rather than reading it.
+
+A **left** lookup, and the eight rows that need it say why. Montreal's 2026
+roll uses 598 distinct codes over 437,192 units and the 2025 manual numbers all
+but five of them - 3190, 3410, 3860, 4815, 6394, carried by eight units
+between them. The roll and the manual are amended on their own cadences, so a
+code in force before its edition lands is an ordinary state; it is a null
+description and a kept property, and `use_codes_not_in_the_manual` names
+exactly which codes so the gap is readable rather than inferred.
+
 `lot_assessed_values` carries that onto the cadastre. It is the join this whole
 chain exists for - Infolot draws the lot, the roll values the property, and
 nothing published connects them.
@@ -108,6 +126,13 @@ from dagster import (
 )
 from pydantic import Field
 
+from urban_rag.cubf import (
+    USE_DESCRIPTION_COLUMN,
+    describe,
+    use_code_descriptions,
+    use_code_key,
+)
+from urban_rag.cubf_assets import CUBF_FILE, cubf_use_codes
 from urban_rag.frames import count_invalid_geometries, write_frame
 from urban_rag.infolot_assets import LOTS_FILE, neighborhood_lots
 from urban_rag.layers import key_prefix
@@ -129,6 +154,7 @@ from urban_rag.role_foncier import (
     ROLL_LOT_COLUMN,
     UNITS_LAYER,
     UNREAD_LAYERS,
+    USE_CODE_COLUMN,
     VALUE_COLUMN,
     RoleError,
     filename_for,
@@ -167,6 +193,7 @@ CADASTRE_FILE = "lot_cadst.parquet"
 #: The one file `assessment_units` writes, under
 #: `silver/assessment_units/<YYYY-MM-DD>/`.
 ASSESSMENT_UNITS_FILE = "assessment_units.parquet"
+
 
 #: The one file `lot_assessed_values` writes, under
 #: `silver/lot_assessed_values/<YYYY-MM-DD>/<neighborhood>/`.
@@ -407,18 +434,21 @@ def property_assessment_roll(
 @asset(
     key_prefix=key_prefix("assessment_units"),
     partitions_def=date_partitions,
-    deps=[property_assessment_roll, reference_neighborhoods],
+    deps=[property_assessment_roll, cubf_use_codes, reference_neighborhoods],
     group_name=SILVER_GROUP,
     kinds={"postgres", "geoparquet"},
     description=(
         "Every assessment unit as one row: its point, and the characteristics "
         "the roll describes it by - assessed values, floor area, storeys, year "
         "built, dwellings, use code. The two bronze files merged on "
-        f"{JOIN_KEY}, which is what the publisher splits them by. Written to "
-        f"silver/assessment_units/<YYYY-MM-DD>/{ASSESSMENT_UNITS_FILE} as wide "
-        "as the bronze snapshot, and upserted into silver.assessment_units on "
-        "(scrape_date, neighborhood, id_provinc) - one borough partition per "
-        "enabled borough, holding the units whose point falls inside it."
+        f"{JOIN_KEY}, which is what the publisher splits them by, plus "
+        f"{USE_DESCRIPTION_COLUMN} - what the MEFQ's codebook says the unit's "
+        f"{USE_CODE_COLUMN} means, which the roll itself never states. Written "
+        f"to silver/assessment_units/<YYYY-MM-DD>/{ASSESSMENT_UNITS_FILE} as "
+        "wide as the bronze snapshot, and upserted into "
+        "silver.assessment_units on (scrape_date, neighborhood, id_provinc) - "
+        "one borough partition per enabled borough, holding the units whose "
+        "point falls inside it."
     ),
 )
 def assessment_units(
@@ -465,6 +495,13 @@ def assessment_units(
             f"No {JOIN_KEY} is in both bronze files for {scrape_date}; the two "
             "layers were read from different archives."
         )
+
+    # The codebook, joined last and by lookup rather than by merge: it is one
+    # column keyed on a value every unit already carries, and a `merge` on
+    # `USE_CODE_COLUMN` would multiply the frame if the sheet ever numbered a
+    # code twice - which is exactly the failure a 437-thousand-row silver asset
+    # should not be one publisher's typo away from.
+    uses = _describe_uses(merged, store, scrape_date=scrape_date, log=context.log)
 
     output_dir = store.partition_dir(context.asset_key.path[-1], scrape_date)
     removed = clear_parquet(output_dir)
@@ -545,6 +582,20 @@ def assessment_units(
             # parquet the table does not carry.
             "num_units_outside_every_borough": cut.outside,
             "num_units_arrond_disagrees": cut.arrond_mismatch,
+            # The codebook's side of the merge. `num_units_with_a_use_code` is
+            # what the roll stated at all - it publishes a handful of blanks -
+            # and the difference to `num_units_described` is the codes the
+            # manual does not number. That is a number to watch rather than an
+            # error: the roll and the manual are amended on their own cadences,
+            # and a code in force before its edition lands is exactly this.
+            "num_units_with_a_use_code": uses.num_coded,
+            "num_units_described": uses.num_described,
+            "num_use_codes_in_the_roll": uses.num_codes,
+            "num_use_codes_not_in_the_manual": len(uses.unmatched),
+            "use_codes_not_in_the_manual": MetadataValue.json(
+                sorted(uses.unmatched)
+            ),
+            "mefq_edition": uses.edition or "unknown",
             "output_path": MetadataValue.path(str(path)),
             **published_metadata(loaded),
         }
@@ -826,6 +877,113 @@ _PAIR_COLUMNS = (
     "shared",
     "by_point",
 )
+
+
+@dataclass(frozen=True)
+class UseDescriptions:
+    """What the codebook was able to say about one date's units.
+
+    ``num_coded`` is the units whose `USE_CODE_COLUMN` is four digits at all
+    and ``num_described`` those the manual had text for, so the difference is
+    the codes it does not number. ``unmatched`` names them - a set, not a
+    count, because the useful thing about a code the manual has never heard of
+    is *which* code it is.
+
+    ``edition`` is what the snapshot's own notice said, carried through so a
+    partition can be read against the manual that described it. Null where the
+    ministry re-worded the notice - see `cubf.edition_of`.
+    """
+
+    num_coded: int
+    num_described: int
+    num_codes: int
+    unmatched: set[str]
+    edition: str | None
+
+
+def _describe_uses(
+    units: gpd.GeoDataFrame,
+    store: ParquetStore,
+    *,
+    scrape_date: str,
+    log,
+) -> UseDescriptions:
+    """Add `USE_DESCRIPTION_COLUMN` to ``units``, in place, from the codebook.
+
+    A lookup rather than a merge - see the call site - and a *left* one: a unit
+    whose code the manual does not number keeps its row and gets a null, the
+    same way this asset treats every other fact it could not establish. The
+    roll and the manual are two publications amended on their own cadences, and
+    a use in force before its edition lands is a null column rather than a
+    dropped property.
+
+    The column is added even when the roll states no use code at all, so the
+    frame's shape does not depend on what the publisher happened to fill in -
+    silver declares its columns, and a table that gains one on a good day is
+    worse than one that carries nulls on a bad one.
+    """
+    codebook = _read_parquet(
+        join(store.partition_dir(cubf_use_codes.key.path[-1], scrape_date), CUBF_FILE),
+        written_by="/".join(cubf_use_codes.key.path),
+        partition=scrape_date,
+    )
+    descriptions = use_code_descriptions(codebook)
+    edition = _first_value(codebook, "mefq_edition")
+
+    if USE_CODE_COLUMN not in units.columns:
+        # The roll without its use code is a roll this platform cannot class
+        # anything by, and `lot_assessment_comparables` would price every floor
+        # at nothing. Reported here rather than raising, because that asset is
+        # where the consequence lands and it already counts unclassified floor.
+        log.warning(
+            "%s: the characteristics table has no %s column, so no unit can "
+            "be described; %s will be null for every row",
+            scrape_date,
+            USE_CODE_COLUMN,
+            USE_DESCRIPTION_COLUMN,
+        )
+        units[USE_DESCRIPTION_COLUMN] = pd.Series(
+            pd.NA, index=units.index, dtype="object"
+        )
+        return UseDescriptions(0, 0, 0, set(), edition)
+
+    codes = units[USE_CODE_COLUMN].map(use_code_key)
+    units[USE_DESCRIPTION_COLUMN] = describe(units[USE_CODE_COLUMN], descriptions)
+
+    present = set(codes.dropna().unique())
+    unmatched = {code for code in present if code not in descriptions}
+    result = UseDescriptions(
+        num_coded=int(codes.notna().sum()),
+        num_described=int(units[USE_DESCRIPTION_COLUMN].notna().sum()),
+        num_codes=len(present),
+        unmatched=unmatched,
+        edition=edition,
+    )
+    if unmatched:
+        log.warning(
+            "%s: %d of the roll's %d use code(s) are not in the MEFQ list "
+            "(edition %s) and describe %d unit(s) as null: %s",
+            scrape_date,
+            len(unmatched),
+            result.num_codes,
+            edition or "unknown",
+            result.num_coded - result.num_described,
+            ", ".join(sorted(unmatched)),
+        )
+    return result
+
+
+def _first_value(frame: pd.DataFrame, column: str):
+    """The first non-null value of ``column``, or None.
+
+    The provenance columns bronze stamps are identical on every row by
+    construction, so the first one is the value - the same shape
+    `comparables_assets._scalar` reads its assumptions back with.
+    """
+    if column not in frame.columns:
+        return None
+    values = frame[column].dropna()
+    return values.iloc[0] if len(values) else None
 
 
 @dataclass(frozen=True)

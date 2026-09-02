@@ -33,6 +33,8 @@ from asset_helpers import (
 )
 
 from urban_rag import role_assets
+from urban_rag.cubf import USE_DESCRIPTION_COLUMN
+from urban_rag.cubf_assets import CUBF_FILE, cubf_use_codes
 from urban_rag.frames import write_frame
 from urban_rag.infolot_assets import LOTS_FILE, neighborhood_lots
 from urban_rag.open_data_assets import QUARTIERS_FILE, reference_neighborhoods
@@ -58,6 +60,7 @@ from urban_rag.role_foncier import (
     ROLL_LOT_COLUMN,
     ROLL_LOT_SUFFIX_COLUMN,
     UNITS_LAYER,
+    USE_CODE_COLUMN,
     VALUE_COLUMN,
     RoleError,
     RoleFetcher,
@@ -68,7 +71,7 @@ from urban_rag.role_foncier import (
 )
 from urban_rag.storage import join
 
-DATE = "2026-08-26"
+DATE = "2026-08-01"
 NEIGHBORHOOD = "VSMPE"
 ROLL_YEAR = 2026
 ARCHIVE = filename_for(ROLL_YEAR)
@@ -101,9 +104,18 @@ def points_layer(rows: list[tuple[str, str, float, float]]) -> gpd.GeoDataFrame:
     )
 
 
-def units_layer(rows: list[tuple[str, str, float]]) -> pd.DataFrame:
-    """`b05v_unite_evaln`: the characteristics, keyed the same way."""
-    return pd.DataFrame(
+def units_layer(
+    rows: list[tuple[str, str, float]], *, use_codes: list[str | None] | None = None
+) -> pd.DataFrame:
+    """`b05v_unite_evaln`: the characteristics, keyed the same way.
+
+    ``use_codes`` is parallel to ``rows`` and adds `USE_CODE_COLUMN`. Left out
+    entirely by default rather than filled with a placeholder, because a roll
+    without that column is a real shape this pipeline has to survive - it is
+    what `assessment_units` warns about instead of failing on - and most of the
+    fixtures here are about the merge rather than about the use code.
+    """
+    frame = pd.DataFrame(
         {
             JOIN_KEY: [unit_id(code, mat) for code, mat, _ in rows],
             "code_mun": [code for code, _, _ in rows],
@@ -112,6 +124,9 @@ def units_layer(rows: list[tuple[str, str, float]]) -> pd.DataFrame:
             VALUE_COLUMN: [value for _, _, value in rows],
         }
     )
+    if use_codes is not None:
+        frame[USE_CODE_COLUMN] = use_codes
+    return frame
 
 
 def cadastre_layer(rows: list[tuple[str, str, str]]) -> pd.DataFrame:
@@ -365,6 +380,34 @@ LOT_A, LOT_SPLIT_1, LOT_SPLIT_2 = ("1 000 001", "1 000 002", "1 000 003")
 LOT_CONDO, LOT_EMPTY = ("PC-9001", "1 000 004")
 LOT_UNDRAWN = "9999999"
 
+#: The use codes the fixture's units are assessed under.
+#:
+#: * `CODE_DWELLING` and `CODE_GARAGE` are real MEFQ codes the fixture sheet
+#:   numbers. 4611 is the one the description column exists for: "4611" and
+#:   "Garage de stationnement pour automobiles" are the same fact about a
+#:   parcel, and only one of them can be read.
+#: * `CODE_UNKNOWN` is four digits the manual does not number - what the roll
+#:   and the manual being amended on their own cadences looks like from here.
+#:   It must give a null description and keep its unit, not drop it.
+CODE_DWELLING, CODE_GARAGE, CODE_UNKNOWN = ("1000", "4611", "1234")
+
+#: What the fixture codebook publishes, as `cubf_use_codes` writes it: the
+#: sheet's own hierarchy rows alongside the four-character leaves. The headings
+#: are there on purpose - bronze keeps them, and the merge in silver has to
+#: select the leaves out. One that let "100" through would describe a unit with
+#: the name of a heading, which is the failure `use_code_key` refuses to pad
+#: its way into.
+CUBF_ROWS: tuple[tuple[str, str | None], ...] = (
+    ("1", "RÉSIDENTIELLE"),
+    ("10", "LOGEMENT"),
+    ("100", "Logement"),
+    (CODE_DWELLING, "Logement"),
+    ("46", "TERRAIN ET GARAGE DE STATIONNEMENT POUR VÉHICULES"),
+    (CODE_GARAGE, "Garage de stationnement pour automobiles (infrastructure)"),
+    # Numbered by the manual and left undescribed, the way 9800 really is.
+    ("9800", None),
+)
+
 
 @pytest.fixture
 def role(tmp_path, monkeypatch):
@@ -391,7 +434,12 @@ def role(tmp_path, monkeypatch):
                 (MONTREAL_CODE_MUN, U_SPLIT, 500_000.0),
                 (MONTREAL_CODE_MUN, U_CONDO, 800_000.0),
                 (LAVAL_CODE_MUN, U_LAVAL, 900_000.0),
-            ]
+            ],
+            # One of each shape the codebook merge has to handle: a code the
+            # manual numbers, the garage code this whole column exists to make
+            # readable, a code in force that the manual has never numbered, and
+            # an assessor who left the field blank.
+            use_codes=[CODE_DWELLING, CODE_GARAGE, CODE_UNKNOWN, None, CODE_DWELLING],
         ),
         cadastre_layer(
             [
@@ -476,6 +524,31 @@ def write_quartiers(store, *, geometry=None, code=None):
     )
 
 
+def write_codebook(store, rows=CUBF_ROWS, *, edition: str = "2025"):
+    """The MEFQ list `assessment_units` looks its descriptions up in.
+
+    As `cubf_use_codes` writes it - the sheet's four columns plus the
+    provenance bronze stamps - so what is under test here is the same lookup
+    the real partition feeds, over the same column names.
+    """
+    write_frame(
+        pd.DataFrame(
+            {
+                "cubf": [code for code, _ in rows],
+                "scian": [None for _ in rows],
+                "description": [text for _, text in rows],
+                "remarque": [None for _ in rows],
+                "source_file": ["CUBF_MEFQ.xlsx" for _ in rows],
+                "source_sheet": ["LISTE NUMÉRIQUE" for _ in rows],
+                "mefq_edition": [edition for _ in rows],
+                "scrape_date": [DATE for _ in rows],
+                "scraped_at": ["2026-08-01T00:00:00+00:00" for _ in rows],
+            }
+        ),
+        join(store.partition_dir(cubf_use_codes.key.path[-1], DATE), CUBF_FILE),
+    )
+
+
 @pytest.fixture(autouse=True)
 def units_published(monkeypatch):
     """`silver.assessment_units` needs a database; the borough cut is recorded.
@@ -488,7 +561,7 @@ def units_published(monkeypatch):
     return stub_publish_by_neighborhood(monkeypatch, role_assets)
 
 
-def run_units(store, *, quartiers: bool = True):
+def run_units(store, *, quartiers: bool = True, codebook: bool = True):
     """Materialize `assessment_units`, over the boundary it cuts the roll on.
 
     The quartiers are written here rather than in every test because most of
@@ -496,6 +569,11 @@ def run_units(store, *, quartiers: bool = True):
     find a boundary fails before it merges anything. Only when there is none
     already, so a test that wants a different outline writes it first;
     ``quartiers=False`` is for the one that wants none at all.
+
+    The codebook is written on the same terms and for the same reason: the
+    asset now looks every unit's use code up in it, so a partition without one
+    fails before it merges anything. ``codebook=False`` is for the test that
+    wants that failure.
     """
     written = join(
         store.partition_dir(reference_neighborhoods.key.path[-1], DATE),
@@ -503,6 +581,11 @@ def run_units(store, *, quartiers: bool = True):
     )
     if quartiers and not Path(written).exists():
         write_quartiers(store)
+    listed = join(
+        store.partition_dir(cubf_use_codes.key.path[-1], DATE), CUBF_FILE
+    )
+    if codebook and not Path(listed).exists():
+        write_codebook(store)
     return materialize(
         [assessment_units],
         partition_key=DATE,
@@ -627,6 +710,113 @@ def test_silver_merges_the_two_layers_on_id_provinc(store, role):
     assert metadata["num_assessment_units"].value == 4
     assert metadata["num_points_unmatched"].value == 0
     assert metadata["total_assessed_value"].value == 1_800_000.0
+
+
+def described(store) -> pd.Series:
+    """The merged partition's use description, indexed by matricule."""
+    merged = gpd.read_parquet(
+        Path(store.partition_dir(assessment_units.key.path[-1], DATE))
+        / ASSESSMENT_UNITS_FILE
+    )
+    return merged.set_index("mat18")[USE_DESCRIPTION_COLUMN]
+
+
+def test_silver_gives_the_use_code_the_manuals_words(store, role):
+    """The whole point of the codebook: 4611 becomes a parking garage."""
+    run_roll(store)
+
+    result = run_units(store)
+
+    assert result.success
+    text = described(store)
+    assert text[U_PAIR_A] == "Logement"
+    assert (
+        text[U_PAIR_B] == "Garage de stationnement pour automobiles (infrastructure)"
+    )
+
+
+def test_silver_keeps_a_unit_whose_code_the_manual_does_not_number(store, role):
+    """A code in force before its edition lands is a null, not a lost property.
+
+    The roll and the MEFQ are amended on their own cadences, so this is an
+    ordinary state rather than an error - and the run has to *name* the code,
+    because "which one" is the only useful thing about it.
+    """
+    run_roll(store)
+
+    result = run_units(store)
+
+    text = described(store)
+    assert pd.isna(text[U_SPLIT])
+    # Still four units: the lookup is a left join and drops nothing.
+    assert len(text) == 4
+
+    metadata = materialization_metadata(result, assessment_units)
+    assert metadata["num_use_codes_not_in_the_manual"].value == 1
+    assert CODE_UNKNOWN in metadata["use_codes_not_in_the_manual"].value
+    # Three of the four units state a code at all; the condo's is blank.
+    assert metadata["num_units_with_a_use_code"].value == 3
+    assert metadata["num_units_described"].value == 2
+    assert metadata["mefq_edition"].value == "2025"
+
+
+def test_silver_describes_nothing_for_a_unit_the_assessor_left_blank(store, role):
+    """A null `rl0105a` is a property nobody classified, and stays one."""
+    run_roll(store)
+
+    run_units(store)
+
+    assert pd.isna(described(store)[U_CONDO])
+
+
+def test_silver_never_describes_a_unit_with_a_hierarchy_heading(store, role):
+    """The sheet's headings are not use codes, however code-shaped they look.
+
+    `100` is the *Logement* subgroup and `10` the rubric above it. A lookup
+    that left-padded either to four characters would hand a unit the name of a
+    heading, which reads exactly like a real answer.
+    """
+    run_roll(store)
+    write_codebook(store, rows=(("100", "Logement"), ("10", "LOGEMENT")))
+
+    run_units(store)
+
+    assert described(store).isna().all()
+
+
+def test_silver_names_the_codebook_to_materialize_when_it_is_missing(store, role):
+    run_roll(store)
+
+    with pytest.raises(Failure, match="cubf_use_codes"):
+        run_units(store, codebook=False)
+
+
+def test_silver_survives_a_roll_that_states_no_use_code_at_all(
+    store, tmp_path, monkeypatch
+):
+    """No `rl0105a` column is a warning and a null column, not a failure.
+
+    The consequence of an unclassifiable roll lands in
+    `lot_assessment_comparables`, which already counts the floor it could not
+    price; refusing the merge here would cost the partition instead.
+    """
+    archive = zipped_geopackage(
+        tmp_path / "src",
+        points_layer([(MONTREAL_CODE_MUN, U_PAIR_A, -73.60, 45.50)]),
+        units_layer([(MONTREAL_CODE_MUN, U_PAIR_A, 300_000.0)]),
+        cadastre_layer([(MONTREAL_CODE_MUN, U_PAIR_A, "1000001")]),
+    )
+    fetcher, _ = fetcher_for(tmp_path, archive)
+    monkeypatch.setattr(RoleResource, "fetcher", lambda self: fetcher)
+    run_roll(store)
+
+    result = run_units(store)
+
+    assert result.success
+    assert described(store).isna().all()
+    metadata = materialization_metadata(result, assessment_units)
+    assert metadata["num_units_with_a_use_code"].value == 0
+    assert metadata["num_use_codes_not_in_the_manual"].value == 0
 
 
 def test_silver_refuses_a_duplicated_unit(store, role):

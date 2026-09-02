@@ -189,7 +189,7 @@ the encoder they need.
 
 `dagster dev` is a single process running both the webserver and the daemon,
 which is fine on a laptop and wrong for a deployment: with no daemon, the two
-daily schedules never fire. [docker-compose.yml](../docker-compose.yml) splits
+monthly schedules never fire. [docker-compose.yml](../docker-compose.yml) splits
 them, which is also the shape that maps onto two ECS services:
 
 ```bash

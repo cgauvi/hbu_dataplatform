@@ -31,6 +31,7 @@ from urban_rag.cmhc_assets import (
     vacancy_rates,
 )
 from urban_rag.comparables_assets import lot_assessment_comparables
+from urban_rag.cubf_assets import cubf_use_codes
 from urban_rag.rent_assets import (
     commercial_rent_index,
     commercial_rents,
@@ -68,6 +69,7 @@ from urban_rag.resources import (
     BdoiResource,
     CmhcResource,
     CrspiResource,
+    CubfResource,
     EmbeddingModel,
     EstimatorResource,
     InfolotResource,
@@ -109,6 +111,7 @@ ASSETS = [
     montreal_residential_costs,
     montreal_nonresidential_costs,
     property_assessment_roll,
+    cubf_use_codes,
     uniformized_property_wealth,
     montreal_commercial_rents,
     commercial_rent_index,
@@ -227,9 +230,19 @@ neighborhood_streets_job = define_asset_job(
 # written, and a day whose points landed without their characteristics is a day
 # with a table nothing can read. The borough axis appears one asset later, in
 # lot_assessed_values.
+#
+# `cubf_use_codes` rides along for the same reason rather than getting a
+# schedule of its own. It is a 185 kB spreadsheet against the roll's 572 MB and
+# nothing about it is borough-shaped either, but it is a genuine input here and
+# not a companion: `assessment_units` looks the MEFQ's text onto every unit
+# from it, so a day whose codebook did not land is a day whose units carry a
+# use code and no words. Ordered ahead of the merge by the dependency, not by
+# this list.
 assessment_roll_job = define_asset_job(
     "assessment_roll_job",
-    selection=AssetSelection.assets(property_assessment_roll, assessment_units),
+    selection=AssetSelection.assets(
+        property_assessment_roll, cubf_use_codes, assessment_units
+    ),
     partitions_def=date_partitions,
 )
 
@@ -410,26 +423,37 @@ document_index_job = define_asset_job(
 )
 
 
+def _scrape_month(context: ScheduleEvaluationContext) -> str:
+    """The partition key a schedule tick belongs to.
+
+    `date_partitions` is monthly, so a key is always the first of its month.
+    The crons below happen to fire on the 1st, but that is a choice about when
+    to scrape rather than what makes the key valid - a tick on any other day
+    has to land on the same partition, and `.replace(day=1)` is what says so.
+    """
+    return context.scheduled_execution_time.replace(day=1).strftime("%Y-%m-%d")
+
+
 @schedule(
     job=catalog_job,
-    cron_schedule="0 4 * * *",
+    cron_schedule="0 4 1 * *",
     execution_timezone=TIMEZONE,
-    description="Refresh the table catalog for today's scrape date.",
+    description="Refresh the table catalog for this month's scrape date.",
 )
-def daily_catalog_schedule(context: ScheduleEvaluationContext) -> RunRequest:
-    scrape_date = context.scheduled_execution_time.strftime("%Y-%m-%d")
+def monthly_catalog_schedule(context: ScheduleEvaluationContext) -> RunRequest:
+    scrape_date = _scrape_month(context)
     return RunRequest(run_key=f"catalog-{scrape_date}", partition_key=scrape_date)
 
 
 @schedule(
     job=features_job,
     # Twenty minutes behind the catalog, which is its upstream input.
-    cron_schedule="20 4 * * *",
+    cron_schedule="20 4 1 * *",
     execution_timezone=TIMEZONE,
-    description="Snapshot every enabled neighborhood for today's scrape date.",
+    description="Snapshot every enabled neighborhood for this month's scrape date.",
 )
-def daily_features_schedule(context: ScheduleEvaluationContext):
-    scrape_date = context.scheduled_execution_time.strftime("%Y-%m-%d")
+def monthly_features_schedule(context: ScheduleEvaluationContext):
+    scrape_date = _scrape_month(context)
     for neighborhood in ENABLED_NEIGHBORHOODS:
         yield RunRequest(
             run_key=f"features-{neighborhood}-{scrape_date}",
@@ -443,14 +467,14 @@ def daily_features_schedule(context: ScheduleEvaluationContext):
     job=reference_neighborhoods_job,
     # Independent of the Spectrum assets, so it only avoids running at the
     # same minute as they do.
-    cron_schedule="40 4 * * *",
+    cron_schedule="40 4 1 * *",
     execution_timezone=TIMEZONE,
-    description="Snapshot the open-data reference neighborhoods for today.",
+    description="Snapshot the open-data reference neighborhoods for this month.",
 )
-def daily_reference_neighborhoods_schedule(
+def monthly_reference_neighborhoods_schedule(
     context: ScheduleEvaluationContext,
 ) -> RunRequest:
-    scrape_date = context.scheduled_execution_time.strftime("%Y-%m-%d")
+    scrape_date = _scrape_month(context)
     return RunRequest(
         run_key=f"reference-neighborhoods-{scrape_date}", partition_key=scrape_date
     )
@@ -460,12 +484,12 @@ def daily_reference_neighborhoods_schedule(
     # Alongside reference_neighborhoods and the CMHC surveys rather than behind
     # them: the geobase double has no upstream in this pipeline. One run for the
     # whole island; the boroughs are cut out of it an hour and a half later.
-    cron_schedule="50 4 * * *",
+    cron_schedule="50 4 1 * *",
     execution_timezone=TIMEZONE,
-    description="Snapshot the island-wide geobase double for today.",
+    description="Snapshot the island-wide geobase double for this month.",
 )
-def daily_street_network_schedule(context: ScheduleEvaluationContext) -> RunRequest:
-    scrape_date = context.scheduled_execution_time.strftime("%Y-%m-%d")
+def monthly_street_network_schedule(context: ScheduleEvaluationContext) -> RunRequest:
+    scrape_date = _scrape_month(context)
     return RunRequest(run_key=f"street-network-{scrape_date}", partition_key=scrape_date)
 
 
@@ -479,15 +503,15 @@ def daily_street_network_schedule(context: ScheduleEvaluationContext) -> RunRequ
     # the CMHC surveys. Kept at its own minute because the first run of a roll
     # year pulls 572 MB and unpacks 2.8 GB, and a run that long should not be
     # sharing a slot with the city's servers.
-    cron_schedule="52 4 * * *",
+    cron_schedule="52 4 1 * *",
     execution_timezone=TIMEZONE,
     description=(
-        "Snapshot the property assessment roll for today, merge it, and "
+        "Snapshot the property assessment roll for this month, merge it, and "
         "publish each borough's units."
     ),
 )
-def daily_assessment_roll_schedule(context: ScheduleEvaluationContext) -> RunRequest:
-    scrape_date = context.scheduled_execution_time.strftime("%Y-%m-%d")
+def monthly_assessment_roll_schedule(context: ScheduleEvaluationContext) -> RunRequest:
+    scrape_date = _scrape_month(context)
     return RunRequest(
         run_key=f"assessment-roll-{scrape_date}", partition_key=scrape_date
     )
@@ -505,12 +529,12 @@ def daily_assessment_roll_schedule(context: ScheduleEvaluationContext) -> RunReq
     # sql/013_silver_lot_assessed_values.sql carries no `-- requires:` header,
     # so it lands on the *first* `db.py init` - the same footing
     # `neighborhood_streets` and the CMHC pair are on.
-    cron_schedule="30 6 * * *",
+    cron_schedule="30 6 1 * *",
     execution_timezone=TIMEZONE,
-    description="Total today's assessment roll onto every enabled borough's lots.",
+    description="Total this month's assessment roll onto every enabled borough's lots.",
 )
-def daily_lot_assessed_values_schedule(context: ScheduleEvaluationContext):
-    scrape_date = context.scheduled_execution_time.strftime("%Y-%m-%d")
+def monthly_lot_assessed_values_schedule(context: ScheduleEvaluationContext):
+    scrape_date = _scrape_month(context)
     for neighborhood in ENABLED_NEIGHBORHOODS:
         yield RunRequest(
             run_key=f"lot-assessed-values-{neighborhood}-{scrape_date}",
@@ -524,14 +548,16 @@ def daily_lot_assessed_values_schedule(context: ScheduleEvaluationContext):
     job=commercial_rent_sources_job,
     # Alongside the other sources with no upstream here. Two PDFs and a 14 kB
     # table, so it costs nothing and can sit early.
-    cron_schedule="47 4 * * *",
+    cron_schedule="47 4 1 * *",
     execution_timezone=TIMEZONE,
-    description="Snapshot the MarketBeats and the commercial rent index for today.",
+    description=(
+        "Snapshot the MarketBeats and the commercial rent index for this month."
+    ),
 )
-def daily_commercial_rent_sources_schedule(
+def monthly_commercial_rent_sources_schedule(
     context: ScheduleEvaluationContext,
 ) -> RunRequest:
-    scrape_date = context.scheduled_execution_time.strftime("%Y-%m-%d")
+    scrape_date = _scrape_month(context)
     return RunRequest(
         run_key=f"commercial-rent-sources-{scrape_date}", partition_key=scrape_date
     )
@@ -542,12 +568,12 @@ def daily_commercial_rent_sources_schedule(
     # Behind the two snapshots above, and ahead of lot_assessment_comparables
     # at 40 6 which prices every square foot of commercial floor against what
     # this resolves.
-    cron_schedule="10 6 * * *",
+    cron_schedule="10 6 1 * *",
     execution_timezone=TIMEZONE,
     description="Resolve each borough's retail, office and industrial rent.",
 )
-def daily_commercial_rents_schedule(context: ScheduleEvaluationContext):
-    scrape_date = context.scheduled_execution_time.strftime("%Y-%m-%d")
+def monthly_commercial_rents_schedule(context: ScheduleEvaluationContext):
+    scrape_date = _scrape_month(context)
     for neighborhood in ENABLED_NEIGHBORHOODS:
         yield RunRequest(
             run_key=f"commercial-rents-{neighborhood}-{scrape_date}",
@@ -568,15 +594,15 @@ def daily_commercial_rents_schedule(context: ScheduleEvaluationContext):
     # sql/016_silver_lot_assessment_comparables.sql carries no `-- requires:`
     # header, so the table lands on the first `db.py init` rather than waiting
     # on a corpus the way sql/006 does.
-    cron_schedule="40 6 * * *",
+    cron_schedule="40 6 1 * *",
     execution_timezone=TIMEZONE,
     description=(
-        "Price today's roll onto every enabled borough's lots and find each "
+        "Price this month's roll onto every enabled borough's lots and find each "
         "lot's comparables."
     ),
 )
-def daily_lot_assessment_comparables_schedule(context: ScheduleEvaluationContext):
-    scrape_date = context.scheduled_execution_time.strftime("%Y-%m-%d")
+def monthly_lot_assessment_comparables_schedule(context: ScheduleEvaluationContext):
+    scrape_date = _scrape_month(context)
     for neighborhood in ENABLED_NEIGHBORHOODS:
         yield RunRequest(
             run_key=f"lot-comparables-{neighborhood}-{scrape_date}",
@@ -590,12 +616,12 @@ def daily_lot_assessment_comparables_schedule(context: ScheduleEvaluationContext
     job=lots_job,
     # An hour behind reference_neighborhoods, which supplies the borough
     # boundary each partition is cut with.
-    cron_schedule="40 5 * * *",
+    cron_schedule="40 5 1 * *",
     execution_timezone=TIMEZONE,
     description="Snapshot the cadastral lots of every enabled neighborhood.",
 )
-def daily_lots_schedule(context: ScheduleEvaluationContext):
-    scrape_date = context.scheduled_execution_time.strftime("%Y-%m-%d")
+def monthly_lots_schedule(context: ScheduleEvaluationContext):
+    scrape_date = _scrape_month(context)
     for neighborhood in ENABLED_NEIGHBORHOODS:
         yield RunRequest(
             run_key=f"lots-{neighborhood}-{scrape_date}",
@@ -609,12 +635,12 @@ def daily_lots_schedule(context: ScheduleEvaluationContext):
     job=buildings_job,
     # An hour behind reference_neighborhoods too, alongside neighborhood_lots
     # which shares the same borough-boundary dependency.
-    cron_schedule="50 5 * * *",
+    cron_schedule="50 5 1 * *",
     execution_timezone=TIMEZONE,
     description="Snapshot the BDOI building footprints of every enabled neighborhood.",
 )
-def daily_buildings_schedule(context: ScheduleEvaluationContext):
-    scrape_date = context.scheduled_execution_time.strftime("%Y-%m-%d")
+def monthly_buildings_schedule(context: ScheduleEvaluationContext):
+    scrape_date = _scrape_month(context)
     for neighborhood in ENABLED_NEIGHBORHOODS:
         yield RunRequest(
             run_key=f"buildings-{neighborhood}-{scrape_date}",
@@ -628,15 +654,15 @@ def daily_buildings_schedule(context: ScheduleEvaluationContext):
     job=building_lots_job,
     # An hour behind lots/buildings/features, which it depends on for the same
     # partition - long enough for all three to clear a borough's worth of rows.
-    cron_schedule="0 7 * * *",
+    cron_schedule="0 7 1 * *",
     execution_timezone=TIMEZONE,
     description=(
         "Recompute the building x lot and lot x feature joins for every "
         "enabled neighborhood."
     ),
 )
-def daily_building_lots_schedule(context: ScheduleEvaluationContext):
-    scrape_date = context.scheduled_execution_time.strftime("%Y-%m-%d")
+def monthly_building_lots_schedule(context: ScheduleEvaluationContext):
+    scrape_date = _scrape_month(context)
     for neighborhood in ENABLED_NEIGHBORHOODS:
         yield RunRequest(
             run_key=f"building-lots-{neighborhood}-{scrape_date}",
@@ -651,12 +677,12 @@ def daily_building_lots_schedule(context: ScheduleEvaluationContext):
     # Alongside reference_neighborhoods rather than behind it: the surveys have
     # no upstream in this pipeline. One run for both, and one for the whole
     # island - the boroughs are cut out of the result an hour later.
-    cron_schedule="45 4 * * *",
+    cron_schedule="45 4 1 * *",
     execution_timezone=TIMEZONE,
-    description="Snapshot both CMHC surveys for today's scrape date.",
+    description="Snapshot both CMHC surveys for this month's scrape date.",
 )
-def daily_cmhc_survey_schedule(context: ScheduleEvaluationContext) -> RunRequest:
-    scrape_date = context.scheduled_execution_time.strftime("%Y-%m-%d")
+def monthly_cmhc_survey_schedule(context: ScheduleEvaluationContext) -> RunRequest:
+    scrape_date = _scrape_month(context)
     return RunRequest(run_key=f"cmhc-survey-{scrape_date}", partition_key=scrape_date)
 
 
@@ -667,12 +693,14 @@ def daily_cmhc_survey_schedule(context: ScheduleEvaluationContext) -> RunRequest
     # axis to wait for one. Kept at its own minute so a publisher that has
     # moved the file fails one small run rather than sharing a run with the
     # city's servers.
-    cron_schedule="47 4 * * *",
+    cron_schedule="47 4 1 * *",
     execution_timezone=TIMEZONE,
-    description="Snapshot the Montreal construction cost rates for today.",
+    description="Snapshot the Montreal construction cost rates for this month.",
 )
-def daily_construction_costs_schedule(context: ScheduleEvaluationContext) -> RunRequest:
-    scrape_date = context.scheduled_execution_time.strftime("%Y-%m-%d")
+def monthly_construction_costs_schedule(
+    context: ScheduleEvaluationContext,
+) -> RunRequest:
+    scrape_date = _scrape_month(context)
     return RunRequest(
         run_key=f"construction-costs-{scrape_date}", partition_key=scrape_date
     )
@@ -684,14 +712,14 @@ def daily_construction_costs_schedule(context: ScheduleEvaluationContext) -> Run
     # order: this is a 275 kB CSV against the roll's 572 MB, so a day on which
     # both are due gets the cheap one out of the way first, and a morning where
     # the big download stalls still has the factor for that date.
-    cron_schedule="45 4 * * *",
+    cron_schedule="45 4 1 * *",
     execution_timezone=TIMEZONE,
     description="Snapshot the RFU, and with it the year's facteur comparatif.",
 )
-def daily_uniformized_property_wealth_schedule(
+def monthly_uniformized_property_wealth_schedule(
     context: ScheduleEvaluationContext,
 ) -> RunRequest:
-    scrape_date = context.scheduled_execution_time.strftime("%Y-%m-%d")
+    scrape_date = _scrape_month(context)
     return RunRequest(
         run_key=f"uniformized-property-wealth-{scrape_date}",
         partition_key=scrape_date,
@@ -702,12 +730,12 @@ def daily_uniformized_property_wealth_schedule(
     job=vacancy_rates_job,
     # Behind cmhc_survey_job, which is now its upstream: the crosswalk is
     # applied to that day's snapshot rather than to a fresh download.
-    cron_schedule="55 5 * * *",
+    cron_schedule="55 5 1 * *",
     execution_timezone=TIMEZONE,
-    description="Cut today's CMHC vacancy survey into every enabled borough.",
+    description="Cut this month's CMHC vacancy survey into every enabled borough.",
 )
-def daily_vacancy_rates_schedule(context: ScheduleEvaluationContext):
-    scrape_date = context.scheduled_execution_time.strftime("%Y-%m-%d")
+def monthly_vacancy_rates_schedule(context: ScheduleEvaluationContext):
+    scrape_date = _scrape_month(context)
     for neighborhood in ENABLED_NEIGHBORHOODS:
         yield RunRequest(
             run_key=f"vacancy-rates-{neighborhood}-{scrape_date}",
@@ -721,12 +749,12 @@ def daily_vacancy_rates_schedule(context: ScheduleEvaluationContext):
     job=average_rents_job,
     # Same upstream, kept at a different minute so one borough's crosswalk
     # failure is one small run at a time.
-    cron_schedule="58 5 * * *",
+    cron_schedule="58 5 1 * *",
     execution_timezone=TIMEZONE,
-    description="Cut today's CMHC rent survey into every enabled borough.",
+    description="Cut this month's CMHC rent survey into every enabled borough.",
 )
-def daily_average_rents_schedule(context: ScheduleEvaluationContext):
-    scrape_date = context.scheduled_execution_time.strftime("%Y-%m-%d")
+def monthly_average_rents_schedule(context: ScheduleEvaluationContext):
+    scrape_date = _scrape_month(context)
     for neighborhood in ENABLED_NEIGHBORHOODS:
         yield RunRequest(
             run_key=f"average-rents-{neighborhood}-{scrape_date}",
@@ -740,14 +768,14 @@ def daily_average_rents_schedule(context: ScheduleEvaluationContext):
     job=neighborhood_streets_job,
     # After street_network (50 4) and reference_neighborhoods (40 4), which
     # supply the island-wide layer and the boundary it is cut with. Ahead of
-    # daily_building_lots_schedule rather than behind the cadastre: the two
+    # monthly_building_lots_schedule rather than behind the cadastre: the two
     # share no input.
-    cron_schedule="20 6 * * *",
+    cron_schedule="20 6 1 * *",
     execution_timezone=TIMEZONE,
-    description="Cut today's geobase double into every enabled borough.",
+    description="Cut this month's geobase double into every enabled borough.",
 )
-def daily_neighborhood_streets_schedule(context: ScheduleEvaluationContext):
-    scrape_date = context.scheduled_execution_time.strftime("%Y-%m-%d")
+def monthly_neighborhood_streets_schedule(context: ScheduleEvaluationContext):
+    scrape_date = _scrape_month(context)
     for neighborhood in ENABLED_NEIGHBORHOODS:
         yield RunRequest(
             run_key=f"neighborhood-streets-{neighborhood}-{scrape_date}",
@@ -775,7 +803,7 @@ def daily_neighborhood_streets_schedule(context: ScheduleEvaluationContext):
 # outstanding is `db.py init` against the target database. It is registered and
 # has a job, so it appears in the lineage and can be run by hand the moment the
 # table lands - see `lot_frontage_job` and `make frontage`. Add the schedule
-# then, at 30 7, behind daily_building_lots_schedule which loads the cadastre
+# then, at 30 7, behind monthly_building_lots_schedule which loads the cadastre
 # it reads.
 
 # No schedule for `lot_buildable_setbacks` either, and for the same reason as
@@ -870,24 +898,24 @@ defs = Definitions(
         document_index_job,
     ],
     schedules=[
-        daily_catalog_schedule,
-        daily_features_schedule,
-        daily_reference_neighborhoods_schedule,
-        daily_street_network_schedule,
-        daily_assessment_roll_schedule,
-        daily_lot_assessed_values_schedule,
-        daily_lot_assessment_comparables_schedule,
-        daily_commercial_rent_sources_schedule,
-        daily_commercial_rents_schedule,
-        daily_lots_schedule,
-        daily_buildings_schedule,
-        daily_building_lots_schedule,
-        daily_cmhc_survey_schedule,
-        daily_construction_costs_schedule,
-        daily_uniformized_property_wealth_schedule,
-        daily_vacancy_rates_schedule,
-        daily_average_rents_schedule,
-        daily_neighborhood_streets_schedule,
+        monthly_catalog_schedule,
+        monthly_features_schedule,
+        monthly_reference_neighborhoods_schedule,
+        monthly_street_network_schedule,
+        monthly_assessment_roll_schedule,
+        monthly_lot_assessed_values_schedule,
+        monthly_lot_assessment_comparables_schedule,
+        monthly_commercial_rent_sources_schedule,
+        monthly_commercial_rents_schedule,
+        monthly_lots_schedule,
+        monthly_buildings_schedule,
+        monthly_building_lots_schedule,
+        monthly_cmhc_survey_schedule,
+        monthly_construction_costs_schedule,
+        monthly_uniformized_property_wealth_schedule,
+        monthly_vacancy_rates_schedule,
+        monthly_average_rents_schedule,
+        monthly_neighborhood_streets_schedule,
     ],
     resources={
         "spectrum": SpectrumResource(),
@@ -932,6 +960,12 @@ defs = Definitions(
             # tree, and always local.
             cache_dir=str(DATA_ROOT / "cache" / "cmhc"),
         ),
+        # No cache_dir, unlike "role" below it, and the contrast is the
+        # point: a roll year is final and this is not. The codebook is
+        # 185 kB at a URL with no year in it, reissued whenever the
+        # manual is amended, so every scrape date reads it again - the
+        # rule "estimator" and "crspi" already follow.
+        "cubf": CubfResource(),
         "role": RoleResource(
             # Same posture again, and by far the largest of these caches: a
             # published roll year is final, so the 572 MB archive and the

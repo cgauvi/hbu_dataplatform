@@ -37,7 +37,7 @@ from urban_rag.storage import join
 
 from asset_helpers import materialization_metadata
 
-DATE = "2026-08-20"
+DATE = "2026-08-01"
 LAST_MODIFIED = "Fri, 08 May 2026 02:14:08 GMT"
 
 #: A trimmed `data/building-types.js`: three cities, and one or two types per
@@ -388,5 +388,5 @@ def test_a_rerun_replaces_the_partition_rather_than_adding_to_it(store, estimato
 def test_a_restructured_publication_fails_the_partition(store):
     broken = StubEstimator(body="const NOTHING = [];")
 
-    with pytest.raises(Failure, match=r"Cost guide read for 2026-08-20 failed"):
+    with pytest.raises(Failure, match=r"Cost guide read for 2026-08-01 failed"):
         run(montreal_residential_costs, store, broken)

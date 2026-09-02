@@ -256,6 +256,10 @@ TABLES: dict[str, Table] = {
         source="sql/014_silver_assessment_units.sql",
         columns={
             "use_code": "rl0105a",
+            # No entry needed for `use_description` beside it: that column is
+            # not the roll's, it is the MEFQ codebook's text looked up onto the
+            # unit by `role_assets`, and it already arrives under the name the
+            # table gives it.
             "frontage_m": "rl0301a",
             "land_area_m2": "rl0302a",
             "num_storeys": "rl0306a",
@@ -438,7 +442,9 @@ def upsert_frame(
     table = table_for(dataset)
     cursor = connection.cursor()
     require_table(cursor, table)
-    ensure_partition(cursor, table, neighborhood=neighborhood, scrape_date=scrape_date)
+    leaf = ensure_partition(
+        cursor, table, neighborhood=neighborhood, scrape_date=scrape_date
+    )
 
     target = _target_columns(cursor, table)
     staging = _create_staging(cursor, table)
@@ -464,6 +470,7 @@ def upsert_frame(
             neighborhood=neighborhood,
             scrape_date=scrape_date,
             prune=prune,
+            leaf=leaf,
         ),
     )
 
@@ -493,7 +500,9 @@ def upsert_select(
     """
     table = table_for(dataset)
     require_table(cursor, table)
-    ensure_partition(cursor, table, neighborhood=neighborhood, scrape_date=scrape_date)
+    leaf = ensure_partition(
+        cursor, table, neighborhood=neighborhood, scrape_date=scrape_date
+    )
 
     staging = _create_staging(cursor, table)
     _require_key_columns(table, columns)
@@ -509,6 +518,7 @@ def upsert_select(
             neighborhood=neighborhood,
             scrape_date=scrape_date,
             prune=prune,
+            leaf=leaf,
         ),
     )
 
@@ -647,17 +657,24 @@ def _require_key_columns(
 
 def ensure_partition(
     cursor: "Cursor", table: Table, *, neighborhood: str, scrape_date: str
-) -> None:
+) -> str:
     """Create this partition's leaf, if the borough or the month is new.
 
     Cheap enough to call on every load - it is two catalog lookups when the
     leaf is already there - and the alternative is a partition set an operator
     has to remember to extend before each new month.
+
+    Returns the leaf's qualified name, which hbu_infra's function has always
+    handed back and this module used to discard. `_analyze` needs it: what a
+    load has to leave behind is fresh statistics on the *leaf* it wrote, and
+    ANALYZE on the parent walks every borough-month the table has ever held.
     """
     cursor.execute(
         "SELECT warehouse.ensure_partition(%s::regclass, %s, %s::date)",
         [table.qualified, neighborhood, scrape_date],
     )
+    row = cursor.fetchone()
+    return row[0] if row else table.qualified
 
 
 def conflict_clause(table: Table, columns: Iterable[str]) -> str:
@@ -686,6 +703,35 @@ def conflict_clause(table: Table, columns: Iterable[str]) -> str:
 # --------------------------------------------------------------------------
 
 
+def _analyze(cursor: "Cursor", leaf: str) -> None:
+    """Refresh the planner's statistics for the partition just written.
+
+    A load replaces most of a leaf's rows, which leaves the statistics
+    describing whatever was there before it. Autovacuum gets to it eventually;
+    "eventually" is the problem, because the window between a load finishing
+    and the stats catching up is exactly when someone opens the map to look at
+    what was loaded.
+
+    What goes wrong in that window is specific and worth naming, because it
+    does not look like a statistics problem. hbu_rag_map draws its layers as
+    vector tiles, which is one query per tile and several dozen per pan, each
+    of them a GiST lookup narrowed by `(neighborhood, scrape_date)`. Handed
+    stale counts the planner mis-estimates that filter's selectivity, drops
+    the index scan for a sequential one, and every tile becomes a scan of the
+    borough. The map does not fail - it just stops answering, on precisely the
+    partition that was most recently loaded.
+
+    The leaf rather than the parent: ANALYZE on a partitioned table walks every
+    partition under it, which for a table with a year of boroughs is most of
+    the load's runtime again for statistics nobody's query needed refreshed.
+
+    Runs in the caller's transaction, which ANALYZE permits - unlike VACUUM -
+    and takes only a ShareUpdateExclusiveLock, so it blocks other maintenance
+    and no reader. A rolled-back load rolls back its statistics with it.
+    """
+    cursor.execute(f"ANALYZE {leaf}")
+
+
 def _merge(
     cursor: "Cursor",
     table: Table,
@@ -695,6 +741,7 @@ def _merge(
     neighborhood: str,
     scrape_date: str,
     prune: bool,
+    leaf: str | None = None,
 ) -> dict[str, int]:
     """Upsert ``staging`` into ``table``, then drop what it no longer holds.
 
@@ -734,6 +781,9 @@ def _merge(
             [neighborhood, scrape_date],
         )
         pruned = max(cursor.rowcount, 0)
+
+    if leaf:
+        _analyze(cursor, leaf)
 
     return {"upserted": upserted, "pruned": pruned}
 

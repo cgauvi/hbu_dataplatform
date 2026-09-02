@@ -133,16 +133,26 @@ square foot falls as dwellings get larger while construction cost per square
 foot does not, so a binding envelope now fills with the class that earns most
 per square metre rather than the class that is simply biggest.
 
-**Dwellings are not the only thing a column authorises.** A column headed
+**Dwellings are not the only thing a zone authorises.** A column headed
 ``H.2, C.2`` permits commerce beside the housing and one headed ``I.1``
 permits industry instead of it, so the envelope those columns describe can be
 filled with more than one kind of space. `commercial_floors` and
 `industrial_floors` are storeys of that space - whole plates, like the parking
 storeys and for the same "one footprint, identical floors" reason - and they
 compete with the dwellings for the storeys *En etage* allows and for the floor
-area *Densite* allows. They exist only where the column's own usage codes
-authorise them, so a pure ``H`` column solves exactly the problem it solved
-before.
+area *Densite* allows.
+
+**And a zone states its usages across columns, not within one.** Most boroughs
+print one usage family per column - all 1 463 parsed columns of
+Villeray-Saint-Michel-Parc-Extension carry exactly one code - so a zone
+permitting housing and commerce says so in two columns, and reading a column
+at a time can only ever describe a pure building. `ZoneEnvelope` is the whole
+zone as one rule-set, and `solve_program` takes one: the usage floor area is
+split by the model rather than fixed by which column it was handed. Each
+column's norms bind only while the family it heads is built, so the pure
+programs remain feasible points of the same model and a mixed answer is
+returned exactly when it is worth more. A single `ZoneColumn` is still
+accepted, wrapped by `ZoneEnvelope.single`, and solves what it always did.
 
 Non-residential space is priced and rented **per square foot**, which is the
 one place its arithmetic differs from a dwelling's: CMHC surveys a rent per
@@ -479,7 +489,80 @@ _RESIDENTIAL_USAGE = re.compile(r"^H(?:\.\d+[A-Za-z]?)?$")
 #: would put a number on a decision nobody in this pipeline is making.
 _COMMERCIAL_USAGE = re.compile(r"^C(?:\.\d+[A-Za-z]?)?$")
 _INDUSTRIAL_USAGE = re.compile(r"^I(?:\.\d+[A-Za-z]?)?$")
+
+#: And the family none of the three above matches: ``E``/``E.1``..``E.7`` for
+#: *Equipements collectifs et institutionnels*. Written out beside them because
+#: "not priced" and "not read" are two different things to say about a column,
+#: and `is_equipment_usage` is what lets `urban_rag.hbu` say the first.
+_EQUIPMENT_USAGE = re.compile(r"^E(?:\.\d+[A-Za-z]?)?$")
 _FOOTNOTE = re.compile(r"\(\s*\d+\s*\)")
+
+#: The most dwellings each *Habitation* class may hold, from by-law 01-283's
+#: own definition of the classes. ``None`` is "no ceiling in the code".
+#:
+#: **The class is a norm, not a label.** A grid states *Nombre de logements
+#: maximal* only where the class leaves room to choose - H.4 spans four to
+#: eight dwellings, so the grid must say which - and leaves the row blank
+#: where the code has already fixed the number (H.1, H.2 and H.3 are the
+#: single, the duplex and the triplex) or left it open above (H.7). Reading
+#: only the printed row therefore loses the ceiling entirely on the classes
+#: that are *most* tightly bound: in Villeray-Saint-Michel-Parc-Extension it
+#: is blank on all 498 columns headed H.1, H.2 or H.3, and the solver was
+#: filling a duplex envelope with whatever the storeys and the site coverage
+#: allowed - about thirteen dwellings on a 500 m2 lot where the code permits
+#: two.
+#:
+#: The published grids corroborate the ranges rather than merely agreeing
+#: with them: every printed value falls inside its class - H.4 prints 4, 5,
+#: 6 and 8; H.5 prints 12; H.6 prints 36 - and the row is blank in exactly
+#: the two cases where printing it would add nothing.
+#:
+#: Bare ``H`` carries no class and so no ceiling: it is the whole category,
+#: and `class_max_dwellings` returns ``None`` for it rather than guessing at
+#: the most restrictive member.
+RESIDENTIAL_CLASS_MAX_DWELLINGS: Mapping[str, int | None] = {
+    "H.1": 1,
+    "H.2": 2,
+    "H.3": 3,
+    "H.4": 8,
+    "H.5": 12,
+    "H.6": 36,
+    "H.7": None,
+}
+
+#: The class part of a usage code, ignoring the optional trailing letter that
+#: distinguishes two grids' readings of one class (``H.7A``). Matched after
+#: `_normalise_usage` has taken the footnote marker off.
+_RESIDENTIAL_CLASS = re.compile(r"^(H\.\d+)[A-Za-z]?$")
+
+
+def class_max_dwellings(usages: Iterable[str]) -> int | None:
+    """The dwelling ceiling ``usages`` imply, or ``None`` where they imply none.
+
+    The **most permissive** of the classes present, because a column headed
+    ``H.2, H.4`` authorises both and a building may be either: taking the
+    minimum would forbid the four-plex the ``H.4`` at its head allows. One
+    unclassed code - bare ``H``, or a class this mapping does not carry -
+    lifts the ceiling for the same reason, since it authorises a category
+    whose own bound is not stated here.
+
+    Non-residential codes are ignored rather than rejected, so a mixed
+    column's ``C.4`` neither contributes a ceiling nor removes one.
+    """
+    caps: list[int] = []
+    for usage in usages:
+        normalised = _normalise_usage(usage)
+        if not is_residential_usage(normalised):
+            continue
+        match = _RESIDENTIAL_CLASS.match(normalised)
+        if match is None or match.group(1) not in RESIDENTIAL_CLASS_MAX_DWELLINGS:
+            # Bare `H`, or a class the by-law numbers and this table does not.
+            return None
+        cap = RESIDENTIAL_CLASS_MAX_DWELLINGS[match.group(1)]
+        if cap is None:
+            return None
+        caps.append(cap)
+    return max(caps) if caps else None
 
 
 class ProgramError(ValueError):
@@ -618,6 +701,18 @@ def is_industrial_usage(usage: str) -> bool:
     return bool(_INDUSTRIAL_USAGE.match(_normalise_usage(usage)))
 
 
+def is_equipment_usage(usage: str) -> bool:
+    """Whether ``usage`` is one of the *Équipements collectifs* classes.
+
+    The one family this module deliberately does not price, and the only one
+    whose matcher exists to *recognise* rather than to authorise: nothing here
+    reads it, and `urban_rag.hbu` calls it to tell a park from a grid whose
+    usage row it simply could not read. Anchored like the three above, so the
+    ``E`` of ``E.4(1)`` is a code and the ``E`` of a word is not.
+    """
+    return bool(_EQUIPMENT_USAGE.match(_normalise_usage(usage)))
+
+
 def _normalise_usage(usage: str) -> str:
     """A usage code with its footnote marker and its whitespace taken off."""
     return _FOOTNOTE.sub("", usage).strip()
@@ -744,6 +839,34 @@ class ZoneColumn:
     def residential_floors(self) -> int:
         """Storeys this column's usage may occupy."""
         return self.permitted_floors_count
+
+    @property
+    def class_max_dwellings(self) -> int | None:
+        """The dwelling ceiling this column's *usage codes* imply.
+
+        `RESIDENTIAL_CLASS_MAX_DWELLINGS` is where the numbers are and why
+        they are a norm rather than a naming convention.
+        """
+        return class_max_dwellings(self.usages)
+
+    @property
+    def effective_max_dwellings(self) -> int | None:
+        """The dwelling ceiling that actually binds: printed **and** class.
+
+        The grid's *Nombre de logements maximal* and the ceiling the class
+        carries are two statements of one norm, and a building answers to
+        both - so this is the smaller of the two, or whichever exists alone,
+        or ``None`` where neither does. `max_dwellings` stays exactly what
+        the grid printed, because a table that reports the norms should
+        report the one on the page.
+        """
+        printed = self.max_dwellings
+        implied = self.class_max_dwellings
+        if printed is None:
+            return implied
+        if implied is None:
+            return printed
+        return min(printed, implied)
 
 
 @dataclass(frozen=True)
@@ -1472,6 +1595,152 @@ class DevelopmentProgram:
         return self.status in ("OPTIMAL", "FEASIBLE")
 
 
+#: What a storey of the reported stack is filled with, ground upwards. Not an
+#: order the solver chose - `solve_program` counts storeys by type and never
+#: places one, because the grid it reads never says which usage belongs on
+#: which level (see `ZoneColumn.permitted_floors_count`). This is the stacking
+#: a reader assumes when nothing says otherwise: commerce at grade where there
+#: is any, industry behind it, the parking deck as a podium over both, and the
+#: housing on top of the lot. Changing it changes a drawing, never a number.
+FLOOR_STACK_ORDER: tuple[str, ...] = (
+    "commercial",
+    "industrial",
+    "parking",
+    "residential",
+)
+
+#: How many decimals the metres and square metres of a stack are reported to.
+#: The stack is a restatement of columns that are already on the row, so it is
+#: rounded to something a person can read; the unrounded figures are the
+#: columns themselves.
+_STACK_PRECISION = 2
+
+
+def floor_stack(
+    program: DevelopmentProgram,
+    *,
+    heights: StoreyHeights = DEFAULT_STOREY_HEIGHTS,
+) -> list[dict]:
+    """What stands on each storey, as runs of identical ones, bottom upwards.
+
+    `DevelopmentProgram` answers in totals - five residential storeys, one of
+    commerce, two levels dug - and the question a reader actually has of a
+    proposed building is what is on floor three. This is that, and it is a
+    *view* of the program rather than anything new: every number here is a
+    column beside it, re-cut by storey.
+
+    **Runs, not storeys.** One entry per run of identical levels rather than
+    one per level, which is the module docstring's "one footprint, identical
+    floors" arriving at its conclusion: every plate of a given use is the same
+    plate, so a use is a single run however tall it is, and a fifteen-storey
+    tower over retail and a deck is four entries and not fifteen. An entry
+    spans ``from_level`` to ``to_level`` inclusive and says how many
+    ``floors`` that is.
+
+    **Levels are numbered from grade.** Level 1 is the *rez-de-chaussée* and
+    there is no level 0; the dug levels are -1 downwards, so a building with
+    two of them starts at -2. That sign is also the one distinction the
+    by-law makes: a below-grade level is not *superficie de plancher* (article
+    38 1°) and is not measured from grade up, so ``counts_as_floor_area`` is
+    false there and ``storey_height_m`` is `UNDERGROUND_LEVEL_HEIGHT_M` - the
+    zero `StoreyHeights` documents rather than an omission.
+
+    **The order is a reporting convention and nothing more.**
+    `FLOOR_STACK_ORDER` is where it is written down and why it carries no
+    weight: the *Niveaux de bâtiment autorisés* block is marked per column and
+    not per usage, so the solver is free to put any of a column's usages on
+    any storey it allows and never records which. Two programs with the same
+    counts stack the same way here whatever an architect would do with them.
+
+    **Every entry has every key**, so ``jsonb_array_elements`` over a column of
+    these needs no branch: ``stalls`` is 0 on a floor that parks nothing,
+    ``dwellings`` is 0 and ``units`` is empty on a floor that houses nobody.
+    The dwelling mix sits on the residential run whole rather than divided by
+    its storeys - the solver chose a mix for the building, not for a plate,
+    and splitting it would be inventing the part it did not choose.
+
+    Areas and heights are rounded to `_STACK_PRECISION`; the unrounded figures
+    are `gross_floor_area_m2`, `underground_area_m2` and `height_m` on the
+    program itself.
+    """
+    plate = program.footprint_m2
+    stack: list[dict] = []
+
+    def run(
+        use: str,
+        *,
+        position: str,
+        first: int,
+        floors: int,
+        storey_height_m: float,
+        counts_as_floor_area: bool,
+        stalls: int = 0,
+        dwellings: int = 0,
+        units: Mapping[str, int] | None = None,
+    ) -> dict:
+        return {
+            "use": use,
+            "position": position,
+            "from_level": first,
+            "to_level": first + floors - 1,
+            "floors": floors,
+            "floor_plate_m2": round(plate, _STACK_PRECISION),
+            "floor_area_m2": round(plate * floors, _STACK_PRECISION),
+            "counts_as_floor_area": counts_as_floor_area,
+            "storey_height_m": round(storey_height_m, _STACK_PRECISION),
+            "height_m": round(storey_height_m * floors, _STACK_PRECISION),
+            "stalls": stalls,
+            "dwellings": dwellings,
+            "units": dict(units or {}),
+        }
+
+    if program.underground_levels > 0:
+        stack.append(
+            run(
+                "parking",
+                position="below_grade",
+                first=-program.underground_levels,
+                floors=program.underground_levels,
+                storey_height_m=UNDERGROUND_LEVEL_HEIGHT_M,
+                counts_as_floor_area=False,
+                stalls=program.underground_stalls,
+            )
+        )
+
+    above: dict[str, tuple[int, float, dict]] = {
+        "commercial": (program.commercial_floors, heights.commercial_m, {}),
+        "industrial": (program.industrial_floors, heights.industrial_m, {}),
+        "parking": (
+            program.above_grade_parking_floors,
+            heights.above_grade_parking_m,
+            {"stalls": program.above_grade_stalls},
+        ),
+        "residential": (
+            program.residential_floors,
+            heights.residential_m,
+            {"dwellings": program.total_dwellings, "units": program.units},
+        ),
+    }
+    level = 1
+    for use in FLOOR_STACK_ORDER:
+        floors, storey_height_m, extra = above[use]
+        if floors <= 0:
+            continue
+        stack.append(
+            run(
+                use,
+                position="above_grade",
+                first=level,
+                floors=floors,
+                storey_height_m=storey_height_m,
+                counts_as_floor_area=True,
+                **extra,
+            )
+        )
+        level += floors
+    return stack
+
+
 def select_governing_column(
     columns: Sequence[ZoneColumn],
     frontage_m: float,
@@ -1540,8 +1809,206 @@ def select_industrial_column(
     )
 
 
+@dataclass(frozen=True)
+class ZoneEnvelope:
+    """Every column governing one lot, as the single rule-set a building answers to.
+
+    **Why this exists.** A grid states one usage family per column in most
+    boroughs - in Villeray-Saint-Michel-Parc-Extension, every one of the 1 463
+    parsed columns carries exactly one code - so "this zone allows housing and
+    commerce" is printed as two columns and never as one. Solving each column
+    on its own and keeping the better answer therefore cannot propose the
+    building the zone actually permits: retail at grade with dwellings above
+    is a *mix*, and a mix is not the maximum of two pure programs. This is the
+    object that lets one model hold all three families at once, with the floor
+    area split between them a decision rather than a choice made in advance.
+
+    **Which norms bind a mixed building.** Each family's governing column is
+    the grid's own pick for that family (`select_governing_column`, on
+    *Largeur du terrain min*), and its norms bind the whole building **when
+    that family is actually built**. A building of housing and commerce
+    answers to the intersection of the H column's caps and the C column's; one
+    of commerce alone answers to the C column's only. That is what makes the
+    single-family programs feasible points of this same model rather than
+    separate solves - `solve_program` never has to be asked twice - and it is
+    the conservative reading where two columns disagree: a mixed building is
+    held to the stricter of the two, never the looser.
+
+    The properties below are the **loosest** bound across the families present,
+    and they exist to size CP-SAT's variable domains, which need only contain
+    every feasible point. The binding caps are the per-family ones, applied
+    inside `solve_program` conditionally on the family being used. Reading a
+    property here as "the norm" would be a mistake: `floors_max` is the tallest
+    any single family may stand, not the tallest the building may.
+    """
+
+    #: The governing column of each family, absent where the grid authorises
+    #: that family nowhere on this lot - or where every column stating it
+    #: demands more frontage than the lot has.
+    residential: ZoneColumn | None = None
+    commercial: ZoneColumn | None = None
+    industrial: ZoneColumn | None = None
+
+    @classmethod
+    def of(
+        cls, columns: Sequence[ZoneColumn], frontage_m: float
+    ) -> ZoneEnvelope:
+        """The envelope a lot of this width gets from a zone's columns.
+
+        One `select_governing_column` pass per family, which is the same rule
+        `envelope_assets` writes its `governs_*` flags with - so the envelope
+        assembled here is the one those flags already mark.
+        """
+        return cls(
+            residential=select_residential_column(columns, frontage_m),
+            commercial=select_commercial_column(columns, frontage_m),
+            industrial=select_industrial_column(columns, frontage_m),
+        )
+
+    @classmethod
+    def single(cls, column: ZoneColumn) -> ZoneEnvelope:
+        """One column as an envelope, governing whichever families it heads.
+
+        The bridge for every caller that has a column rather than a zone -
+        `solve_program` accepts either, and a pure ``H`` column wrapped here
+        produces exactly the model it produced before this class existed.
+        """
+        return cls(
+            residential=column if column.permits_residential else None,
+            commercial=column if column.permits_commercial else None,
+            industrial=column if column.permits_industrial else None,
+        )
+
+    @property
+    def columns(self) -> tuple[ZoneColumn, ...]:
+        """The distinct governing columns, in family order.
+
+        Identity, not equality: two columns of one grid can state identical
+        norms, and a zone that governs its housing and its commerce with two
+        such columns still has two of them.
+        """
+        seen: list[ZoneColumn] = []
+        for column in (self.residential, self.commercial, self.industrial):
+            if column is not None and not any(column is other for other in seen):
+                seen.append(column)
+        return tuple(seen)
+
+    @property
+    def permits_residential(self) -> bool:
+        return self.residential is not None
+
+    @property
+    def permits_commercial(self) -> bool:
+        return self.commercial is not None
+
+    @property
+    def permits_industrial(self) -> bool:
+        return self.industrial is not None
+
+    @property
+    def is_empty(self) -> bool:
+        """Whether the grid authorises none of the three families here."""
+        return not self.columns
+
+    @property
+    def zone(self) -> str | None:
+        """The zone these columns belong to, carried for reporting."""
+        for column in self.columns:
+            if column.zone is not None:
+                return column.zone
+        return None
+
+    @property
+    def usages(self) -> tuple[str, ...]:
+        """Every usage code the governing columns carry, deduplicated."""
+        codes: list[str] = []
+        for column in self.columns:
+            for usage in column.usages:
+                if usage not in codes:
+                    codes.append(usage)
+        return tuple(codes)
+
+    # -- domain bounds -----------------------------------------------------
+    # The loosest norm across the governing columns. Domains, not caps: see
+    # the class docstring.
+
+    @property
+    def floors_max(self) -> int:
+        return max((column.floors_max for column in self.columns), default=0)
+
+    @property
+    def floors_min(self) -> int:
+        return min((column.floors_min for column in self.columns), default=0)
+
+    @property
+    def permitted_floors_count(self) -> int:
+        return max(
+            (column.permitted_floors_count for column in self.columns), default=0
+        )
+
+    @property
+    def height_max_m(self) -> float | None:
+        return _loosest_max(column.height_max_m for column in self.columns)
+
+    @property
+    def height_min_m(self) -> float | None:
+        return _loosest_min(column.height_min_m for column in self.columns)
+
+    @property
+    def density_max(self) -> float | None:
+        return _loosest_max(column.density_max for column in self.columns)
+
+    @property
+    def density_min(self) -> float | None:
+        return _loosest_min(column.density_min for column in self.columns)
+
+    @property
+    def site_coverage_max_pct(self) -> float | None:
+        return _loosest_max(column.site_coverage_max_pct for column in self.columns)
+
+    @property
+    def site_coverage_min_pct(self) -> float | None:
+        return _loosest_min(column.site_coverage_min_pct for column in self.columns)
+
+    @property
+    def max_dwellings(self) -> int | None:
+        """The dwelling ceiling, from the Habitation column alone.
+
+        A ``C.4`` column states no *Nombre de logements maximal* and implies
+        no class ceiling, and it must not be allowed to lift the H column's.
+        """
+        if self.residential is None:
+            return None
+        return self.residential.effective_max_dwellings
+
+
+def _loosest_max(values: Iterable[float | None]) -> float | None:
+    """The weakest of several maxima: the largest, or ``None`` if any is absent.
+
+    An absent maximum is no maximum at all, so it dominates - a family whose
+    column prints ``Densite -`` may build to whatever else allows, and the
+    domain has to reach that far.
+    """
+    seen = list(values)
+    if not seen or any(value is None for value in seen):
+        return None
+    return max(value for value in seen if value is not None)
+
+
+def _loosest_min(values: Iterable[float | None]) -> float | None:
+    """The weakest of several minima: the smallest of those that are stated.
+
+    An absent minimum is a minimum of nothing rather than a missing bound, so
+    unlike `_loosest_max` it does not dominate - it simply contributes no
+    floor, and a family that states one still needs the domain to start below
+    it.
+    """
+    stated = [value for value in values if value is not None]
+    return min(stated) if stated else None
+
+
 def solve_program(
-    column: ZoneColumn,
+    column: ZoneColumn | ZoneEnvelope,
     lot: Lot,
     economics: UnitEconomics,
     *,
@@ -1685,17 +2152,35 @@ def solve_program(
     its dwellings owe has no program at this ratio. That is a real answer
     about the parcel rather than a bug, and `NO_PARKING` is how to ask the
     question without it. The status says which.
+
+    **A zone, not a column.** The first argument may be a `ZoneEnvelope` - the
+    governing column of each family a zone authorises - and that is the form
+    that answers the question a mixed-use zone actually poses. Where a grid
+    prints its housing and its commerce in two columns, solving the two
+    separately can only ever return the better *pure* building; handed both at
+    once, the model splits the floor area between them and returns the mix
+    that is worth the most, which may be neither. A bare `ZoneColumn` is
+    wrapped with `ZoneEnvelope.single` and behaves exactly as it did.
+
+    **What binds a mixed building.** Each family's norms are enforced only
+    when that family is built, through the `use_*` literals below - so a
+    building of housing and commerce answers to the intersection of the two
+    columns' caps, and one of commerce alone answers to the C column's alone.
+    The single-family programs therefore remain feasible points of this model:
+    it never returns less than solving each column apart would have, and where
+    two columns disagree it holds the mix to the stricter of them.
     """
-    if not (
-        column.permits_residential
-        or column.permits_commercial
-        or column.permits_industrial
-    ):
+    envelope = (
+        column if isinstance(column, ZoneEnvelope) else ZoneEnvelope.single(column)
+    )
+    if envelope.is_empty:
+        usages = column.usages if isinstance(column, ZoneColumn) else envelope.usages
         raise ProgramError(
-            f"{column.usages} authorises none of the usages this module "
+            f"{usages} authorises none of the usages this module "
             "prices (Habitation, Commerce, Industrie); an Equipements "
             "collectifs column is deliberately not a proforma"
         )
+    column = envelope
 
     # *Hauteur en mètre*, as centimetres. Rounded the way each bound wants to
     # be read: a maximum floors so a building may not exceed it by a rounding,
@@ -1749,11 +2234,15 @@ def solve_program(
             binding=("height_max_below_floors_min",),
         )
 
-    # The storeys the level rows allow this column's usages, jointly - the
-    # grid marks the rows per column, not per usage, so the three families
-    # share one bound.
+    # The storeys the level rows allow, at their loosest across the governing
+    # columns. A bound on the variable domains only: the level rows are marked
+    # per column, so the storeys a *family* may occupy come from that family's
+    # own column and are imposed per column further down.
     permitted_count = column.permitted_floors_count
-    if permitted_count < column.floors_min:
+    if all(
+        governing.permitted_floors_count < governing.floors_min
+        for governing in envelope.columns
+    ):
         # Not an empty solution but a contradiction between two rows of the
         # same column, so it is named rather than returned as a bare
         # INFEASIBLE the caller would have to diagnose. The height cannot be
@@ -1762,6 +2251,10 @@ def solve_program(
         # own doing. *En étage min* is read as a minimum on the *usage*
         # storeys, not on the building's, so a parking floor is not allowed
         # to talk the grid out of it.
+        #
+        # Every governing column, because one column contradicting itself in a
+        # zone whose other column does not is a building that can still be
+        # built - out of the family the coherent column heads.
         return _empty_program(
             column,
             lot,
@@ -1776,14 +2269,21 @@ def solve_program(
     height_floors_cap = (
         None if height_cap_cm is None else height_cap_cm // heights.residential_cm
     )
-    res_floors_allowed = permitted_count if column.permits_residential else 0
+    res_floors_allowed = (
+        envelope.residential.permitted_floors_count
+        if envelope.residential is not None
+        else 0
+    )
     if height_floors_cap is not None:
         res_floors_allowed = min(res_floors_allowed, height_floors_cap)
-    # What the dwellings must supply of *En étage min*, and therefore claim
-    # out of the stack before anything else is placed. A column with no
-    # Habitation at its head owes the minimum from its commercial and
-    # industrial storeys instead - the constraint below the variables.
-    res_floors_min = column.floors_min if column.permits_residential else 0
+    # *En étage min* is owed by the usage storeys between them and not by the
+    # dwellings in particular, so it is a constraint on their sum rather than
+    # a floor under this variable's domain - the commerce of a mixed zone may
+    # supply it. Held at zero here and imposed per governing column below,
+    # which on a single column is the same rule the module has always applied:
+    # a pure Habitation column spares no other family to supply it, so the sum
+    # constraint reduces to the dwellings owing the whole minimum.
+    res_floors_min = 0
 
     unpriced = tuple(
         sorted(
@@ -1867,10 +2367,14 @@ def solve_program(
     spare_floors = max(column.floors_max - res_floors_min, 0)
     parking_floors_hi = spare_floors
     commercial_floors_hi = (
-        min(spare_floors, permitted_count) if column.permits_commercial else 0
+        min(spare_floors, envelope.commercial.permitted_floors_count)
+        if envelope.commercial is not None
+        else 0
     )
     industrial_floors_hi = (
-        min(spare_floors, permitted_count) if column.permits_industrial else 0
+        min(spare_floors, envelope.industrial.permitted_floors_count)
+        if envelope.industrial is not None
+        else 0
     )
     if height_cap_cm is not None:
         # Same reading of the same cap, for the storey types that are not the
@@ -1959,6 +2463,33 @@ def solve_program(
         floors
         == residential_floors + parking_floors + commercial_floors + industrial_floors
     )
+    # Whether each family is built at all. These are what make one model do
+    # the work of three: a column's norms bind the building only when the
+    # family it heads is present, so the pure-Habitation and pure-Commerce
+    # programs stay feasible points here rather than separate solves, and the
+    # mixed one is held to both columns at once.
+    usage_floors = {
+        "residential": residential_floors,
+        "commercial": commercial_floors,
+        "industrial": industrial_floors,
+    }
+    governing = {
+        "residential": envelope.residential,
+        "commercial": envelope.commercial,
+        "industrial": envelope.industrial,
+    }
+    used: dict[str, cp_model.IntVar] = {}
+    for family, floors_var in usage_floors.items():
+        if governing[family] is None:
+            continue
+        literal = model.NewBoolVar(f"use_{family}")
+        # Reified both ways: the solver may not claim a family is absent while
+        # standing storeys of it, nor pay a column's caps for a family it did
+        # not build.
+        model.Add(floors_var >= 1).OnlyEnforceIf(literal)
+        model.Add(floors_var == 0).OnlyEnforceIf(literal.Not())
+        used[family] = literal
+
     # The level rows are the *column's*, not any one usage's, so the storeys
     # its usages occupy between them are bounded by what those rows allow -
     # not by that number three times over. A column marked "Tous sauf le RDC"
@@ -1966,21 +2497,66 @@ def solve_program(
     # without this the solver would stack two of housing on four of commerce
     # and hand back a building standing on a ground floor nothing may occupy.
     #
-    # The parking is *not* in this sum: a stall is not one of the usages the
+    # Per governing column, because that is the grain the rows are marked at:
+    # the families one column heads share its allowance, and a second column's
+    # families answer to its own. On a single column - the pure ``H`` grid, and
+    # every zone in a borough that prints one usage per column - all three
+    # families fall in one group and this is exactly the sum it always was.
+    #
+    # The parking is *not* in these sums: a stall is not one of the usages the
     # grid marks these rows for, and the storey it sits in is bounded by
     # *En etage max* alone - which is the constraint above.
-    model.Add(
-        residential_floors + commercial_floors + industrial_floors <= permitted_count
-    )
-    # And the same sum owes *En étage min*, which the parking is likewise not
-    # allowed to pay. Implied where dwellings are authorised - their own
-    # domain already starts at the minimum - and the whole of the rule on a
-    # column whose minimum must be met with commerce or industry instead.
-    if column.floors_min:
+    for group, group_column in _families_by_column(governing):
         model.Add(
-            residential_floors + commercial_floors + industrial_floors
-            >= column.floors_min
+            sum(usage_floors[family] for family in group)
+            <= group_column.permitted_floors_count
         )
+
+    # *En étage min* is not one of those allowances. The level rows say which
+    # storeys a family may occupy and are read per column above; the minimum
+    # says how tall the *building* must be, and every usage storey pays it
+    # whichever column authorised it. Charging it to one family's storeys
+    # instead would make a Commerce column printing "2/6" beside level rows
+    # marking only the RDC impossible to use at all - it would demand two
+    # storeys of commerce where the same column allows one - and a grid saying
+    # "retail at grade, two storeys minimum" is describing a building with
+    # something above the shop, not a contradiction.
+    #
+    # The parking is still not in the sum: a stall is not a usage, and a
+    # building may not meet its storey minimum with a garage.
+    usage_floor_total = residential_floors + commercial_floors + industrial_floors
+    if column.floors_min:
+        # The loosest minimum any governing column states, owed whatever the
+        # building turns out to be made of. Unconditional, unlike the per-family
+        # tightenings below, because without it a model that used no family at
+        # all could meet *En étage min* with parking storeys and hand back a
+        # garage - the storeys the dwellings' own domain used to guarantee
+        # before the mix became a decision.
+        model.Add(usage_floor_total >= column.floors_min)
+
+    # The storey and footprint norms each column states, imposed the same way:
+    # on the whole building, and only while the family whose column states it
+    # is built. This is the "intersection of the uses built" reading - a mixed
+    # building meets the strictest cap among the columns it draws its usages
+    # from, and a single-family building meets only its own. *Hauteur* and
+    # *Densité* get the same treatment below, once the variables they bound
+    # exist.
+    for family, literal in used.items():
+        governing_column = governing[family]
+        if governing_column.floors_max < floors_hi:
+            model.Add(floors <= governing_column.floors_max).OnlyEnforceIf(literal)
+        if governing_column.floors_min:
+            model.Add(
+                usage_floor_total >= governing_column.floors_min
+            ).OnlyEnforceIf(literal)
+        family_footprint_cap = _site_coverage_cap(governing_column, lot)
+        if family_footprint_cap < footprint_hi:
+            model.Add(footprint <= family_footprint_cap).OnlyEnforceIf(literal)
+        family_footprint_floor = _ceil_scaled(
+            lot.area_m2 * (governing_column.site_coverage_min_pct or 0.0) / 100.0
+        )
+        if family_footprint_floor > footprint_lo:
+            model.Add(footprint >= family_footprint_floor).OnlyEnforceIf(literal)
 
     # The products that rule out an LP: every floor type is a footprint the
     # model chooses, stacked a number of times the model also chooses. All
@@ -2054,6 +2630,46 @@ def solve_program(
         model.Add(gross <= density_cap)
     if column.density_min is not None:
         model.Add(gross >= _ceil_scaled(lot.area_m2 * column.density_min))
+
+    # The other half of the per-family norms begun above the areas: *Hauteur en
+    # mètre* and *Densité*, each binding the whole building while the family
+    # whose column prints it is built. An absent cap on a family that is built
+    # lifts nothing - the loosest bound is already what sized the domain, and
+    # the columns that do state one still bind.
+    for family, literal in used.items():
+        governing_column = governing[family]
+        family_height_cap = (
+            _floor_scaled_height(governing_column.height_max_m)
+            if governing_column.height_max_m is not None
+            else None
+        )
+        if family_height_cap is not None and (
+            height_cap_cm is None or family_height_cap < height_cap_cm
+        ):
+            model.Add(height <= family_height_cap).OnlyEnforceIf(literal)
+        family_height_floor = (
+            _ceil_scaled_height(governing_column.height_min_m)
+            if governing_column.height_min_m is not None
+            else 0
+        )
+        if family_height_floor > height_floor_cm:
+            model.Add(height >= family_height_floor).OnlyEnforceIf(literal)
+        family_density_cap = (
+            _floor_scaled(lot.area_m2 * governing_column.density_max)
+            if governing_column.density_max is not None
+            else None
+        )
+        if family_density_cap is not None and (
+            density_cap is None or family_density_cap < density_cap
+        ):
+            model.Add(gross <= family_density_cap).OnlyEnforceIf(literal)
+        if governing_column.density_min is not None and (
+            column.density_min is None
+            or governing_column.density_min > column.density_min
+        ):
+            model.Add(
+                gross >= _ceil_scaled(lot.area_m2 * governing_column.density_min)
+            ).OnlyEnforceIf(literal)
 
     counts: dict[str, cp_model.IntVar] = {}
     for unit_type, area_sqft in priced.items():
@@ -2269,7 +2885,36 @@ def solve_program(
     )
 
 
-def _site_coverage_cap(column: ZoneColumn, lot: Lot) -> int:
+def _families_by_column(
+    governing: Mapping[str, ZoneColumn | None],
+) -> list[tuple[tuple[str, ...], ZoneColumn]]:
+    """The families grouped by the column that governs them.
+
+    Identity, not equality: two columns of one grid can state identical norms,
+    and a zone governing its housing by one and its commerce by the other has
+    two allowances rather than one shared between them. Grouping by value would
+    silently merge them and charge a mixed building a single column's level
+    rows twice over.
+
+    A borough printing one usage per column yields one group per family; a
+    single `ZoneColumn` handed to `solve_program` yields one group holding
+    every family it heads, which is the shape the module had before envelopes
+    existed.
+    """
+    groups: list[tuple[list[str], ZoneColumn]] = []
+    for family, column in governing.items():
+        if column is None:
+            continue
+        for names, existing in groups:
+            if existing is column:
+                names.append(family)
+                break
+        else:
+            groups.append(([family], column))
+    return [(tuple(names), column) for names, column in groups]
+
+
+def _site_coverage_cap(column: ZoneColumn | ZoneEnvelope, lot: Lot) -> int:
     """*Taux d'implantation au sol max* x lot area, as a scaled footprint.
 
     A column stating no maximum may cover the whole parcel, which is what the
@@ -2292,7 +2937,7 @@ def _site_coverage_cap(column: ZoneColumn, lot: Lot) -> int:
     )
 
 
-def _footprint_cap_norm(column: ZoneColumn, lot: Lot) -> str:
+def _footprint_cap_norm(column: ZoneColumn | ZoneEnvelope, lot: Lot) -> str:
     """Which of the two footprint ceilings is the binding one.
 
     `solve_program` caps a footprint at the lesser of *Taux d'implantation au
@@ -2313,7 +2958,7 @@ def _footprint_cap_norm(column: ZoneColumn, lot: Lot) -> str:
 
 
 def _binding_caps(
-    column: ZoneColumn,
+    column: ZoneColumn | ZoneEnvelope,
     lot: Lot,
     *,
     total_dwellings: int,
@@ -2445,7 +3090,7 @@ def _binding_caps(
 
 
 def _empty_program(
-    column: ZoneColumn,
+    column: ZoneColumn | ZoneEnvelope,
     lot: Lot,
     *,
     status: str,

@@ -28,6 +28,7 @@ from shapely.geometry import Point, box
 
 from asset_helpers import materialization_metadata, stub_publish
 from urban_rag import comparables, comparables_assets
+from urban_rag.cubf import USE_DESCRIPTION_COLUMN
 from urban_rag.cmhc_assets import (
     AVERAGE_RENTS_FILE,
     VACANCY_FILE,
@@ -84,7 +85,7 @@ from urban_rag.role_foncier import (
 )
 from urban_rag.storage import join
 
-DATE = "2026-08-26"
+DATE = "2026-08-01"
 NEIGHBORHOOD = "VSMPE"
 ROLL_YEAR = 2026
 
@@ -98,10 +99,17 @@ ROLL_YEAR = 2026
         ("1000", "habitation", "residential"),
         ("1932", "habitation", "residential"),
         ("2311", "industrie_manufacturiere", "industrial"),
-        ("4611", "commerciale", "commercial"),
-        ("5811", "services", "commercial"),
-        ("6512", "culturelle_recreative_loisirs", "commercial"),
-        ("8000", "immeubles_non_exploites_etendues_eau", "none"),
+        # Manufacturing spans 2 and 3, so both digits are one category.
+        ("3190", "industrie_manufacturiere", "industrial"),
+        # 4611 is a parking garage, which the manual files under
+        # transport and utilities rather than under commerce.
+        ("4611", "transport_communication_services_publics", "industrial"),
+        # 5811 is a restaurant - the 5000s are where commerce actually is.
+        ("5811", "commerciale", "commercial"),
+        ("6512", "services", "commercial"),
+        ("7412", "culturelle_recreative_loisirs", "commercial"),
+        ("8110", "production_extraction_ressources", "industrial"),
+        ("9100", "immeubles_non_exploites_etendues_eau", "none"),
     ],
 )
 def test_the_leading_digit_is_the_class(code, expected_class, expected_income):
@@ -120,6 +128,37 @@ def test_a_use_code_is_never_read_as_a_magnitude():
     """1000 and 4000 are residential and commercial, not three thousand apart."""
     assert use_class_of("1000") != use_class_of("4000")
     assert use_class_of("1999") == use_class_of("1000")
+
+
+@pytest.mark.parametrize("code", ["4500", "4510", "4550", "4562", "4599"])
+def test_the_road_group_is_the_whole_of_45(code):
+    assert comparables.is_road_use_code(code)
+
+
+@pytest.mark.parametrize(
+    "code", ["4000", "4499", "4600", "1000", "5000", None, "", "abcd", "455",
+             float("nan")]
+)
+def test_nothing_outside_45_is_a_road(code):
+    assert not comparables.is_road_use_code(code)
+
+
+def test_a_road_code_survives_a_parquet_round_trip_as_a_float():
+    """`4550.0` is what a nullable column hands back, and it is still a road."""
+    assert comparables.is_road_use_code(4550.0)
+    assert comparables.is_road_use_code("4550.0")
+
+
+def test_a_road_is_still_filed_under_the_category_the_manual_gives_it():
+    """The two readings sit side by side rather than one replacing the other.
+
+    Rubric 45 is VOIE PUBLIQUE and the manual puts it inside category 4,
+    TRANSPORTS, COMMUNICATIONS ET SERVICES PUBLICS - which is where a public
+    road belongs. `use_class_of` says so, and `is_road_use_code` is the finer
+    reading kept beside it.
+    """
+    assert use_class_of("4550") == "transport_communication_services_publics"
+    assert comparables.is_road_use_code("4550")
 
 
 # -- the aggregation --------------------------------------------------------
@@ -164,7 +203,7 @@ def test_the_floor_is_split_by_each_units_own_use_code():
     units = units_frame(
         [
             {JOIN_KEY: "A", USE_CODE_COLUMN: "1000", FLOOR_AREA_COLUMN: 200.0},
-            {JOIN_KEY: "B", USE_CODE_COLUMN: "4611", FLOOR_AREA_COLUMN: 80.0},
+            {JOIN_KEY: "B", USE_CODE_COLUMN: "5413", FLOOR_AREA_COLUMN: 80.0},
             {JOIN_KEY: "C", USE_CODE_COLUMN: "2311", FLOOR_AREA_COLUMN: 900.0},
         ]
     )
@@ -181,13 +220,13 @@ def test_the_floor_is_split_by_each_units_own_use_code():
 
 
 def test_commerce_splits_into_retail_and_office_and_adds_back_up():
-    """CUBF 4000 is retail and 5000/6000 are offices and services. The two are
+    """CUBF 5000 is retail and 6000/7000 are services and culture. The two are
     priced at different surveyed rents and reported as one column."""
     units = units_frame(
         [
-            {JOIN_KEY: "A", USE_CODE_COLUMN: "4611", FLOOR_AREA_COLUMN: 95.0},
-            {JOIN_KEY: "B", USE_CODE_COLUMN: "5811", FLOOR_AREA_COLUMN: 120.0},
-            {JOIN_KEY: "C", USE_CODE_COLUMN: "6512", FLOOR_AREA_COLUMN: 40.0},
+            {JOIN_KEY: "A", USE_CODE_COLUMN: "5811", FLOOR_AREA_COLUMN: 95.0},
+            {JOIN_KEY: "B", USE_CODE_COLUMN: "6512", FLOOR_AREA_COLUMN: 120.0},
+            {JOIN_KEY: "C", USE_CODE_COLUMN: "7412", FLOOR_AREA_COLUMN: 40.0},
         ]
     )
     pairs = pd.DataFrame({JOIN_KEY: ["A", "B", "C"], "NO_LOT": ["L1"] * 3})
@@ -207,11 +246,15 @@ def test_commerce_splits_into_retail_and_office_and_adds_back_up():
     "code, rent_class",
     [
         ("1000", "residential"),
-        ("4611", "retail"),
-        ("5811", "office"),
+        # The 5000s are the shops, and they are charged a retail rent.
+        ("5811", "retail"),
         ("6512", "office"),
+        ("7412", "office"),
         ("2311", "industrial"),
-        ("8000", "none"),
+        # A parking garage is transport infrastructure, priced as
+        # industrial floor rather than as a shop.
+        ("4611", "industrial"),
+        ("9100", "none"),
         (None, "none"),
     ],
 )
@@ -277,10 +320,66 @@ def test_the_dominant_unit_is_the_one_carrying_most_of_the_value():
     ).loc["L1"]
 
     assert row["dominant_use_code"] == "4611"
-    assert row["dominant_use_class"] == "commerciale"
-    assert row["dominant_income_class"] == "commercial"
+    assert row["dominant_use_class"] == (
+        "transport_communication_services_publics"
+    )
+    assert row["dominant_income_class"] == "industrial"
     assert row["year_built"] == 1985
     assert row["num_storeys"] == 4
+
+
+def test_the_dominant_units_description_is_read_off_that_same_unit():
+    """What the lot *is*, in words, from the row the code and year came from.
+
+    Carried across from `silver.assessment_units` rather than looked up here,
+    so this module needs no second copy of the manual and the words beside a
+    code are the ones that partition was described with.
+    """
+    units = units_frame(
+        [
+            {
+                JOIN_KEY: "A",
+                USE_CODE_COLUMN: "1000",
+                USE_DESCRIPTION_COLUMN: "Logement",
+                VALUE_COLUMN: 200_000.0,
+            },
+            {
+                JOIN_KEY: "B",
+                USE_CODE_COLUMN: "4611",
+                USE_DESCRIPTION_COLUMN: "Garage de stationnement pour automobiles",
+                VALUE_COLUMN: 900_000.0,
+            },
+        ]
+    )
+    pairs = pd.DataFrame({JOIN_KEY: ["A", "B"], "NO_LOT": ["L1", "L1"]})
+
+    row = aggregate_units_by_lot(
+        pairs, units, lot_column="NO_LOT", join_key=JOIN_KEY
+    ).loc["L1"]
+
+    assert row["dominant_use_code"] == "4611"
+    assert row["dominant_use_description"] == (
+        "Garage de stationnement pour automobiles"
+    )
+
+
+def test_a_partition_with_no_description_column_still_aggregates():
+    """A silver partition written before the codebook existed carries none.
+
+    It must cost the column and nothing else - the floor split, the dominant
+    code and every sum are computed from the roll's own fields.
+    """
+    units = units_frame(
+        [{JOIN_KEY: "A", USE_CODE_COLUMN: "4611", VALUE_COLUMN: 900_000.0}]
+    )
+    pairs = pd.DataFrame({JOIN_KEY: ["A"], "NO_LOT": ["L1"]})
+
+    aggregated = aggregate_units_by_lot(
+        pairs, units, lot_column="NO_LOT", join_key=JOIN_KEY
+    )
+
+    assert aggregated.loc["L1", "dominant_use_code"] == "4611"
+    assert "dominant_use_description" not in aggregated.columns
 
 
 def test_a_lot_whose_units_state_no_floor_reports_null_and_not_zero():
@@ -501,7 +600,7 @@ def test_the_same_use_code_beats_a_nearer_lot_of_another_class():
     lots = comparable_lots(
         [
             {"lot_number": "SUBJECT", "use_code": "1000"},
-            {"lot_number": "NEAR_SHOP", "x_m": 20.0, "use_code": "4611"},
+            {"lot_number": "NEAR_SHOP", "x_m": 20.0, "use_code": "5413"},
             {"lot_number": "FAR_TRIPLEX", "x_m": 300.0, "use_code": "1000"},
         ]
     )
@@ -772,12 +871,15 @@ _LOTS = {
 }
 
 #: (unit, lot, use code, floor m2, dwellings, non-residential units, value).
+#: 5413 is *Dépanneur (sans vente d'essence)* - a real 5000-series retail
+#: code, so the shop lots are charged the surveyed retail rent rather than
+#: an office one.
 _UNITS = [
     ("U_A", LOT_TRIPLEX_A, "1000", 240.0, 3, 0, 900_000.0),
     ("U_B", LOT_TRIPLEX_B, "1000", 260.0, 3, 0, 1_000_000.0),
-    ("U_SHOP", LOT_SHOP, "4611", 300.0, 0, 1, 1_200_000.0),
+    ("U_SHOP", LOT_SHOP, "5413", 300.0, 0, 1, 1_200_000.0),
     ("U_MIX_H", LOT_MIXED, "1000", 200.0, 3, 0, 800_000.0),
-    ("U_MIX_C", LOT_MIXED, "4611", 90.0, 0, 1, 400_000.0),
+    ("U_MIX_C", LOT_MIXED, "5413", 90.0, 0, 1, 400_000.0),
 ]
 
 

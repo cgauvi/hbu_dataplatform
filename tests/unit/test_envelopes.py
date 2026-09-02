@@ -45,7 +45,7 @@ from urban_rag.rag_assets import DOCUMENTS_FILE, linked_documents
 from urban_rag.resources import ParquetStore, PdfCache, PostgisResource
 from urban_rag.storage import join
 
-DATE = "2026-08-24"
+DATE = "2026-08-01"
 NEIGHBORHOOD = "VSMPE"
 ZONE_TABLE = "Reglement_urbanisme__VSP_REG_ZONE"
 GRID_URL = "http://example.invalid/zone/C01-001.pdf"

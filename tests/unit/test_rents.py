@@ -60,7 +60,7 @@ from urban_rag.resources import (
 )
 from urban_rag.storage import join
 
-DATE = "2026-08-26"
+DATE = "2026-08-01"
 NEIGHBORHOOD = "VSMPE"
 
 ASSETS = "https://assets.cushmanwakefield.com/-/media/cw/marketbeat-pdfs"

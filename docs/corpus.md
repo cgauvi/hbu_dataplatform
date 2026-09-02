@@ -24,9 +24,9 @@ corpus:
 ```
 data/
 ├── cache/pdf/<sha256(url)>.pdf          # outside the partitions on purpose
-├── linked_documents/2026-08-18/VSMPE/documents.parquet
-├── document_chunks/2026-08-18/VSMPE/chunks.parquet
-└── document_embeddings/2026-08-18/VSMPE/embeddings.parquet
+├── linked_documents/2026-09-01/VSMPE/documents.parquet
+├── document_chunks/2026-09-01/VSMPE/chunks.parquet
+└── document_embeddings/2026-09-01/VSMPE/embeddings.parquet
 ```
 
 Each step owns its own prefix, so re-chunking replaces `document_chunks/` and
@@ -164,9 +164,9 @@ the corpus unqueryable while it runs. The steady state is the `document_index`
 asset, one partition at a time:
 
 ```bash
-make publish DATE=2026-08-18 NEIGHBORHOOD=VSMPE
+make publish DATE=2026-09-01 NEIGHBORHOOD=VSMPE
 # or
-uv run dagster asset materialize --select gold/document_index --partition "2026-08-18|VSMPE" -m urban_rag.definitions
+uv run dagster asset materialize --select gold/document_index --partition "2026-09-01|VSMPE" -m urban_rag.definitions
 ```
 
 It is a load, not a computation — no encoder, no PDF, no model weights — so it

@@ -97,6 +97,13 @@ _CARRIED: tuple[str, ...] = (
     "is_underbuilt",
     # What stands there now, and what the roll thinks it is worth.
     "existing_dominant_income_class",
+    # The MEFQ's words for the dominant unit's use code, and the one column
+    # here that exists purely to be read. This is a shortlist someone opens
+    # parcels from, and "Garage de stationnement pour automobiles" decides that
+    # faster than any ratio beside it. The *code* is deliberately not carried:
+    # it is one join away on `lot_uid` like the other forty columns of the gap,
+    # and `existing_dominant_income_class` is what the screen below sorts on.
+    "existing_dominant_use_description",
     "existing_num_dwellings",
     "existing_floor_area_m2",
     "existing_total_assessed_value",

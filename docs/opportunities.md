@@ -52,6 +52,13 @@ Five values, four of them theses:
 | `industrial` | ≥ `dominant_share` industrial |
 | `none` | the solver produced no program |
 
+A street and a park land in `none` and cannot be ranked, which is the whole of
+what this asset has to do about them: `lot_highest_best_use` withholds the
+program from a `road_parcel` and an `equipment_zone` lot, so no proposed floor
+reaches the thesis rules above and no shortlist can contain one. Read
+`hbu_status` on `gold.lot_highest_best_use` to tell those apart from a parcel
+the solver merely found infeasible.
+
 Where the lines fall is a mandate's judgement, so both thresholds are config and
 both land on every row in `screen_assumptions`:
 

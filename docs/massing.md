@@ -98,6 +98,13 @@ SQL anti-joins `gold.lot_highest_best_use`, which has every lot and an
 `hbu_status` saying why it has no program. The run reports `num_lots` and
 `num_drawn` side by side so the gap is never a surprise.
 
+Nothing is drawn on a street or on a park, and this asset does not decide that:
+`lot_highest_best_use` gives a `road_parcel` and an `equipment_zone` lot no
+program, so both arrive here as `no_program` and never reach a rectangle. The
+gate is one asset upstream on purpose — a parcel nobody may build on should be
+excluded once, where the reason can be stated, rather than in each of the four
+tables that read the answer.
+
 ## Looking at it
 
 ```bash

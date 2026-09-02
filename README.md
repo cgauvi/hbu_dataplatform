@@ -25,7 +25,7 @@ the flags each target needs:
 ```bash
 make sync
 make dagster_run                                     # UI on :2500
-make materialize DATE=2026-08-18 NEIGHBORHOOD=VSMPE  # a full scrape of one partition
+make materialize DATE=2026-09-01 NEIGHBORHOOD=VSMPE  # a full scrape of one partition
 make help                                            # every target, with the variables it reads
 ```
 

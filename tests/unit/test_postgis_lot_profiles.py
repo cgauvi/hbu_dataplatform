@@ -137,6 +137,10 @@ class FakeCursor:
             self._result = (10,)
         elif "FROM pg_attribute" in text:
             self._result = []
+        elif text.startswith("ANALYZE"):
+            # `warehouse._merge` closes a publish by refreshing the leaf's
+            # statistics — see test_warehouse for what that is for.
+            pass
         else:  # pragma: no cover - a statement this stub does not know about
             raise AssertionError(f"unexpected statement: {text[:80]}")
         return self

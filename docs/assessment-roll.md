@@ -104,6 +104,71 @@ by borough needs a borough and the roll supplies none. See
 [Both have a table](#both-have-a-table-and-one-of-them-fills-several-partitions-at-once)
 below.
 
+## The use code, and what it says
+
+`rl0105a` is the CUBF — four digits classifying what the property is *for*, and
+the single most useful thing the roll says about a parcel after its value. All
+437 192 Montreal units state one, and 598 distinct codes are in use.
+
+The roll does not say what any of them mean. A unit reads `4611` and stops
+there. The list that says `4611` is *Garage de stationnement pour automobiles
+(infrastructure)* is Annexe 2C.1 of the **Manuel d'évaluation foncière du
+Québec**, published on its own as a single spreadsheet:
+
+- [CUBF_MEFQ.xlsx](https://cdn-contenu.quebec.ca/cdn-contenu/adm/min/affaires-municipales/publications/evaluation_fonciere/manuel_evaluation_fonciere/CUBF_MEFQ.xlsx),
+  185 kB, linked from
+  [quebec.ca](https://www.quebec.ca/habitation-territoire/information-fonciere/evaluation-fonciere/manuel/codes-utilisation-biens-fonds).
+
+`cubf_use_codes` snapshots it and `assessment_units` looks it up onto every
+unit as `use_description`.
+
+**The sheet is a hierarchy in one column.** `CUBF` holds one, two, three and
+four characters on different rows, and the width is the level — `1`
+(*RÉSIDENTIELLE*), `10` (*LOGEMENT*), `100` (*Logement*), then `1000`, the code
+an assessor actually writes. Only the 1 260 four-character rows are use codes.
+Bronze keeps all 1 705 rows because the headings are the classification the
+codes hang off; silver selects the leaves.
+
+Nothing is left-padded on the way. No CUBF begins with a zero — the categories
+run 1 to 9 — so padding `100` to `0100` could only ever fabricate a code, and
+would hand the *Logement* heading's name to whatever unit collided with it.
+
+**The category is not always one digit.** `2-3` is a single row spanning both
+leading digits: manufacturing is numbered 2000 through 3999. That is why the
+column is read as text and why this pipeline maps a leading digit to an income
+class in `urban_rag.comparables` rather than here — see the note on
+`CUBF_CLASSES` in that module.
+
+**The lookup is a left join, and eight rows say why.** The 2025 edition
+describes 437 184 of Montreal's 437 192 units. The eight it misses are five
+codes — 3190, 3410, 3860, 4815, 6394 — in force on a roll filed against an
+earlier edition. The roll and the manual are amended on their own cadences, so
+a retired code is an ordinary state: a null description and a kept property.
+The run reports `num_use_codes_not_in_the_manual` and names each one, so the
+gap is on the record rather than inferred. `9800` is the one code the manual
+numbers and leaves undescribed — a slot held open for a use not yet named.
+
+**Only the description is carried.** The sheet also publishes a SCIAN
+correspondence and the manual's remarks, several of which run to a paragraph of
+assessment instruction. Repeating those onto 437 thousand units would be
+carrying the manual rather than reading it; a reader who wants them joins the
+bronze file on the code.
+
+**The roll archive ships the same file.** `ROLE2026_GEOPACKAGE.zip` carries
+`CUBF_MEFQ.xlsx` beside the GeoPackage, byte-identical to the standalone
+download (189 379 bytes, same SHA-256). The standalone one is read for what it
+costs rather than for what it says: the codebook is then a 185 kB fetch that
+can be re-run on its own instead of something recoverable only by unpacking
+2.8 GB.
+
+`use_description` travels from here into `silver.lot_assessment_comparables` as
+`dominant_use_description` — the words for the unit carrying most of the lot's
+value — and from there into `gold.lot_profiles`,
+`gold.lot_redevelopment_gap` and `gold.lot_investment_opportunities`. Nothing
+on that path looks a code up twice. It is for **reading, not filtering**: the
+code stays the key, and two editions of the manual can word one code
+differently.
+
 ## The lot join is by lot number, with the point as a fallback
 
 `lot_assessed_values` places each unit on the lots the roll itself says it

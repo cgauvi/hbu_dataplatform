@@ -68,6 +68,8 @@ from urban_rag.program import (
     COMMERCIAL_VACANCY_PCT,
     ConstructionCosts,
     DEFAULT_STOREY_HEIGHTS,
+    DevelopmentProgram,
+    FLOOR_STACK_ORDER,
     INDUSTRIAL_COST_PER_SQFT_CAD,
     INDUSTRIAL_REVENUE_PER_SQFT_CAD,
     INDUSTRIAL_STOREY_HEIGHT_M,
@@ -95,8 +97,11 @@ from urban_rag.program import (
     UNIT_AREAS_SQFT,
     UnitEconomics,
     ZoneColumn,
+    ZoneEnvelope,
     building_age_years,
+    class_max_dwellings,
     effective_operating_expense_ratio,
+    floor_stack,
     is_commercial_usage,
     is_industrial_usage,
     is_residential_usage,
@@ -144,6 +149,91 @@ def column(**overrides) -> ZoneColumn:
         "zone": "C01-001",
     }
     return ZoneColumn(**{**base, **overrides})
+
+
+# -- the Habitation class ceiling -------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("usages", "expected"),
+    [
+        (("H.1",), 1),
+        (("H.2",), 2),
+        (("H.3",), 3),
+        (("H.4",), 8),
+        (("H.5",), 12),
+        (("H.6",), 36),
+        # H.7 is "37 and up", which is no ceiling the model can hold.
+        (("H.7",), None),
+        # Bare H is the whole category and bounds nothing.
+        (("H",), None),
+        # The most permissive of several, not the least: a column headed both
+        # authorises either building.
+        (("H.2", "H.4"), 8),
+        # A trailing letter distinguishes two readings of one class.
+        (("H.7A",), None),
+        (("H.4A",), 8),
+        # A footnote qualifies a usage rather than renaming it.
+        (("H.2(9)",), 2),
+        # Non-residential codes neither add a ceiling nor lift one.
+        (("C.4",), None),
+        (("H.2", "C.4"), 2),
+        ((), None),
+    ],
+)
+def test_the_class_ceiling_is_read_off_the_usage_codes(usages, expected):
+    assert class_max_dwellings(usages) == expected
+
+
+@pytest.mark.parametrize(
+    ("usages", "printed", "expected"),
+    [
+        # The grid prints nothing for H.2 - the code has already said two.
+        (("H.2",), None, 2),
+        # Both stated: a building answers to whichever is stricter.
+        (("H.4",), 4, 4),
+        (("H.4",), 12, 8),
+        # Neither stated.
+        (("H",), None, None),
+        # Only the grid.
+        (("H",), 5, 5),
+    ],
+)
+def test_the_effective_ceiling_is_the_stricter_of_the_two(usages, printed, expected):
+    assert (
+        column(usages=usages, max_dwellings=printed).effective_max_dwellings
+        == expected
+    )
+
+
+def test_the_class_ceiling_binds_a_column_the_grid_left_blank():
+    """The 498 H.1/H.2/H.3 columns of VSMPE, which print no dwelling maximum.
+
+    Three storeys at 60% of a 600 m2 lot is 1 080 m2 of floor and about twenty
+    dwellings, and an H.2 column authorises a duplex. Without the class the
+    solver built the twenty.
+    """
+    duplex = column(
+        usages=("H.2",),
+        levels=frozenset({BuildingLevel.ALL}),
+        floors_max=3,
+        site_coverage_max_pct=60.0,
+        density_max=None,
+        max_dwellings=None,
+    )
+    lot = Lot(area_m2=600.0, frontage_m=15.0)
+    program = solve_program(duplex, lot, ECONOMICS, parking=NO_PARKING)
+    assert sum(program.units.values()) == 2
+    assert "max_dwellings" in program.binding
+
+    # The identical envelope read as bare H has no ceiling and fills up.
+    from dataclasses import replace
+
+    unclassed = solve_program(
+        replace(duplex, usages=("H",)), lot, ECONOMICS, parking=NO_PARKING
+    )
+    assert sum(unclassed.units.values()) > 2
+    assert "max_dwellings" not in unclassed.binding
 
 
 # -- the usage codes --------------------------------------------------------
@@ -952,12 +1042,90 @@ def mixed(*extra_usages, **overrides) -> ZoneColumn:
     "Tous les niveaux" rather than the base column's "Tous sauf le RDC", so
     the storeys the level rows allow equal the storeys *En etage* allows and a
     test about who wins a storey is not also a test about how many there are.
+
+    Bare ``H`` rather than a numbered class for the same reason, one norm
+    over: ``H.2`` carries a ceiling of two dwellings
+    (`RESIDENTIAL_CLASS_MAX_DWELLINGS`), and a test about which usage takes a
+    storey should not also be a test about how many dwellings fit on it. The
+    class ceiling has its own tests below.
     """
     return column(
-        usages=("H.2", *extra_usages),
+        usages=("H", *extra_usages),
         levels=frozenset({BuildingLevel.ALL}),
         **overrides,
     )
+
+
+def test_two_columns_of_a_zone_are_one_building():
+    """The whole point of `ZoneEnvelope`: a zone printing its housing in one
+    column and its commerce in another authorises both in one building, and
+    the answer must be the same as if the grid had printed them together."""
+    lot = Lot(area_m2=400.0, frontage_m=12.0)
+    together = solve_program(
+        mixed("C.2"), lot, ECONOMICS, parking=NO_PARKING
+    )
+    apart = solve_program(
+        ZoneEnvelope.of(
+            [
+                column(usages=("H",), levels=frozenset({BuildingLevel.ALL})),
+                column(usages=("C.2",), levels=frozenset({BuildingLevel.ALL})),
+            ],
+            12.0,
+        ),
+        lot,
+        ECONOMICS,
+        parking=NO_PARKING,
+    )
+    assert apart.solved
+    assert apart.commercial_floors == together.commercial_floors
+    assert apart.residential_floors == together.residential_floors
+    assert apart.npv_cad == pytest.approx(together.npv_cad)
+
+
+def test_a_mixed_building_meets_the_stricter_of_the_two_columns():
+    """The reading this module takes where two columns disagree: each one's
+    norms bind the building while the family it heads is built, so a mix
+    answers to the intersection and a pure program answers to its own column
+    alone."""
+    lot = Lot(area_m2=400.0, frontage_m=12.0)
+    housing = column(
+        usages=("H",), levels=frozenset({BuildingLevel.ALL}), floors_max=3
+    )
+    commerce = column(
+        usages=("C.2",), levels=frozenset({BuildingLevel.ALL}), floors_max=6
+    )
+    envelope = ZoneEnvelope.of([housing, commerce], 12.0)
+
+    # Commerce outearns housing here, so the solver takes the six storeys its
+    # own column allows and builds no dwelling - the H column's three do not
+    # bind a building with no housing in it.
+    program = solve_program(envelope, lot, ECONOMICS, parking=NO_PARKING)
+    assert program.residential_floors == 0
+    assert program.floors == 6
+
+    # Force the mix by making the commerce worthless above the ground floor:
+    # the C column may then take one storey, the H column's cap of three binds
+    # the whole building, and two storeys of housing sit on the shop.
+    grade_only = column(
+        usages=("C.2",), levels=frozenset({BuildingLevel.GROUND}), floors_max=6
+    )
+    mixed_program = solve_program(
+        ZoneEnvelope.of([housing, grade_only], 12.0),
+        lot,
+        ECONOMICS,
+        parking=NO_PARKING,
+    )
+    assert mixed_program.commercial_floors == 1
+    assert mixed_program.residential_floors == 2
+    # Three, not six: the housing is built, so the H column's ceiling applies.
+    assert mixed_program.floors == 3
+
+
+def test_an_envelope_that_authorises_nothing_is_refused():
+    with pytest.raises(ProgramError, match="Equipements"):
+        solve_program(
+            ZoneEnvelope(), Lot(area_m2=400.0, frontage_m=12.0), ECONOMICS
+        )
 
 
 def test_a_column_that_authorises_no_commerce_builds_none():
@@ -978,8 +1146,13 @@ def test_a_column_that_authorises_no_commerce_builds_none():
 def test_commerce_outbids_housing_for_every_storey_the_grid_will_spare():
     # 80/12 x 0.93 - 300/300 = $5.20 a square foot a month, against a
     # one-bedroom's $470 over 600 square feet, or $0.78. With no stalls owed,
-    # commerce takes every storey that is not held back by *En etage min*,
-    # which reserves two for the dwellings.
+    # commerce takes every storey *En etage max* allows - all six.
+    #
+    # *En etage min* holds none of them back for the dwellings: the minimum is
+    # owed by the usage storeys between them and six of commerce pay it, which
+    # is what "the mix is a decision" means. The module reserved two for the
+    # housing before envelopes existed, and that reservation was the model
+    # choosing a mix rather than solving for one.
     program = solve_program(
         mixed("C.2"),
         Lot(area_m2=400.0, frontage_m=12.0),
@@ -987,12 +1160,10 @@ def test_commerce_outbids_housing_for_every_storey_the_grid_will_spare():
         parking=NO_PARKING,
     )
     assert program.solved
-    assert program.commercial_floors == 4
-    assert program.residential_floors == 2
+    assert program.commercial_floors == 6
+    assert program.residential_floors == 0
     assert program.floors == 6
     assert program.industrial_floors == 0
-    # The storeys the dwellings did not get are the answer to why there are
-    # only ten of them, and no printed norm binds at all here.
     assert program.binding == ("commercial_floor_area",)
 
 
@@ -1006,7 +1177,7 @@ def test_industry_takes_the_storeys_where_no_commerce_is_authorised():
         ECONOMICS,
         parking=NO_PARKING,
     )
-    assert program.industrial_floors == 4
+    assert program.industrial_floors == 6
     assert program.commercial_floors == 0
     assert program.binding == ("industrial_floor_area",)
 
@@ -1018,7 +1189,7 @@ def test_commerce_beats_industry_where_both_are_authorised():
         ECONOMICS,
         parking=NO_PARKING,
     )
-    assert program.commercial_floors == 4
+    assert program.commercial_floors == 6
     assert program.industrial_floors == 0
 
 
@@ -1124,8 +1295,9 @@ def test_a_rent_that_does_not_cover_the_build_is_declined():
 
 
 def test_the_storey_ceiling_is_shared_with_the_dwellings():
-    # *En etage max* is six and *En etage min* two, so four are what commerce
-    # can take at most - a column printing a tighter maximum spares fewer.
+    # *En etage max* is the ceiling on the stack whatever fills it, so a column
+    # printing a tighter maximum spares the commerce fewer storeys - three
+    # here rather than the six of the tests above.
     program = solve_program(
         mixed("C.2", floors_max=3),
         Lot(area_m2=400.0, frontage_m=12.0),
@@ -1133,8 +1305,8 @@ def test_the_storey_ceiling_is_shared_with_the_dwellings():
         parking=NO_PARKING,
     )
     assert program.floors == 3
-    assert program.residential_floors == 2
-    assert program.commercial_floors == 1
+    assert program.residential_floors == 0
+    assert program.commercial_floors == 3
 
 
 def test_the_level_rows_bound_the_commerce_as_they_bound_the_dwellings():
@@ -1148,8 +1320,8 @@ def test_the_level_rows_bound_the_commerce_as_they_bound_the_dwellings():
         parking=NO_PARKING,
     )
     assert program.floors == 5
-    assert program.commercial_floors == 3
-    assert program.residential_floors == 2
+    assert program.commercial_floors == 5
+    assert program.residential_floors == 0
 
 
 @pytest.mark.parametrize(
@@ -1335,12 +1507,18 @@ def test_the_commerce_digs_rather_than_spend_the_density_cap_on_its_parking():
     # nearly a parking plate for every retail plate, and an above-grade plate
     # is floor area *Densite* counts while an underground one is not - article
     # 38 1°. So the stalls a retail storey owes go under the building.
+    # Three storeys, so the stalls the retail owes stay inside what six
+    # underground levels can hold: 3 x 280 m2 is 9 042 sq ft and 28 stalls
+    # against a capacity of 45. Asked for more commerce than the digging can
+    # serve the answer is a mix of both, which is a different question - this
+    # one is about which the solver reaches for first.
     program = solve_program(
-        mixed("C.2"),
+        mixed("C.2", floors_max=3),
         Lot(area_m2=400.0, frontage_m=12.0),
         ECONOMICS,
         parking=ParkingRules(stalls_per_dwelling=0.0),
     )
+    assert program.commercial_floors == 3
     assert program.underground_stalls > 0
     assert program.above_grade_stalls == 0
     assert program.above_grade_parking_floors == 0
@@ -1426,24 +1604,35 @@ def test_the_slacker_of_the_two_ceilings_is_not_the_one_that_binds():
 
 
 def test_a_commercial_storey_spends_four_metres_of_the_cap_and_housing_three():
-    # The whole of what a metric cap adds to a storey cap. This column allows
-    # six storeys on every level and the commerce outbids the housing for all
-    # four it can have, so *En etage* alone builds 2 x 3 m + 4 x 4 m = 22 m.
-    # An 18 m limit buys one fewer commercial plate, a 14 m limit two fewer,
-    # and neither is a number the storey row could have produced.
+    # The whole of what a metric cap adds to a storey cap: the same metres buy
+    # different numbers of storeys depending on what fills them. The commerce
+    # outbids the housing for every storey here, so a metric cap is spent at
+    # four metres a plate - six of them need 24 m, and an 18 m limit buys four
+    # while a 14 m limit buys three. Neither is a number *En etage* could have
+    # produced, which is the point.
     lot = Lot(area_m2=400.0, frontage_m=12.0)
-    expected = {None: (4, 22.0), 18.0: (3, 18.0), 14.0: (2, 14.0)}
+    expected = {None: (6, 24.0), 18.0: (4, 16.0), 14.0: (3, 12.0)}
     for cap, (commercial_floors, height_m) in expected.items():
         program = solve_program(
             mixed("C.2", height_max_m=cap), lot, ECONOMICS, parking=NO_PARKING
         )
-        assert program.residential_floors == 2
         assert program.commercial_floors == commercial_floors
         assert program.height_m == pytest.approx(height_m)
         if cap is not None:
             assert program.height_m <= cap + 1e-9
-        # The storey row is unmoved throughout: what changed is the metres.
-        assert program.floors == 2 + commercial_floors
+        assert program.floors == commercial_floors
+
+    # And the other half of the comparison, on the identical caps: a column
+    # with no commerce at its head spends the same metres three at a time, so
+    # 18 m stands six storeys of housing where it stood four of retail.
+    housing = solve_program(
+        column(levels=frozenset({BuildingLevel.ALL}), height_max_m=18.0),
+        lot,
+        ECONOMICS,
+        parking=NO_PARKING,
+    )
+    assert housing.residential_floors == 6
+    assert housing.height_m == pytest.approx(18.0)
 
 
 def test_an_underground_level_stands_no_metres():
@@ -1825,3 +2014,222 @@ def test_a_program_that_does_not_pencil_discounted_is_not_built():
 def test_an_investment_stance_that_cannot_be_priced_is_refused(overrides):
     with pytest.raises(ProgramError):
         InvestmentAssumptions(**overrides)
+
+
+# -- the floor stack --------------------------------------------------------
+#
+# `floor_stack` decides nothing the solver decided: it re-cuts storey counts
+# the solver produced into runs of identical levels, and the order it stacks
+# them in is `FLOOR_STACK_ORDER`'s stated convention rather than an answer.
+# So these are of two kinds - arithmetic over a program written out by hand,
+# where every level number can be counted on fingers, and one reconciliation
+# against a real solve, which is the only thing that can catch the stack and
+# the columns beside it drifting apart.
+
+#: Every key an entry carries, whatever it is filled with. Named here because
+#: the promise is the *stable shape* - a reader unnesting these in SQL should
+#: never have to branch on the use to know a key is there.
+STACK_KEYS = {
+    "use",
+    "position",
+    "from_level",
+    "to_level",
+    "floors",
+    "floor_plate_m2",
+    "floor_area_m2",
+    "counts_as_floor_area",
+    "storey_height_m",
+    "height_m",
+    "stalls",
+    "dwellings",
+    "units",
+}
+
+
+def mixed_program(**overrides) -> DevelopmentProgram:
+    """Two dug levels, retail at grade, a workshop, a deck and five of housing.
+
+    Written out rather than solved: no envelope produces all four above-grade
+    uses at once, and the point of the fixture is to have every branch of the
+    stack present in one answer.
+    """
+    base = {
+        "units": {"1_bedroom": 8, "2_bedroom": 4},
+        "floors": 9,
+        "footprint_m2": 200.0,
+        "gross_floor_area_m2": 1800.0,
+        "unit_area_m2": 900.0,
+        "net_operating_income": 0.0,
+        "status": "OPTIMAL",
+        "residential_floors": 5,
+        "commercial_floors": 1,
+        "industrial_floors": 1,
+        "above_grade_parking_floors": 2,
+        "underground_levels": 2,
+        "underground_stalls": 7,
+        "above_grade_stalls": 5,
+        "underground_area_m2": 400.0,
+        "commercial_area_m2": 200.0,
+        "industrial_area_m2": 200.0,
+    }
+    return DevelopmentProgram(**{**base, **overrides})
+
+
+def test_a_run_of_identical_storeys_is_one_entry():
+    """Five identical plates are one entry and not five rows to read."""
+    stack = floor_stack(
+        mixed_program(
+            floors=5,
+            residential_floors=5,
+            commercial_floors=0,
+            industrial_floors=0,
+            above_grade_parking_floors=0,
+            underground_levels=0,
+            underground_stalls=0,
+            above_grade_stalls=0,
+            underground_area_m2=0.0,
+            commercial_area_m2=0.0,
+            industrial_area_m2=0.0,
+            gross_floor_area_m2=1000.0,
+        )
+    )
+    assert len(stack) == 1
+    entry = stack[0]
+    assert entry["use"] == "residential"
+    assert (entry["from_level"], entry["to_level"], entry["floors"]) == (1, 5, 5)
+    assert entry["floor_plate_m2"] == pytest.approx(200.0)
+    assert entry["floor_area_m2"] == pytest.approx(1000.0)
+
+
+def test_the_uses_stack_in_the_stated_order():
+    """Dug levels, then `FLOOR_STACK_ORDER` from grade up, with no gaps."""
+    stack = floor_stack(mixed_program())
+    assert [entry["use"] for entry in stack] == [
+        "parking",
+        "commercial",
+        "industrial",
+        "parking",
+        "residential",
+    ]
+    assert [(entry["from_level"], entry["to_level"]) for entry in stack] == [
+        (-2, -1),
+        (1, 1),
+        (2, 2),
+        (3, 4),
+        (5, 9),
+    ]
+    above = [entry["use"] for entry in stack if entry["position"] == "above_grade"]
+    assert above == list(FLOOR_STACK_ORDER)
+
+
+def test_the_dug_levels_are_numbered_below_grade_and_are_not_floor_area():
+    """Article 38 1 arriving in the one place the stack can show it."""
+    stack = floor_stack(mixed_program())
+    dug = stack[0]
+    assert dug["position"] == "below_grade"
+    # -2 to -1: there is no level 0, and the ground floor is 1.
+    assert (dug["from_level"], dug["to_level"]) == (-2, -1)
+    assert dug["counts_as_floor_area"] is False
+    assert dug["storey_height_m"] == UNDERGROUND_LEVEL_HEIGHT_M
+    assert dug["height_m"] == 0.0
+    assert all(entry["counts_as_floor_area"] for entry in stack[1:])
+
+
+def test_the_stalls_are_reported_where_they_were_put():
+    stack = floor_stack(mixed_program())
+    parked = {
+        entry["position"]: entry["stalls"]
+        for entry in stack
+        if entry["use"] == "parking"
+    }
+    assert parked == {"below_grade": 7, "above_grade": 5}
+    assert sum(entry["stalls"] for entry in stack) == 12
+    assert all(entry["stalls"] == 0 for entry in stack if entry["use"] != "parking")
+
+
+def test_the_mix_sits_on_the_residential_run_whole():
+    """The solver chose a mix for the building rather than for a plate, and
+    dividing it by the storeys would be inventing the part it did not choose."""
+    stack = floor_stack(mixed_program())
+    housing = [entry for entry in stack if entry["use"] == "residential"]
+    assert len(housing) == 1
+    assert housing[0]["units"] == {"1_bedroom": 8, "2_bedroom": 4}
+    assert housing[0]["dwellings"] == 12
+    assert all(
+        entry["units"] == {} and entry["dwellings"] == 0
+        for entry in stack
+        if entry["use"] != "residential"
+    )
+
+
+def test_every_entry_carries_every_key():
+    """The shape is stable so unnesting one of these needs no branch."""
+    assert all(set(entry) == STACK_KEYS for entry in floor_stack(mixed_program()))
+
+
+def test_each_run_is_priced_at_its_own_storey_height():
+    expected = {
+        ("commercial", "above_grade"): COMMERCIAL_STOREY_HEIGHT_M,
+        ("industrial", "above_grade"): INDUSTRIAL_STOREY_HEIGHT_M,
+        ("parking", "above_grade"): ABOVE_GRADE_PARKING_STOREY_HEIGHT_M,
+        ("residential", "above_grade"): RESIDENTIAL_STOREY_HEIGHT_M,
+        ("parking", "below_grade"): UNDERGROUND_LEVEL_HEIGHT_M,
+    }
+    for entry in floor_stack(mixed_program()):
+        height = expected[(entry["use"], entry["position"])]
+        assert entry["storey_height_m"] == pytest.approx(height)
+        assert entry["height_m"] == pytest.approx(height * entry["floors"])
+
+
+def test_a_stated_storey_height_reaches_the_stack():
+    """The heights are an assumption, and a run is priced at the one the
+    program was solved with rather than at the module's default."""
+    tall = StoreyHeights(residential_m=4.0)
+    stack = floor_stack(mixed_program(), heights=tall)
+    housing = next(entry for entry in stack if entry["use"] == "residential")
+    assert housing["storey_height_m"] == pytest.approx(4.0)
+    assert housing["height_m"] == pytest.approx(20.0)
+
+
+def test_a_program_with_nothing_built_has_no_stack():
+    empty = floor_stack(
+        mixed_program(
+            floors=0,
+            residential_floors=0,
+            commercial_floors=0,
+            industrial_floors=0,
+            above_grade_parking_floors=0,
+            underground_levels=0,
+            gross_floor_area_m2=0.0,
+            underground_area_m2=0.0,
+        )
+    )
+    assert empty == []
+
+
+def test_the_stack_reconciles_with_the_columns_beside_it():
+    """Every number in a stack is one already on the program, re-cut by level."""
+    solved = solve_program(
+        column(),
+        Lot(area_m2=500.0, frontage_m=15.0),
+        ECONOMICS,
+        investment=UNDISCOUNTED,
+    )
+    assert solved.solved
+    stack = floor_stack(solved)
+    above = [entry for entry in stack if entry["position"] == "above_grade"]
+    below = [entry for entry in stack if entry["position"] == "below_grade"]
+    assert sum(entry["floors"] for entry in above) == solved.floors
+    assert sum(entry["floors"] for entry in below) == solved.underground_levels
+    assert sum(entry["floor_area_m2"] for entry in above) == pytest.approx(
+        solved.gross_floor_area_m2, abs=0.05
+    )
+    assert sum(entry["floor_area_m2"] for entry in below) == pytest.approx(
+        solved.underground_area_m2, abs=0.05
+    )
+    # The dug levels stand no metres, so the whole stack is the reported height.
+    assert sum(entry["height_m"] for entry in stack) == pytest.approx(
+        solved.height_m, abs=0.05
+    )
+    assert sum(entry["stalls"] for entry in stack) == solved.total_stalls
+    assert sum(entry["dwellings"] for entry in stack) == solved.total_dwellings

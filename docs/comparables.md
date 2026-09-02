@@ -95,21 +95,35 @@ one *unité d'évaluation* with one `rl0105a`, so the class its whole floor
 belongs to is a property of the row rather than a judgement about the parcel — a
 triplex over a dépanneur gets both a residential and a commercial income because
 its two units say so. `dominant_use_code` exists for reading and filtering, not
-for the arithmetic.
+for the arithmetic, and `dominant_use_description` beside it is the MEFQ's
+own words for that code — *Garage de stationnement pour automobiles* rather
+than `4611`. It is carried across from `silver.assessment_units`, which
+merged the codebook onto every unit, so nothing here looks a code up twice;
+it is for **reading only**, since two editions of the manual can word one
+code differently and the code is what a filter should match. See
+[the use code, and what it says](assessment-roll.md#the-use-code-and-what-it-says).
 
-The CUBF's leading digit is the category, and that is all `use_class_of` reads:
+The CUBF's leading digit is the category, and that is all `use_class_of` reads
+— with one wrinkle that is easy to get wrong. **Manufacturing is written `2-3`
+in the manual**: industry is numbered 2000 through 3999, so the nine categories
+do not sit on nine digits, and reading them as if they did mislabels every
+class from 3 up by one.
 
-| leading digit | CUBF class | priced as |
-| --- | --- | --- |
-| 1 | Habitation | residential |
-| 2 | Industries manufacturières | industrial |
-| 3 | Transport, communication, services publics | industrial |
-| 4 | Commerciale | commercial |
-| 5 | Services | commercial |
-| 6 | Culturelle, récréative et de loisirs | commercial |
-| 7 | Production et extraction de richesses naturelles | industrial |
-| 8 | Immeubles non exploités et étendues d'eau | nothing |
-| anything else | `unknown` | nothing |
+| leading digit | CUBF class | priced as | charged as |
+| --- | --- | --- | --- |
+| 1 | Habitation | residential | residential |
+| 2, 3 | Industries manufacturières | industrial | industrial |
+| 4 | Transports, communications et services publics | industrial | industrial |
+| 5 | Commerciale | commercial | retail |
+| 6 | Services | commercial | office |
+| 7 | Culturelle, récréative et de loisirs | commercial | office |
+| 8 | Production et extraction de richesses naturelles | industrial | industrial |
+| 9 | Immeubles non exploités et étendues d'eau | nothing | nothing |
+| anything else | `unknown` | nothing | nothing |
+
+The categories are Annexe 2C.1's own, and `bronze/cubf_use_codes` snapshots
+that annexe — so this table can be read back against the publisher rather than
+taken on trust.
 
 The mapping from eight classes to three is this platform's judgement and lives
 in one constant (`CUBF_CLASSES`). Floor the classifier cannot place earns
@@ -278,7 +292,8 @@ are telling different stories.
 `gold.lot_profiles` joins this table on `lot_number` — a plain `LEFT JOIN`, like
 `lot_assessed_values`, because it is already one row per lot. Seventeen columns
 land: the roll's characteristics (`num_dwellings`, the four floor areas,
-`dominant_use_code`, `year_built`), the income pair, the two cap rates, the
+`dominant_use_code`, `dominant_use_description`, `year_built`), the income
+pair, the two cap rates, the
 estimate and its basis, the ratio, `num_comparables`, and the two jsonb objects
 `comparables` and `income_assumptions`.
 

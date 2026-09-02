@@ -47,7 +47,7 @@ import pytest
 from conftest import NEIGHBORHOOD, SCRAPE_DATE
 
 from urban_rag.postgis import (
-    DEFAULT_FRONTAGE_BUFFER_M,
+    DEFAULT_ROAD_LOT_MIN_STREET_M,
     compute_lot_buildable_setbacks,
     compute_lot_frontage,
 )
@@ -148,7 +148,7 @@ def measured(connection, loaded, zoned):
                 connection,
                 neighborhood=NEIGHBORHOOD,
                 scrape_date=SCRAPE_DATE,
-                buffer_m=DEFAULT_FRONTAGE_BUFFER_M,
+                min_street_m=DEFAULT_ROAD_LOT_MIN_STREET_M,
             )
         with connection.transaction():
             return compute_lot_buildable_setbacks(

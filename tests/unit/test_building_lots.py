@@ -44,7 +44,7 @@ from urban_rag.infolot_assets import LOTS_FILE, neighborhood_lots
 from urban_rag.resources import ParquetStore, PostgisResource
 from urban_rag.storage import join
 
-DATE = "2026-08-20"
+DATE = "2026-08-01"
 NEIGHBORHOOD = "VSMPE"
 ZONE_SLUG = "Reglement_urbanisme__VSP_REG_ZONE"
 

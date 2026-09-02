@@ -117,6 +117,11 @@ class FakeCursor:
             self.rowcount = self._upserted
         elif text.startswith("DELETE FROM"):
             self.rowcount = self._pruned
+        elif text.startswith("ANALYZE"):
+            # The statistics refresh that closes a load. It returns nothing and
+            # sets no rowcount; what matters is that it happened, and against
+            # which relation - see the tests at the end of this file.
+            pass
         else:  # pragma: no cover - a statement this stub does not know about
             raise AssertionError(f"unexpected statement: {text[:80]}")
         return self
@@ -753,3 +758,86 @@ def test_each_borough_is_pruned_against_its_own_frame_alone():
     assert [params[0] for _, params in deletes] == [NEIGHBORHOOD, "PMR"]
     for statement, _ in deletes:
         assert "t.neighborhood = %s AND t.scrape_date = %s::date" in statement
+
+
+# ---------------------------------------------------------------------------
+# The statistics a load leaves behind
+#
+# A load rewrites most of a partition, which leaves the planner's statistics
+# describing what was there before it. Autovacuum catches up in its own time,
+# and that window is exactly when someone opens the map to look at what was
+# loaded — where a mis-estimated `(neighborhood, scrape_date)` filter turns
+# every one of the several dozen tile queries a pan issues from an index scan
+# into a scan of the borough.
+# ---------------------------------------------------------------------------
+
+
+def test_a_load_refreshes_the_statistics_it_invalidated():
+    cursor = FakeCursor(upserted=2)
+
+    upsert_frame(
+        FakeConnection(cursor),
+        "neighborhood_streets",
+        streets(),
+        neighborhood=NEIGHBORHOOD,
+        scrape_date=DATE,
+    )
+
+    assert cursor.one("ANALYZE").startswith("ANALYZE ")
+
+
+def test_the_analyze_is_of_the_leaf_and_not_the_partitioned_parent():
+    """ANALYZE on the parent walks every borough-month the table has ever
+    held, which is most of the load's runtime again for statistics no query
+    needed refreshed."""
+    cursor = FakeCursor(upserted=2)
+
+    upsert_frame(
+        FakeConnection(cursor),
+        "neighborhood_streets",
+        streets(),
+        neighborhood=NEIGHBORHOOD,
+        scrape_date=DATE,
+    )
+
+    # The name the stubbed warehouse.ensure_partition() hands back.
+    assert cursor.one("ANALYZE") == (
+        "ANALYZE silver.neighborhood_streets__vsmpe__202608"
+    )
+
+
+def test_the_analyze_comes_after_the_prune_not_before_it():
+    """Statistics taken before the partition is finished describe a table that
+    never existed — half the new rows and all of the old ones."""
+    cursor = FakeCursor(upserted=2, pruned=1)
+
+    upsert_frame(
+        FakeConnection(cursor),
+        "neighborhood_streets",
+        streets(),
+        neighborhood=NEIGHBORHOOD,
+        scrape_date=DATE,
+    )
+
+    issued = cursor.issued()
+    pruned = next(i for i, t in enumerate(issued) if t.startswith("DELETE FROM"))
+    analyzed = next(i for i, t in enumerate(issued) if t.startswith("ANALYZE"))
+    assert pruned < analyzed
+
+
+def test_a_computed_partition_is_analyzed_too():
+    """The three PostGIS joins reach their table by `upsert_select`, which has
+    its own path into `_merge` and would otherwise miss this."""
+    cursor = FakeCursor(columns=["scrape_date", "neighborhood", "lot_number"])
+
+    upsert_select(
+        cursor,
+        "lot_profiles",
+        ("scrape_date", "neighborhood", "lot_number"),
+        "SELECT l.scrape_date, l.neighborhood, l.lot_number FROM rag.lots l",
+        {"neighborhood": NEIGHBORHOOD},
+        neighborhood=NEIGHBORHOOD,
+        scrape_date=DATE,
+    )
+
+    assert cursor.one("ANALYZE").startswith("ANALYZE ")

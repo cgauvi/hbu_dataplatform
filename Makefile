@@ -64,7 +64,10 @@ DAGSTER_DAEMON := uv run python -m urban_rag.dagster_home dagster-daemon
 # AssetsDefinition and dagster answers DagsterInvalidSubsetError, so adding a
 # target means looking the asset's layer up rather than copying its name.
 MODULE := urban_rag.definitions
-DATE ?= $(shell date +%F)
+# The scrape partition is monthly (see urban_rag.partitions), so the key is
+# the first of the current month rather than today. Override to run an
+# earlier month: `make hbu DATE=2026-08-01`.
+DATE ?= $(shell date +%Y-%m-01)
 NEIGHBORHOOD ?= VSMPE
 PORT ?= 2500
 K ?= 5
@@ -72,14 +75,16 @@ K ?= 5
 # the shared Postgres/pgvector one (configured from URBAN_RAG_PG_*, see
 # docs/corpus.md). `make index BACKEND=postgres` reloads the latter from parquet.
 BACKEND ?= duckdb
-# How far a lot boundary may be from a street side and still be matched to it,
-# for `make frontage`. It decides which lots get measured, not what they then
-# measure. See docs/street-frontage.md.
-BUFFER_M ?= 10.0
+# How much geobase street line must run inside a parcel before `make frontage`
+# reads that parcel as the roadway itself. It decides which parcels are street,
+# not what any lot then measures - the frontage is an exact shared boundary and
+# has no setting. Replaces BUFFER_M, which did decide what every lot measured.
+# See docs/street-frontage.md.
+MIN_STREET_M ?= 1.0
 # How far off a lot boundary a measured street edge still counts as lying on
-# it, for `make setbacks`. Much smaller than BUFFER_M above and a much smaller
-# judgement: the frontage geometry was cut from that very boundary, so this
-# only absorbs the round trip through EPSG:4326. See
+# it, for `make setbacks`. A much smaller judgement than MIN_STREET_M above:
+# the frontage geometry was cut from that very boundary, so this only absorbs
+# the round trip through EPSG:4326. See
 # docs/assets.md, under silver/lot_buildable_setbacks.
 TOLERANCE_M ?= 0.05
 # Which municipalities' assessment rolls `make roll` keeps out of the
@@ -185,7 +190,7 @@ help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  %-18s %s\n", $$1, $$2}'
 	@echo ""
 	@echo "Vars: DATE=$(DATE) NEIGHBORHOOD=$(NEIGHBORHOOD) PORT=$(PORT) K=$(K)"
-	@echo "      BACKEND=$(BACKEND) BUFFER_M=$(BUFFER_M)"
+	@echo "      BACKEND=$(BACKEND) MIN_STREET_M=$(MIN_STREET_M)"
 	@echo "      K_COMPARABLES=$(K_COMPARABLES) MAX_DISTANCE_M=$(MAX_DISTANCE_M) OPEX=$(OPEX) MARKET_FACTOR=$(MARKET_FACTOR)"
 	@echo "      RETAIL_BASE=$(RETAIL_BASE) RETAIL_BASE_PERIOD=$(RETAIL_BASE_PERIOD)"
 	@echo "      IMAGE=$(IMAGE):$(TAG)"
@@ -338,13 +343,19 @@ borough-streets: | $(UV_SYNC_STAMP) ## Materialize neighborhood_streets for DATE
 # reuses both. CODE_MUN picks the municipalities out of the province-wide
 # archive - `CODE_MUN='[]'` keeps all of them, at ten times the rows.
 #
+# `cubf_use_codes` rides along because `assessment_units` looks every unit's
+# rl0105a up in it - the MEFQ's use-code list, which is what says 4611 is a
+# parking garage. 185 kB and uncached, against the roll's 572 MB, so it costs
+# nothing to re-fetch; a DATE without it is a partition whose units carry a
+# code and no words, and the merge fails naming the asset to run.
+#
 # Needs `quartiers` for the same DATE, and hbu_infra's sql/014 applied: the
 # parquet stays province-wide, but the merge is also cut into borough
 # partitions of silver.assessment_units by where each unit's point falls, and
 # one run publishes every enabled borough. The file lands first, so a database
 # that is down costs a re-run of the load rather than of the merge.
-roll: | $(UV_SYNC_STAMP) ## Snapshot the property assessment roll for DATE and merge it
-	$(DAGSTER) asset materialize --select bronze/property_assessment_roll,silver/assessment_units --partition $(DATE) -m $(MODULE) \
+roll: | $(UV_SYNC_STAMP) ## Snapshot the property assessment roll for DATE, its codebook, and merge them
+	$(DAGSTER) asset materialize --select bronze/property_assessment_roll,bronze/cubf_use_codes,silver/assessment_units --partition $(DATE) -m $(MODULE) \
 		--config-json '{"ops":{"bronze__property_assessment_roll":{"config":{"municipality_codes":$(CODE_MUN)}}}}'
 
 # Needs `roll` for the same DATE and `lots` for the same DATE x NEIGHBORHOOD:
@@ -394,10 +405,13 @@ comparables: | $(UV_SYNC_STAMP) ## Price DATE's roll onto NEIGHBORHOOD's lots an
 
 # Needs silver.neighborhood_streets and silver.lot_frontage (hbu_infra sql/007, sql/008) applied,
 # and building_lot_intersections run first for the same partition - that is what
-# puts this borough's cadastre in rag.lots. BUFFER_M overrides the 10 m default.
+# puts this borough's cadastre in rag.lots. MIN_STREET_M overrides the 1 m
+# default, and moving it does not move any frontage: it only changes which
+# parcels are read as roadway, and the fixture separates those from every other
+# parcel by two orders of magnitude.
 frontage: | $(UV_SYNC_STAMP) ## Materialize lot_frontage for DATE x NEIGHBORHOOD
 	$(DAGSTER) asset materialize --select silver/lot_frontage --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE) \
-		--config-json '{"ops":{"silver__lot_frontage":{"config":{"buffer_m":$(BUFFER_M)}}}}'
+		--config-json '{"ops":{"silver__lot_frontage":{"config":{"min_street_m":$(MIN_STREET_M)}}}}'
 
 # document_chunks also upserts into silver.document_chunks (hbu_infra sql/011);
 # the vectors stay out of the silver schema and go to rag.chunks, which

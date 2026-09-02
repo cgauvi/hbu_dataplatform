@@ -169,6 +169,9 @@ from urban_rag.role_foncier import (
 from urban_rag.role_foncier import (
     YEAR_BUILT_COLUMN as _YEAR_BUILT,
 )
+from urban_rag.cubf import (
+    USE_DESCRIPTION_COLUMN as _USE_DESCRIPTION,
+)
 
 #: The unit columns `aggregate_units_by_lot` carries across from the
 #: characteristics table. Aliased to short private names on the way in - the
@@ -177,6 +180,13 @@ from urban_rag.role_foncier import (
 #: one place the MAMH codes are written down.
 _CARRIED_COLUMNS: tuple[str, ...] = (
     _USE_CODE,
+    # Not the roll's - the MEFQ codebook's text for `_USE_CODE`, which
+    # `assessment_units` looked up onto the unit. Carried through rather than
+    # re-derived here so this module needs no second copy of the manual, and so
+    # the words beside a code are the ones that silver partition was described
+    # with. Absent on a partition materialized before the codebook existed,
+    # which is why every use of it is guarded on the column being there.
+    _USE_DESCRIPTION,
     _LAND_AREA,
     _STOREYS,
     _YEAR_BUILT,
@@ -241,6 +251,25 @@ METRIC_CRS = "EPSG:32188"
 #: the remaining three are the kind of thing within it, which is why
 #: `use_class_of` reads one character and never compares two codes as numbers.
 #:
+#: **Manufacturing is two digits, and everything after it shifts.** The manual
+#: writes its second category as ``2-3`` on one row - industry is numbered 2000
+#: through 3999 - so the nine categories do not sit on nine digits. That is the
+#: one thing about this table that is easy to get wrong, and getting it wrong
+#: mislabels every class from 3 up by one: it puts public roads under
+#: *commerciale*, prices a depanneur as an office, and leaves the 9000s
+#: unplaced. The categories, verbatim from Annexe 2C.1 - which
+#: `urban_rag.cubf_assets` snapshots, so they can be read back rather than
+#: taken on trust:
+#:
+#:     1    RESIDENTIELLE
+#:     2-3  INDUSTRIES MANUFACTURIERES
+#:     4    TRANSPORTS, COMMUNICATIONS ET SERVICES PUBLICS
+#:     5    COMMERCIALE
+#:     6    SERVICES
+#:     7    CULTURELLE, RECREATIVE ET DE LOISIRS
+#:     8    PRODUCTION ET EXTRACTION DE RICHESSES NATURELLES
+#:     9    IMMEUBLES NON EXPLOITES ET ETENDUES D'EAU
+#:
 #: The mapping to three income classes is this module's own and is a judgement:
 #: transport, communication and public utilities (3000) and natural-resource
 #: production (7000) are priced as industrial floor because that is what they
@@ -260,20 +289,50 @@ METRIC_CRS = "EPSG:32188"
 #: class only decides which rate that floor is multiplied by.
 CUBF_CLASSES: Mapping[str, tuple[str, str, str]] = {
     "1": ("habitation", "residential", "residential"),
+    # One category over two digits, so these two entries are deliberately
+    # identical rather than a copy-paste to be tidied away.
     "2": ("industrie_manufacturiere", "industrial", "industrial"),
-    "3": ("transport_communication_services_publics", "industrial", "industrial"),
-    "4": ("commerciale", "commercial", "retail"),
-    "5": ("services", "commercial", "office"),
-    "6": ("culturelle_recreative_loisirs", "commercial", "office"),
-    "7": ("production_extraction_ressources", "industrial", "industrial"),
-    "8": ("immeubles_non_exploites_etendues_eau", "none", "none"),
+    "3": ("industrie_manufacturiere", "industrial", "industrial"),
+    "4": ("transport_communication_services_publics", "industrial", "industrial"),
+    "5": ("commerciale", "commercial", "retail"),
+    "6": ("services", "commercial", "office"),
+    "7": ("culturelle_recreative_loisirs", "commercial", "office"),
+    "8": ("production_extraction_ressources", "industrial", "industrial"),
+    # Vacant land, water, unoccupied floor and buildings under construction.
+    # Priced as nothing at all - there is no floor here earning anything, and
+    # the roll's own `rl0308a` for these is null or zero. Previously absent,
+    # which made every 9000-series parcel `UNKNOWN_USE_CLASS`: the same income
+    # of nothing, but reported as a use nobody read rather than as one there is
+    # nothing standing on.
+    "9": ("immeubles_non_exploites_etendues_eau", "none", "none"),
 }
 
-#: What `use_class_of` answers for a code it cannot place - a null `rl0105a`, a
-#: 9000-series code the manual above does not number, or a value that is not
-#: four digits at all. Kept distinct from 8000's "nothing stands here": one is
-#: a parcel known to carry no floor, the other is a parcel whose use was not
-#: read, and the comparables score the two differently.
+#: The CUBF's road group: every code from 4510 to 4599 is a piece of the
+#: public way - a street, a lane, a highway, a right of way, the land under a
+#: rail line. The roll files them as assessment units so that the ground has a
+#: row, and then carries them at a nominal $100 with no floor area, no storeys
+#: and no dwellings: across the 2026 Montreal roll all 95,415 of them together
+#: hold 3,287 m2 of floor, which is to say none.
+#:
+#: **It is a two-digit prefix and not a class of its own.** `use_class_of`
+#: reads the leading ``4`` and answers *commerciale*, which is what the manual
+#: says and is not wrong - the group sits inside the commercial category. It is
+#: also not usable: a street priced as retail floor is a category error that
+#: only stays harmless while the floor area is null. `is_road_use_code` is the
+#: finer reading, kept beside the coarse one rather than replacing it, and
+#: `urban_rag.hbu` is what acts on it - a parcel the roll calls a road is not a
+#: development site, whatever its zoning permits.
+ROAD_USE_PREFIX = "45"
+
+#: What `use_class_of` answers for a code it cannot place - a null `rl0105a`,
+#: or a value that is not four digits at all. Every category the manual
+#: numbers is in the table above, 9000 included, so this is now only what a
+#: code the *roll* states and the manual does not reach answers - the 2026
+#: roll has five such codes over eight of Montreal's 437,192 units.
+#:
+#: Kept distinct from 9000's "nothing stands here": one is a parcel known to
+#: carry no floor, the other is a parcel whose use could not be read, and the
+#: comparables score the two differently.
 UNKNOWN_USE_CLASS = "unknown"
 
 #: The income class an unplaceable use code is priced as: none. A floor whose
@@ -362,6 +421,23 @@ def rent_class_of(code) -> str:
     """
     entry = _cubf_entry(code)
     return entry[2] if entry else UNKNOWN_INCOME_CLASS
+
+
+def is_road_use_code(code) -> bool:
+    """Whether ``code`` is the roll saying this parcel is part of the road.
+
+    Two digits rather than one - see `ROAD_USE_PREFIX` - and read off the same
+    four-character text every other reader here works from, so a `4550` that
+    survived a parquet round trip as ``4550.0`` answers the same as the string
+    the roll printed. A null, a blank and a code that is not four digits are
+    all False: the question is what the roll *said*, and it said nothing.
+    """
+    if code is None or (isinstance(code, float) and math.isnan(code)):
+        return False
+    text = _use_code_text(code)
+    if text is None or len(text) != 4 or not text.isdigit():
+        return False
+    return text.startswith(ROAD_USE_PREFIX)
 
 
 def _cubf_entry(code) -> tuple[str, str, str] | None:
@@ -754,15 +830,20 @@ def aggregate_units_by_lot(
 
     **Floor area is split by each unit's own use code**, so a lot whose two
     units are a triplex and a depanneur reports both a residential and a
-    commercial floor area. A class the code cannot be placed in - a blank
-    `rl0105a`, a 9000-series code - lands in none of the three, which is why
-    they need not add up to `floor_area_m2` and why the gap is worth reporting.
+    commercial floor area. A class the code earns nothing in - the 9000s,
+    which are vacant land, water, unoccupied floor and buildings still under
+    construction - lands in none of the three, and neither does a blank
+    `rl0105a`, which is why they need not add up to `floor_area_m2` and why
+    the gap is worth reporting.
 
     **"Dominant" means the largest share of the value**, not the largest floor
     or the commonest code: the unit carrying most of what the lot is worth is
     the one whose use a reader means when they ask what the lot *is*.
     `year_built` and `num_storeys` are read off that same unit, so the three
     describe one property rather than three different ones.
+    `dominant_use_description` is the MEFQ's own words for that unit's code,
+    carried across from `silver.assessment_units` rather than looked up again -
+    so what a lot says it is, and what it was classed as, came from one row.
     """
     if pairs.empty:
         return _empty_aggregate(lot_column)
@@ -837,7 +918,7 @@ def _dominant_unit(joined: pd.DataFrame, *, lot_column: str) -> pd.DataFrame:
     """
     columns = [
         name
-        for name in (_USE_CODE, _YEAR_BUILT, _STOREYS)
+        for name in (_USE_CODE, _USE_DESCRIPTION, _YEAR_BUILT, _STOREYS)
         if name in joined.columns
     ]
     if not columns:
@@ -855,6 +936,7 @@ def _dominant_unit(joined: pd.DataFrame, *, lot_column: str) -> pd.DataFrame:
     dominant = ranked.set_index(lot_column)[columns].rename(
         columns={
             _USE_CODE: "dominant_use_code",
+            _USE_DESCRIPTION: "dominant_use_description",
             _YEAR_BUILT: "year_built",
             _STOREYS: "num_storeys",
         }
@@ -912,6 +994,7 @@ def _empty_aggregate(lot_column: str) -> pd.DataFrame:
             name: pd.Series(dtype="object")
             for name in (
                 "dominant_use_code",
+                "dominant_use_description",
                 "dominant_use_class",
                 "dominant_income_class",
             )

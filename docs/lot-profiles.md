@@ -17,7 +17,7 @@ Two more are already the right shape, and are the only upstreams here that are:
 | upstream | grain | what it contributes |
 |---|---|---|
 | `silver.lot_assessed_values` | **lot** | `total_assessed_value`, `total_assessed_value_apportioned`, `num_assessment_units`, `num_shared_units`, `num_units_by_point`, `roll_year` |
-| `silver.lot_assessment_comparables` | **lot** | `cap_rate_pct`, `comparable_cap_rate_pct`, `net_operating_income_cad`, `estimated_value_cad`, `assessed_to_estimated_ratio`, `num_dwellings`, the four floor areas, `dominant_use_code`, and the `comparables` / `income_assumptions` objects |
+| `silver.lot_assessment_comparables` | **lot** | `cap_rate_pct`, `comparable_cap_rate_pct`, `net_operating_income_cad`, `estimated_value_cad`, `assessed_to_estimated_ratio`, `num_dwellings`, the four floor areas, `dominant_use_code` and the MEFQ's words for it in `dominant_use_description`, and the `comparables` / `income_assumptions` objects |
 
 Both have `(scrape_date, neighborhood, lot_number)` as their primary key, so
 neither needs a CTE or a pivot — a plain `LEFT JOIN` on `lot_number`, which cannot fan a lot
@@ -106,7 +106,7 @@ column and turns the old question into a filter over an inventory:
 ```sql
 SELECT lot_number, primary_street_name, round(primary_frontage_m::numeric, 1)
 FROM gold.lot_profiles
-WHERE neighborhood = 'VSMPE' AND scrape_date = '2026-08-18'
+WHERE neighborhood = 'VSMPE' AND scrape_date = '2026-09-01'
   AND NOT has_building
 ORDER BY primary_frontage_m DESC NULLS LAST
 LIMIT 20;
@@ -124,10 +124,10 @@ a 12 m² shed satisfies. Whether a lot is *usably* empty depends on a threshold,
 a threshold is a judgement about the built form rather than a property of the
 data, and a boolean cannot carry one. So that lives in `category`, computed
 against `LotProfilesConfig.max_built_area_m2`, which every row records the way
-`silver.lot_frontage` records its `buffer_m`:
+`silver.lot_frontage` records the cutoff it was built under:
 
 ```
-make lot-profiles DATE=2026-08-18 NEIGHBORHOOD=VSMPE
+make lot-profiles DATE=2026-09-01 NEIGHBORHOOD=VSMPE
 ```
 
 The two columns are worth having side by side because they answer different

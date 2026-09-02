@@ -82,6 +82,7 @@ ASSET_LAYERS: dict[str, Layer] = {
     "montreal_residential_costs": Layer.BRONZE,
     "montreal_nonresidential_costs": Layer.BRONZE,
     "property_assessment_roll": Layer.BRONZE,
+    "cubf_use_codes": Layer.BRONZE,
     "uniformized_property_wealth": Layer.BRONZE,
     "montreal_commercial_rents": Layer.BRONZE,
     "commercial_rent_index": Layer.BRONZE,

@@ -63,7 +63,7 @@ from urban_rag.postgis import DEFAULT_MAX_BUILT_AREA_M2, MissingRelation
 from urban_rag.resources import ParquetStore, PostgisResource
 from urban_rag.storage import join
 
-DATE = "2026-08-20"
+DATE = "2026-08-01"
 NEIGHBORHOOD = "VSMPE"
 
 
@@ -204,7 +204,7 @@ def _costs_frame(rates, *, cat, unit_flag):
             "rate_low": [rates[i][1] for i in ids],
             "rate_high": [rates[i][2] for i in ids],
             "scrape_date": [DATE] * len(ids),
-            "scraped_at": ["2026-08-20T12:00:00+00:00"] * len(ids),
+            "scraped_at": ["2026-08-01T12:00:00+00:00"] * len(ids),
             "source_url": [
                 "https://zef-builds.github.io/construction-estimator/"
                 "data/building-types.js"

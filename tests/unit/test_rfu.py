@@ -135,7 +135,7 @@ def run_asset(tmp_path, monkeypatch, session: FakeSession | None = None, **confi
     )
     result = materialize(
         [uniformized_property_wealth],
-        partition_key="2026-08-30",
+        partition_key="2026-08-01",
         resources={
             "rfu": RfuResource(**config),
             "store": ParquetStore(root_dir=str(tmp_path)),
@@ -214,7 +214,7 @@ def test_the_snapshot_lands_with_both_files(tmp_path, monkeypatch):
     result, _ = run_asset(tmp_path, monkeypatch)
 
     assert result.success
-    partition = tmp_path / "bronze" / "uniformized_property_wealth" / "2026-08-30"
+    partition = tmp_path / "bronze" / "uniformized_property_wealth" / "2026-08-01"
     assert (partition / RFU_FILE).exists()
     assert (partition / POSTES_FILE).exists()
 
@@ -235,7 +235,7 @@ def test_the_geographic_code_keeps_its_leading_zero(tmp_path, monkeypatch):
     run_asset(tmp_path, monkeypatch)
 
     frame = pd.read_parquet(
-        tmp_path / "bronze" / "uniformized_property_wealth" / "2026-08-30" / RFU_FILE
+        tmp_path / "bronze" / "uniformized_property_wealth" / "2026-08-01" / RFU_FILE
     )
     # It joins against the roll's `code_mun`, which is text. Inferred as an
     # integer, 01023 becomes 1023 and matches nothing.
@@ -246,7 +246,7 @@ def test_the_publishers_column_names_survive(tmp_path, monkeypatch):
     run_asset(tmp_path, monkeypatch)
 
     frame = pd.read_parquet(
-        tmp_path / "bronze" / "uniformized_property_wealth" / "2026-08-30" / RFU_FILE
+        tmp_path / "bronze" / "uniformized_property_wealth" / "2026-08-01" / RFU_FILE
     )
     # Mixed case as MAMH spells it: the codes are what the companion table is
     # keyed on, so lower-casing them here would break that join.
@@ -255,7 +255,7 @@ def test_the_publishers_column_names_survive(tmp_path, monkeypatch):
     assert {"source_file", "rfu_year", "scrape_date", "scraped_at"} <= set(
         frame.columns
     )
-    assert set(frame["scrape_date"]) == {"2026-08-30"}
+    assert set(frame["scrape_date"]) == {"2026-08-01"}
 
 
 def test_a_cp1252_companion_is_decoded(tmp_path, monkeypatch):
@@ -263,7 +263,7 @@ def test_a_cp1252_companion_is_decoded(tmp_path, monkeypatch):
     run_asset(tmp_path, monkeypatch)
 
     postes = pd.read_parquet(
-        tmp_path / "bronze" / "uniformized_property_wealth" / "2026-08-30" / POSTES_FILE
+        tmp_path / "bronze" / "uniformized_property_wealth" / "2026-08-01" / POSTES_FILE
     )
     assert "Facteur comparatif" in set(postes["Sujet"])
 
@@ -318,7 +318,7 @@ def test_a_year_without_descriptions_still_writes_the_data(tmp_path, monkeypatch
     result, _ = run_asset(tmp_path, monkeypatch, session=FakeSession(payload=payload))
 
     assert result.success
-    partition = tmp_path / "bronze" / "uniformized_property_wealth" / "2026-08-30"
+    partition = tmp_path / "bronze" / "uniformized_property_wealth" / "2026-08-01"
     assert (partition / RFU_FILE).exists()
     assert not (partition / POSTES_FILE).exists()
     metadata = materialization_metadata(result, uniformized_property_wealth)
