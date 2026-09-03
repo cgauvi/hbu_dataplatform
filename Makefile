@@ -171,6 +171,11 @@ RENT_PREMIUM_PCT ?= 30.0
 # perpendicular, so 2.0 covers 1:2 as well. Past 3:1 a "building" is a wall,
 # which is why the default stops there. See docs/massing.md.
 RATIOS ?= [1.0,1.5,2.0,3.0]
+
+# Which map layers `map_cells` dissolves, as a JSON list. All five is
+# the default and the only setting a scheduled run should use; naming
+# fewer is for rebuilding one layer's cells by hand.
+LAYERS ?= ["capacity","streets","lots","buildings","massing"]
 # Where the investment-thesis lines fall for `make opportunities`: the share
 # of proposed floor one class needs to own a lot outright, and what the
 # smaller of residential and commercial needs for it to be mixed-use instead.
@@ -192,7 +197,7 @@ DOCKER_RUN := docker run --rm -it \
 
 .PHONY: help sync dagster_run daemon test materialize catalog features \
 	quartiers cmhc costs vacancy rents envelopes setbacks lot-profiles \
-	programs hbu massing \
+	programs hbu massing map_cells \
 	streets borough-streets roll lot-values comparables \
 	rent-sources commercial-rents \
 	frontage corpus publish index search ask status \
@@ -340,6 +345,24 @@ opportunities: | $(UV_SYNC_STAMP) ## Rank DATE x NEIGHBORHOOD's under-built lots
 massing: | $(UV_SYNC_STAMP) ## Draw DATE x NEIGHBORHOOD's HBU buildings as map polygons
 	$(DAGSTER) asset materialize --select gold/lot_building_massing --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE) \
 		--config-json '{"ops":{"gold__lot_building_massing":{"config":{"aspect_ratios":$(RATIOS)}}}}'
+
+# Needs gold.map_cell_aggregates (hbu_infra sql/023) applied, and runs last:
+# it reads rag.lots, rag.buildings, silver.neighborhood_streets,
+# gold.lot_redevelopment_gap and gold.lot_building_massing, all of which have
+# to hold this partition already. A source that has not been run contributes
+# no cells rather than failing the run - the asset's `layers_empty` metadata
+# says which - so a borough without a massing still gets a utilisation
+# surface.
+#
+# This is what makes hbu_rag_map draw anything below zoom 15. Its output is
+# not read by anything else in this platform: it is one row per tile-grid cell
+# per layer, and the map serves display zoom Z from the cells at Z + 4. LAYERS
+# narrows it to one layer's cells after that layer's own asset re-ran - but
+# note a narrowed run still prunes the partition, so the layers left out are
+# removed rather than kept.
+map_cells: | $(UV_SYNC_STAMP) ## Dissolve DATE x NEIGHBORHOOD's map layers onto the tile grid
+	$(DAGSTER) asset materialize --select gold/map_cell_aggregates --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE) \
+		--config-json '{"ops":{"gold__map_cell_aggregates":{"config":{"layers":$(LAYERS)}}}}'
 
 # Bronze: one 91 MB download for the whole island, so DATE only.
 streets: | $(UV_SYNC_STAMP) ## Snapshot the island-wide geobase double for DATE

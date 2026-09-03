@@ -128,6 +128,17 @@ question, not to the geometry. `pct_of_lot` is the column to filter on, and
 genuinely split between two zones has two real rows, and no ranking will tell
 you which of those is the artifact.
 
+The questions this platform asks answer at one square metre, and
+`overlap_area_m2` on `rag.lot_documents` is what lets them. It is deliberately
+a different shape of cutoff from `pct_of_lot`: how much of a lot a zone should
+govern before it counts is a judgement about the borough, and a percentage
+states it, but whether a zone reaches the lot at all is not — below a square
+metre the two surveys have simply missed each other, on a 200 m² duplex parcel
+and on Parc Jarry alike. `postgis.MIN_ZONE_OVERLAP_M2` is that value here,
+`EnvelopeConfig.min_overlap_m2` and `compute_lot_profiles` read it, and
+`rag.search_at_lot_number(..., min_overlap_m2 => 1)` is its default in the
+corpus search. Pass 0 to any of them to get every overlap back.
+
 **Layers are loaded under the file slug, not the Spectrum path.** A feature
 parquet carries `source_table = /19_VSMPE/Reglement_urbanisme/VSP_REG_ZONE`,
 but `linked_documents` writes the slug `Reglement_urbanisme__VSP_REG_ZONE` into

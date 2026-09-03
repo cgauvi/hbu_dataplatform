@@ -59,6 +59,7 @@ from urban_rag.frames import write_frame
 from urban_rag.frontage_assets import LOT_FRONTAGE_FILE, lot_frontage
 from urban_rag.layers import key_prefix
 from urban_rag.partitions import scrape_partitions
+from urban_rag.postgis import MIN_ZONE_OVERLAP_M2
 from urban_rag.program import (
     ProgramError,
     ZoneColumn,
@@ -131,13 +132,40 @@ class EnvelopeConfig(Config):
     Zone polygons and cadastral polygons are drawn by two publishers and agree
     only approximately, so a parcel on a zone boundary picks up a sliver of the
     neighbouring zone - a fraction of a percent of its area, and not a set of
-    rules anybody would build under. Config rather than a constant because it
-    is a judgement about how far apart the two publishers' lines are, not a
-    property of the data.
+    rules anybody would build under. Two cutoffs, and they are different in
+    kind, which is why they are two.
 
-    The default keeps every overlap: `pct_of_lot` is on every row, so a table
-    written at 0 can be read back at any threshold, and one written at 5 cannot
-    be read back at 0.
+    **`min_pct_of_lot` is a judgement**, and its default keeps every overlap:
+    how much of a parcel a zone should govern before it counts as governing it
+    is an argument about the borough, not about the data. `pct_of_lot` is on
+    every row, so a table written at 0 can be read back at any threshold, and
+    one written at 5 cannot be read back at 0.
+
+    **`min_overlap_m2` is an artefact filter**, and its default drops rows,
+    because there is no threshold it could be read back at. A clip of under a
+    square metre is the two publishers' lines missing each other by
+    centimetres along a lot line; it is not a small amount of governing, it is
+    a survey disagreement wearing a zone's number. Parc Jarry is the case to
+    picture - 1.59 km2 carrying 31 envelope rows over 14 zones, its own E04-019
+    covering 98.3% of it and one of the other thirteen covering 0.000022%, a
+    few square centimetres of a residential zone at the corner of the park.
+    `governing_zone` already stops such a row from *answering* for a lot (see
+    `urban_rag.hbu`); this stops it from being written, priced and solved
+    first.
+
+    Absolute rather than proportional because the artefact has an absolute
+    size, while a percentage means one thing on a 200 m2 duplex parcel and
+    quite another on the park. A parcel smaller than the cutoff itself would
+    lose every zone to it and go out as unzoned - there is no such development
+    site, and `num_lots_unzoned` reports it either way.
+
+    `silver.lot_features` keeps both kinds of row on purpose - see
+    005_silver_lot_features.sql - so nothing is lost upstream by cutting here.
+    The value is `postgis.MIN_ZONE_OVERLAP_M2`, which `compute_lot_profiles`
+    reads too, and hbu_infra's `rag.search_at_lot_number` and hbu_rag_map's
+    `queries.MIN_ZONE_OVERLAP_M2` are the same square metre in the repos that
+    cannot import it - so the zone the map shows, the zone the corpus answers
+    from and the zone the solver priced cannot disagree.
     """
 
     min_pct_of_lot: float = Field(
@@ -147,6 +175,16 @@ class EnvelopeConfig(Config):
         description=(
             "A zone gives a lot an envelope row when it covers at least this "
             "percentage of it. 0 keeps every overlap the join found."
+        ),
+    )
+    min_overlap_m2: float = Field(
+        default=MIN_ZONE_OVERLAP_M2,
+        ge=0.0,
+        description=(
+            "A zone gives a lot an envelope row when it covers at least this "
+            "many square metres of it. Guards against the sliver a cadastral "
+            "boundary and a zoning boundary produce where they disagree; 0 "
+            "keeps every overlap the join found."
         ),
     )
 
@@ -311,6 +349,9 @@ def zoning_grid_columns(
         "minimum lot width, site coverage, density, dwelling ceiling, heights "
         "and margins. Joins building_lot_intersections' lot x feature side to "
         "zoning_grid_columns on the zone number, and lot_frontage on the lot. "
+        "A zone clipping under min_overlap_m2 (1 m2) of a lot is dropped "
+        "rather than given a row: that is the cadastre and the zoning layer "
+        "disagreeing by centimetres, not a zone anybody could build under. "
         "governs_residential marks the column select_residential_column picks "
         "for that lot's width. Writes silver/lot_zoning_envelopes/"
         f"<YYYY-MM-DD>/<neighborhood>/{LOT_ENVELOPES_FILE} and upserts "
@@ -343,17 +384,34 @@ def lot_zoning_envelopes(
     )
 
     num_lots = int(lot_features["lot_uid"].nunique())
-    covered = lot_features[
-        lot_features["source_table"].isin(DOCUMENT_SOURCES)
-        & (lot_features["pct_of_lot"] >= config.min_pct_of_lot)
+    zoning = lot_features[lot_features["source_table"].isin(DOCUMENT_SOURCES)]
+    covered = zoning[
+        (zoning["pct_of_lot"] >= config.min_pct_of_lot)
+        & (zoning["overlap_area_m2"] >= config.min_overlap_m2)
     ]
     if covered.empty:
         raise Failure(
             f"{neighborhood} {scrape_date}: no lot is covered by a "
             f"{'/'.join(DOCUMENT_SOURCES)} feature at or above "
-            f"{config.min_pct_of_lot}% of its area, so no envelope can be "
-            "built. Check that building_lot_intersections loaded the zoning "
-            "layer for this partition."
+            f"{config.min_pct_of_lot}% of its area and "
+            f"{config.min_overlap_m2} m2, so no envelope can be built. Check "
+            "that building_lot_intersections loaded the zoning layer for this "
+            "partition."
+        )
+    # Counted here rather than inferred from the row drop downstream: a sliver
+    # removed is a zone that would have been priced, solved and reported as a
+    # development site, so how many of them there were belongs in the run's
+    # metadata rather than in the difference between two other numbers.
+    num_slivers = len(zoning) - len(covered)
+    if num_slivers:
+        context.log.info(
+            "%s %s: dropped %d lot x zone pair(s) covering under %g m2 of "
+            "their lot - the cadastre and the zoning layer disagreeing, not a "
+            "zone that governs anything",
+            neighborhood,
+            scrape_date,
+            num_slivers,
+            config.min_overlap_m2,
         )
     if "lot_number" not in covered.columns:
         # Added to `postgis._LOT_FEATURE_COLUMNS` after some partitions were
@@ -392,6 +450,25 @@ def lot_zoning_envelopes(
     frame = envelopes[list(_OUTPUT_COLUMNS)].sort_values(
         ["lot_uid", "feature_id", "column_index"], kind="stable"
     )
+    # One row per (lot, zone, column) - the grain this asset upserts at, and
+    # the grain the solver reads. Postgres enforces it and would have hidden
+    # the problem: `ON CONFLICT` collapses a repeated key, so a duplicate would
+    # be invisible in the table and still be in the parquet, which is what
+    # `hbu_candidates` actually reads. The way one arrives is a zone number
+    # cited twice by one grid's `feature_ids`, and the cost is a second CP-SAT
+    # model on the same envelope and a lot counted twice in whatever sums it.
+    keyed = ["lot_uid", "feature_id", "column_index"]
+    num_duplicates = int(frame.duplicated(subset=keyed).sum())
+    if num_duplicates:
+        context.log.warning(
+            "%s %s: %d duplicate (lot, zone, column) row(s) - the same "
+            "envelope reached by more than one grid citing the zone; keeping "
+            "the first of each",
+            neighborhood,
+            scrape_date,
+            num_duplicates,
+        )
+        frame = frame.drop_duplicates(subset=keyed, keep="first")
 
     output_dir = store.partition_dir(
         context.asset_key.path[-1], scrape_date, neighborhood
@@ -448,9 +525,12 @@ def lot_zoning_envelopes(
             "num_rows_without_frontage": len(frame) - with_frontage,
             "num_corner_lots": int((frame["num_frontages"] > 1).sum()),
             "median_lot_area_m2": round(float(frame["lot_area_m2"].median()), 1),
-            # What the row count means depends entirely on this, so it travels
-            # with it rather than only in the run's config.
+            # What the row count means depends entirely on these, so they
+            # travel with it rather than only in the run's config.
             "min_pct_of_lot": config.min_pct_of_lot,
+            "min_overlap_m2": config.min_overlap_m2,
+            "num_sliver_pairs_dropped": num_slivers,
+            "num_duplicate_rows_dropped": num_duplicates,
             "output_path": MetadataValue.path(str(path)),
             **published_metadata(loaded),
         }
@@ -651,12 +731,21 @@ def _as_zone_column(row: pd.Series) -> ZoneColumn:
 
 
 def _feature_ids(document) -> list[str]:
-    """The map features whose link is this document, as `rag_assets` wrote them."""
+    """The map features whose link is this document, as `rag_assets` wrote them.
+
+    Distinct, in the order the document lists them. A zone number repeated in
+    the array would emit that zone's columns twice, and the duplicate survives
+    all the way to the parquet the solver reads - `silver.zoning_grid_columns`
+    is keyed on (source_table, feature_id, column_index) and would collapse it
+    in the table while leaving it in the file.
+    """
     try:
         ids = json.loads(document.feature_ids or "[]")
     except (TypeError, ValueError):
         return []
-    return [str(value) for value in ids if value is not None]
+    return list(
+        dict.fromkeys(str(value) for value in ids if value is not None)
+    )
 
 
 def _publish(

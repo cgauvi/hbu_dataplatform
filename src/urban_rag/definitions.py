@@ -21,6 +21,7 @@ from dagster import (
     schedule,
 )
 
+from urban_rag.aggregate_assets import map_cell_aggregates
 from urban_rag.assets import neighborhood_features, spectrum_table_catalog
 from urban_rag.bdoi_assets import neighborhood_buildings
 from urban_rag.building_lots_assets import building_lot_intersections
@@ -137,6 +138,7 @@ ASSETS = [
     lot_redevelopment_gap,
     lot_investment_opportunities,
     lot_building_massing,
+    map_cell_aggregates,
     document_index,
 ]
 
@@ -398,6 +400,19 @@ lot_massing_job = define_asset_job(
 # file, and re-screening a borough at a different mixed-use threshold or a
 # different land factor should not re-solve it. The same split
 # `lot_redevelopment_gap` makes behind `lot_highest_best_use`.
+# Its own job, and the last one in the chain: this reads the two gold tables
+# above plus the streets and the working set, so it can only be right once they
+# are. Kept apart from all of them for the reason the split between them
+# already draws - re-dissolving a borough onto the tile grid should not re-solve
+# it - and because this is the one job whose output is a *rendering* rather than
+# an answer. A different `ZOOM_OFFSET` would be a different map at the same
+# findings, and that is not a reason to re-run the solver.
+map_aggregates_job = define_asset_job(
+    "map_aggregates_job",
+    selection=AssetSelection.assets(map_cell_aggregates),
+    partitions_def=scrape_partitions,
+)
+
 lot_opportunities_job = define_asset_job(
     "lot_opportunities_job",
     selection=AssetSelection.assets(lot_investment_opportunities),
@@ -889,6 +904,7 @@ defs = Definitions(
         lot_hbu_job,
         lot_massing_job,
         lot_opportunities_job,
+        map_aggregates_job,
         cmhc_survey_job,
         construction_costs_job,
         uniformized_property_wealth_job,

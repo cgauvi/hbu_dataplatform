@@ -383,6 +383,24 @@ TABLES: dict[str, Table] = {
         source="sql/022_gold_lot_building_massing.sql",
         geometry="geom",
     ),
+    # The one table here keyed by a *pixel* rather than by a parcel: five map
+    # layers dissolved onto the Web Mercator tile grid, one row per (layer,
+    # cell). Its natural key is the cell address, and `layer` leads it because
+    # that is what a tile request names - a request for /tiles/lots/12/... asks
+    # for one layer at one level, and both are wanted before the geometry is.
+    #
+    # `attributes` carries the per-layer measures. That is deliberate rather
+    # than lazy: the five layers agree on nothing past `value` and
+    # `feature_count`, and a wide table of mutually exclusive nullable columns
+    # would need a migration every time a layer learns a new number.
+    "map_cell_aggregates": Table(
+        asset="map_cell_aggregates",
+        name="map_cell_aggregates",
+        keys=("layer", "cell_z", "cell_x", "cell_y"),
+        source="sql/023_gold_map_cell_aggregates.sql",
+        geometry="geom",
+        attributes="attributes",
+    ),
 }
 
 

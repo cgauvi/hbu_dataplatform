@@ -81,7 +81,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator, Sequence
 import geopandas as gpd
 import pandas as pd
 
-from urban_rag import warehouse
+from urban_rag import tile_grid, warehouse
 from urban_rag.rag.pgvector import PgSettings, PostgresUnavailable
 from urban_rag.warehouse import MissingRelation  # noqa: F401  (re-exported)
 
@@ -290,7 +290,7 @@ def _as_multi_line(geometry: Any):
         return geometry
     return (
         geometry
-        if geometry.geom_type == "MultiLineString"
+        if shape.geom_type == "MultiLineString"
         else MultiLineString([geometry])
     )
 
@@ -1936,6 +1936,29 @@ LOT_CATEGORIES: tuple[str, ...] = (
 #: detached garage 30-60, so 30 keeps the shed and drops the garage.
 DEFAULT_MAX_BUILT_AREA_M2 = 30.0
 
+#: How much of a lot a zone has to cover, in square metres, before it counts
+#: as covering it at all.
+#:
+#: The artefact cutoff, and the one number the whole platform reads it at. A
+#: cadastral boundary and a zoning boundary are drawn by two offices from two
+#: surveys, so they miss each other by centimetres along every lot line and
+#: each parcel clips a corner of its neighbour's zone. `silver.lot_features`
+#: keeps those rows deliberately - 005_silver_lot_features.sql argues that the
+#: cutoff belongs to the question being asked - and this is the value each
+#: question that asks "which zone governs this lot" answers at.
+#:
+#: Absolute rather than proportional because the artefact has an absolute size,
+#: while a percentage means one thing on a 200 m2 duplex parcel and quite
+#: another on Parc Jarry. That is what separates it from
+#: `EnvelopeConfig.min_pct_of_lot`, which is a judgement about the borough and
+#: is why that one defaults to keeping everything and this one does not.
+#:
+#: Read by `EnvelopeConfig.min_overlap_m2` and by `compute_lot_profiles`.
+#: hbu_infra's `rag.search_at_lot_number` and hbu_rag_map's
+#: `queries.MIN_ZONE_OVERLAP_M2` are the same square metre in the two repos
+#: that cannot import this one.
+MIN_ZONE_OVERLAP_M2 = 1.0
+
 #: The relations `compute_lot_profiles` reads, and the hbu_infra file that
 #: creates each. Checked up front so a partition fails naming what to apply
 #: rather than on whichever identifier the planner happened to resolve first.
@@ -1965,6 +1988,18 @@ _LOT_PROFILE_RELATIONS: tuple[tuple[str, str], ...] = (
         "sql/015_silver_lot_buildable_setbacks.sql",
     ),
     ("gold.lot_profiles", "sql/009_gold_lot_profiles.sql"),
+)
+
+#: Columns `compute_lot_profiles` reads that arrived after the relation holding
+#: them did, with the hbu_infra file that adds each.
+#:
+#: A relation being present is not the same as it being current, and a view is
+#: where the difference bites: `rag.lot_documents` has existed since 006 was
+#: first applied, and the revision that carries `overlap_area_m2` may not have
+#: been. Without this the partition fails on `column ld.overlap_area_m2 does
+#: not exist`, which names neither the view nor the file to re-apply.
+_LOT_PROFILE_REQUIRED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("rag.lot_documents", "overlap_area_m2", "sql/006_lot_documents.sql"),
 )
 
 
@@ -2024,6 +2059,7 @@ def compute_lot_profiles(
     neighborhood: str,
     scrape_date: str,
     max_built_area_m2: float = DEFAULT_MAX_BUILT_AREA_M2,
+    min_overlap_m2: float = MIN_ZONE_OVERLAP_M2,
     vacancy_rates: dict | None = None,
     average_rents: dict | None = None,
     construction_costs: dict | None = None,
@@ -2038,6 +2074,10 @@ def compute_lot_profiles(
     * `silver.building_lot_intersections` -> `num_buildings`, `built_area_m2`, `category`
     * `silver.lot_frontage`  -> `primary_*` and `secondary_*`, `num_frontages`
     * `rag.lot_documents` -> `doc_*` and the `documents` array
+
+    That third one is read at `min_overlap_m2`: a zone clipping under a square
+    metre of a parcel contributes no document to it, because it is not a zone
+    the parcel is in. See `MIN_ZONE_OVERLAP_M2`.
 
     A fourth table joins without a CTE, because it is the one input that
     already arrives at this grain:
@@ -2142,6 +2182,7 @@ def compute_lot_profiles(
 
     cursor = connection.cursor()
     _require_relations(cursor, _LOT_PROFILE_RELATIONS)
+    _require_columns(cursor, _LOT_PROFILE_REQUIRED_COLUMNS)
 
     # Ahead of the write so a malformed envelope costs nothing: the partition
     # is only rebuilt once there is something to rebuild it from.
@@ -2240,12 +2281,21 @@ def compute_lot_profiles(
             -- same layer that both cite the same grid arrives twice; keeping
             -- the feature that covers most of the lot is what makes
             -- `num_documents` a count of documents rather than of overlaps.
+            --
+            -- The area cutoff is what keeps it a count of documents that
+            -- *apply*. A parcel clipping a square metre of the block next door
+            -- picks up that block's grid, and it lands in `documents` and in
+            -- `num_documents` looking exactly like the grid of the zone the
+            -- parcel is actually in. `doc_id` and the other flattened columns
+            -- were already safe - they take the highest `pct_of_lot` - so this
+            -- is the array and the count, which nothing else was guarding.
             SELECT DISTINCT ON (ld.lot_uid, ld.source_table, ld.doc_id)
                    ld.lot_uid, ld.source_table, ld.doc_id, ld.url, ld.title,
                    ld.feature_id, ld.pct_of_lot
               FROM rag.lot_documents ld
              WHERE ld.neighborhood = %(neighborhood)s
                AND ld.scrape_date = %(scrape_date)s::date
+               AND ld.overlap_area_m2 >= %(min_overlap_m2)s
              ORDER BY ld.lot_uid, ld.source_table, ld.doc_id, ld.pct_of_lot DESC
         ),
         docs AS (
@@ -2539,6 +2589,7 @@ def compute_lot_profiles(
             "neighborhood": neighborhood,
             "scrape_date": scrape_date,
             "threshold": threshold,
+            "min_overlap_m2": min_overlap_m2,
             "vacancy_rates": Jsonb(vacancy_rates or {}),
             "average_rents": Jsonb(average_rents or {}),
             "construction_costs": Jsonb(construction_costs or {}),
@@ -2763,6 +2814,534 @@ def compute_lot_profiles(
     }
 
 
+# --------------------------------------------------------------------------
+# the low-zoom aggregates
+#
+# `gold.map_cell_aggregates` is the one table here whose rows are not a fact
+# about a lot but a fact about a *pixel*: every gated map layer dissolved onto
+# the Web Mercator tile grid, so a borough-wide view has something true to draw
+# where at present it draws nothing at all. `urban_rag.tile_grid` holds the
+# grid arithmetic and declares what each layer's cell carries; everything below
+# is the SQL that fills it, and hbu_infra's sql/023 is the table.
+#
+# **The pyramid.** Only the finest level - `tile_grid.BASE_CELL_ZOOM` - is
+# computed from real geometry. Every coarser level is four children rolled into
+# their parent, which is a halving of the two cell indices and a `sum`. The
+# alternative, clipping twenty-five thousand lots against the grid once per
+# level, does the expensive part five times over to arrive at the same answer.
+#
+# **Two staging tables, and they are why this reads the way it does.** The
+# geometry and the measures roll up on different keys - a union grouped by
+# parent cell, and a sum grouped by parent cell *and measure name* - so they
+# are accumulated apart and joined once at the end. Keeping the measures in
+# long form (one row per cell per measure) is what makes that rollup generic:
+# giving a layer another number in `tile_grid` needs no change here, because
+# `sum(value) GROUP BY measure` does not care how many measures there are. They
+# are pivoted into the `attributes` jsonb in the final select, which is the one
+# place those names become keys.
+#
+# **Nothing crosses into Python until the upsert.** Five layers by five levels
+# is twenty-five statements for a borough, each an aggregate over rows already
+# loaded and GiST-indexed - the same posture `compute_lot_features` takes, for
+# the same reason.
+# --------------------------------------------------------------------------
+
+#: The Mercator limit, in degrees. A latitude past this has no row in the tile
+#: grid to land in - the projection sends it to infinity - so it is clamped
+#: rather than left to produce a NaN cell index. Nothing in Montreal is near
+#: it; the clamp is here so one stray geometry cannot take a partition down.
+_MERCATOR_MAX_LAT = 85.0511287798
+
+#: The measures read off the dissolved geometry rather than off the feature
+#: rows: everything in `tile_grid.UNIVERSAL_MEASURES` except the count, which
+#: comes from the representative points and has a column of its own.
+#:
+#: Derived rather than restated, because the two lists disagreeing is not a
+#: crash: `_measure_reference` would resolve the stray name to a jsonb key that
+#: is never written, and the layer shading on it would come back NULL on every
+#: cell - a borough drawn entirely in the "not answered" grey, which is a
+#: legible thing for a map to draw.
+_GEOMETRY_MEASURES = tuple(
+    name for name in tile_grid.UNIVERSAL_MEASURES if name != "feature_count"
+)
+
+
+def _sql_literal(value: str) -> str:
+    """A Python string as a SQL string literal.
+
+    These are layer and measure names out of `tile_grid`, never user input, and
+    they are interpolated rather than bound because they appear inside `VALUES`
+    lists and `CASE` arms built per layer. Quoting them properly anyway costs
+    nothing and closes the one way a name could break the statement.
+    """
+    escaped = value.replace("'", "''")
+    return f"'{escaped}'"
+
+
+def _cell_x_sql(lon: str, zoom: int) -> str:
+    """The tile column containing longitude ``lon`` at ``zoom``, as SQL.
+
+    `tile_grid.cell_of` is the same arithmetic in Python, and the unit tests
+    check the two agree on real coordinates: a grid computed one way in SQL and
+    asserted another way in Python is a grid with no test at all.
+    """
+    span = 1 << zoom
+    return (
+        f"greatest(0, least({span - 1}, "
+        f"floor(((({lon}) + 180.0) / 360.0) * {span}.0)::integer))"
+    )
+
+
+def _cell_y_sql(lat: str, zoom: int) -> str:
+    """The tile row containing latitude ``lat`` at ``zoom``, as SQL.
+
+    Rows run north to south, so this is the one place where the smaller index
+    comes from the larger coordinate. `asinh(tan(radians(lat)))` is the
+    Mercator northing; Postgres has had `asinh` since 12.
+    """
+    span = 1 << zoom
+    clamped = f"greatest({-_MERCATOR_MAX_LAT}, least({_MERCATOR_MAX_LAT}, {lat}))"
+    return (
+        f"greatest(0, least({span - 1}, "
+        f"floor(((1.0 - asinh(tan(radians({clamped}))) / pi()) / 2.0) "
+        f"* {span}.0)::integer))"
+    )
+
+
+def _cell_envelope_sql(zoom: str, x: str, y: str) -> str:
+    """The cell ``zoom/x/y`` as an EPSG:4326 box.
+
+    `ST_TileEnvelope` answers in 3857 and every layer here is stored in 4326,
+    so one of the two has to move. Transforming the *envelope* rather than the
+    geometry is what keeps the clip cheap and leaves the GiST indexes usable,
+    and it is exact rather than approximate: the projection is separable and
+    monotone on each axis, so the transform of an axis-parallel box is the box
+    it should be.
+    """
+    return f"ST_Transform(ST_TileEnvelope({zoom}, {x}, {y}), 4326)"
+
+
+def _create_aggregate_staging(cursor: Any) -> None:
+    """The two temp tables the pyramid is accumulated in.
+
+    ``ON COMMIT DROP`` rather than an explicit clean-up: the whole computation
+    runs inside the caller's transaction, so these live exactly as long as it
+    does and a failed partition leaves nothing behind for the retry to collide
+    with.
+    """
+    cursor.execute(
+        """
+        CREATE TEMP TABLE _agg_cells (
+            layer   text     NOT NULL,
+            cell_z  smallint NOT NULL,
+            cell_x  integer  NOT NULL,
+            cell_y  integer  NOT NULL,
+            geom    geometry NOT NULL
+        ) ON COMMIT DROP
+        """
+    )
+    cursor.execute(
+        """
+        CREATE TEMP TABLE _agg_measures (
+            layer   text     NOT NULL,
+            cell_z  smallint NOT NULL,
+            cell_x  integer  NOT NULL,
+            cell_y  integer  NOT NULL,
+            measure text     NOT NULL,
+            value   double precision
+        ) ON COMMIT DROP
+        """
+    )
+    # Every rollup and the final join look rows up by level. Two indexes on
+    # temp tables of a few tens of thousands of rows, which is cheaper than the
+    # five sequential scans they replace.
+    cursor.execute("CREATE INDEX ON _agg_cells (cell_z, layer)")
+    cursor.execute("CREATE INDEX ON _agg_measures (cell_z, layer)")
+
+
+def _seed_cell_geometry(
+    cursor: Any, spec: "tile_grid.LayerSpec", params: dict
+) -> int:
+    """Dissolve one layer's geometry into the finest cells.
+
+    The clip, and the only statement in this module that touches raw geometry.
+    A feature is expanded into every cell its *envelope* spans and then
+    intersected with each, so a diagonal street side generates some cells its
+    linework never enters; those clip to empty and are dropped by the `WHERE`.
+    That waste is bounded - an envelope spans a few hundred cells at worst -
+    and it is what lets the expansion be plain arithmetic on a bounding box
+    instead of a spatial join.
+
+    `ST_CollectionExtract` at the layer's own dimension is not optional. A
+    polygon clipped against a box its edge runs along comes back as a
+    collection carrying that edge, and unioning those into the cell would draw
+    a hairline along every cell boundary the cadastre happens to touch.
+    """
+    zoom = tile_grid.BASE_CELL_ZOOM
+    geom = spec.geometry
+    envelope = _cell_envelope_sql(str(zoom), "cx.cell_x", "cy.cell_y")
+    statement = f"""
+        INSERT INTO _agg_cells (layer, cell_z, cell_x, cell_y, geom)
+        SELECT %(layer)s, {zoom}, cx.cell_x, cy.cell_y, ST_Union(clip.geom)
+          FROM {spec.source}
+          CROSS JOIN LATERAL (
+              SELECT {_cell_x_sql(f"ST_XMin({geom})", zoom)} AS x0,
+                     {_cell_x_sql(f"ST_XMax({geom})", zoom)} AS x1,
+                     {_cell_y_sql(f"ST_YMax({geom})", zoom)} AS y0,
+                     {_cell_y_sql(f"ST_YMin({geom})", zoom)} AS y1
+          ) AS box
+          CROSS JOIN LATERAL generate_series(box.x0, box.x1) AS cx(cell_x)
+          CROSS JOIN LATERAL generate_series(box.y0, box.y1) AS cy(cell_y)
+          CROSS JOIN LATERAL (
+              SELECT ST_CollectionExtract(
+                         ST_Intersection({geom}, {envelope}),
+                         {spec.dimension}
+                     ) AS geom
+          ) AS clip
+         WHERE {spec.where}
+           AND {geom} IS NOT NULL
+           AND NOT ST_IsEmpty({geom})
+           AND NOT ST_IsEmpty(clip.geom)
+         GROUP BY cx.cell_x, cy.cell_y
+    """
+    cursor.execute(statement, params)
+    return max(cursor.rowcount, 0)
+
+
+def _seed_cell_measures(
+    cursor: Any, spec: "tile_grid.LayerSpec", params: dict
+) -> int:
+    """Sum one layer's per-feature numbers into the finest cells.
+
+    The other assignment, and the one that makes the counts exact: a feature
+    contributes to precisely one cell, the one holding its `ST_PointOnSurface`.
+    `ST_Centroid` is the obvious choice and the wrong one - the centroid of an
+    L-shaped parcel can fall outside it, and on a grid this fine that is a lot
+    credited to ground it does not touch.
+
+    The measures land in long form, one row per (cell, measure), which is what
+    lets the rollup above them be a single generic `sum`. `feature_count` rides
+    along as a measure whose value is 1 rather than as a `count(*)`, for the
+    same reason: it then rolls up through exactly the same statement as
+    everything else.
+    """
+    zoom = tile_grid.BASE_CELL_ZOOM
+    measures = {"feature_count": "1.0", **spec.point_measures}
+    values = ", ".join(
+        f"({_sql_literal(name)}, ({expression})::double precision)"
+        for name, expression in measures.items()
+    )
+    statement = f"""
+        INSERT INTO _agg_measures (layer, cell_z, cell_x, cell_y, measure, value)
+        SELECT %(layer)s,
+               {zoom},
+               {_cell_x_sql("ST_X(point.geom)", zoom)},
+               {_cell_y_sql("ST_Y(point.geom)", zoom)},
+               measured.measure,
+               sum(measured.value)
+          FROM {spec.source}
+          CROSS JOIN LATERAL (
+              SELECT ST_PointOnSurface({spec.geometry}) AS geom
+          ) AS point
+          CROSS JOIN LATERAL (VALUES {values}) AS measured(measure, value)
+         WHERE {spec.where}
+           AND {spec.geometry} IS NOT NULL
+           AND NOT ST_IsEmpty({spec.geometry})
+         GROUP BY 3, 4, measured.measure
+    """
+    cursor.execute(statement, params)
+    return max(cursor.rowcount, 0)
+
+
+def _roll_up_level(cursor: Any, zoom: int) -> tuple[int, int]:
+    """Build level ``zoom`` from the level one finer.
+
+    Both halves are the same idea spelled for their own key: four children
+    reduce to one parent by halving each index, which is what makes this a
+    pyramid rather than five independent grids. `>>` rather than `/ 2` because
+    these are grid indices and the shift is the definition, not an
+    optimisation.
+
+    Geometry is unioned and measures are summed, and both are exact for the
+    reason `urban_rag.tile_grid` gives: the four children of a cell are
+    disjoint and tile it exactly.
+    """
+    child = zoom + 1
+    cursor.execute(
+        """
+        INSERT INTO _agg_cells (layer, cell_z, cell_x, cell_y, geom)
+        SELECT layer, %(zoom)s, cell_x >> 1, cell_y >> 1, ST_Union(geom)
+          FROM _agg_cells
+         WHERE cell_z = %(child)s
+         GROUP BY layer, cell_x >> 1, cell_y >> 1
+        """,
+        {"zoom": zoom, "child": child},
+    )
+    cells = max(cursor.rowcount, 0)
+    cursor.execute(
+        """
+        INSERT INTO _agg_measures
+               (layer, cell_z, cell_x, cell_y, measure, value)
+        SELECT layer, %(zoom)s, cell_x >> 1, cell_y >> 1, measure, sum(value)
+          FROM _agg_measures
+         WHERE cell_z = %(child)s
+         GROUP BY layer, cell_x >> 1, cell_y >> 1, measure
+        """,
+        {"zoom": zoom, "child": child},
+    )
+    return cells, max(cursor.rowcount, 0)
+
+
+#: The columns of `gold.map_cell_aggregates` a run writes, in the order
+#: `_aggregate_select` produces them. `warehouse.upsert_select` pairs the two
+#: **positionally**, so this list and that SELECT are one thing written twice -
+#: which is a thing worth naming rather than leaving inline, because a column
+#: added to one and not the other shifts every value after it one place to the
+#: left and Postgres only notices where the types happen to disagree.
+MAP_CELL_COLUMNS: tuple[str, ...] = (
+    "scrape_date",
+    "neighborhood",
+    "layer",
+    "cell_z",
+    "cell_x",
+    "cell_y",
+    "feature_count",
+    "value",
+    "value_kind",
+    "dissolved_area_m2",
+    "dissolved_length_m",
+    "cell_area_m2",
+    "coverage_pct",
+    "attributes",
+    "geom",
+)
+
+
+def _measure_reference(name: str) -> str:
+    """Where a measure named in a `LayerSpec.value` is read from."""
+    if name in _GEOMETRY_MEASURES:
+        return f"shape.{name}"
+    if name == "feature_count":
+        return "measures.feature_count"
+    return f"(measures.attributes ->> {_sql_literal(name)})::double precision"
+
+
+def _value_expression(spec: "tile_grid.LayerSpec") -> str:
+    """``spec``'s shaded number, as SQL over the joined staging rows.
+
+    Every layer's value is ``scale * numerator / denominator``, and the two
+    names are resolved to wherever that measure actually lives - a
+    geometry-derived column, the count, or a key of the measures pivot. That
+    indirection is what lets `tile_grid` declare a layer's shading as three
+    values rather than as a fragment of SQL.
+
+    `NULLIF` on the denominator is what produces the NULL the map shades as
+    "not answered". On the capacity layer that is the whole difference between
+    a cell nothing was solved for and a cell at 0% of its permitted floor, and
+    those are opposite findings.
+    """
+    return (
+        f"{spec.scale} * {_measure_reference(spec.numerator)} "
+        f"/ NULLIF({_measure_reference(spec.denominator)}, 0)"
+    )
+
+
+def _aggregate_select(layers: Sequence[str]) -> str:
+    """The statement that turns the two staging tables into table rows.
+
+    Three things happen here and nowhere else, which is why it is assembled
+    rather than written out:
+
+    * the **geometry measures** are taken, in the `shape` CTE - the dissolved
+      area and length of the clip, and the cell's own area, which is what every
+      density on this table is per. Named `shape` rather than `geometry`
+      because the latter is a PostGIS type name, and an alias that shadows one
+      is a thing to trip over rather than a thing to read;
+    * the **measures are pivoted** out of long form into `attributes`, with
+      `feature_count` lifted into a column of its own because it is the one
+      number every layer has and the one the map wants without parsing json;
+    * each layer's **value** is computed by its own rule, in a CASE built from
+      `tile_grid`'s specs - so the shading rule lives beside the layer
+      declaration instead of inside this string.
+    """
+    specs = [tile_grid.layer_spec(name) for name in layers]
+    value_cases = "\n               ".join(
+        f"WHEN {_sql_literal(spec.name)} THEN {_value_expression(spec)}"
+        for spec in specs
+    )
+    kind_cases = "\n               ".join(
+        f"WHEN {_sql_literal(spec.name)} THEN {_sql_literal(spec.value_kind)}"
+        for spec in specs
+    )
+    envelope = _cell_envelope_sql(
+        "cells.cell_z::integer", "cells.cell_x", "cells.cell_y"
+    )
+    return f"""
+        WITH shape AS (
+            SELECT cells.layer,
+                   cells.cell_z,
+                   cells.cell_x,
+                   cells.cell_y,
+                   cells.geom,
+                   -- Both taken on every layer: ST_Area of linework is 0 and
+                   -- ST_Length of an areal geometry is 0, so the layers sort
+                   -- themselves out without a branch here.
+                   ST_Area(geography(cells.geom))   AS dissolved_area_m2,
+                   ST_Length(geography(cells.geom)) AS dissolved_length_m,
+                   ST_Area(geography({envelope}))   AS cell_area_m2
+              FROM _agg_cells AS cells
+        ),
+        measures AS (
+            SELECT layer,
+                   cell_z,
+                   cell_x,
+                   cell_y,
+                   max(value) FILTER (WHERE measure = 'feature_count')
+                       AS feature_count,
+                   COALESCE(
+                       jsonb_object_agg(measure, value)
+                           FILTER (WHERE measure <> 'feature_count'),
+                       '{{}}'::jsonb
+                   ) AS attributes
+              FROM _agg_measures
+             GROUP BY layer, cell_z, cell_x, cell_y
+        )
+        SELECT %(scrape_date)s::date,
+               %(neighborhood)s,
+               shape.layer,
+               shape.cell_z,
+               shape.cell_x,
+               shape.cell_y,
+               COALESCE(measures.feature_count, 0)::integer,
+               CASE shape.layer
+               {value_cases}
+               END,
+               CASE shape.layer
+               {kind_cases}
+               END,
+               shape.dissolved_area_m2,
+               shape.dissolved_length_m,
+               shape.cell_area_m2,
+               100.0 * shape.dissolved_area_m2
+                   / NULLIF(shape.cell_area_m2, 0),
+               COALESCE(measures.attributes, '{{}}'::jsonb),
+               shape.geom
+          FROM shape
+          -- LEFT, and from the shape side: a cell a neighbouring lot's edge
+          -- reaches into has a shape and no feature of its own. Dropping it
+          -- would put a hole in the dissolved surface exactly where a large
+          -- parcel meets a cell boundary.
+          LEFT JOIN measures
+                 ON measures.layer  = shape.layer
+                AND measures.cell_z = shape.cell_z
+                AND measures.cell_x = shape.cell_x
+                AND measures.cell_y = shape.cell_y
+    """
+
+
+def compute_map_cell_aggregates(
+    connection: "Connection",
+    *,
+    neighborhood: str,
+    scrape_date: str,
+    layers: Sequence[str] | None = None,
+) -> dict[str, object]:
+    """(Re)compute `gold.map_cell_aggregates` for one (neighborhood, scrape_date).
+
+    The map's five gated layers, dissolved onto the tile grid at every level in
+    `tile_grid.CELL_ZOOMS`, so a view below a layer's gate has something true
+    to draw instead of nothing. See `urban_rag.tile_grid` for why a cell is a
+    tile and why two different assignments are used for the two kinds of
+    measure.
+
+    Assumes the partition's rows are already in Postgres - `rag.lots` and
+    `rag.buildings` from `load_lots`/`load_buildings`, and the three published
+    tables from their own assets. Every layer is screened on
+    ``(neighborhood, scrape_date)``, so a borough can never be summarised
+    against another date's cadastre.
+
+    A layer whose source holds nothing for this partition contributes no rows
+    rather than failing the run, which is both the honest outcome and the
+    useful one: `lot_building_massing` may not have been materialized for a
+    borough yet, and refusing to build the other four because of it would make
+    this asset as fragile as its least-run input. The per-layer counts come
+    back in the result, so an empty layer is visible rather than silent.
+    """
+    wanted = tuple(layers) if layers is not None else tile_grid.LAYERS
+    cursor = connection.cursor()
+    _require_relations(
+        cursor,
+        (("gold.map_cell_aggregates", "sql/023_gold_map_cell_aggregates.sql"),),
+    )
+    _create_aggregate_staging(cursor)
+
+    params = {"neighborhood": neighborhood, "scrape_date": scrape_date}
+    base_cells: dict[str, int] = {}
+    for name in wanted:
+        spec = tile_grid.layer_spec(name)
+        layer_params = {**params, "layer": name}
+        base_cells[name] = _seed_cell_geometry(cursor, spec, layer_params)
+        _seed_cell_measures(cursor, spec, layer_params)
+
+    # Coarsest last, each level reading the one below it. `CELL_ZOOMS` is
+    # ascending and the base is its maximum, so this walks back down from
+    # `BASE_CELL_ZOOM - 1`.
+    for zoom in sorted(tile_grid.CELL_ZOOMS, reverse=True)[1:]:
+        _roll_up_level(cursor, zoom)
+
+    published = warehouse.upsert_select(
+        cursor,
+        "map_cell_aggregates",
+        MAP_CELL_COLUMNS,
+        _aggregate_select(wanted),
+        params,
+        neighborhood=neighborhood,
+        scrape_date=scrape_date,
+    )
+
+    cursor.execute(
+        """
+        SELECT layer, cell_z, count(*)
+          FROM gold.map_cell_aggregates
+         WHERE neighborhood = %s AND scrape_date = %s::date
+         GROUP BY layer, cell_z
+        """,
+        [neighborhood, scrape_date],
+    )
+    by_level = {
+        f"{layer}@z{zoom}": int(count) for layer, zoom, count in cursor.fetchall()
+    }
+
+    # The bound this whole design exists for, measured rather than asserted in
+    # a comment: how many cells the busiest served tile would carry. It should
+    # be `tile_grid.cells_per_tile()` and cannot exceed it, because a tile at
+    # zoom Z holds exactly that many cells at Z + ZOOM_OFFSET - so what this
+    # actually catches is a level built from the wrong child level.
+    cursor.execute(
+        f"""
+        SELECT COALESCE(max(per_tile), 0)
+          FROM (
+              SELECT count(*) AS per_tile
+                FROM gold.map_cell_aggregates
+               WHERE neighborhood = %s AND scrape_date = %s::date
+               GROUP BY layer,
+                        cell_z,
+                        cell_x >> {tile_grid.ZOOM_OFFSET},
+                        cell_y >> {tile_grid.ZOOM_OFFSET}
+          ) AS served
+        """,
+        [neighborhood, scrape_date],
+    )
+    (max_per_tile,) = cursor.fetchone()
+
+    return {
+        "published": published,
+        "num_cells_by_layer_level": by_level,
+        "num_base_cells_by_layer": base_cells,
+        "max_cells_per_served_tile": int(max_per_tile or 0),
+    }
+
+
 def _require_relations(
     cursor: Any, relations: tuple[tuple[str, str], ...]
 ) -> None:
@@ -2788,6 +3367,42 @@ def _require_relations(
             + ", ".join(missing)
             + " - apply the file(s) above with `./scripts/db.py init` in that "
             "repo, then re-run this partition."
+        )
+
+
+def _require_columns(
+    cursor: Any, columns: tuple[tuple[str, str, str], ...]
+) -> None:
+    """Raise `MissingRelation` naming every column an older revision lacks.
+
+    The companion to `_require_relations`, for the case that check cannot see:
+    the relation is there and out of date. Same exception, because the fix is
+    the same one - re-apply the file - and a caller that already handles a
+    missing view should not need a second branch for a missing column of it.
+
+    Assumes the relation itself exists; run it after `_require_relations`, so
+    a database missing the view entirely is told that rather than this.
+    """
+    missing: list[str] = []
+    for name, column, source in columns:
+        cursor.execute(
+            """
+            SELECT 1 FROM pg_attribute
+             WHERE attrelid = to_regclass(%s)
+               AND attname = %s
+               AND attnum > 0
+               AND NOT attisdropped
+            """,
+            [name, column],
+        )
+        if cursor.fetchone() is None:
+            missing.append(f"{name}.{column} ({source})")
+    if missing:
+        raise MissingRelation(
+            "hbu_infra has an out-of-date definition, missing: "
+            + ", ".join(missing)
+            + " - re-apply the file(s) above with `./scripts/db.py init` in "
+            "that repo, then re-run this partition."
         )
 
 
@@ -3116,6 +3731,50 @@ def fetch_lot_profiles(
         FROM gold.lot_profiles
         WHERE neighborhood = %s AND scrape_date = %s::date
         ORDER BY lot_number
+        """,
+        [neighborhood, scrape_date],
+    )
+
+
+#: `gold.map_cell_aggregates`, for the copy written to the tree. `attributes`
+#: is cast to text on the way out for the reason the other jsonb columns here
+#: are: psycopg hands a jsonb back as a parsed dict, and a parquet column of
+#: dicts is a struct whose fields are whatever the first row happened to have.
+#: Text round-trips, and every reader of the tree already parses it.
+_MAP_CELL_COLUMNS = (
+    "layer",
+    "cell_z",
+    "cell_x",
+    "cell_y",
+    "neighborhood",
+    "feature_count",
+    "value",
+    "value_kind",
+    "dissolved_area_m2",
+    "dissolved_length_m",
+    "cell_area_m2",
+    "coverage_pct",
+    "attributes::text AS attributes",
+)
+
+
+def fetch_map_cell_aggregates(
+    connection: "Connection", *, neighborhood: str, scrape_date: str
+) -> gpd.GeoDataFrame:
+    """This partition's `gold.map_cell_aggregates` rows, as a GeoDataFrame.
+
+    Ordered by (layer, level, x, y) - the address, not any of the measures.
+    This table is read a tile at a time rather than as a ranked list, so the
+    order that helps is the one that puts a level's cells next to each other
+    in the file.
+    """
+    return _fetch_partition(
+        connection,
+        _MAP_CELL_COLUMNS,
+        """
+        FROM gold.map_cell_aggregates
+        WHERE neighborhood = %s AND scrape_date = %s::date
+        ORDER BY layer, cell_z, cell_x, cell_y
         """,
         [neighborhood, scrape_date],
     )

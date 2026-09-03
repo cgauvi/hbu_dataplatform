@@ -864,6 +864,14 @@ def governing_zone(envelopes: pd.DataFrame) -> pd.Series:
     the same zone on every run rather than to whichever the join happened to
     place first. A frame carrying no `pct_of_lot` - a hand-built one in a test
     - leaves every zone in, since there is nothing to rank them by.
+
+    **The smallest of those slivers no longer reach here.**
+    `EnvelopeConfig.min_overlap_m2` drops a zone clipping under a square metre
+    of a lot before `lot_zoning_envelopes` writes a row for it - the few square
+    centimetres at the corner of the park above is one of them. That changes
+    the counts quoted here, which were measured before it: this still decides
+    every case, and now has fewer to decide. Nothing about the rule changes,
+    since the rows removed are the ones it was already ranking last.
     """
     if "lot_uid" not in envelopes.columns or "feature_id" not in envelopes.columns:
         return pd.Series(dtype="object")

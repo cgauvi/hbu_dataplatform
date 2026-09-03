@@ -21,6 +21,7 @@ from __future__ import annotations
 import pytest
 from psycopg._queries import _query2pg_nocache
 
+from urban_rag import postgis
 from urban_rag.postgis import (
     DEFAULT_MAX_BUILT_AREA_M2,
     LOT_CATEGORIES,
@@ -63,12 +64,17 @@ class FakeCursor:
         self,
         *,
         missing: tuple[str, ...] = (),
+        outdated: tuple[str, ...] = (),
         num_envelopes: int = 4,
         assessed: tuple[object, ...] = (7, 19, 4_200_000.0, 2026),
         buildable: tuple[object, ...] = (9, 5, 41.5),
         comparables: tuple[object, ...] = (8, 6, 4.25, 0.82, 1_450_000.0),
     ):
         self.missing = missing
+        #: "relation.column" entries a database with an older hbu_infra
+        #: revision would not have, answered the way Postgres answers them -
+        #: the relation resolves and the column is simply not on it.
+        self.outdated = outdated
         self.num_envelopes = num_envelopes
         #: What the assessment join reports back: lots carrying a total, the
         #: units standing on them, the apportioned total and the roll year.
@@ -91,7 +97,15 @@ class FakeCursor:
         self.statements.append((statement, params))
         text = " ".join(statement.split())
 
-        if "to_regclass" in text:
+        if "pg_attribute" in text and "to_regclass" in text:
+            # `_require_columns`, which names a relation *and* a column - so it
+            # has to be matched before the relation check below, whose text it
+            # also contains.
+            name, column = params
+            self._result = (
+                None if f"{name}.{column}" in self.outdated else (1,)
+            )
+        elif "to_regclass" in text:
             (name,) = params
             self._result = (None if name in self.missing else name,)
         elif "warehouse.ensure_partition" in text:
@@ -378,6 +392,60 @@ def test_a_missing_relation_names_the_hbu_infra_file_to_apply():
         "INSERT" in statement or "DELETE" in statement
         for statement, _ in cursor.statements
     ), "the partition was rewritten against relations that are not there"
+
+
+def test_an_outdated_view_names_the_file_to_re_apply():
+    """A relation can be present and stale, which the relation check cannot see.
+
+    `rag.lot_documents` gained `overlap_area_m2` after it first shipped, and a
+    database still on the older revision resolves the view perfectly well.
+    Without this the partition fails on `column ld.overlap_area_m2 does not
+    exist`, which names neither the view nor the file that fixes it.
+    """
+    cursor = FakeCursor(outdated=("rag.lot_documents.overlap_area_m2",))
+
+    with pytest.raises(MissingRelation) as caught:
+        compute(cursor)
+
+    message = str(caught.value)
+    assert "rag.lot_documents.overlap_area_m2" in message
+    assert "sql/006_lot_documents.sql" in message
+    assert not any(
+        "INSERT" in statement or "DELETE" in statement
+        for statement, _ in cursor.statements
+    ), "the partition was rewritten against a view that cannot answer it"
+
+
+def test_the_document_join_drops_a_zone_that_clips_the_lot():
+    """A square metre of the block next door is not one of a lot's documents."""
+    cursor = FakeCursor()
+    compute(cursor)
+
+    select = next(
+        params
+        for statement, params in cursor.statements
+        if "INSERT INTO gold_lot_profiles_load" in statement
+    )
+    assert select["min_overlap_m2"] == postgis.MIN_ZONE_OVERLAP_M2
+
+    statement = next(
+        statement
+        for statement, _ in cursor.statements
+        if "INSERT INTO gold_lot_profiles_load" in statement
+    )
+    assert "ld.overlap_area_m2 >= %(min_overlap_m2)s" in statement
+
+
+def test_the_document_cutoff_can_be_turned_off():
+    cursor = FakeCursor()
+    compute(cursor, min_overlap_m2=0.0)
+
+    select = next(
+        params
+        for statement, params in cursor.statements
+        if "INSERT INTO gold_lot_profiles_load" in statement
+    )
+    assert select["min_overlap_m2"] == 0.0
 
 
 def test_every_missing_relation_is_reported_at_once():

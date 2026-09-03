@@ -320,9 +320,12 @@ def test_a_column_with_no_storey_ceiling_lands_but_is_not_solver_ready(
 # -- lot_zoning_envelopes ---------------------------------------------------
 
 
-def materialize_both(store, cache, stub_pdfs, **envelope_kwargs):
+def materialize_both(store, cache, stub_pdfs, *, feature_ids=None, **envelope_kwargs):
     stub_pdfs.setdefault(GRID_URL, grid_pdf())
-    write_documents(store)
+    if feature_ids is None:
+        write_documents(store)
+    else:
+        write_documents(store, feature_ids=(feature_ids,))
     run_columns(store, cache)
     return run_envelopes(store, **envelope_kwargs)
 
@@ -401,10 +404,14 @@ def test_a_lot_too_narrow_for_every_residential_column_governs_none(
 def test_a_sliver_of_a_neighbouring_zone_can_be_configured_away(
     store, cache, stub_pdfs
 ):
-    write_lot_features(store, lot_uids=(1, 1), zones=("C01-001",) * 2, pct=(97.0, 3.0))
+    # Two *distinct* zones, which is what a lot on a boundary actually meets:
+    # the same number twice is one zone, and the assets now say so.
+    write_lot_features(
+        store, lot_uids=(1, 1), zones=("C01-001", "C01-009"), pct=(97.0, 3.0)
+    )
     write_frontage(store)
 
-    materialize_both(store, cache, stub_pdfs)
+    materialize_both(store, cache, stub_pdfs, feature_ids=["C01-001", "C01-009"])
     assert len(read_envelopes(store)) == 4
 
     run_envelopes(
@@ -418,6 +425,80 @@ def test_a_sliver_of_a_neighbouring_zone_can_be_configured_away(
     frame = read_envelopes(store)
     assert len(frame) == 2
     assert frame["pct_of_lot"].unique().tolist() == [97.0]
+
+
+def test_a_square_metre_of_a_neighbouring_zone_is_not_an_envelope(
+    store, cache, stub_pdfs
+):
+    """The artefact cutoff, which unlike `min_pct_of_lot` is on by default.
+
+    0.2% of a 400 m2 lot is 0.8 m2 - the cadastre and the zoning layer missing
+    each other along a lot line, not a second set of rules. It goes out
+    without being configured away, and the percentage cutoff would not have
+    caught it: at its default of 0 every overlap is kept.
+    """
+    write_lot_features(
+        store, lot_uids=(1, 1), zones=("C01-001", "C01-009"), pct=(99.8, 0.2)
+    )
+    write_frontage(store)
+
+    result = materialize_both(
+        store, cache, stub_pdfs, feature_ids=["C01-001", "C01-009"]
+    )
+    frame = read_envelopes(store)
+    assert frame["feature_id"].unique().tolist() == ["C01-001"]
+    assert len(frame) == 2
+
+    metadata = materialization_metadata(result, lot_zoning_envelopes)
+    # One lot x zone pair, which the grid then turns into the two columns the
+    # kept zone contributes.
+    assert metadata["min_overlap_m2"].value == 1.0
+    assert metadata["num_sliver_pairs_dropped"].value == 1
+
+
+def test_the_artefact_cutoff_can_be_turned_off(store, cache, stub_pdfs):
+    write_lot_features(
+        store, lot_uids=(1, 1), zones=("C01-001", "C01-009"), pct=(99.8, 0.2)
+    )
+    write_frontage(store)
+
+    materialize_both(
+        store,
+        cache,
+        stub_pdfs,
+        feature_ids=["C01-001", "C01-009"],
+        run_config={
+            "ops": {
+                "silver__lot_zoning_envelopes": {"config": {"min_overlap_m2": 0.0}}
+            }
+        },
+    )
+    assert len(read_envelopes(store)) == 4
+
+
+def test_a_zone_a_grid_cites_twice_is_one_zone(store, cache, stub_pdfs):
+    """A repeated id in `feature_ids` is not two zones sharing a grid.
+
+    `silver.zoning_grid_columns` is keyed on (source_table, feature_id,
+    column_index) and `silver.lot_zoning_envelopes` on (lot_uid, feature_id,
+    column_index), so Postgres would collapse the repeat and leave it in the
+    parquet - which is the file `hbu_candidates` reads, and a second CP-SAT
+    model on the same envelope.
+    """
+    write_lot_features(store)
+    write_frontage(store)
+
+    materialize_both(store, cache, stub_pdfs, feature_ids=["C01-001", "C01-001"])
+
+    columns = read_columns(store)
+    assert len(columns) == 2
+    assert columns["feature_id"].unique().tolist() == ["C01-001"]
+
+    frame = read_envelopes(store)
+    assert len(frame) == 2
+    assert not frame.duplicated(
+        subset=["lot_uid", "feature_id", "column_index"]
+    ).any()
 
 
 def test_a_zone_no_grid_was_parsed_for_fails_the_partition(store, cache, stub_pdfs):
@@ -440,6 +521,9 @@ def test_metadata_counts_what_is_solvable(store, cache, stub_pdfs):
     assert metadata["num_solvable_envelopes"].value == 1
     assert metadata["num_lots_solvable"].value == 1
     assert metadata["min_pct_of_lot"].value == 0.0
+    assert metadata["min_overlap_m2"].value == 1.0
+    assert metadata["num_sliver_pairs_dropped"].value == 0
+    assert metadata["num_duplicate_rows_dropped"].value == 0
 
 
 def test_a_row_is_one_call_to_solve_program(store, cache, stub_pdfs):
