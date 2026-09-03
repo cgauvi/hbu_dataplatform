@@ -14,6 +14,7 @@ from dagster import (
     asset,
 )
 
+from urban_rag.guards import guard_current_scrape_month
 from urban_rag.frames import (
     count_invalid_geometries,
     features_to_frame,
@@ -50,6 +51,7 @@ CATALOG_FILE = "tables.parquet"
         "without notice."
     ),
 )
+@guard_current_scrape_month
 def spectrum_table_catalog(
     context: AssetExecutionContext, spectrum: SpectrumResource, store: ParquetStore
 ) -> MaterializeResult:
@@ -105,6 +107,7 @@ def spectrum_table_catalog(
         "as plain parquet."
     ),
 )
+@guard_current_scrape_month
 def neighborhood_features(
     context: AssetExecutionContext,
     spectrum: SpectrumResource,

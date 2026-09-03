@@ -19,6 +19,7 @@ from dagster import (
     asset,
 )
 
+from urban_rag.guards import guard_current_scrape_month
 from urban_rag.frames import count_invalid_geometries, features_to_frame, write_frame
 from urban_rag.infolot import (
     InfolotError,
@@ -65,6 +66,7 @@ AREA_COLUMN = "VA_SUPRF_LOT_CALCL"
         "Source: Infolot, Registre foncier du Quebec."
     ),
 )
+@guard_current_scrape_month
 def neighborhood_lots(
     context: AssetExecutionContext,
     infolot: InfolotResource,

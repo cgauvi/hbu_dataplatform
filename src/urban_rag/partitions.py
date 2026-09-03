@@ -148,9 +148,15 @@ ENABLED_NEIGHBORHOODS: tuple[str, ...] = ("VSMPE",)
 #: reads a scrape date as a plain ISO date has to change.
 SCRAPE_START_DATE = "2026-08-01"
 
+#: Where a scrape month begins and ends. Declared once because two things have
+#: to agree about it: the windows `date_partitions` cuts, and the month
+#: `urban_rag.guards` compares a partition key against. If they disagreed, the
+#: guard would be wrong for the hours between this zone's midnight and UTC's.
+SCRAPE_TIMEZONE = "America/Toronto"
+
 date_partitions = MonthlyPartitionsDefinition(
     start_date=SCRAPE_START_DATE,
-    timezone="America/Toronto",
+    timezone=SCRAPE_TIMEZONE,
     end_offset=1,
 )
 

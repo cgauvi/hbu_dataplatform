@@ -18,6 +18,7 @@ from dagster import (
     asset,
 )
 
+from urban_rag.guards import guard_current_scrape_month
 from urban_rag.frames import count_invalid_geometries, features_to_frame, write_frame
 from urban_rag.layers import key_prefix
 from urban_rag.open_data import OpenDataError, decode_csv
@@ -88,6 +89,7 @@ STREET_NAME_COLUMN = "NOM_VOIE"
         "alongside it. Source: https://donnees.montreal.ca/dataset/quartiers"
     ),
 )
+@guard_current_scrape_month
 def reference_neighborhoods(
     context: AssetExecutionContext,
     open_data: OpenDataResource,
@@ -171,6 +173,7 @@ def reference_neighborhoods(
         "https://donnees.montreal.ca/dataset/geobase-double"
     ),
 )
+@guard_current_scrape_month
 def street_network(
     context: AssetExecutionContext,
     open_data: OpenDataResource,

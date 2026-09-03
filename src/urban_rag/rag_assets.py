@@ -39,6 +39,7 @@ from dagster import (
     asset,
 )
 
+from urban_rag.guards import guard_current_scrape_month
 from urban_rag.assets import neighborhood_features
 from urban_rag.rag.documents import (
     DOCUMENT_SOURCES,
@@ -95,6 +96,7 @@ _TITLE_COLUMNS = ("USAGE", "DESCRIPTION", "NOM_CAT")
         "one document."
     ),
 )
+@guard_current_scrape_month
 def linked_documents(
     context: AssetExecutionContext,
     store: ParquetStore,

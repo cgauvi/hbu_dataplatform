@@ -51,7 +51,8 @@ from urban_rag.hbu_assets import (
     lot_redevelopment_gap,
 )
 from urban_rag.infolot_assets import neighborhood_lots
-from urban_rag.layers import ASSET_LAYERS
+from urban_rag.guards import guards_scrape_month
+from urban_rag.layers import ASSET_LAYERS, Layer, layer_of
 from urban_rag.lot_profiles_assets import lot_profiles
 from urban_rag.massing_assets import lot_building_massing
 from urban_rag.open_data_assets import reference_neighborhoods, street_network
@@ -166,6 +167,35 @@ def _assert_layers_declared() -> None:
 
 
 _assert_layers_declared()
+
+
+def _assert_bronze_assets_guarded() -> None:
+    """Every bronze asset refuses to fetch into a month it is not in.
+
+    The guard has to be spelled at each asset - it is the only place every way
+    of launching a run converges - so this is what keeps "spell it at each
+    asset" from meaning "remember to". A bronze asset registered without
+    `guard_current_scrape_month` is a code-location load error here, rather
+    than a fabricated snapshot noticed a quarter later.
+
+    Silver and gold are skipped on purpose: they recompute from bronze parquet
+    already on disk, so backfilling them is a feature. See `urban_rag.guards`.
+    """
+    unguarded = sorted(
+        definition.key.path[-1]
+        for definition in ASSETS
+        if layer_of(definition.key.path[-1]) is Layer.BRONZE
+        and not guards_scrape_month(definition)
+    )
+    if unguarded:
+        raise ValueError(
+            f"Bronze asset(s) registered without @guard_current_scrape_month: "
+            f"{', '.join(unguarded)}. Bronze records what a publisher returned "
+            f"now, so it must refuse a past partition - see urban_rag.guards."
+        )
+
+
+_assert_bronze_assets_guarded()
 
 catalog_job = define_asset_job(
     "spectrum_catalog_job",

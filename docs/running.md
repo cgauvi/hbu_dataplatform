@@ -102,7 +102,42 @@ run started on any other day of the month lands on that same key.
 
 Add keys to `ENABLED_NEIGHBORHOODS` in [partitions.py](../src/urban_rag/partitions.py);
 all 17 borough namespaces are already mapped there. Existing partitions are
-untouched, and the new ones backfill from the UI.
+untouched, and the new borough starts at the **current** month.
+
+Adding a key crosses it with every month since `SCRAPE_START_DATE`, so the UI
+will show the borough's earlier partitions as missing and offer to backfill
+them. Do not: bronze records what a publisher returned *now*, and the sources
+behind it have no time travel, so filling `2026-08-01` in September writes
+September's data under an August key. The bronze assets refuse it — see
+[the scrape-month guard](#the-scrape-month-guard) — and those earlier
+partitions stay empty because the borough genuinely was not scraped then.
+
+Materialize the current month for the new borough instead, and let the
+schedules carry it from there. Its silver and gold partitions follow from that
+bronze, and *those* are backfillable in the ordinary way.
+
+## The scrape-month guard
+
+Every bronze asset refuses a partition whose month is not the one being lived
+in, whichever way the run was launched — the UI's backfill dialog, a schedule,
+or `dagster asset materialize` from a `make` target. The refusal happens before
+the fetch and before the partition directory is cleared, so a mistaken backfill
+costs nothing:
+
+```
+bronze/street_network was asked for 2026-08-01, but bronze records what a
+publisher returned *now* ... Materialize 2026-09-01 instead.
+```
+
+Silver and gold are deliberately not guarded: they recompute from bronze
+parquet already on disk, so re-deriving a past month after a fixed crosswalk is
+exactly what backfilling is for.
+
+The one legitimate reason to write a past month is recovery — a scrape that ran
+on the 1st, failed on the write, and was noticed in the following month. Launch
+that run with the tag `urban_rag/allow_stale_scrape=true`, set in the Launchpad
+or with `--tag`. It is logged as a warning and stays visible in the run's tags.
+See [guards.py](../src/urban_rag/guards.py).
 
 ## Talking to the service
 

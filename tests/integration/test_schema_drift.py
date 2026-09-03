@@ -41,6 +41,7 @@ import re
 import pytest
 
 from urban_rag.warehouse import TABLES, Table
+from urban_rag.postgis import MAP_CELL_COLUMNS
 
 psycopg = pytest.importorskip("psycopg")
 
@@ -219,6 +220,36 @@ def test_every_widened_column_is_also_declared_on_the_table_it_alters(infra):
                 stray.append(f"{table.source}: ALTER TABLE {name}")
     assert not stray, "widening blocks on tables their file never creates: " + (
         "; ".join(sorted(set(stray)))
+    )
+
+
+def test_every_column_the_map_cell_asset_writes_is_declared_by_its_file(infra):
+    """The same drift the other way round, which is the one that got through.
+
+    `postgis.MAP_CELL_COLUMNS` is the list `warehouse.upsert_select` names in
+    its INSERT, and the table it inserts into is a temp copy made `LIKE
+    gold.map_cell_aggregates`. So a column the code writes and sql/023 never
+    declares is not a wrong number in a cell - it is ``column
+    "dissolved_length_m" of relation "gold_map_cell_aggregates_load" does not
+    exist``, on every materialisation, on a fresh database as surely as on an
+    upgraded one.
+
+    The check above cannot see it: that one reads the file as the authority on
+    what the database should hold, and here the file is the thing that is
+    behind. No database and no widening block would help either, which is why
+    this is a separate assertion rather than a case of the first.
+    """
+    table = TABLES["map_cell_aggregates"]
+    declared = _declared_columns(infra, table)
+    assert declared, f"no columns parsed out of {table.source}"
+
+    missing = sorted(set(MAP_CELL_COLUMNS) - declared)
+    assert not missing, (
+        f"urban_rag.postgis.MAP_CELL_COLUMNS writes {', '.join(missing)}, "
+        f"which {table.source} does not declare. The INSERT names its columns, "
+        "so this fails on the staging table before a single row is computed - "
+        "add them to the CREATE TABLE *and* to that file's "
+        "ALTER TABLE ... ADD COLUMN IF NOT EXISTS block."
     )
 
 

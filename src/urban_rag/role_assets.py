@@ -126,6 +126,7 @@ from dagster import (
 )
 from pydantic import Field
 
+from urban_rag.guards import guard_current_scrape_month
 from urban_rag.cubf import (
     USE_DESCRIPTION_COLUMN,
     describe,
@@ -321,6 +322,7 @@ class LotValuesConfig(Config):
         f"publication. Source: {SOURCE_URL}"
     ),
 )
+@guard_current_scrape_month
 def property_assessment_roll(
     context: AssetExecutionContext,
     config: AssessmentRollConfig,

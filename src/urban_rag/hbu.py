@@ -106,13 +106,30 @@ they are the answer. Both are named in `hbu_status` rather than dropped,
 because a table that is meant to be an inventory of a borough should be able to
 say *why* the park is not on the shortlist.
 
-**A parcel the roll calls a road.** `road_parcel_lots` reads the CUBF: every
+**A parcel that is the road.** The zoning grid says nothing useful about one -
+the zone polygon over a roadway states what may be built on the *block it
+serves*, and a solver handed the roadway's own area will happily propose eleven
+dwellings on it. This overrides the zoning entirely, which is why `_hbu_status`
+applies it last.
+
+Two predicates answer it and both are needed, because they are two different
+publishers looking at the same ground. `road_parcel_lots` reads the CUBF: every
 code from 4510 to 4599 is a piece of the public way, and the roll carries them
-at a nominal hundred dollars with no floor, no storeys and no dwellings. The
-zoning grid says nothing useful about one - the zone polygon over a roadway
-states what may be built on the *block it serves*, and a solver handed the
-roadway's own area will happily propose eleven dwellings on it. This overrides
-the zoning entirely, which is why `_hbu_status` applies it last.
+at a nominal hundred dollars with no floor, no storeys and no dwellings.
+`cadastral_road_lots` reads the geometry instead - the parcels a *géobase
+double* side runs inside, which `lot_frontage` already identifies because it
+cannot measure a frontage without them.
+
+**The roll alone was not enough, and the gap was not marginal.** Montreal does
+not enter its own roadways on the assessment roll, so the CUBF gate found 48 of
+Villeray-Saint-Michel-Parc-Extension's street parcels where the cadastre and the
+street network together find some 1,400. Avenue Querbes between Ball and
+Saint-Roch is lots 2 249 179 and 2 249 339 - two 3,300 m² strips, each carrying
+some 365 m of geobase street line and neither on the roll - and under the zoning
+of the blocks either side of it the solver built on both, put them in the
+redevelopment gap, and ranked them among the borough's investment
+opportunities. The union of the two predicates is what closes that; the sets
+overlap little and neither is a superset of the other.
 
 **A parcel whose zone authorises only Équipements collectifs.** A park, a
 school, a hospital, a cemetery. `program` has never priced the ``E`` family -
@@ -129,13 +146,15 @@ answers, 206 of them on Équipements parcels, Parc Jarry among them, and takes
 the borough's candidate rows from 75,007 to 64,493 - which is that many CP-SAT
 models not run on parcels nobody may build on.
 
-The two are independent, and the roll is the narrower of them: it reaches
-21,862 of the borough's 24,952 parcels, and among those it calls 48 a road, 42
-of which the zoning would otherwise have put a building on. The lanes it never
-assessed keep whatever their zoning says. That is this module reporting what
-its inputs know rather than inferring a street from a parcel's shape, and a
-predicate for the parcels the roll never reached would be a different
-judgement, argued somewhere it can be seen.
+The road gate and the equipment gate are independent of each other, and of the
+two road predicates the roll is much the narrower: it reaches 21,862 of the
+borough's 24,952 parcels, and among those it calls 48 a road. The cadastral
+predicate is what reaches the rest, and it is a different kind of claim - it
+infers the street from where the street network runs rather than from what a
+publisher wrote down - which is why it lives in `lot_frontage`, where the same
+inference is already load-bearing and already measured, rather than being
+invented here. `postgis.DEFAULT_ROAD_LOT_MIN_STREET_M` is the whole of its
+judgement and is argued there.
 
 ----------------------------------------------------------------------------
 Comparing
@@ -284,8 +303,9 @@ _ALL_DWELLINGS = "all"
 HBU_STATUSES: tuple[str, ...] = (
     # A governing envelope was solved, and the row carries its program.
     "solved",
-    # The roll files this parcel under a CUBF road code - it is a street, a
-    # lane, a highway or a right of way. Reported before the zoning is
+    # This parcel is a street, a lane, a highway or a right of way - either
+    # because the roll files it under a CUBF road code or because a geobase
+    # double side runs down the inside of it. Reported before the zoning is
     # consulted at all, because the zone polygon over a lane says what may be
     # built on the *block*, not on the roadway, and a parcel nobody may build
     # on is not a development site whatever the grid permits.
@@ -1161,6 +1181,7 @@ def select_highest_best_use(
     envelopes: pd.DataFrame,
     *,
     assessments: pd.DataFrame | None = None,
+    road_lots: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """One row per lot: the program of the envelope that governs it.
 
@@ -1182,19 +1203,31 @@ def select_highest_best_use(
     roll, and every test that is not about this, passes none and gets the
     behaviour it had - and dropped rather than never solved because the solve
     is `lot_development_programs`' lineage and the roll is not in it.
+
+    ``road_lots`` is `frontage_assets`' `road_lots.parquet`, and is the same
+    gate read off the geometry instead of the roll - the parcels a geobase
+    double side runs inside, which is what Montreal's own street lots are and
+    what the roll never records. The two sets are unioned: a parcel either of
+    them calls a street gets `road_parcel`. Optional on the same terms, and
+    for a second reason - `lot_frontage` has no schedule and reads a relation
+    hbu_infra has to create, so a partition without it must answer as it did
+    before rather than fail.
     """
     envelopes = ensure_use_flags(envelopes)
     lots = _lot_index(envelopes)
     if lots.empty:
         return pd.DataFrame(columns=list(HBU_COLUMNS))
 
-    # The roll speaks lot numbers and everything from here on speaks `lot_uid`,
-    # so the translation happens once, here, off the lot index that already
-    # holds both.
+    # Both road predicates speak lot numbers and everything from here on speaks
+    # `lot_uid`, so the translation happens once, here, off the lot index that
+    # already holds both. Unioned before the translation: they are two ways of
+    # learning the same fact and they reach different parcels - the roll knows
+    # a right of way it assessed, the cadastre knows every street Montreal
+    # never put on the roll.
     road_numbers = (
         road_parcel_lots(assessments) if assessments is not None else frozenset()
-    )
-    road_lots = frozenset(
+    ) | cadastral_road_lots(road_lots)
+    road_uids = frozenset(
         lots.index[lots["lot_number"].isin(road_numbers)]
         if road_numbers and "lot_number" in lots.columns
         else ()
@@ -1203,13 +1236,13 @@ def select_highest_best_use(
     # Before the join, so a road parcel's row is the same shape as any other
     # lot without a program: nulls across the envelope and the program, and
     # `hbu_status` carrying the reason.
-    chosen = chosen[~chosen.index.isin(road_lots)]
+    chosen = chosen[~chosen.index.isin(road_uids)]
     frame = lots.join(chosen, how="left")
     frame["hbu_status"] = _hbu_status(
         frame,
         programs,
         equipment_lots=equipment_zone_lots(envelopes),
-        road_lots=road_lots,
+        road_lots=road_uids,
     )
     frame["hbu_dominant_use"] = _dominant_use(frame)
     return frame.reset_index()[list(HBU_COLUMNS)]
@@ -1388,6 +1421,39 @@ def equipment_zone_lots(envelopes: pd.DataFrame) -> frozenset:
     return frozenset(governing.loc[permits, "lot_uid"])
 
 
+def cadastral_road_lots(road_lots: pd.DataFrame | None) -> frozenset:
+    """The **lot numbers** the cadastre and the street network agree are road.
+
+    ``road_lots`` is `frontage_assets`' `road_lots.parquet` for one partition:
+    the parcels a `silver.neighborhood_streets` side runs at least
+    `postgis.DEFAULT_ROAD_LOT_MIN_STREET_M` inside. In Quebec's renewed
+    cadastre the street is a lot like any other - avenue Querbes is 2 249 179
+    and 2 249 339, some 9 m wide and a block long - and a geobase double side
+    is drawn along the roadway, so it runs *within* the parcel that is the
+    roadway and enters no other.
+
+    **This is the predicate `road_parcel_lots` cannot be.** That one asks the
+    assessment roll, which is a record of tenure: Montreal does not enter its
+    own roadways on it, so the roll names 48 of this borough's streets where
+    the geometry names some fourteen hundred. The two are unioned rather than
+    chosen between - each reaches parcels the other misses, and a parcel either
+    of them calls a street is not a development site.
+
+    Keyed on the lot *number*, like `road_parcel_lots` and for its reason:
+    `lot_uid` is a bigserial that means nothing outside the partition that
+    minted it.
+    """
+    if road_lots is None or road_lots.empty:
+        return frozenset()
+    key = next(
+        (name for name in ("lot_number", "NO_LOT") if name in road_lots.columns),
+        None,
+    )
+    if key is None:
+        return frozenset()
+    return frozenset(road_lots[key].dropna())
+
+
 def road_parcel_lots(assessments: pd.DataFrame) -> frozenset:
     """The **lot numbers** the assessment roll files under a CUBF road code.
 
@@ -1408,9 +1474,9 @@ def road_parcel_lots(assessments: pd.DataFrame) -> frozenset:
     partition 3,090 of 24,952 lots carry no assessment unit at all, and most of
     the ruelles are among them - of the 337 parcels in that borough shaped like
     a lane, the roll reaches 63 and calls 12 of them roads. This says what the
-    roll says, which is a fact about tenure and not a guess about shape; a
-    second predicate for the parcels it never reached would be a different
-    judgement, made somewhere it can be argued with.
+    roll says, which is a fact about tenure and not a guess about shape. The
+    parcels it never reached are `cadastral_road_lots`' to answer for, off the
+    geometry, and the two are unioned - see `select_highest_best_use`.
     """
     if assessments.empty or "dominant_use_code" not in assessments.columns:
         return frozenset()
@@ -1445,6 +1511,10 @@ def _hbu_status(
     `road_parcel` *overrides* it, applied last and regardless of what the
     envelopes said, because it is a fact about the parcel rather than about the
     grid: the zone polygon over a roadway describes the block it serves.
+
+    ``road_lots`` here is already `lot_uid`s and already the union of the two
+    road predicates - `select_highest_best_use` does both translations, so this
+    function never learns which publisher called a given parcel a street.
     """
     status = pd.Series("solved", index=frame.index, dtype="object")
     lots = frame.index.to_series()

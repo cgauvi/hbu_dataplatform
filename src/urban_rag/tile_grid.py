@@ -81,12 +81,25 @@ ZOOM_OFFSET = 4
 #: the finest downwards, so `max(CELL_ZOOMS)` is the only level computed from
 #: raw geometry and the rest are rollups of it.
 #:
-#: 15..19 covers display zooms 11..15 — from `MAP_MIN_ZOOM` in hbu_rag_map up
-#: to the highest gate any layer has. Uniform across layers *deliberately*:
-#: each layer's gate lives in the other repository and moves whenever somebody
-#: tunes what is legible, and a table that depended on those numbers would
-#: need every borough re-materialised to follow a one-line change over there.
-CELL_ZOOMS: tuple[int, ...] = (15, 16, 17, 18, 19)
+#: 1..19 — every level of the Web Mercator grid a tile request can name, so
+#: `cell_zoom_for` never has to be clamped to a level built for a different
+#: zoom. 15..19 is the range the map's own gates use today (display zooms
+#: 11..15, from `MAP_MIN_ZOOM` in hbu_rag_map up to the highest gate any layer
+#: has); everything below it is built so that lowering that floor, or pointing
+#: anything else at this table at country or continent zoom, is a change in
+#: the other repository rather than a re-materialisation of every borough.
+#: Uniform across layers for the same reason it always was: a layer's gate
+#: moves whenever somebody tunes what is legible, and a table that depended on
+#: those numbers would follow a one-line change over there with a full rebuild.
+#:
+#: Reaching down to 1 is close to free in rows and is **not** free in bytes.
+#: Each level holds a quarter of the cells of the one below, so 1..14 together
+#: add well under 1% of the row count of 15..19 — but a borough is a few
+#: kilometres across, so from around zoom 11 down it fits inside a single cell
+#: and every level below that stores another copy of its whole dissolved
+#: union. See `urban_rag.postgis` on why those copies are stored intact rather
+#: than simplified.
+CELL_ZOOMS: tuple[int, ...] = tuple(range(1, 20))
 
 #: The zoom the pyramid is seeded at, from real geometry.
 BASE_CELL_ZOOM = max(CELL_ZOOMS)

@@ -664,6 +664,38 @@ def compute_lot_features(
 #: lane is access, not street edge.
 DEFAULT_ROAD_LOT_MIN_STREET_M = 1.0
 
+#: What `compute_lot_frontage` reports each road lot as, and the schema of the
+#: `road_lots.parquet` `frontage_assets` writes from it.
+#:
+#: The parcels this names are the ones nothing else in the platform can name.
+#: `hbu.road_parcel_lots` asks the roll and gets 48 of VSMPE's roadways;
+#: measured against the geobase double the borough has some fourteen hundred,
+#: because Montreal does not enter its own street lots on the roll at all. So
+#: this set is what stops a solver being handed the roadway - see
+#: `hbu.select_highest_best_use` - and it is published rather than left inside
+#: this function for that reason.
+#:
+#: `street_m_inside` is carried so the judgement is auditable per parcel: it is
+#: the quantity `min_street_m` is compared against, and the distance between a
+#: real street lot and a cutoff artefact is two orders of magnitude of it.
+ROAD_LOT_COLUMNS: tuple[str, ...] = (
+    "lot_uid",
+    "lot_number",
+    "street_m_inside",
+    "num_street_sides",
+)
+
+#: Fixed rather than inferred, so an empty partition writes the same schema a
+#: full one does - a parquet whose `lot_number` came back as all-null object
+#: would still read, and one whose columns changed type between partitions
+#: would not concatenate.
+_ROAD_LOT_DTYPES: dict[str, str] = {
+    "lot_uid": "int64",
+    "lot_number": "object",
+    "street_m_inside": "float64",
+    "num_street_sides": "int64",
+}
+
 #: Where the frontage geometry is measured. NAD83 / MTM zone 8 is the projected
 #: system the island is surveyed in, the same one `street_assets.METRIC_CRS`
 #: measures street length in. A planar CRS rather than `geography`, which has
@@ -827,6 +859,13 @@ def compute_lot_frontage(
     count and a sample; see the `lots_without_frontage` key in the returned
     dict, which `frontage_assets` surfaces as metadata.
 
+    **The road lots themselves come back too**, under `road_lots`, and that is
+    not a by-product. "This parcel is the roadway" is a fact the rest of the
+    platform has no other way to learn - the roll never assessed Montreal's
+    street lots - and a table of them is what keeps a CP-SAT solver from
+    proposing eleven dwellings on avenue Querbes. `frontage_assets` writes it,
+    `hbu.select_highest_best_use` gates on it. `ROAD_LOT_COLUMNS` is the shape.
+
     Assumes `load_lots` and `load_streets` have already landed this partition's
     rows - both sides are filtered to (`neighborhood`, `scrape_date`) before
     anything is measured, so a street side from another date cannot identify a
@@ -907,6 +946,35 @@ def compute_lot_frontage(
 
     cursor.execute("SELECT count(DISTINCT road_lot_uid) FROM _frontage_road_sides")
     (num_road_lots,) = cursor.fetchone()
+
+    # *Which* parcels those are, not only how many. This is the only place in
+    # the platform that knows: the roll files the public way under CUBF 45xx
+    # but never reached Montreal's own street lots, so `hbu.road_parcel_lots`
+    # can answer for a handful of them and no more - see
+    # `DEFAULT_ROAD_LOT_MIN_STREET_M`. Read out of the temp table here because
+    # that is where the answer exists; `frontage_assets` writes it beside the
+    # frontages, and `lot_highest_best_use` reads it as the half of its road
+    # gate the roll cannot supply.
+    #
+    # `street_m_inside` travels with the number so the identification is
+    # readable rather than asserted: a parcel carrying 363 m of street line is
+    # the roadway on any reading of the cutoff, and one carrying 1.2 m is a
+    # side clipping the corner of a parcel where the two publishers disagree.
+    cursor.execute(
+        """
+        SELECT l.lot_uid,
+               l.lot_number,
+               sum(ST_Length(ST_Intersection(r.geom, l.geom))) AS street_m_inside,
+               count(DISTINCT r.cote_rue_id) AS num_street_sides
+        FROM _frontage_road_sides r
+        JOIN _frontage_lots l ON l.lot_uid = r.road_lot_uid
+        GROUP BY l.lot_uid, l.lot_number
+        ORDER BY street_m_inside DESC, l.lot_number
+        """
+    )
+    road_lots = pd.DataFrame(
+        cursor.fetchall(), columns=list(ROAD_LOT_COLUMNS)
+    ).astype(_ROAD_LOT_DTYPES)
 
     result = warehouse.upsert_select(
         cursor,
@@ -1116,6 +1184,11 @@ def compute_lot_frontage(
         # The parcels that *are* the street. Not candidates for frontage, so
         # `num_lots` minus this is the denominator coverage is read against.
         "num_road_lots": int(num_road_lots),
+        # The same parcels named rather than counted, one row each - see the
+        # query above. A frame rather than a list because it is written to
+        # parquet unchanged, and the only value in this dict that is neither a
+        # scalar nor a sample.
+        "road_lots": road_lots,
         # Parcels that lie within `_SLIVER_GAP_M` of a road lot and abut none.
         # 0 on a topologically clean cadastre, which is what makes measuring
         # the shared edge exactly the right thing to do; anything else is a
@@ -2840,10 +2913,28 @@ def compute_lot_profiles(
 # are pivoted into the `attributes` jsonb in the final select, which is the one
 # place those names become keys.
 #
-# **Nothing crosses into Python until the upsert.** Five layers by five levels
-# is twenty-five statements for a borough, each an aggregate over rows already
-# loaded and GiST-indexed - the same posture `compute_lot_features` takes, for
-# the same reason.
+# **Nothing crosses into Python until the upsert.** Five layers seeded once
+# and rolled up eighteen times is under a hundred statements for a borough,
+# each an aggregate over rows already loaded and GiST-indexed - the same
+# posture `compute_lot_features` takes, for the same reason.
+#
+# **The coarse end of the pyramid, and why it is stored intact.** A borough is
+# a few kilometres across, so from about level 11 downwards it fits inside a
+# single cell and that cell's geometry is its entire dissolved union. The rows
+# are nothing - a quarter of the level below, every level down - but each of
+# those levels stores another copy of that union, so the cost of reaching down
+# to level 1 is roughly one borough of geometry per level rather than one in
+# total.
+#
+# Simplifying the coarse levels is the obvious saving and it is not a local
+# change. `dissolved_area_m2` and `coverage_pct` are `ST_Area` over the stored
+# geometry, so simplifying it would break the property this whole table rests
+# on: a parent's area being exactly the sum of its four children's. Doing it
+# honestly means measuring before simplifying and carrying the measures up the
+# pyramid separately from the shape, which is a different rollup than this one.
+# Until then the geometry is stored as it is dissolved, and `ST_AsMVTGeom`
+# quantises it onto the tile grid at request time, so what reaches the browser
+# is the same size either way.
 # --------------------------------------------------------------------------
 
 #: The Mercator limit, in degrees. A latitude past this has no row in the tile
@@ -2919,6 +3010,44 @@ def _cell_envelope_sql(zoom: str, x: str, y: str) -> str:
     it should be.
     """
     return f"ST_Transform(ST_TileEnvelope({zoom}, {x}, {y}), 4326)"
+
+
+#: How long a cell edge may be, in degrees, before `_cell_area_sql` splits it.
+#: A quarter of a degree is under 30 km, and the deviation between a parallel
+#: and the great circle joining its ends over that distance is centimetres - so
+#: the area this produces is exact to far more places than the cadastre it is
+#: divided into. A cell's edges are shorter than this from level 11 down to 19,
+#: which is every level the map has ever read: the segmentisation adds no
+#: vertex there and those numbers are unchanged to the bit.
+_CELL_EDGE_SEGMENT_DEG = 0.25
+
+
+def _cell_area_sql(zoom: str, x: str, y: str) -> str:
+    """The ground area of cell ``zoom/x/y`` in m2, as SQL.
+
+    Every density on this table is per cell area, so this is the denominator
+    the map is shaded through, and taking it off the raw envelope is wrong at
+    the coarse end of the pyramid.
+
+    ``geography`` joins a polygon's vertices with **great circles**, not with
+    parallels. On a level-19 cell that distinction is nothing - the northern
+    edge spans 0.0007 degrees. On a level-1 cell it spans 180, and the great
+    circle across it runs over the pole rather than along the latitude the
+    tile is bounded by: the area comes back describing a region the tile is
+    not, and every `lots_per_km2` and `built_coverage_pct` at that level is
+    divided by it. Segmentising first puts real vertices along the parallel,
+    which is the shape `ST_TileEnvelope` means, and it also removes the
+    ambiguity a single 180-degree edge has about which way round the sphere it
+    goes.
+
+    Split from `_cell_envelope_sql` rather than folded into it because the
+    clip wants the opposite thing: `_seed_cell_geometry` intersects against
+    this box in the plane, where the straight edge *is* correct and every
+    vertex added to it is one more vertex to intersect twenty-five thousand
+    lots against.
+    """
+    envelope = _cell_envelope_sql(zoom, x, y)
+    return f"ST_Area(geography(ST_Segmentize({envelope}, {_CELL_EDGE_SEGMENT_DEG})))"
 
 
 def _create_aggregate_staging(cursor: Any) -> None:
@@ -3173,7 +3302,7 @@ def _aggregate_select(layers: Sequence[str]) -> str:
         f"WHEN {_sql_literal(spec.name)} THEN {_sql_literal(spec.value_kind)}"
         for spec in specs
     )
-    envelope = _cell_envelope_sql(
+    cell_area = _cell_area_sql(
         "cells.cell_z::integer", "cells.cell_x", "cells.cell_y"
     )
     return f"""
@@ -3188,7 +3317,9 @@ def _aggregate_select(layers: Sequence[str]) -> str:
                    -- themselves out without a branch here.
                    ST_Area(geography(cells.geom))   AS dissolved_area_m2,
                    ST_Length(geography(cells.geom)) AS dissolved_length_m,
-                   ST_Area(geography({envelope}))   AS cell_area_m2
+                   -- Segmentised before it is measured; see `_cell_area_sql`
+                   -- for why the raw envelope is the wrong box at level 1.
+                   {cell_area}                      AS cell_area_m2
               FROM _agg_cells AS cells
         ),
         measures AS (

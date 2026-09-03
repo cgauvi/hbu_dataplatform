@@ -86,9 +86,11 @@ from urban_rag.comparables_assets import (
 )
 from urban_rag.envelope_assets import LOT_ENVELOPES_FILE, lot_zoning_envelopes
 from urban_rag.frames import write_frame
+from urban_rag.frontage_assets import ROAD_LOTS_FILE, lot_frontage
 from urban_rag.hbu import (
     HBU_STATUSES,
     ProgramAssumptions,
+    cadastral_road_lots,
     investment_assumptions_of,
     operating_expense_ratio_of,
     road_parcel_lots,
@@ -655,6 +657,12 @@ def lot_development_programs(
         # docstring - so a change to ComparablesConfig re-runs a join and a
         # sort here rather than a borough of CP-SAT models upstream.
         lot_assessment_comparables,
+        # The other half of that same question, and the half the roll cannot
+        # answer: the parcels a geobase double side runs inside, which is what
+        # Montreal's own street lots are. Already upstream through the
+        # envelopes, which take their frontage from it; named here because
+        # this asset now reads a file of its own from that partition.
+        lot_frontage,
     ],
     group_name=GOLD_GROUP,
     kinds={"parquet", "postgres"},
@@ -677,9 +685,11 @@ def lot_development_programs(
         "stalls, what it costs to build, the npv and present value, and the "
         "monthly and annual net operating income, plus num_candidates and "
         "num_zones so a real choice is distinguishable from none. Two kinds "
-        "of parcel keep their row and get no program: one the roll files "
-        "under a CUBF road code (4510-4599 - a street, a lane, a right of "
-        "way), and one whose governing zone authorises only Equipements "
+        "of parcel keep their row and get no program: one that is the road - "
+        "either the roll files it under a CUBF road code (4510-4599) or a "
+        "geobase double street side runs down the inside of it, which is how "
+        "Montreal's own street lots are found, since the roll never records "
+        "them - and one whose governing zone authorises only Equipements "
         "collectifs (a park, a school, a cemetery). Every lot "
         "the envelopes reach keeps a row: hbu_status is one of "
         f"{', '.join(HBU_STATUSES)}. Written to gold/lot_highest_best_use/"
@@ -719,8 +729,11 @@ def lot_highest_best_use(
         neighborhood=neighborhood,
         scrape_date=scrape_date,
     )
+    road_lots = _road_lots(context, store, neighborhood, scrape_date)
 
-    frame = select_highest_best_use(programs, envelopes, assessments=assessments)
+    frame = select_highest_best_use(
+        programs, envelopes, assessments=assessments, road_lots=road_lots
+    )
     # Carried from the programs rather than recomputed: the assumptions that
     # produced a chosen program are the ones that produced the candidate it was
     # chosen from, and a second copy would be the one that goes stale.
@@ -768,8 +781,17 @@ def lot_highest_best_use(
             # produced a building for. Zero means the roll reached no roadway
             # in this borough, which is a fact about the roll worth seeing.
             "num_road_programs_withheld": _road_programs_withheld(
-                programs, assessments
+                programs, assessments, road_lots
             ),
+            # The two road predicates, side by side. They are not alternatives
+            # and neither contains the other: the roll knows a right of way it
+            # assessed, the cadastre knows every street Montreal never put on
+            # the roll. A borough where the second collapses to near zero is a
+            # lot_frontage partition that did not land, not a borough of
+            # roadless blocks - which is exactly the failure this gate had
+            # before, silently.
+            "num_road_parcels_on_the_roll": len(road_parcel_lots(assessments)),
+            "num_road_parcels_in_the_cadastre": len(cadastral_road_lots(road_lots)),
             # A lot two zones reach is a lot on a zoning boundary, where the
             # answer depends on which line is believed. pct_of_lot decides it
             # and travels on every row, so a pick made off a 2 percent sliver
@@ -1140,22 +1162,55 @@ def _sum_ha(frame: pd.DataFrame, column: str) -> float:
 
 
 def _road_programs_withheld(
-    programs: pd.DataFrame, assessments: pd.DataFrame
+    programs: pd.DataFrame, assessments: pd.DataFrame, road_lots: pd.DataFrame | None
 ) -> int:
     """How many road parcels the solver had already built a program for.
 
     The count the gate is worth judging on. `num_road_parcel` says how many
-    parcels the roll calls a street; this says how many of them the zoning
-    would otherwise have put a building on, which is the number that was wrong
-    before and is the number to watch if the roll's coverage changes. Counted
-    over lot numbers, which is the key `road_parcel_lots` answers in.
+    parcels are the street; this says how many of them the zoning would
+    otherwise have put a building on, which is the number that was wrong before
+    and is the number to watch if either predicate's coverage changes. Counted
+    over lot numbers, which is the key both of them answer in.
     """
-    roads = road_parcel_lots(assessments)
+    roads = road_parcel_lots(assessments) | cadastral_road_lots(road_lots)
     if not roads or programs.empty or "lot_number" not in programs.columns:
         return 0
     solved = programs["solved"].fillna(False).astype(bool)
     numbers = programs.loc[solved, "lot_number"]
     return int(numbers[numbers.isin(roads)].nunique())
+
+
+def _road_lots(
+    context: AssetExecutionContext,
+    store: ParquetStore,
+    neighborhood: str,
+    scrape_date: str,
+) -> pd.DataFrame | None:
+    """The parcels `lot_frontage` identified as the roadway, if it has run.
+
+    Optional the way `_with_buildable_area`'s setbacks are, and for the same
+    reason: `lot_frontage` has no schedule and reads a relation hbu_infra has
+    to create, so a partition without it must answer as it did before rather
+    than fail. What it costs is much larger here, though, and the warning says
+    so - without this file the road gate is the assessment roll alone, and the
+    roll does not reach Montreal's street lots at all, so a borough's roadways
+    come back through the solver as development sites.
+    """
+    path = join(
+        store.partition_dir(lot_frontage.key.path[-1], scrape_date, neighborhood),
+        ROAD_LOTS_FILE,
+    )
+    if not filesystem(path).exists(path):
+        context.log.warning(
+            "%s is missing, so a parcel is only a road if the assessment roll "
+            "says so - and the roll does not record Montreal's roadways. "
+            "Materialize %s for this partition to keep the solver off the "
+            "street lots",
+            path,
+            lot_frontage.key.path[-1],
+        )
+        return None
+    return pd.read_parquet(path, storage_options=storage_options(path))
 
 
 def _sum_millions(frame: pd.DataFrame, column: str) -> float:

@@ -44,6 +44,7 @@ from dagster import (
     asset,
 )
 
+from urban_rag.guards import guard_current_scrape_month
 from urban_rag.cubf import (
     LISTE_SHEET,
     SOURCE_URL,
@@ -86,6 +87,7 @@ CUBF_FILE = "cubf_use_codes.parquet"
         "whenever the manual is amended. Source: " + SOURCE_URL
     ),
 )
+@guard_current_scrape_month
 def cubf_use_codes(
     context: AssetExecutionContext, cubf: CubfResource, store: ParquetStore
 ) -> MaterializeResult:

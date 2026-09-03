@@ -31,6 +31,7 @@ from dagster import (
     asset,
 )
 
+from urban_rag.guards import guard_current_scrape_month
 from urban_rag.estimator import (
     MONTREAL_CITY_ID,
     NON_RESIDENTIAL_CATEGORIES,
@@ -73,6 +74,7 @@ SOURCE_URL = "https://zef-builds.github.io/construction-estimator/"
         f"Source: {SOURCE_URL}"
     ),
 )
+@guard_current_scrape_month
 def montreal_residential_costs(
     context: AssetExecutionContext,
     estimator: EstimatorResource,
@@ -106,6 +108,7 @@ def montreal_residential_costs(
         f"are deliberately not read here. Source: {SOURCE_URL}"
     ),
 )
+@guard_current_scrape_month
 def montreal_nonresidential_costs(
     context: AssetExecutionContext,
     estimator: EstimatorResource,

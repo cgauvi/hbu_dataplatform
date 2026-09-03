@@ -19,6 +19,7 @@ from dagster import (
     asset,
 )
 
+from urban_rag.guards import guard_current_scrape_month
 from urban_rag.frames import write_frame
 from urban_rag.layers import key_prefix
 from urban_rag.open_data import OpenDataError, decode_csv
@@ -65,6 +66,7 @@ POSTES_FILE = "rfu_postes.parquet"
         "https://www.donneesquebec.ca/recherche/dataset/richesse-fonciere-uniformisee"
     ),
 )
+@guard_current_scrape_month
 def uniformized_property_wealth(
     context: AssetExecutionContext,
     rfu: RfuResource,

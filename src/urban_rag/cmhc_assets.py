@@ -43,6 +43,7 @@ from dagster import (
     asset,
 )
 
+from urban_rag.guards import guard_current_scrape_month
 from urban_rag.cmhc import (
     BEDROOM_TYPES,
     DWELLING_TYPES,
@@ -119,6 +120,7 @@ AVERAGE_RENTS_SOURCE_URL = AVERAGE_RENTS_READING_MODE_URL
         f"cuts it into boroughs is applied in silver. Source: {SOURCE_URL}"
     ),
 )
+@guard_current_scrape_month
 def cmhc_vacancy_survey(
     context: AssetExecutionContext,
     cmhc: CmhcResource,
@@ -188,6 +190,7 @@ def cmhc_vacancy_survey(
         f"{AVERAGE_RENTS_SOURCE_URL}"
     ),
 )
+@guard_current_scrape_month
 def cmhc_rent_survey(
     context: AssetExecutionContext,
     cmhc: CmhcResource,

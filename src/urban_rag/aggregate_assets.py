@@ -237,8 +237,15 @@ def map_cell_aggregates(
             "max_cells_per_served_tile": max_per_tile,
             "cells_per_served_tile_limit": tile_grid.cells_per_tile(),
             "cell_zooms": MetadataValue.json(list(tile_grid.CELL_ZOOMS)),
+            # Only the levels that name a zoom a map can be at. The three
+            # coarsest cells are served from display zooms -3..-1, which are
+            # real rows in the table and not requests anything makes.
             "display_zooms_served": MetadataValue.json(
-                [zoom - tile_grid.ZOOM_OFFSET for zoom in tile_grid.CELL_ZOOMS]
+                [
+                    zoom - tile_grid.ZOOM_OFFSET
+                    for zoom in tile_grid.CELL_ZOOMS
+                    if zoom >= tile_grid.ZOOM_OFFSET
+                ]
             ),
             "zoom_offset": tile_grid.ZOOM_OFFSET,
             "output_path": MetadataValue.path(str(path)),

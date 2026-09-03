@@ -42,6 +42,18 @@ on the wrong side of a corner costs a name, never a metre.
 which parcels count as road rather than what any lot then measures. The measure
 itself has no setting at all, which is the point of the change.
 
+**The road lots are published, not just used.** They go out as `road_lots.parquet`
+beside the frontages, because identifying them is the more valuable half of
+this asset and it used to be thrown away. Nothing else in the platform can name
+a Montreal street parcel: `hbu.road_parcel_lots` asks the assessment roll and
+gets 48 of this borough's roadways where the geobase double finds some fourteen
+hundred, so `lot_highest_best_use` was handing avenue Querbes to a CP-SAT solver
+and getting back a plausible apartment block on it. A road lot gets no frontage
+row - it fronts on nothing - so the set cannot travel as a column of the table
+beside it, and "no row here" cannot stand in for it either: that says roadway
+*or* landlocked parcel, and those two want opposite treatment. Hence a file of
+its own. See `ROAD_LOTS_FILE`, and `hbu.select_highest_best_use` for the gate.
+
 A lot that shares no boundary with any road lot gets no row: a true interior
 parcel, one reached only by a lane, or a street snapshot that stopped short. A
 road lot gets no row either - a street does not front on itself - and is left
@@ -73,6 +85,7 @@ a different quantity from rows saying 0.
 """
 
 import geopandas as gpd
+import pandas as pd
 from dagster import (
     AssetExecutionContext,
     Config,
@@ -89,6 +102,7 @@ from urban_rag.layers import key_prefix
 from urban_rag.partitions import scrape_partitions
 from urban_rag.postgis import (
     DEFAULT_ROAD_LOT_MIN_STREET_M,
+    ROAD_LOT_COLUMNS,
     MissingRelation,
     compute_lot_frontage,
     fetch_lot_frontage,
@@ -100,9 +114,20 @@ from urban_rag.street_assets import STREETS_FILE_OUT, neighborhood_streets
 
 GROUP = "silver_streets"
 
-#: The one file a partition is written to, under
+#: The frontages themselves, under
 #: `silver/lot_frontage/<YYYY-MM-DD>/<neighborhood>/`.
 LOT_FRONTAGE_FILE = "lot_frontage.parquet"
+
+#: The parcels that *are* the street, beside them - one row per road lot, with
+#: how much geobase double street line runs inside it.
+#:
+#: A second file rather than a column on the first, because a road lot has no
+#: frontage row to carry one: it fronts on nothing, which is the definition.
+#: The absence is what made this set unreadable downstream - "no row in
+#: lot_frontage" says *either* roadway *or* landlocked parcel, and the two want
+#: opposite treatment - so it is written out rather than left to be inferred.
+#: `lot_highest_best_use` is the reader; see `hbu.select_highest_best_use`.
+ROAD_LOTS_FILE = "road_lots.parquet"
 
 
 class FrontageConfig(Config):
@@ -150,7 +175,11 @@ class FrontageConfig(Config):
         "building_lot_intersections landed for the same partition, upserted "
         "into silver.lot_frontage on (scrape_date, neighborhood, lot_uid, "
         f"cote_rue_id) and written to silver/lot_frontage/<YYYY-MM-DD>/"
-        f"<neighborhood>/{LOT_FRONTAGE_FILE}."
+        f"<neighborhood>/{LOT_FRONTAGE_FILE}. The road lots themselves are "
+        f"written beside it as {ROAD_LOTS_FILE} - one row per parcel that is "
+        "the street, which is a set no other input to this platform holds, "
+        "since the assessment roll does not reach Montreal's roadways. "
+        "lot_highest_best_use reads it to keep the solver off them."
     ),
 )
 def lot_frontage(
@@ -228,6 +257,18 @@ def lot_frontage(
     if removed:
         context.log.info("Removed %d file(s) from a previous run", len(removed))
     path = write_frame(frame, join(output_dir, LOT_FRONTAGE_FILE))
+    # Beside the frontages, and in the same partition, because it is the same
+    # answer read the other way round: these are the parcels the measure
+    # identified as the street and therefore measured nothing for. Written
+    # unconditionally - a borough with no road lot writes an empty file rather
+    # than none, so a reader can tell "no roadway here" from "this asset has
+    # not run".
+    road_lots_path = write_frame(
+        _road_lot_frame(
+            result["road_lots"], neighborhood=neighborhood, scrape_date=scrape_date
+        ),
+        join(output_dir, ROAD_LOTS_FILE),
+    )
 
     lots_matched = int(result["lots_matched"])
     num_road_lots = int(result["num_road_lots"])
@@ -334,9 +375,47 @@ def lot_frontage(
             # travels with the numbers rather than living only in the run's
             # config, the way `buffer_m` used to.
             "min_street_m": config.min_street_m,
+            # How far the nearest road lot sits above the cutoff. The cutoff
+            # is the run's only judgement, and this is what says whether it is
+            # a guard or a knife edge: on a real borough the parcels that are
+            # the roadway carry hundreds of metres of street line, so a
+            # minimum in the single digits means the identification does not
+            # turn on where `min_street_m` was set.
+            "min_road_lot_street_m": _min_street_m_inside(result["road_lots"]),
             "output_path": MetadataValue.path(str(path)),
+            # The parcels nothing else can name - see `ROAD_LOTS_FILE`.
+            "road_lots_path": MetadataValue.path(str(road_lots_path)),
         }
     )
+
+
+def _road_lot_frame(
+    road_lots: pd.DataFrame, *, neighborhood: str, scrape_date: str
+) -> pd.DataFrame:
+    """`compute_lot_frontage`'s road lots, ready to be written.
+
+    The partition travels as columns rather than in the path, because the path
+    carries bare keys rather than hive `key=value` pairs - the same reason
+    `neighborhood_streets` writes them onto its own frame. `lot_number` is what
+    the reader joins on: `lot_uid` is a bigserial that means nothing outside
+    the partition that minted it, and `hbu` speaks lot numbers for exactly that
+    reason.
+    """
+    frame = road_lots.copy()
+    frame["neighborhood"] = neighborhood
+    frame["scrape_date"] = scrape_date
+    return frame
+
+
+def _min_street_m_inside(road_lots: pd.DataFrame) -> float:
+    """The least street line any parcel had to carry to be called the roadway.
+
+    0.0 when nothing was - which is a borough whose street snapshot did not
+    land, and is already reported as `num_road_lots` being zero.
+    """
+    if road_lots.empty or "street_m_inside" not in road_lots.columns:
+        return 0.0
+    return round(float(road_lots["street_m_inside"].min()), 1)
 
 
 def _read_streets(

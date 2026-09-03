@@ -23,6 +23,7 @@ from dagster import (
     asset,
 )
 
+from urban_rag.guards import guard_current_scrape_month
 from urban_rag.bdoi import BdoiError, QUEBEC_FILES, read_shapefile_zip
 from urban_rag.frames import count_invalid_geometries, write_frame
 from urban_rag.layers import key_prefix
@@ -63,6 +64,7 @@ SOURCE_URL = "https://www150.statcan.gc.ca/n1/en/catalogue/34260001"
         f"spatial join. Source: {SOURCE_URL}"
     ),
 )
+@guard_current_scrape_month
 def neighborhood_buildings(
     context: AssetExecutionContext,
     bdoi: BdoiResource,

@@ -110,3 +110,6 @@ root_module = "urban_rag"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "scrape_month_guard: keep the bronze scrape-month guard live for this test",
+]

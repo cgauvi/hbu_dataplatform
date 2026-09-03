@@ -81,6 +81,7 @@ from dagster import (
 )
 from pydantic import Field
 
+from urban_rag.guards import guard_current_scrape_month
 from urban_rag.crspi import (
     BASE_PERIOD,
     PRICED_TYPES,
@@ -210,6 +211,7 @@ class RentsConfig(Config):
         "and quarters, and only the /<year>/q<n>/ path is stable."
     ),
 )
+@guard_current_scrape_month
 def montreal_commercial_rents(
     context: AssetExecutionContext,
     store: ParquetStore,
@@ -305,6 +307,7 @@ def montreal_commercial_rents(
         "forward. Re-fetched every scrape date because the table is revised."
     ),
 )
+@guard_current_scrape_month
 def commercial_rent_index(
     context: AssetExecutionContext, store: ParquetStore, crspi: CrspiResource
 ) -> MaterializeResult:

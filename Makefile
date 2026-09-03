@@ -65,8 +65,14 @@ DAGSTER_DAEMON := uv run python -m urban_rag.dagster_home dagster-daemon
 # target means looking the asset's layer up rather than copying its name.
 MODULE := urban_rag.definitions
 # The scrape partition is monthly (see urban_rag.partitions), so the key is
-# the first of the current month rather than today. Override to run an
-# earlier month: `make hbu DATE=2026-08-01`.
+# the first of the current month rather than today. Override to re-derive an
+# earlier month from bronze already on disk: `make hbu DATE=2026-08-01`.
+#
+# That override is for the silver and gold targets only. The targets that
+# reach a bronze asset - `catalog`, `cmhc`, `corpus`, `costs`, `features`,
+# `quartiers`, `rent-sources`, `roll`, `streets` - fetch from a live publisher,
+# so an earlier DATE would write today's data under an earlier month's key.
+# They refuse it; see urban_rag.guards and docs/running.md.
 DATE ?= $(shell date +%Y-%m-01)
 NEIGHBORHOOD ?= VSMPE
 PORT ?= 2500
