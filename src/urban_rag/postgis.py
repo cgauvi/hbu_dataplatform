@@ -290,7 +290,7 @@ def _as_multi_line(geometry: Any):
         return geometry
     return (
         geometry
-        if shape.geom_type == "MultiLineString"
+        if geometry.geom_type == "MultiLineString"
         else MultiLineString([geometry])
     )
 

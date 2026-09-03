@@ -18,7 +18,7 @@ from contextlib import contextmanager
 import geopandas as gpd
 import pytest
 from dagster import Failure, MultiPartitionKey, materialize
-from shapely.geometry import LineString, Polygon, box
+from shapely.geometry import LineString, MultiLineString, Polygon, box
 
 from asset_helpers import materialization_metadata
 
@@ -478,3 +478,46 @@ def test_a_failure_message_carries_the_partition(store):
 
     with pytest.raises(Failure, match=f"{NEIGHBORHOOD} {DATE}"):
         materialize_silver(store)
+
+
+def test_load_streets_promotes_every_side_to_multi(monkeypatch):
+    """The column is `geometry(MultiLineString, 4326)`, and a typmod rejects a
+    bare `LineString` rather than promoting it - so `load_streets` promotes.
+
+    Direct, because the asset's own tests stub the load away: this helper only
+    ever runs against a real database, which is where the promotion failing
+    would first be seen.
+    """
+    from urban_rag import postgis, warehouse
+
+    seen: dict[str, object] = {}
+
+    def upsert_frame(connection, dataset, frame, **kwargs):
+        seen["frame"] = frame
+        return {"copied": len(frame), "duplicates": 0, "upserted": len(frame), "pruned": 0}
+
+    monkeypatch.setattr(warehouse, "upsert_frame", upsert_frame)
+
+    frame = gpd.GeoDataFrame(
+        {STREET_ID_COLUMN: [1, 2]},
+        geometry=[
+            LineString([(-73.627, 45.546), (-73.625, 45.546)]),
+            MultiLineString(
+                [
+                    [(-73.627, 45.547), (-73.626, 45.547)],
+                    [(-73.624, 45.547), (-73.623, 45.547)],
+                ]
+            ),
+        ],
+        crs="EPSG:4326",
+    )
+
+    postgis.load_streets(
+        object(), frame, neighborhood=NEIGHBORHOOD, scrape_date=DATE
+    )
+
+    loaded = seen["frame"]
+    assert set(loaded.geometry.geom_type) == {"MultiLineString"}
+    # Measured geodesically here rather than in a projected CRS, so it agrees
+    # with the `ST_Length(geography(...))` every other measure is stated in.
+    assert (loaded["length_m"] > 0).all()
