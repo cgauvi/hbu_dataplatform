@@ -22,7 +22,7 @@ import pytest
 from asset_helpers import materialization_metadata, stub_publish as stub_publish_into
 from dagster import Failure, MultiPartitionKey, materialize
 
-from urban_rag import hbu, hbu_assets
+from urban_rag import hbu, hbu_assets, opportunity_assets
 from urban_rag.cmhc_assets import (
     AVERAGE_RENTS_FILE,
     VACANCY_FILE,
@@ -35,6 +35,7 @@ from urban_rag.comparables_assets import (
 )
 from urban_rag.envelope_assets import LOT_ENVELOPES_FILE, lot_zoning_envelopes
 from urban_rag.frames import write_frame
+from urban_rag.frontage_assets import ROAD_LOTS_FILE, lot_frontage
 from urban_rag.hbu_assets import (
     LOT_GAP_FILE,
     LOT_HBU_FILE,
@@ -42,6 +43,10 @@ from urban_rag.hbu_assets import (
     lot_development_programs,
     lot_highest_best_use,
     lot_redevelopment_gap,
+)
+from urban_rag.opportunity_assets import (
+    LOT_OPPORTUNITIES_FILE,
+    lot_investment_opportunities,
 )
 from urban_rag.program import (
     M2_PER_SQFT,
@@ -167,6 +172,44 @@ def comparables_frame(**overrides) -> pd.DataFrame:
         **overrides,
     }
     return pd.DataFrame([row])
+
+
+#: The two parcels that are avenue Querbes between Ball and Saint-Roch. Real
+#: numbers, from `bronze/neighborhood_lots` VSMPE 2026-08-26: two strips of
+#: 3,319 m2 and 3,298 m2, each some 9 m wide and a block long, each carrying
+#: about 365 m of geobase double street line, and *neither on the assessment
+#: roll*. Under the CUBF gate alone they were development sites - the zoning of
+#: the blocks either side put an apartment building on each of them, and they
+#: reached the redevelopment gap and the investment shortlist from there.
+#:
+#: Named rather than invented so this is a regression test on the two parcels
+#: the failure was reported for; the geometry that actually identifies them is
+#: `tests/integration/test_street_parcels.py`.
+QUERBES_LOTS = ("2 249 179", "2 249 339")
+
+
+def road_lots_frame(*lot_numbers, **overrides) -> pd.DataFrame:
+    """`lot_frontage`'s `road_lots.parquet` at the columns the gate reads.
+
+    Not marginal by default: 365 m of street line inside a parcel is a block
+    of roadway, and `near_cutoff` False is what says the roll gets no vote on
+    it. Pass ``near_cutoff=True`` for the ambiguous end of the range.
+    """
+    return pd.DataFrame(
+        [
+            {
+                "lot_uid": index,
+                "lot_number": number,
+                "street_m_inside": 365.0,
+                "num_street_sides": 16,
+                hbu.ROAD_LOT_FLAG_COLUMN: False,
+                "neighborhood": NEIGHBORHOOD,
+                "scrape_date": DATE,
+                **overrides,
+            }
+            for index, number in enumerate(lot_numbers or QUERBES_LOTS, start=1)
+        ]
+    )
 
 
 @pytest.fixture
@@ -658,6 +701,187 @@ def test_a_lot_the_roll_never_reached_is_not_a_road(economics):
     assert chosen.iloc[0]["hbu_status"] == "solved"
 
 
+def test_a_street_parcel_the_roll_never_reached_is_still_a_road(economics):
+    """The failure this gate was added for.
+
+    Lot 2 249 179 *is* avenue Querbes. Montreal never entered it on the roll,
+    so `road_parcel_lots` cannot see it and the zoning of the blocks either
+    side of it - which is what the zone polygon over a roadway describes -
+    built an apartment block on the street.
+    """
+    frame = envelopes(envelope(lot_number=QUERBES_LOTS[0]))
+    programs = hbu.solve_envelopes(frame, economics)
+    # The zoning alone builds here, which is exactly the problem.
+    assert programs.iloc[0]["solved"]
+
+    chosen = hbu.select_highest_best_use(
+        programs,
+        frame,
+        # The roll reaches this parcel with nothing to say about it, which is
+        # the state the borough is actually in.
+        assessments=comparables_frame(NO_LOT=QUERBES_LOTS[0], dominant_use_code=None),
+        road_lots=road_lots_frame(),
+    )
+    row = chosen.iloc[0]
+    assert row["hbu_status"] == "road_parcel"
+    assert pd.isna(row["status"])
+    assert pd.isna(row["num_dwellings"])
+    assert pd.isna(row["npv_cad"])
+    # It keeps its row and its own facts. The borough has a street here, and
+    # this table is an inventory of the borough.
+    assert row["lot_number"] == QUERBES_LOTS[0]
+    assert row["lot_area_m2"] == 500.0
+
+
+def test_the_two_road_predicates_are_unioned_and_neither_contains_the_other(
+    economics,
+):
+    """Each reaches parcels the other cannot, so both have to be consulted.
+
+    The roll knows a right of way it assessed; the cadastre knows every street
+    Montreal never put on the roll. A lot either of them calls a street is not
+    a development site.
+    """
+    frame = envelopes(
+        envelope(lot_uid=1, lot_number="2 216 001"),
+        # On the roll as a road, and not a parcel the street network reaches -
+        # a right of way the city did assess.
+        envelope(lot_uid=2, lot_number="2 216 002"),
+        # The other way round: avenue Querbes, which the roll never saw.
+        envelope(lot_uid=3, lot_number=QUERBES_LOTS[0]),
+    )
+    programs = hbu.solve_envelopes(frame, economics)
+    chosen = hbu.select_highest_best_use(
+        programs,
+        frame,
+        assessments=comparables_frame(NO_LOT="2 216 002", dominant_use_code="4550"),
+        road_lots=road_lots_frame(QUERBES_LOTS[0]),
+    )
+    assert dict(zip(chosen["lot_uid"], chosen["hbu_status"])) == {
+        1: "solved",
+        2: "road_parcel",
+        3: "road_parcel",
+    }
+
+
+def test_a_parcel_the_cadastre_does_not_call_a_road_still_builds(economics):
+    """The gate is a membership test, not a blanket over the partition."""
+    frame = envelopes(envelope(lot_number="2 216 001"))
+    programs = hbu.solve_envelopes(frame, economics)
+    chosen = hbu.select_highest_best_use(
+        programs, frame, road_lots=road_lots_frame()
+    )
+    assert chosen.iloc[0]["hbu_status"] == "solved"
+
+
+def test_no_road_lots_at_all_leaves_the_answer_as_it_was(economics):
+    """`road_lots` is optional, the way `assessments` is: a partition where
+    `lot_frontage` has not run answers as it did before rather than failing."""
+    frame = envelopes(envelope(lot_number=QUERBES_LOTS[0]))
+    programs = hbu.solve_envelopes(frame, economics)
+    for road_lots in (None, pd.DataFrame(), road_lots_frame("9 999 999")):
+        chosen = hbu.select_highest_best_use(programs, frame, road_lots=road_lots)
+        assert chosen.iloc[0]["hbu_status"] == "solved"
+
+
+def test_the_roll_overturns_a_marginal_call_but_not_a_clear_one(economics):
+    """The roll's veto, and the two halves of why it is this narrow.
+
+    A parcel caught by 1.5 m of street line is the one case the geometry
+    cannot read - a short stub of roadway and a geobase side clipping a corner
+    look identical there - so a roll saying *Logement* is better evidence and
+    wins. A parcel with 365 m of street line down the inside of it is the
+    street whatever the roll calls it, and VSMPE has ten such parcels coded
+    *Logement*, so there the roll gets no vote at all.
+    """
+    frame = envelopes(
+        envelope(lot_uid=1, lot_number="2 216 001"),
+        envelope(lot_uid=2, lot_number=QUERBES_LOTS[0]),
+    )
+    programs = hbu.solve_envelopes(frame, economics)
+    assessments = pd.concat(
+        [
+            comparables_frame(NO_LOT="2 216 001", dominant_use_code="1000"),
+            comparables_frame(NO_LOT=QUERBES_LOTS[0], dominant_use_code="1000"),
+        ],
+        ignore_index=True,
+    )
+    road_lots = pd.concat(
+        [
+            # A corner clip: barely over the cutoff, and assessed as housing.
+            road_lots_frame(
+                "2 216 001", street_m_inside=1.5, **{hbu.ROAD_LOT_FLAG_COLUMN: True}
+            ),
+            # A block of avenue Querbes, also assessed as housing.
+            road_lots_frame(QUERBES_LOTS[0]),
+        ],
+        ignore_index=True,
+    )
+    chosen = hbu.select_highest_best_use(
+        programs, frame, assessments=assessments, road_lots=road_lots
+    )
+    assert dict(zip(chosen["lot_uid"], chosen["hbu_status"])) == {
+        1: "solved",
+        2: "road_parcel",
+    }
+
+
+def test_a_lot_the_roll_never_reached_is_not_rescued(economics):
+    """The asymmetry the whole design turns on: absence of a use code is not
+    evidence of anything.
+
+    Read as a whitelist - keep only what the roll files as non-road - the same
+    column would drop the 2,509 VSMPE parcels the roll never reached, of which
+    1,245 are not roads and 1,053 had solved programs. So a marginal parcel
+    with no code stays a road; only a stated non-road use overturns one.
+    """
+    frame = envelopes(envelope(lot_number="2 216 001"))
+    programs = hbu.solve_envelopes(frame, economics)
+    chosen = hbu.select_highest_best_use(
+        programs,
+        frame,
+        assessments=comparables_frame(NO_LOT="2 216 001", dominant_use_code=None),
+        road_lots=road_lots_frame(
+            "2 216 001", street_m_inside=1.5, **{hbu.ROAD_LOT_FLAG_COLUMN: True}
+        ),
+    )
+    assert chosen.iloc[0]["hbu_status"] == "road_parcel"
+
+
+def test_a_marginal_parcel_the_roll_calls_a_road_stays_one(economics):
+    """Both predicates agreeing is not a case the rescue may reach."""
+    frame = envelopes(envelope(lot_number="2 216 001"))
+    programs = hbu.solve_envelopes(frame, economics)
+    chosen = hbu.select_highest_best_use(
+        programs,
+        frame,
+        assessments=comparables_frame(NO_LOT="2 216 001", dominant_use_code="4550"),
+        road_lots=road_lots_frame(
+            "2 216 001", street_m_inside=1.5, **{hbu.ROAD_LOT_FLAG_COLUMN: True}
+        ),
+    )
+    assert chosen.iloc[0]["hbu_status"] == "road_parcel"
+
+
+def test_road_lots_written_before_the_flag_existed_keep_their_answer(economics):
+    """A parquet with no `near_cutoff` column is read as nothing being
+    marginal, so the roll gets no vote and the partition answers as it did."""
+    frame = envelopes(envelope(lot_number=QUERBES_LOTS[0]))
+    programs = hbu.solve_envelopes(frame, economics)
+    old_file = road_lots_frame(QUERBES_LOTS[0]).drop(
+        columns=[hbu.ROAD_LOT_FLAG_COLUMN]
+    )
+    chosen = hbu.select_highest_best_use(
+        programs,
+        frame,
+        assessments=comparables_frame(
+            NO_LOT=QUERBES_LOTS[0], dominant_use_code="1000"
+        ),
+        road_lots=old_file,
+    )
+    assert chosen.iloc[0]["hbu_status"] == "road_parcel"
+
+
 def test_no_roll_at_all_leaves_the_answer_as_it_was(economics):
     """`assessments` is optional, and omitting it is not the same as an empty
     one - both leave the zoning to answer alone."""
@@ -907,8 +1131,16 @@ def stub_publish(monkeypatch):
     return stub_publish_into(monkeypatch, hbu_assets)
 
 
-def write_upstreams(store, *, rows=None, setbacks=True, comparables=None):
-    """Every parquet partition the three assets read."""
+def write_upstreams(
+    store, *, rows=None, setbacks=True, comparables=None, road_lots=None
+):
+    """Every parquet partition the three assets read.
+
+    ``road_lots`` defaults to an empty `road_lots.parquet` rather than to no
+    file at all, because that is the shape of a real partition: `lot_frontage`
+    writes the file whether or not the borough has a roadway in it, and a test
+    that omitted it would be exercising the degraded path by accident.
+    """
     write_frame(
         pd.DataFrame(rows or [ENVELOPE]),
         join(
@@ -961,6 +1193,14 @@ def write_upstreams(store, *, rows=None, setbacks=True, comparables=None):
             LOT_COMPARABLES_FILE,
         ),
     )
+    if road_lots is not False:
+        write_frame(
+            road_lots_frame().iloc[:0] if road_lots is None else road_lots,
+            join(
+                store.partition_dir(lot_frontage.key.path[-1], DATE, NEIGHBORHOOD),
+                ROAD_LOTS_FILE,
+            ),
+        )
 
 
 def run(store, asset_def, run_config=None):
@@ -1141,6 +1381,123 @@ def test_hbu_asset_answers_every_lot(store, stub_publish):
     # the answer this gate actually took away.
     assert metadata["num_road_programs_withheld"].value == 1
     assert stub_publish["datasets"].keys() == {"lot_highest_best_use"}
+
+
+def test_hbu_asset_gates_the_street_parcels_the_roll_never_reached(
+    store, stub_publish
+):
+    """Avenue Querbes, end to end, at the grain the complaint was made in.
+
+    Lots 2 249 179 and 2 249 339 are the roadway. Nothing in the assessment
+    roll says so - Montreal does not enter its streets on it - so before the
+    cadastral predicate the zoning of the blocks either side answered for them
+    and the borough's HBU table proposed a building on each.
+    """
+    rows = [
+        envelope(lot_uid=1, lot_number="2 216 001"),
+        envelope(lot_uid=2, lot_number=QUERBES_LOTS[0]),
+        envelope(lot_uid=3, lot_number=QUERBES_LOTS[1]),
+    ]
+    write_upstreams(
+        store,
+        rows=rows,
+        # The roll reaches the ordinary parcel and neither street.
+        comparables=comparables_frame(),
+        road_lots=road_lots_frame(),
+    )
+    assert run(store, lot_development_programs).success
+    result = run(store, lot_highest_best_use)
+    assert result.success
+
+    frame = pd.read_parquet(
+        join(
+            store.partition_dir(lot_highest_best_use.key.path[-1], DATE, NEIGHBORHOOD),
+            LOT_HBU_FILE,
+        )
+    ).set_index("lot_number")
+    assert frame.loc["2 216 001", "hbu_status"] == "solved"
+    for number in QUERBES_LOTS:
+        assert frame.loc[number, "hbu_status"] == "road_parcel", number
+        assert pd.isna(frame.loc[number, "num_dwellings"]), number
+        assert pd.isna(frame.loc[number, "npv_cad"]), number
+
+    metadata = materialization_metadata(result, lot_highest_best_use)
+    assert metadata["num_road_parcel"].value == 2
+    # The count that says the gate did work rather than merely labelled: both
+    # streets had a solved program, and both lost it.
+    assert metadata["num_road_programs_withheld"].value == 2
+    # And which predicate found them, kept apart on purpose - the roll found
+    # neither, which is the whole reason the second one exists.
+    assert metadata["num_road_parcels_on_the_roll"].value == 0
+    assert metadata["num_road_parcels_in_the_cadastre"].value == 2
+
+
+def test_a_cadastral_street_parcel_reaches_neither_the_gap_nor_the_shortlist(
+    store, stub_publish, monkeypatch
+):
+    """The gate is applied once, at the choice, and the rest of gold inherits
+    it: no program means no gap, and no gap means no investment thesis."""
+    write_upstreams(
+        store,
+        rows=[envelope(lot_number=QUERBES_LOTS[0])],
+        comparables=comparables_frame(NO_LOT=QUERBES_LOTS[0], dominant_use_code=None),
+        road_lots=road_lots_frame(QUERBES_LOTS[0]),
+    )
+    assert run(store, lot_development_programs).success
+    assert run(store, lot_highest_best_use).success
+    assert run(store, lot_redevelopment_gap).success
+
+    gap = pd.read_parquet(
+        join(
+            store.partition_dir(lot_redevelopment_gap.key.path[-1], DATE, NEIGHBORHOOD),
+            LOT_GAP_FILE,
+        )
+    ).iloc[0]
+    assert gap["hbu_status"] == "road_parcel"
+    assert not gap["is_underbuilt"]
+    assert pd.isna(gap["hbu_residential_floor_area_m2"])
+
+    # The shortlist is a fourth asset and a fourth upsert, so it needs its own
+    # module patched out - `stub_publish` above only covers `hbu_assets`.
+    stub_publish_into(monkeypatch, opportunity_assets)
+    assert run(store, lot_investment_opportunities).success
+    shortlist = pd.read_parquet(
+        join(
+            store.partition_dir(
+                lot_investment_opportunities.key.path[-1], DATE, NEIGHBORHOOD
+            ),
+            LOT_OPPORTUNITIES_FILE,
+        )
+    ).iloc[0]
+    # It keeps its row - this is an inventory - and it is not an opportunity.
+    assert shortlist["lot_number"] == QUERBES_LOTS[0]
+    assert shortlist["investment_thesis"] == "none"
+    assert pd.isna(shortlist["thesis_rank"])
+    assert not shortlist["is_top_opportunity"]
+
+
+def test_hbu_asset_without_the_road_lots_file_warns_and_falls_back_to_the_roll(
+    store, stub_publish
+):
+    """`lot_frontage` has no schedule and reads a relation hbu_infra creates,
+    so a partition without it must answer as it did before rather than fail -
+    loudly, because what it costs is a borough of streets read as sites."""
+    write_upstreams(
+        store, rows=[envelope(lot_number=QUERBES_LOTS[0])], road_lots=False
+    )
+    assert run(store, lot_development_programs).success
+    result = run(store, lot_highest_best_use)
+    assert result.success
+
+    frame = pd.read_parquet(
+        join(
+            store.partition_dir(lot_highest_best_use.key.path[-1], DATE, NEIGHBORHOOD),
+            LOT_HBU_FILE,
+        )
+    )
+    assert frame.iloc[0]["hbu_status"] == "solved"
+    metadata = materialization_metadata(result, lot_highest_best_use)
+    assert metadata["num_road_parcels_in_the_cadastre"].value == 0
 
 
 def test_gap_asset_puts_the_two_buildings_side_by_side(store, stub_publish):

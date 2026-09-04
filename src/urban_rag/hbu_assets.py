@@ -791,7 +791,18 @@ def lot_highest_best_use(
             # roadless blocks - which is exactly the failure this gate had
             # before, silently.
             "num_road_parcels_on_the_roll": len(road_parcel_lots(assessments)),
-            "num_road_parcels_in_the_cadastre": len(cadastral_road_lots(road_lots)),
+            "num_road_parcels_in_the_cadastre": len(
+                cadastral_road_lots(road_lots, assessments)
+            ),
+            # How many marginal calls the roll overturned - parcels the
+            # geometry caught by barely more street line than the cutoff asks
+            # for, which the roll files as primarily something else. The roll's
+            # whole vote, and worth seeing because it is the one place a use
+            # code is allowed to put a parcel back into the inventory.
+            "num_road_parcels_rescued_by_the_roll": (
+                len(cadastral_road_lots(road_lots))
+                - len(cadastral_road_lots(road_lots, assessments))
+            ),
             # A lot two zones reach is a lot on a zoning boundary, where the
             # answer depends on which line is believed. pct_of_lot decides it
             # and travels on every row, so a pick made off a 2 percent sliver
@@ -1172,7 +1183,7 @@ def _road_programs_withheld(
     and is the number to watch if either predicate's coverage changes. Counted
     over lot numbers, which is the key both of them answer in.
     """
-    roads = road_parcel_lots(assessments) | cadastral_road_lots(road_lots)
+    roads = road_parcel_lots(assessments) | cadastral_road_lots(road_lots, assessments)
     if not roads or programs.empty or "lot_number" not in programs.columns:
         return 0
     solved = programs["solved"].fillna(False).astype(bool)

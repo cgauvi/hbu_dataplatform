@@ -297,6 +297,17 @@ PRICED_BEDROOM_TYPES: tuple[str, ...] = (
 #: ``row`` nor exactly ``apartment_other`` - so the total is the honest cell.
 _ALL_DWELLINGS = "all"
 
+#: The column of `lot_frontage`'s `road_lots.parquet` that says the geometry
+#: was a close call - see `cadastral_road_lots`, which is the only reader.
+#:
+#: Declared here rather than beside the rest of that file's schema in
+#: `urban_rag.postgis`, because it is the one column of it this module
+#: *interprets* rather than passes through, and because a name defined there
+#: could only reach this one through an import of the I/O layer that this
+#: module deliberately does not take. `frontage_assets` writes it and imports
+#: the spelling from here.
+ROAD_LOT_FLAG_COLUMN = "near_cutoff"
+
 #: Why a lot has the row it has. One value per row of `lot_highest_best_use`,
 #: so "the borough has four hundred unanswered lots" is a `GROUP BY` rather
 #: than a set of nulls to interpret.
@@ -1212,6 +1223,12 @@ def select_highest_best_use(
     for a second reason - `lot_frontage` has no schedule and reads a relation
     hbu_infra has to create, so a partition without it must answer as it did
     before rather than fail.
+
+    The roll is then consulted a *second* time, in the other direction: where
+    the geometry was a close call and the roll says the parcel is primarily
+    something else, the parcel is not a road. That is the whole of the roll's
+    veto and it is deliberately narrow - see `cadastral_road_lots`, which is
+    also where the arithmetic on why it cannot be widened into a whitelist is.
     """
     envelopes = ensure_use_flags(envelopes)
     lots = _lot_index(envelopes)
@@ -1226,7 +1243,7 @@ def select_highest_best_use(
     # never put on the roll.
     road_numbers = (
         road_parcel_lots(assessments) if assessments is not None else frozenset()
-    ) | cadastral_road_lots(road_lots)
+    ) | cadastral_road_lots(road_lots, assessments)
     road_uids = frozenset(
         lots.index[lots["lot_number"].isin(road_numbers)]
         if road_numbers and "lot_number" in lots.columns
@@ -1421,7 +1438,10 @@ def equipment_zone_lots(envelopes: pd.DataFrame) -> frozenset:
     return frozenset(governing.loc[permits, "lot_uid"])
 
 
-def cadastral_road_lots(road_lots: pd.DataFrame | None) -> frozenset:
+def cadastral_road_lots(
+    road_lots: pd.DataFrame | None,
+    assessments: pd.DataFrame | None = None,
+) -> frozenset:
     """The **lot numbers** the cadastre and the street network agree are road.
 
     ``road_lots`` is `frontage_assets`' `road_lots.parquet` for one partition:
@@ -1442,6 +1462,34 @@ def cadastral_road_lots(road_lots: pd.DataFrame | None) -> frozenset:
     Keyed on the lot *number*, like `road_parcel_lots` and for its reason:
     `lot_uid` is a bigserial that means nothing outside the partition that
     minted it.
+
+    **``assessments`` overturns the marginal calls, and only those.** A parcel
+    caught by a metre or two of street line is the one case this geometry
+    cannot read - a short stub of roadway and a geobase side clipping the
+    corner of an ordinary lot look identical at that end of the range - and
+    `lot_frontage` marks exactly those rows `near_cutoff`. Where the roll says
+    such a parcel is primarily something else, that is better evidence than two
+    metres of line, and it is dropped from the road set. On the 2026
+    Villeray-Saint-Michel-Parc-Extension partition this rescues 14 parcels, ten
+    of which the solver had a building for, at a median 738 m2 - three
+    *Logement*, three *Espace de terrain non aménagé*, an office building, a
+    local shopping centre.
+
+    **It is a rescue and not a gate, and the difference is the whole of the
+    argument.** Read as a gate - keep only the parcels the roll files as
+    something other than a road - the same column drops every lot the roll
+    never reached, which is 2,509 of that borough's 24,952: 1,245 of them are
+    not roads at all and 1,053 had solved programs, 3,074 dwellings over 40 ha
+    of ordinary house lots and unassessed vacant land. It would also still miss
+    93 real street parcels, because the roll files them as parking, railway,
+    vacant land, ten as *Logement* and six as *Abribus*. Absence of a code is
+    not evidence, and a non-road code does not outweigh 300 m of street line
+    running down the inside of a parcel. Restricting the roll's vote to the
+    ambiguous band is what keeps it worth having.
+
+    Old parquet has no `near_cutoff` column, and is read as no row being
+    marginal - so a partition written before this existed keeps the answer it
+    had, which is the safe direction.
     """
     if road_lots is None or road_lots.empty:
         return frozenset()
@@ -1451,7 +1499,38 @@ def cadastral_road_lots(road_lots: pd.DataFrame | None) -> frozenset:
     )
     if key is None:
         return frozenset()
-    return frozenset(road_lots[key].dropna())
+    numbers = frozenset(road_lots[key].dropna())
+    if assessments is None or ROAD_LOT_FLAG_COLUMN not in road_lots.columns:
+        return numbers
+    marginal = road_lots.loc[
+        road_lots[ROAD_LOT_FLAG_COLUMN].fillna(False).astype(bool), key
+    ]
+    return numbers - (frozenset(marginal.dropna()) & _non_road_use_lots(assessments))
+
+
+def _non_road_use_lots(assessments: pd.DataFrame) -> frozenset:
+    """Lot numbers the roll files under a use code that is *not* a road.
+
+    The complement of `road_parcel_lots` over the parcels the roll reached, and
+    deliberately not over the ones it did not: a lot with no `dominant_use_code`
+    is absent here rather than counted as non-road. That asymmetry is the point
+    - see `cadastral_road_lots` on why the same column read as a whitelist
+    deletes an eighth of a borough.
+    """
+    if assessments is None or assessments.empty:
+        return frozenset()
+    if "dominant_use_code" not in assessments.columns:
+        return frozenset()
+    key = next(
+        (name for name in ("NO_LOT", "lot_number") if name in assessments.columns),
+        None,
+    )
+    if key is None:
+        return frozenset()
+    codes = assessments["dominant_use_code"]
+    stated = codes.notna() & codes.astype("string").str.strip().ne("")
+    not_road = ~codes.map(is_road_use_code).fillna(False)
+    return frozenset(assessments.loc[stated & not_road, key].dropna())
 
 
 def road_parcel_lots(assessments: pd.DataFrame) -> frozenset:

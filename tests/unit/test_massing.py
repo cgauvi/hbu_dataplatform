@@ -280,6 +280,43 @@ def test_massing_frame_keeps_every_lot_and_says_why():
     assert frame.loc[frame["lot_uid"] != 1, "geometry"].isna().all()
 
 
+def test_a_road_parcel_is_never_drawn():
+    """The parcel that *is* avenue Querbes, with everything a build needs.
+
+    A street lot is a clean rectangle of a few thousand square metres with a
+    buildable envelope inside it, so nothing about its geometry stops a
+    footprint being placed on it - the only thing that does is `hbu_status`.
+    This pins that the massing reads the status and not the numbers beside it,
+    because a road parcel drawn on a map is the one failure that looks entirely
+    plausible: a mid-rise standing in the middle of the roadway.
+    """
+    hbu = pd.DataFrame(
+        [
+            hbu_row(1),
+            hbu_row(
+                2,
+                lot_number="2 249 179",
+                hbu_status="road_parcel",
+                # Not nulled out, deliberately: the assertion is about the
+                # status winning over a full set of numbers.
+                footprint_m2=200.0,
+            ),
+        ]
+    )
+    setbacks = envelopes_gdf(
+        [
+            setback_row(near_villeray(box(0, 0, 20, 20)), lot_uid=1),
+            setback_row(near_villeray(box(40, 0, 60, 20)), lot_uid=2),
+        ]
+    )
+    frame = massing.massing_frame(hbu, setbacks).set_index("lot_uid")
+    assert frame.loc[1, "massing_status"] == "fitted"
+    assert frame.loc[1, "geometry"] is not None
+    # It keeps its row and says why, the way every unbuilt lot here does.
+    assert frame.loc[2, "massing_status"] == "no_program"
+    assert frame.loc[2, "geometry"] is None
+
+
 def test_massing_frame_reports_the_fit():
     hbu = pd.DataFrame([hbu_row(1, footprint_m2=200.0, floors=5)])
     setbacks = envelopes_gdf([setback_row(near_villeray(box(0, 0, 20, 20)))])

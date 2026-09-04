@@ -22,6 +22,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 
 import geopandas as gpd
+import pandas as pd
 import pytest
 from dagster import Failure, MultiPartitionKey, materialize
 from shapely.geometry import LineString
@@ -29,8 +30,17 @@ from shapely.geometry import LineString
 from asset_helpers import materialization_metadata
 
 from urban_rag.frames import write_frame
-from urban_rag.frontage_assets import LOT_FRONTAGE_FILE, lot_frontage
-from urban_rag.postgis import DEFAULT_ROAD_LOT_MIN_STREET_M, FRONTAGE_NO_BUFFER
+from urban_rag.hbu import ROAD_LOT_FLAG_COLUMN
+from urban_rag.frontage_assets import (
+    LOT_FRONTAGE_FILE,
+    ROAD_LOTS_FILE,
+    lot_frontage,
+)
+from urban_rag.postgis import (
+    DEFAULT_ROAD_LOT_MIN_STREET_M,
+    FRONTAGE_NO_BUFFER,
+    ROAD_LOT_COLUMNS,
+)
 from urban_rag.resources import ParquetStore, PostgisResource
 from urban_rag.storage import join
 from urban_rag.street_assets import STREETS_FILE_OUT, neighborhood_streets
@@ -71,6 +81,29 @@ def write_streets(store, *, street_ids=(1, 2), names=("Jarry", "Papineau")):
     )
 
 
+#: A parcel the geobase double runs a block's worth of street down the inside
+#: of. Real numbers: avenue Querbes between Ball and Saint-Roch is lots
+#: 2 249 179 and 2 249 339, and neither is on the assessment roll - which is
+#: why this file exists at all, and why `test_hbu.py` gates on the same two.
+ROAD_LOT_NUMBERS = ("2 249 179", "2 249 339")
+
+
+def road_lot_frame(count: int) -> pd.DataFrame:
+    """`compute_lot_frontage`'s road lots, at `postgis.ROAD_LOT_COLUMNS`."""
+    return pd.DataFrame(
+        [
+            {
+                "lot_uid": index,
+                "lot_number": ROAD_LOT_NUMBERS[index % len(ROAD_LOT_NUMBERS)],
+                "street_m_inside": 365.0 - index,
+                "num_street_sides": 16,
+            }
+            for index in range(count)
+        ],
+        columns=list(ROAD_LOT_COLUMNS),
+    )
+
+
 def stub_postgis(
     monkeypatch,
     *,
@@ -84,6 +117,7 @@ def stub_postgis(
     total_frontage_m=60.0,
     max_frontage_m=30.0,
     lots_without_frontage=("3 790 556", "3 790 557"),
+    road_lots=None,
 ):
     """Patched on the class: Dagster rebuilds the resource before the run."""
     calls: dict[str, object] = {}
@@ -106,6 +140,12 @@ def stub_postgis(
             # count of lots that faced nothing is num_lots - num_road_lots -
             # lots_matched, and this sample is which ones.
             "num_road_lots": num_road_lots,
+            # The same parcels named rather than counted. The set nothing else
+            # in the platform holds - see the module docstring - and the one
+            # this asset now writes a file of.
+            "road_lots": (
+                road_lot_frame(num_road_lots) if road_lots is None else road_lots
+            ),
             # Parcels a sliver off a road lot and touching none. 0 on a
             # topologically clean cadastre, which is what lets the measure be
             # an exact shared edge with no tolerance at all.
@@ -216,6 +256,139 @@ def test_the_written_rows_are_ordered_longest_frontage_first(
         / LOT_FRONTAGE_FILE
     )
     assert frame["frontage_m"].is_monotonic_decreasing
+
+
+def test_the_road_lots_are_written_beside_the_frontages(
+    store, monkeypatch, tmp_path
+):
+    """The half of this asset's answer that used to be thrown away.
+
+    A road lot gets no frontage row - it fronts on nothing, which is the
+    definition - so the set cannot travel as a column of the table beside it,
+    and "no row here" cannot stand in for it either: that says roadway *or*
+    landlocked parcel, and the two want opposite treatment. Hence a file.
+    """
+    stub_postgis(monkeypatch, num_road_lots=2)
+    write_streets(store)
+
+    assert materialize_partition(store).success
+
+    frame = pd.read_parquet(
+        tmp_path / "store" / "silver" / "lot_frontage" / DATE / NEIGHBORHOOD
+        / ROAD_LOTS_FILE
+    )
+    assert list(frame["lot_number"]) == list(ROAD_LOT_NUMBERS)
+    assert set(ROAD_LOT_COLUMNS) <= set(frame.columns)
+    # Both carry a block of street, so neither is a call the roll may overturn.
+    assert not frame[ROAD_LOT_FLAG_COLUMN].any()
+    # The partition travels as columns, because the path carries bare keys
+    # rather than hive `key=value` pairs.
+    assert set(frame["neighborhood"]) == {NEIGHBORHOOD}
+    assert set(frame["scrape_date"]) == {DATE}
+    # What the identification actually rested on, per parcel, so the cutoff is
+    # auditable rather than asserted.
+    assert (frame["street_m_inside"] > DEFAULT_ROAD_LOT_MIN_STREET_M).all()
+
+
+def test_a_borough_with_no_road_lot_writes_an_empty_file_not_no_file(
+    store, monkeypatch, tmp_path
+):
+    """`lot_highest_best_use` reads this file to decide whether a parcel is a
+    development site, and it treats a missing one as "the frontage asset has
+    not run" - which is a different fact from "this borough has no roadway"
+    and gets a warning rather than a gate. So the file is always written."""
+    stub_postgis(monkeypatch, num_road_lots=0)
+    write_streets(store)
+
+    assert materialize_partition(store).success
+
+    frame = pd.read_parquet(
+        tmp_path / "store" / "silver" / "lot_frontage" / DATE / NEIGHBORHOOD
+        / ROAD_LOTS_FILE
+    )
+    assert frame.empty
+    assert set(ROAD_LOT_COLUMNS) <= set(frame.columns)
+
+
+def test_metadata_reports_how_far_the_road_lots_clear_the_cutoff(
+    store, monkeypatch
+):
+    """The cutoff is the run's only judgement. This is what says whether it is
+    a guard or a knife edge: a parcel that is the roadway carries hundreds of
+    metres of street line, so a minimum far above `min_street_m` means the
+    identification does not turn on where the cutoff was set."""
+    stub_postgis(monkeypatch, num_road_lots=2)
+    write_streets(store)
+
+    metadata = materialization_metadata(materialize_partition(store), lot_frontage)
+
+    assert metadata["num_road_lots"].value == 2
+    assert metadata["min_road_lot_street_m"].value == 364.0
+    assert metadata["road_lots_path"].value.endswith(ROAD_LOTS_FILE)
+    # Both of these carry a block of street, so neither is near the cutoff.
+    assert metadata["num_road_lots_near_the_cutoff"].value == 0
+
+
+def test_a_road_lot_barely_over_the_cutoff_is_counted_and_kept(store, monkeypatch):
+    """A parcel identified by 1.5 m of street line is either a short stub of
+    roadway or a side clipping a corner, and nothing here can tell which. It
+    is kept - the cutoff is the judgement and this is not a second one - and
+    counted, because gating a parcel as road removes it from the development
+    inventory and that must not happen silently."""
+    stub_postgis(
+        monkeypatch,
+        num_road_lots=1,
+        road_lots=road_lot_frame(2).assign(street_m_inside=[1.5, 400.0]),
+    )
+    write_streets(store)
+
+    metadata = materialization_metadata(materialize_partition(store), lot_frontage)
+
+    assert metadata["num_road_lots_near_the_cutoff"].value == 1
+    assert metadata["min_road_lot_street_m"].value == 1.5
+
+
+def test_the_marginal_road_lots_are_flagged_for_the_roll_to_overturn(
+    store, monkeypatch, tmp_path
+):
+    """`near_cutoff` is computed here because this is the only place
+    `min_street_m` is known - the reader downstream has a file, not the config
+    that produced it. See `hbu.cadastral_road_lots` for what it licenses."""
+    stub_postgis(
+        monkeypatch,
+        num_road_lots=2,
+        road_lots=road_lot_frame(2).assign(street_m_inside=[1.5, 400.0]),
+    )
+    write_streets(store)
+
+    assert materialize_partition(store).success
+
+    frame = pd.read_parquet(
+        tmp_path / "store" / "silver" / "lot_frontage" / DATE / NEIGHBORHOOD
+        / ROAD_LOTS_FILE
+    ).set_index("street_m_inside")
+    assert frame.loc[1.5, ROAD_LOT_FLAG_COLUMN]
+    assert not frame.loc[400.0, ROAD_LOT_FLAG_COLUMN]
+
+
+def test_the_flag_moves_with_the_configured_cutoff(store, monkeypatch, tmp_path):
+    """It is a multiple of `min_street_m`, not an absolute length: what counts
+    as a close call depends on where the line was drawn."""
+    stub_postgis(
+        monkeypatch,
+        num_road_lots=1,
+        road_lots=road_lot_frame(1).assign(street_m_inside=[30.0]),
+    )
+    write_streets(store)
+
+    materialize_partition(store, run_config=config_for(5.0))
+
+    frame = pd.read_parquet(
+        tmp_path / "store" / "silver" / "lot_frontage" / DATE / NEIGHBORHOOD
+        / ROAD_LOTS_FILE
+    )
+    # 30 m clears a 1 m cutoff comfortably; against a 5 m one it does not.
+    assert frame[ROAD_LOT_FLAG_COLUMN].all()
 
 
 def test_the_default_road_lot_cutoff_is_the_one_postgis_declares(store, monkeypatch):

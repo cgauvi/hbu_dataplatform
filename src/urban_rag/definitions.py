@@ -878,6 +878,17 @@ def monthly_neighborhood_streets_schedule(context: ScheduleEvaluationContext):
 # `lot_redevelopment_gap` also reads `lot_assessment_comparables`, which *is*
 # scheduled (40 6) - so of its four upstreams that one needs no waiting, and the
 # gap it computes is only as fresh as the envelopes behind the other three.
+#
+# `lot_highest_best_use` also reads `lot_frontage`, and one file of it:
+# `road_lots.parquet`, the parcels that are the street. That was already
+# upstream through the envelopes, which take their frontage from the same
+# asset, so the ordering does not change - but what a *missing* frontage
+# partition costs here is different in kind. Without it the road gate falls
+# back to the assessment roll, and the roll does not record Montreal's
+# roadways at all, so a borough's streets come back through the solver as
+# development sites. The asset warns and carries on rather than failing; when
+# these get schedules, `lot_frontage` belongs ahead of them for that reason and
+# not only for the frontages.
 
 # No schedule for `lot_building_massing` either, behind all of them:
 # `gold.lot_building_massing` is hbu_infra's sql/022 and has not been applied,

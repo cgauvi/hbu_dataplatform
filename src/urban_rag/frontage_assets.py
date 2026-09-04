@@ -100,6 +100,7 @@ from urban_rag.building_lots_assets import building_lot_intersections
 from urban_rag.frames import write_frame
 from urban_rag.layers import key_prefix
 from urban_rag.partitions import scrape_partitions
+from urban_rag.hbu import ROAD_LOT_FLAG_COLUMN
 from urban_rag.postgis import (
     DEFAULT_ROAD_LOT_MIN_STREET_M,
     ROAD_LOT_COLUMNS,
@@ -265,7 +266,10 @@ def lot_frontage(
     # not run".
     road_lots_path = write_frame(
         _road_lot_frame(
-            result["road_lots"], neighborhood=neighborhood, scrape_date=scrape_date
+            result["road_lots"],
+            neighborhood=neighborhood,
+            scrape_date=scrape_date,
+            min_street_m=config.min_street_m,
         ),
         join(output_dir, ROAD_LOTS_FILE),
     )
@@ -382,6 +386,16 @@ def lot_frontage(
             # minimum in the single digits means the identification does not
             # turn on where `min_street_m` was set.
             "min_road_lot_street_m": _min_street_m_inside(result["road_lots"]),
+            # How many of them are anywhere near it. A parcel that is the
+            # roadway carries hundreds of metres of street line; one that
+            # carries a few is a geobase side clipping a corner where the two
+            # publishers disagree, and calling it a road costs a real
+            # development site downstream. On the 2026 VSMPE partition this is
+            # 61 of 1,405 - small, and the number to watch rather than assume,
+            # because the lever for it is `min_street_m` and nothing else.
+            "num_road_lots_near_the_cutoff": _near_the_cutoff(
+                result["road_lots"], config.min_street_m
+            ),
             "output_path": MetadataValue.path(str(path)),
             # The parcels nothing else can name - see `ROAD_LOTS_FILE`.
             "road_lots_path": MetadataValue.path(str(road_lots_path)),
@@ -390,7 +404,11 @@ def lot_frontage(
 
 
 def _road_lot_frame(
-    road_lots: pd.DataFrame, *, neighborhood: str, scrape_date: str
+    road_lots: pd.DataFrame,
+    *,
+    neighborhood: str,
+    scrape_date: str,
+    min_street_m: float,
 ) -> pd.DataFrame:
     """`compute_lot_frontage`'s road lots, ready to be written.
 
@@ -400,8 +418,17 @@ def _road_lot_frame(
     the reader joins on: `lot_uid` is a bigserial that means nothing outside
     the partition that minted it, and `hbu` speaks lot numbers for exactly that
     reason.
+
+    `near_cutoff` is computed here rather than downstream because this is the
+    only place `min_street_m` is known - the reader has a file, not the config
+    that produced it. See `postgis.ROAD_LOT_FLAG_COLUMN` for what it is for.
     """
     frame = road_lots.copy()
+    frame[ROAD_LOT_FLAG_COLUMN] = (
+        frame["street_m_inside"] < _CUTOFF_MARGIN * float(min_street_m)
+        if not frame.empty
+        else pd.Series(dtype="bool")
+    )
     frame["neighborhood"] = neighborhood
     frame["scrape_date"] = scrape_date
     return frame
@@ -416,6 +443,30 @@ def _min_street_m_inside(road_lots: pd.DataFrame) -> float:
     if road_lots.empty or "street_m_inside" not in road_lots.columns:
         return 0.0
     return round(float(road_lots["street_m_inside"].min()), 1)
+
+
+#: How many multiples of `min_street_m` a road lot has to clear to be out of
+#: the band worth watching. Twenty metres at the shipped cutoff of 1 m, which
+#: is well under the shortest real street parcel in the boroughs measured so
+#: far - the shortest in the Querbes fixture holds 126 m - and well over what a
+#: corner clip produces, which is under a metre.
+_CUTOFF_MARGIN = 20.0
+
+
+def _near_the_cutoff(road_lots: pd.DataFrame, min_street_m: float) -> int:
+    """Road lots identified by barely more street line than the cutoff asks.
+
+    Not an error and not filtered out: a short street stub is a real parcel of
+    roadway and belongs here. But so is a side clipping the corner of an
+    ordinary lot, and the two are indistinguishable at this end of the range -
+    so the count is published, because gating a parcel as road removes it from
+    the development inventory and that should never happen silently.
+    """
+    if road_lots.empty or "street_m_inside" not in road_lots.columns:
+        return 0
+    return int(
+        (road_lots["street_m_inside"] < _CUTOFF_MARGIN * float(min_street_m)).sum()
+    )
 
 
 def _read_streets(

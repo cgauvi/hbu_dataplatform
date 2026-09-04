@@ -675,15 +675,20 @@ DEFAULT_ROAD_LOT_MIN_STREET_M = 1.0
 #: `hbu.select_highest_best_use` - and it is published rather than left inside
 #: this function for that reason.
 #:
-#: `street_m_inside` is carried so the judgement is auditable per parcel: it is
-#: the quantity `min_street_m` is compared against, and the distance between a
-#: real street lot and a cutoff artefact is two orders of magnitude of it.
+#: `street_m_inside` is carried so the judgement is auditable per parcel: how
+#: much street line the sides that identified it run inside it, summed. Note
+#: that `min_street_m` is compared against one *side* at a time and this is the
+#: total over the sides that cleared it, so the two are not the same number - a
+#: strip cut into six sides of 100 m holds 606 m and is identified by any cutoff
+#: under 100. The gap between a real street lot and a side clipping a corner is
+#: two orders of magnitude either way.
 ROAD_LOT_COLUMNS: tuple[str, ...] = (
     "lot_uid",
     "lot_number",
     "street_m_inside",
     "num_street_sides",
 )
+
 
 #: Fixed rather than inferred, so an empty partition writes the same schema a
 #: full one does - a parquet whose `lot_number` came back as all-null object
@@ -3319,7 +3324,7 @@ def _aggregate_select(layers: Sequence[str]) -> str:
                    ST_Length(geography(cells.geom)) AS dissolved_length_m,
                    -- Segmentised before it is measured; see `_cell_area_sql`
                    -- for why the raw envelope is the wrong box at level 1.
-                   {cell_area}                      AS cell_area_m2
+                   {cell_area} AS cell_area_m2
               FROM _agg_cells AS cells
         ),
         measures AS (

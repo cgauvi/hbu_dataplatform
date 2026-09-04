@@ -54,7 +54,7 @@ zone 8), not in the 4326 the geometry is stored in — a degree is not a metre.
 
 ## What the street layer is for now
 
-Two things, and measuring is not one of them.
+Three things, and measuring is not one of them.
 
 **It says which parcels are the roadway.** A géobase double side is drawn along
 the roadway, so it runs *inside* the parcel that is the roadway and enters no
@@ -80,6 +80,16 @@ street happens to be closer — lot 3 790 549 comes back as Chabot twice. With
 the restriction it reads 31.2 m on Jarry and 13.1 m on Chabot, which is what it
 is. Naming is all the géobase does to the numbers: a label landing on the wrong
 side of a corner costs a name, never a metre.
+
+**And it publishes the road lots**, as `road_lots.parquet` beside
+`lot_frontage.parquet` — one row per parcel that is the street, with the
+`street_m_inside` that identified it. Identifying them is the more valuable
+half of this asset and it used to be thrown away, because a road lot gets no
+frontage row and so has nowhere to carry a flag. "No row in `silver.lot_frontage`"
+cannot stand in for it either: that says *roadway or landlocked parcel*, and
+the two want opposite treatment. So the set travels as a file of its own, and
+`gold.lot_highest_best_use` reads it — see [Keeping the solver off the
+street](#keeping-the-solver-off-the-street).
 
 ## Why the assessment roll cannot do the identifying
 
@@ -108,6 +118,75 @@ a map of the street network. `urban_rag.hbu.road_parcel_lots` says the same
 thing from the other side, and still reads the roll — for what the roll is
 good for, which is knowing that a parcel it *did* reach is not a development
 site.
+
+## Keeping the solver off the street
+
+That gap was not academic. `gold.lot_highest_best_use` used to decide "is this
+parcel a development site" on the roll alone, which meant the highest-and-best-use
+chain answered for Montreal's roadways out of the zoning of the blocks either
+side — and a zone polygon over a roadway describes the block it serves, so a
+CP-SAT solver handed the strip's own 3,300 m² builds an entirely plausible
+apartment block on it. It then reached `gold.lot_redevelopment_gap` as
+under-built and `gold.lot_investment_opportunities` as a ranked opportunity.
+
+Avenue Querbes between Ball and Saint-Roch is the worked example: lots
+**2 249 179** and **2 249 339**, 3,319 m² and 3,298 m², each about 9 m wide and
+a block long, each carrying some 365 m of géobase street line, and neither on
+the roll. Nothing in the cadastre's own attributes separates them from a house
+lot — same `CO_TYPE_POLGN`, same `CO_STATT_LOT`, same `CO_TYPE_MORCL`. The
+street network is the only thing that does.
+
+So `hbu.select_highest_best_use` now takes the **union** of two predicates:
+
+| | reads | reaches, on VSMPE |
+| --- | --- | --- |
+| `hbu.road_parcel_lots` | the roll's CUBF 45xx | 48 parcels |
+| `hbu.cadastral_road_lots` | this asset's `road_lots.parquet` | ~1,400 parcels |
+
+Neither contains the other — the roll knows a right of way it assessed, the
+cadastre knows every street the city never put on the roll — and a parcel
+either of them calls a street gets `hbu_status = road_parcel`, keeps its row and
+loses its program. `tests/integration/test_street_parcels.py` is the regression,
+on the two Querbes lots and the real geometry.
+
+On the 2026-09-01 VSMPE partition the gate is 1,436 parcels, of which **1,216
+had a solved program** carrying **28,203 proposed dwellings** — 11% of the
+borough's total, all of it on the roadway.
+
+### Why the roll is a veto and not a whitelist
+
+The obvious cheaper design is to skip the geometry: keep only the lots the roll
+files as primarily something *other* than a road. It does exclude the Querbes
+lots, and it costs far too much. Measured over the same partition:
+
+| | lots |
+| --- | --- |
+| no `dominant_use_code` at all | 2,509 |
+| roll says 45xx | 48 |
+| **a whitelist would drop** | **2,557** |
+| — of which geometrically road | 1,312 |
+| — **of which not road at all** | **1,245** |
+| genuine street parcels it would still keep | 93 |
+
+**Absence of a code is not evidence.** An eighth of the borough is not on the
+roll, and 1,245 of those parcels are ordinary house lots and unassessed vacant
+land — 1,053 with solved programs, 3,074 dwellings, median lot 248 m². An
+unassessed vacant parcel is the *best* thing this pipeline can find, so a
+whitelist deletes the rows it exists to surface.
+
+**And a non-road code is not evidence either, at scale.** The 93 street parcels
+a whitelist keeps are assessed as parking (25), railway (17), vacant land (14),
+*Logement* (10) and *Abribus* (6). A strip assessed as a bus shelter is still
+the roadway.
+
+So the roll's vote is restricted to where the geometry is genuinely ambiguous:
+rows `lot_frontage` marks `near_cutoff`, caught by under twenty times the
+cutoff. A parcel holding 1.5 m of street line and assessed as *Logement* is a
+corner clip; a parcel holding 365 m of it is the street whatever the roll calls
+it. On VSMPE that overturns **14** calls, ten of which had programs, at a median
+738 m² — three *Logement*, three *Espace de terrain non aménagé*, an office
+building, a local shopping centre. The run reports it as
+`num_road_parcels_rescued_by_the_roll`.
 
 ## Lanes settle themselves
 

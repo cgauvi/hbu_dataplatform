@@ -72,10 +72,23 @@ SCHEMA_FILES = (
 #: the geometry is the publisher's, not a fixture author's idea of it.
 FIXTURE_DIR = pathlib.Path(__file__).resolve().parents[1] / "fixtures" / "frontage"
 
-#: The partition the fixture is loaded into. A date of its own so a run against
-#: a database that already holds real rows cannot collide with them.
+#: The second slice: avenue Querbes between Ball and Saint-Roch, in
+#: Parc-Extension. Carved the same way and for a different question - the
+#: Chabot window above is about *measuring* a frontage, this one is about
+#: *identifying* the parcels that are the street, which is what keeps a
+#: roadway out of the highest-and-best-use inventory. See its README.
+STREET_PARCEL_FIXTURE_DIR = (
+    pathlib.Path(__file__).resolve().parents[1] / "fixtures" / "street_parcels"
+)
+
+#: The partition each fixture is loaded into. A date of its own so a run
+#: against a database that already holds real rows cannot collide with them,
+#: and one per slice so the two never overwrite each other's partition - both
+#: are the same borough, and `silver.lot_frontage` holds one row set per
+#: (neighborhood, scrape_date).
 NEIGHBORHOOD = "VSMPE"
 SCRAPE_DATE = "2000-01-01"
+STREET_PARCEL_SCRAPE_DATE = "2000-01-02"
 
 
 def _infra_sql_dir() -> pathlib.Path:
@@ -107,20 +120,31 @@ def connection():
 
 @pytest.fixture(scope="session")
 def loaded(connection):
-    """The fixture slice, in `rag.lots` and `silver.neighborhood_streets`.
+    """The Chabot slice, in `rag.lots` and `silver.neighborhood_streets`."""
+    return load_slice(connection, FIXTURE_DIR, SCRAPE_DATE)
+
+
+@pytest.fixture(scope="session")
+def loaded_street_parcels(connection):
+    """The Querbes slice, in the same two tables under its own scrape date."""
+    return load_slice(connection, STREET_PARCEL_FIXTURE_DIR, STREET_PARCEL_SCRAPE_DATE)
+
+
+def load_slice(connection, fixture_dir: pathlib.Path, scrape_date: str):
+    """One fixture slice, in `rag.lots` and `silver.neighborhood_streets`.
 
     Loaded the way the two owning assets load it - `building_lot_intersections`
     for the cadastre, `neighborhood_streets` for the sides - because
     `compute_lot_frontage` joins those two tables and nothing else.
     """
-    lots = gpd.read_parquet(FIXTURE_DIR / "lots.parquet")
-    sides = gpd.read_parquet(FIXTURE_DIR / "street_sides.parquet")
+    lots = gpd.read_parquet(fixture_dir / "lots.parquet")
+    sides = gpd.read_parquet(fixture_dir / "street_sides.parquet")
 
     with connection.transaction():
         cursor = connection.cursor()
         cursor.execute(
             "DELETE FROM rag.lots WHERE neighborhood = %s AND scrape_date = %s::date",
-            [NEIGHBORHOOD, SCRAPE_DATE],
+            [NEIGHBORHOOD, scrape_date],
         )
         cursor.executemany(
             "INSERT INTO rag.lots "
@@ -131,7 +155,7 @@ def loaded(connection):
                 (
                     row["lot_number"],
                     NEIGHBORHOOD,
-                    SCRAPE_DATE,
+                    scrape_date,
                     float(row["area_m2"]),
                     row.geometry.wkb_hex,
                 )
@@ -150,7 +174,7 @@ def loaded(connection):
         cursor.execute(
             "DELETE FROM silver.neighborhood_streets "
             "WHERE neighborhood = %s AND scrape_date = %s::date",
-            [NEIGHBORHOOD, SCRAPE_DATE],
+            [NEIGHBORHOOD, scrape_date],
         )
         cursor.executemany(
             "INSERT INTO silver.neighborhood_streets "
@@ -159,7 +183,7 @@ def loaded(connection):
             "ST_Multi(ST_GeomFromWKB(decode(%s, 'hex'), 4326)))",
             [
                 (
-                    SCRAPE_DATE,
+                    scrape_date,
                     NEIGHBORHOOD,
                     str(row["cote_rue_id"]),
                     row["street_name"],
