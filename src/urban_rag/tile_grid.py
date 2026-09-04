@@ -83,11 +83,14 @@ ZOOM_OFFSET = 4
 #:
 #: 1..19 — every level of the Web Mercator grid a tile request can name, so
 #: `cell_zoom_for` never has to be clamped to a level built for a different
-#: zoom. 15..19 is the range the map's own gates use today (display zooms
-#: 11..15, from `MAP_MIN_ZOOM` in hbu_rag_map up to the highest gate any layer
-#: has); everything below it is built so that lowering that floor, or pointing
-#: anything else at this table at country or continent zoom, is a change in
-#: the other repository rather than a re-materialisation of every borough.
+#: zoom. 12..19 is the range the map's own gates use today (display zooms
+#: 8..15, from `MAP_MIN_ZOOM` in hbu_rag_map up to the highest gate any layer
+#: has); everything below it is built so that lowering that floor further, or
+#: pointing anything else at this table at country or continent zoom, is a
+#: change in the other repository rather than a re-materialisation of every
+#: borough. Lowering it from 11 to 8 was exactly that change, and it cost
+#: nothing here.
+#:
 #: Uniform across layers for the same reason it always was: a layer's gate
 #: moves whenever somebody tunes what is legible, and a table that depended on
 #: those numbers would follow a one-line change over there with a full rebuild.
@@ -98,7 +101,11 @@ ZOOM_OFFSET = 4
 #: kilometres across, so from around zoom 11 down it fits inside a single cell
 #: and every level below that stores another copy of its whole dissolved
 #: union. See `urban_rag.postgis` on why those copies are stored intact rather
-#: than simplified.
+#: than simplified - the measures on the row are taken over the stored shape,
+#: so thinning it here would break the rollup. hbu_rag_map thins it on the way
+#: out instead: below its `AGGREGATE_OUTLINE_ZOOM` a tile is simplified at
+#: request time, which is the one place it can be done without touching a
+#: number anything reads.
 CELL_ZOOMS: tuple[int, ...] = tuple(range(1, 20))
 
 #: The zoom the pyramid is seeded at, from real geometry.

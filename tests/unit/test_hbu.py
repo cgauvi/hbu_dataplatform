@@ -420,7 +420,16 @@ def test_the_floor_stack_travels_as_json_beside_the_counts(economics):
     assert sum(entry["floor_area_m2"] for entry in above) == pytest.approx(
         row["gross_floor_area_m2"], abs=0.05
     )
-    assert sum(entry["stalls"] for entry in stack) == row["total_stalls"]
+    # The stack is storeys, and a surface stall stands in none - it is on the
+    # yard the footprint leaves. Everything parked *in* the building does
+    # reconcile, garage bays included: they ride on the residential run because
+    # they are floor area inside it rather than a storey of their own.
+    assert sum(entry["stalls"] for entry in stack) == (
+        row["underground_stalls"] + row["above_grade_stalls"] + row["garage_stalls"]
+    )
+    assert row["total_stalls"] == (
+        sum(entry["stalls"] for entry in stack) + row["surface_stalls"]
+    )
     assert sum(entry["dwellings"] for entry in stack) == row["num_dwellings"]
 
 

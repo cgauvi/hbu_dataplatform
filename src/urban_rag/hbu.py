@@ -383,6 +383,7 @@ PROGRAM_COLUMNS: tuple[str, ...] = (
     "commercial_area_m2",
     "industrial_area_m2",
     "underground_area_m2",
+    "garage_area_m2",
     "residential_floors",
     "commercial_floors",
     "industrial_floors",
@@ -390,6 +391,8 @@ PROGRAM_COLUMNS: tuple[str, ...] = (
     "underground_levels",
     "underground_stalls",
     "above_grade_stalls",
+    "surface_stalls",
+    "garage_stalls",
     "total_stalls",
     "floor_stack",
     "construction_cost_cad",
@@ -420,6 +423,7 @@ _PROGRAM_FLOATS: tuple[str, ...] = (
     "commercial_area_m2",
     "industrial_area_m2",
     "underground_area_m2",
+    "garage_area_m2",
     "construction_cost_cad",
     "commercial_cost_cad",
     "industrial_cost_cad",
@@ -438,6 +442,8 @@ _PROGRAM_COUNTS: tuple[str, ...] = (
     "underground_levels",
     "underground_stalls",
     "above_grade_stalls",
+    "surface_stalls",
+    "garage_stalls",
     "total_stalls",
 )
 
@@ -548,9 +554,15 @@ class ProgramAssumptions:
             "stalls_per_1000_sqft": self.parking.stalls_per_1000_sqft,
             "underground_stall_area_sqft": self.parking.underground_area_sqft,
             "above_grade_stall_area_sqft": self.parking.above_grade_area_sqft,
+            "surface_stall_area_sqft": self.parking.surface_area_sqft,
+            "garage_stall_area_sqft": self.parking.garage_area_sqft,
             "underground_stall_cost_cad": self.parking.underground_cost_cad,
             "above_grade_stall_cost_cad": self.parking.above_grade_cost_cad,
+            "surface_stall_cost_cad": self.parking.surface_cost_cad,
+            "garage_stall_cost_cad": self.parking.garage_cost_cad,
             "max_underground_levels": self.parking.max_underground_levels,
+            "max_surface_stalls": self.parking.max_surface_stalls,
+            "max_garage_stalls": self.parking.max_garage_stalls,
             "residential_cost_per_sqft_cad": (
                 self.construction.residential_cost_per_sqft
             ),
@@ -1112,6 +1124,7 @@ def program_row(
         "commercial_area_m2": program.commercial_area_m2,
         "industrial_area_m2": program.industrial_area_m2,
         "underground_area_m2": program.underground_area_m2,
+        "garage_area_m2": program.garage_area_m2,
         "residential_floors": program.residential_floors,
         "commercial_floors": program.commercial_floors,
         "industrial_floors": program.industrial_floors,
@@ -1119,6 +1132,8 @@ def program_row(
         "underground_levels": program.underground_levels,
         "underground_stalls": program.underground_stalls,
         "above_grade_stalls": program.above_grade_stalls,
+        "surface_stalls": program.surface_stalls,
+        "garage_stalls": program.garage_stalls,
         "total_stalls": program.total_stalls,
         "floor_stack": json.dumps(
             floor_stack(program, heights=heights), ensure_ascii=False
