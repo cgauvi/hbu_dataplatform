@@ -250,6 +250,7 @@ from urban_rag.comparables import (
     is_road_use_code,
 )
 from urban_rag.program import (
+    BASEMENT_LEVELS_ALLOWED,
     DEFAULT_CONSTRUCTION,
     DEFAULT_INVESTMENT,
     DEFAULT_NON_RESIDENTIAL,
@@ -378,16 +379,27 @@ PROGRAM_COLUMNS: tuple[str, ...] = (
     "height_m",
     "footprint_m2",
     "gross_floor_area_m2",
+    "density_floor_area_m2",
     "residential_area_m2",
     "unit_area_m2",
     "commercial_area_m2",
     "industrial_area_m2",
+    "basement_area_m2",
+    "basement_residential_area_m2",
+    "basement_commercial_area_m2",
+    "basement_industrial_area_m2",
     "underground_area_m2",
     "garage_area_m2",
+    "surface_area_m2",
     "residential_floors",
     "commercial_floors",
     "industrial_floors",
     "above_grade_parking_floors",
+    "basement_levels",
+    "basement_residential_levels",
+    "basement_commercial_levels",
+    "basement_industrial_levels",
+    "basement_dwellings",
     "underground_levels",
     "underground_stalls",
     "above_grade_stalls",
@@ -418,12 +430,18 @@ _PROGRAM_FLOATS: tuple[str, ...] = (
     "height_m",
     "footprint_m2",
     "gross_floor_area_m2",
+    "density_floor_area_m2",
     "residential_area_m2",
     "unit_area_m2",
     "commercial_area_m2",
     "industrial_area_m2",
+    "basement_area_m2",
+    "basement_residential_area_m2",
+    "basement_commercial_area_m2",
+    "basement_industrial_area_m2",
     "underground_area_m2",
     "garage_area_m2",
+    "surface_area_m2",
     "construction_cost_cad",
     "commercial_cost_cad",
     "industrial_cost_cad",
@@ -439,6 +457,11 @@ _PROGRAM_COUNTS: tuple[str, ...] = (
     "commercial_floors",
     "industrial_floors",
     "above_grade_parking_floors",
+    "basement_levels",
+    "basement_residential_levels",
+    "basement_commercial_levels",
+    "basement_industrial_levels",
+    "basement_dwellings",
     "underground_levels",
     "underground_stalls",
     "above_grade_stalls",
@@ -470,6 +493,7 @@ CANDIDATE_COLUMNS: tuple[str, ...] = (
     "lot_area_m2",
     "primary_frontage_m",
     "buildable_area_m2",
+    "parkable_area_m2",
 )
 
 #: The columns a chosen program brings across from its candidate row. The lot's
@@ -501,6 +525,7 @@ _HBU_LOT_COLUMNS: tuple[str, ...] = (
     "scrape_date",
     "lot_area_m2",
     "primary_frontage_m",
+    "parkable_area_m2",
     "num_candidates",
     "num_governing_candidates",
     "num_zones",
@@ -540,6 +565,11 @@ class ProgramAssumptions:
     non_residential: NonResidentialEconomics = DEFAULT_NON_RESIDENTIAL
     heights: StoreyHeights = DEFAULT_STOREY_HEIGHTS
     investment: InvestmentAssumptions = DEFAULT_INVESTMENT
+    #: Below-grade levels of *usage* a program may take where the grid's level
+    #: rows authorise one. A modelling bound rather than a norm, like
+    #: `ParkingRules.max_underground_levels` beside it, and `NO_BASEMENT` is
+    #: how a run asks what the borough is worth built entirely above grade.
+    basement_levels_allowed: int = BASEMENT_LEVELS_ALLOWED
     #: Seconds CP-SAT may spend on one envelope. A borough is tens of thousands
     #: of models of fifteen variables each and nearly all of them are solved in
     #: milliseconds; this bounds the handful that are not. A model that runs out
@@ -589,6 +619,11 @@ class ProgramAssumptions:
             "new_build_rent_premium_pct": (
                 self.investment.new_build_rent_premium_pct
             ),
+            "below_grade_rent_discount_pct": (
+                self.investment.below_grade_rent_discount_pct
+            ),
+            "below_grade_cost_premium": self.construction.below_grade_premium,
+            "basement_levels_allowed": self.basement_levels_allowed,
             "max_seconds": self.max_seconds,
         }
 
@@ -690,12 +725,21 @@ def lot_of(row: Mapping) -> Lot:
     `buildable_area_m2` is absent on a partition where `lot_buildable_setbacks`
     has not run, and `Lot` reads `None` as "no margin cap known" rather than as
     no buildable area at all.
+
+    `parkable_area_m2` is absent on the same terms and reads the same way -
+    "nobody measured the yard's shape", which leaves the surface stalls bounded
+    by the area arithmetic alone. It is measured off the cadastre rather than
+    off a zoning column, so unlike the buildable area it belongs to the lot and
+    is the same on every candidate row of it. A measured **0.0** is not absence
+    and must not be collapsed into it: it says this parcel parks no car on the
+    ground, and `_float_or_none` is careful to return it rather than None.
     """
     return Lot(
         area_m2=float(row["lot_area_m2"]),
         frontage_m=_float_or_none(row.get("primary_frontage_m")) or 0.0,
         lot_number=_text_or_none(row.get("lot_number")),
         buildable_area_m2=_float_or_none(row.get("buildable_area_m2")),
+        parkable_area_m2=_float_or_none(row.get("parkable_area_m2")),
     )
 
 
@@ -1119,16 +1163,27 @@ def program_row(
         "height_m": program.height_m,
         "footprint_m2": program.footprint_m2,
         "gross_floor_area_m2": program.gross_floor_area_m2,
+        "density_floor_area_m2": program.density_floor_area_m2,
         "residential_area_m2": program.footprint_m2 * program.residential_floors,
         "unit_area_m2": program.unit_area_m2,
         "commercial_area_m2": program.commercial_area_m2,
         "industrial_area_m2": program.industrial_area_m2,
+        "basement_area_m2": program.basement_area_m2,
+        "basement_residential_area_m2": program.basement_residential_area_m2,
+        "basement_commercial_area_m2": program.basement_commercial_area_m2,
+        "basement_industrial_area_m2": program.basement_industrial_area_m2,
         "underground_area_m2": program.underground_area_m2,
         "garage_area_m2": program.garage_area_m2,
+        "surface_area_m2": program.surface_area_m2,
         "residential_floors": program.residential_floors,
         "commercial_floors": program.commercial_floors,
         "industrial_floors": program.industrial_floors,
         "above_grade_parking_floors": program.above_grade_parking_floors,
+        "basement_levels": program.basement_levels,
+        "basement_residential_levels": program.basement_residential_levels,
+        "basement_commercial_levels": program.basement_commercial_levels,
+        "basement_industrial_levels": program.basement_industrial_levels,
+        "basement_dwellings": program.basement_dwellings,
         "underground_levels": program.underground_levels,
         "underground_stalls": program.underground_stalls,
         "above_grade_stalls": program.above_grade_stalls,
@@ -1170,6 +1225,7 @@ def _program_row(
             non_residential=assumptions.non_residential,
             heights=assumptions.heights,
             investment=assumptions.investment,
+            basement_levels_allowed=assumptions.basement_levels_allowed,
             max_seconds=assumptions.max_seconds,
         )
     except (ProgramError, ValueError, KeyError) as exc:
@@ -1375,14 +1431,23 @@ def _lot_index(envelopes: pd.DataFrame) -> pd.DataFrame:
         empty.index.name = "lot_uid"
         return empty
     candidates = candidate_envelopes(envelopes)
-    per_lot = envelopes.groupby("lot_uid", sort=False).agg(
-        lot_number=("lot_number", "first"),
-        neighborhood=("neighborhood", "first"),
-        scrape_date=("scrape_date", "first"),
-        lot_area_m2=("lot_area_m2", "first"),
-        primary_frontage_m=("primary_frontage_m", "first"),
-        num_zones=("feature_id", "nunique"),
-    )
+    aggregations = {
+        "lot_number": ("lot_number", "first"),
+        "neighborhood": ("neighborhood", "first"),
+        "scrape_date": ("scrape_date", "first"),
+        "lot_area_m2": ("lot_area_m2", "first"),
+        "primary_frontage_m": ("primary_frontage_m", "first"),
+        "num_zones": ("feature_id", "nunique"),
+    }
+    # Optional the way `buildable_area_m2` is optional upstream: a frame from a
+    # partition written before the cadastre was measured for parking simply has
+    # no such column, and a lot index that raised on it would cost the whole
+    # borough its inventory over a number only the surface stalls read.
+    if "parkable_area_m2" in envelopes.columns:
+        aggregations["parkable_area_m2"] = ("parkable_area_m2", "first")
+    per_lot = envelopes.groupby("lot_uid", sort=False).agg(**aggregations)
+    if "parkable_area_m2" not in per_lot.columns:
+        per_lot["parkable_area_m2"] = pd.NA
     per_lot["num_candidates"] = _count_by_lot(candidates, per_lot.index)
     per_lot["num_governing_candidates"] = _count_by_lot(
         candidates[_governs_any(candidates)], per_lot.index

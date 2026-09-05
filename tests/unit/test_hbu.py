@@ -22,7 +22,7 @@ import pytest
 from asset_helpers import materialization_metadata, stub_publish as stub_publish_into
 from dagster import Failure, MultiPartitionKey, materialize
 
-from urban_rag import hbu, hbu_assets, opportunity_assets
+from urban_rag import hbu, hbu_assets, opportunity_assets, postgis
 from urban_rag.cmhc_assets import (
     AVERAGE_RENTS_FILE,
     VACANCY_FILE,
@@ -1138,6 +1138,34 @@ def store(tmp_path):
 def stub_publish(monkeypatch):
     """The upsert into the three tables, recorded rather than run."""
     return stub_publish_into(monkeypatch, hbu_assets)
+
+
+@pytest.fixture(autouse=True)
+def stub_lots(monkeypatch):
+    """The one read `lot_development_programs` makes against `rag.lots`.
+
+    It measures the shape of each parcel's yard, which bounds the surface
+    stalls. Empty here, which is the documented fallback: no cadastre means
+    `parkable_area_m2` is absent and the stalls are bounded on the yard's
+    *area* alone, exactly as every run did before that bound existed - so the
+    programs these tests assert on are the ones they always were. The bound
+    itself is tested in `test_program.py`, against parcels rather than
+    partitions, and drawn in `test_massing.py`.
+
+    Needed at all because `stub_publish` replaces `PostgisResource.connect`
+    with something that yields a bare object; without this the read fails on
+    it instead of degrading.
+    """
+    import geopandas as gpd
+
+    def fetch_lot_polygons(connection, *, neighborhood, scrape_date):
+        return gpd.GeoDataFrame(
+            {"lot_uid": [], "lot_number": [], "lot_area_m2": []},
+            geometry=[],
+            crs="EPSG:4326",
+        )
+
+    monkeypatch.setattr(postgis, "fetch_lot_polygons", fetch_lot_polygons)
 
 
 def write_upstreams(

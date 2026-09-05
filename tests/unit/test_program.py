@@ -64,6 +64,13 @@ import pytest
 
 from urban_rag.program import (
     ABOVE_GRADE_PARKING_STOREY_HEIGHT_M,
+    BASEMENT_LEVELS,
+    BASEMENT_LEVELS_ALLOWED,
+    BASEMENT_STACK_ORDER,
+    BELOW_GRADE_COST_PREMIUM,
+    BELOW_GRADE_RENT_DISCOUNT_PCT,
+    NO_BASEMENT,
+    permitted_basement_levels,
     ABOVE_GRADE_STALL_AREA_SQFT,
     ABOVE_GRADE_STALL_COST_CAD,
     AMORTIZATION_MONTHS,
@@ -284,7 +291,9 @@ def test_other_usages_are_not_residential(usage):
         ({BuildingLevel.ALL}, 6),
         ({BuildingLevel.ALL_EXCEPT_GROUND}, 5),
         ({BuildingLevel.GROUND}, 1),
-        ({BuildingLevel.BELOW_GROUND}, 1),
+        # A cellar is not a storey: *Inferieurs au RDC* authorises a level and
+        # `permitted_basement_levels` is what counts it. See the group below.
+        ({BuildingLevel.BELOW_GROUND}, 0),
         ({BuildingLevel.SECOND}, 1),
         (set(), 0),
     ],
@@ -404,6 +413,7 @@ def test_the_best_square_foot_wins_when_the_envelope_is_what_binds():
         ECONOMICS,
         parking=NO_PARKING,
         investment=UNDISCOUNTED,
+        basement_levels_allowed=NO_BASEMENT,
     )
     assert program.units == {"1_bedroom": 25}
     assert program.net_operating_income == pytest.approx(25 * 470.00)
@@ -474,6 +484,7 @@ def test_the_margins_bind_when_they_leave_less_than_the_coverage_allows():
         ECONOMICS,
         parking=NO_PARKING,
         investment=UNDISCOUNTED,
+        basement_levels_allowed=NO_BASEMENT,
     )
     assert program.solved
     assert program.footprint_m2 <= 240.0 + 1e-9
@@ -706,10 +717,20 @@ def test_a_pure_commerce_column_solves_without_a_dwelling():
     assert program.commercial_floors > 0
     assert program.commercial_area_m2 > 0
     assert program.npv_cad > 0
+    # The cellar is in the answer as well: a below-grade shop is floor area
+    # *Densite* counts and no storey *En etage* does, so a column whose storeys
+    # are spent digs for one more plate. Its rent is the same rate a level
+    # down - see `BELOW_GRADE_RENT_DISCOUNT_PCT`.
+    assert program.basement_commercial_levels == BASEMENT_LEVELS_ALLOWED
+    below_grade = 1.0 - BELOW_GRADE_RENT_DISCOUNT_PCT / 100.0
     assert program.gross_revenue_cad == pytest.approx(
         DEFAULT_NON_RESIDENTIAL.commercial_monthly_revenue(
             program.commercial_area_sqft
         )
+        + DEFAULT_NON_RESIDENTIAL.commercial_monthly_revenue(
+            program.basement_commercial_area_sqft
+        )
+        * below_grade
     )
 
 
@@ -858,7 +879,14 @@ def test_more_stalls_a_dwelling_stack_more_underground_levels():
     )
     assert program.total_dwellings == 9
     assert program.underground_stalls == 18
-    assert program.underground_levels == 4
+    # However many levels that plate takes: the footprint is not pinned by the
+    # objective - any plate big enough to hold the mix is equally optimal - so
+    # what is true of the answer is that the hole is exactly deep enough.
+    stall_area_m2 = UNDERGROUND_STALL_AREA_SQFT * M2_PER_SQFT
+    assert program.underground_levels == math.ceil(
+        program.underground_stalls * stall_area_m2 / program.footprint_m2 - 1e-9
+    )
+    assert program.underground_levels <= 4
 
 
 def test_the_footprint_holds_whichever_floor_is_hungriest():
@@ -1430,7 +1458,14 @@ def test_a_cheaper_structure_is_worth_more_on_the_same_envelope():
         investment=UNDISCOUNTED,
     )
     assert wood.net_operating_income > concrete.net_operating_income
-    assert wood.construction_cost_cad < concrete.construction_cost_cad
+    # Per square foot of dwelling rather than in total, because the two are no
+    # longer the same building: at the wood rate the sous-sol pays for itself
+    # and the answer takes a sixth plate below grade, at the concrete rate it
+    # does not and the answer buys a parking deck instead. What the rate moved
+    # is the price of a square foot, so that is what is compared.
+    assert wood.construction_cost_cad / wood.unit_area_m2 < (
+        concrete.construction_cost_cad / concrete.unit_area_m2
+    )
 
 
 def test_no_construction_cost_leaves_the_revenue_alone():
@@ -1615,7 +1650,17 @@ def test_commerce_outbids_housing_for_every_storey_the_grid_will_spare():
     assert program.residential_floors == 0
     assert program.floors == 6
     assert program.industrial_floors == 0
-    assert program.binding == ("commercial_floor_area",)
+    # And the cellar under them, which *En etage max* does not ration: six
+    # storeys is every storey the grid allows and the seventh plate is below
+    # grade. `density_max` is then what stops the seventh from being an
+    # eighth - 400 x 4,5 = 1 800 m2 over seven plates is a 257,14 m2 footprint.
+    assert program.basement_commercial_levels == BASEMENT_LEVELS_ALLOWED
+    assert program.density_floor_area_m2 == pytest.approx(1800.0, abs=0.05)
+    assert set(program.binding) == {
+        "density_max",
+        "commercial_floor_area",
+        "basement_levels",
+    }
 
 
 def test_industry_takes_the_storeys_where_no_commerce_is_authorised():
@@ -1645,17 +1690,24 @@ def test_commerce_beats_industry_where_both_are_authorised():
 
 
 def test_the_non_residential_storeys_are_floor_area_the_density_cap_sees():
-    # Unlike an underground stall, a retail floor is *superficie de plancher*:
-    # inside `gross_floor_area_m2`, and what the cap is tested against.
+    # Unlike an underground stall, a retail floor is *superficie de plancher* -
+    # and so is a retail *cellar*, which is the half of article 38 1° that is
+    # about what the level holds rather than how deep it is. So the cap is
+    # tested against `density_floor_area_m2`, and `gross_floor_area_m2` beside
+    # it stays the above-grade figure a massing extrudes.
     lot = Lot(area_m2=400.0, frontage_m=12.0)
     program = solve_program(mixed("C.2"), lot, ECONOMICS, parking=NO_PARKING)
-    assert program.gross_floor_area_m2 <= 400.0 * 4.5 + 1e-9
+    assert program.density_floor_area_m2 <= 400.0 * 4.5 + 1e-9
     assert program.commercial_area_m2 > 0.0
     assert program.gross_floor_area_m2 == pytest.approx(
         program.footprint_m2 * program.floors
     )
+    assert program.density_floor_area_m2 == pytest.approx(
+        program.footprint_m2 * (program.floors + program.basement_levels)
+    )
     assert program.non_residential_area_m2 == pytest.approx(
-        program.footprint_m2 * program.commercial_floors
+        program.footprint_m2
+        * (program.commercial_floors + program.basement_commercial_levels)
     )
 
 
@@ -1681,16 +1733,24 @@ def test_the_commercial_floors_are_priced_and_rented_by_the_square_foot():
         investment=UNDISCOUNTED,
     )
     sqft = program.commercial_area_sqft
+    cellar_sqft = program.basement_commercial_area_sqft
+    # The cellar is the same rate with the premium on it, and it is charged to
+    # the same column: `commercial_cost_cad` is the commerce in this building,
+    # wherever in it that commerce stands.
     assert program.commercial_cost_cad == pytest.approx(
         sqft * COMMERCIAL_COST_PER_SQFT_CAD
+        + cellar_sqft * COMMERCIAL_COST_PER_SQFT_CAD * (1 + BELOW_GRADE_COST_PREMIUM)
     )
     # The rate is annual per square foot, the objective is a month, and the
-    # vacancy comes off it exactly as a dwelling's does.
-    commercial_rent = (
-        sqft
-        * COMMERCIAL_REVENUE_PER_SQFT_CAD
+    # vacancy comes off it exactly as a dwelling's does. One level down the
+    # rent comes off again, at `BELOW_GRADE_RENT_DISCOUNT_PCT`.
+    per_sqft_month = (
+        COMMERCIAL_REVENUE_PER_SQFT_CAD
         / MONTHS_PER_YEAR
         * (1 - COMMERCIAL_VACANCY_PCT / 100.0)
+    )
+    commercial_rent = per_sqft_month * (
+        sqft + cellar_sqft * (1 - BELOW_GRADE_RENT_DISCOUNT_PCT / 100.0)
     )
     dwelling_rent = sum(
         RENTS[unit_type] * (1 - VACANCY[unit_type] / 100.0) * quantity
@@ -1846,7 +1906,11 @@ def test_the_reported_revenue_is_net_of_the_vacancy():
         for unit_type, quantity in program.units.items()
     )
     commerce = (
-        program.commercial_area_sqft
+        (
+            program.commercial_area_sqft
+            + program.basement_commercial_area_sqft
+            * (1 - BELOW_GRADE_RENT_DISCOUNT_PCT / 100.0)
+        )
         * COMMERCIAL_REVENUE_PER_SQFT_CAD
         / MONTHS_PER_YEAR
         * (1 - COMMERCIAL_VACANCY_PCT / 100.0)
@@ -1895,7 +1959,14 @@ def test_the_non_residential_floor_owes_stalls_by_the_thousand_square_feet():
         parking=rules,
     )
     assert program.commercial_area_sqft > 0.0
-    owed = math.ceil(STALLS_PER_1000_SQFT * program.commercial_area_sqft / 1000.0)
+    # The cellar owes them too: what generates a trip is a shop, not a storey,
+    # and the by-law exclusion that spares a below-grade *stall* has nothing to
+    # say about the floor area above it.
+    owed = math.ceil(
+        STALLS_PER_1000_SQFT
+        * (program.commercial_area_sqft + program.basement_commercial_area_sqft)
+        / 1000.0
+    )
     assert program.total_stalls == owed
 
 
@@ -1922,7 +1993,9 @@ def test_the_dwellings_and_the_floors_owe_one_number_of_stalls_between_them():
     )
     demand = (
         STALLS_PER_DWELLING * program.total_dwellings
-        + STALLS_PER_1000_SQFT * program.commercial_area_sqft / 1000.0
+        + STALLS_PER_1000_SQFT
+        * (program.commercial_area_sqft + program.basement_commercial_area_sqft)
+        / 1000.0
     )
     assert program.total_stalls == math.ceil(demand)
 
@@ -2228,6 +2301,419 @@ def test_a_storey_of_no_height_is_refused(overrides):
 def test_a_negative_metric_norm_is_refused(norm):
     with pytest.raises(ProgramError):
         column(**{norm: -1.0})
+
+
+# -- the cellar --------------------------------------------------------------
+#
+# A sous-sol is the one plate in the model that answers to a single cap. *En
+# etage* counts storeys and a below-grade level is not one; *Hauteur en metre*
+# is measured from grade up and a below-grade level stands under it; *Densite*
+# is computed on the *superficie de plancher*, from which article 38 1 removes
+# a below-grade **stall and its ramp** and nothing else. So a cellar of
+# dwellings is floor area and the parkade beneath it is not, and the two are
+# the same hole - which is what this group is about, one cap at a time.
+#
+# The footprint is not a second decision: the basement is flat under the
+# building, so *Taux d'implantation* has already said everything it has to say
+# about it. `BASEMENT_LEVELS_ALLOWED` is one cellar, and
+# `basement_levels_allowed=NO_BASEMENT` is how the tests above ask for the
+# building this module solved before the cellar was in it.
+
+
+@pytest.mark.parametrize(
+    ("levels", "expected"),
+    [
+        # The row that names the level outright.
+        ({BuildingLevel.BELOW_GROUND}, BASEMENT_LEVELS_ALLOWED),
+        # And the two blanket rows, read as covering it: "every level" and
+        # "every level but the RDC" both include the one below.
+        ({BuildingLevel.ALL}, BASEMENT_LEVELS_ALLOWED),
+        ({BuildingLevel.ALL_EXCEPT_GROUND}, BASEMENT_LEVELS_ALLOWED),
+        # The rows naming a level above grade authorise nothing under it.
+        ({BuildingLevel.GROUND}, 0),
+        ({BuildingLevel.SECOND}, 0),
+        (set(), 0),
+        # Two rows that both reach the basement are one cellar and not two -
+        # the same "covers the building exactly once" that caps
+        # `permitted_floors`.
+        ({BuildingLevel.GROUND, BuildingLevel.BELOW_GROUND}, BASEMENT_LEVELS_ALLOWED),
+    ],
+)
+def test_the_level_rows_that_authorise_a_cellar(levels, expected):
+    assert permitted_basement_levels(levels) == expected
+
+
+def test_a_column_and_a_zone_report_the_cellar_they_allow():
+    """The accessors beside `permitted_floors_count`, read at the same grain:
+    per column, and loosest across a zone's governing columns."""
+    # Two families, because `ZoneEnvelope.of` governs one column per family -
+    # the housing has no cellar and the commerce beside it does.
+    housing = column(levels=frozenset({BuildingLevel.GROUND}))
+    shop = column(usages=("C.2",), levels=frozenset({BuildingLevel.ALL}))
+    assert shop.permitted_basement_levels == BASEMENT_LEVELS_ALLOWED
+    assert housing.permitted_basement_levels == 0
+    assert ZoneEnvelope.single(housing).permitted_basement_levels == 0
+    # The loosest across the governing columns: it sizes a domain, and what
+    # binds a family is its own column's allowance.
+    assert (
+        ZoneEnvelope.of([housing, shop], frontage_m=12.0).permitted_basement_levels
+        == BASEMENT_LEVELS_ALLOWED
+    )
+
+
+def test_the_rows_that_reach_the_basement_are_the_documented_set():
+    """`BASEMENT_LEVELS` is the reading, in one place, so it can be narrowed."""
+    assert BASEMENT_LEVELS == {
+        BuildingLevel.BELOW_GROUND,
+        BuildingLevel.ALL,
+        BuildingLevel.ALL_EXCEPT_GROUND,
+    }
+
+
+def test_a_cellar_is_not_a_storey_and_stands_no_metres():
+    # The whole of the difference, on one envelope: the same column solved with
+    # the cellar and without it. Both storey caps see the same building either
+    # way, and *Densite* sees one plate more.
+    lot = Lot(area_m2=400.0, frontage_m=12.0)
+    above_only = solve_program(
+        column(density_max=None),
+        lot,
+        ECONOMICS,
+        parking=NO_PARKING,
+        investment=UNDISCOUNTED,
+        basement_levels_allowed=NO_BASEMENT,
+    )
+    with_cellar = solve_program(
+        column(density_max=None),
+        lot,
+        ECONOMICS,
+        parking=NO_PARKING,
+        investment=UNDISCOUNTED,
+    )
+    assert with_cellar.basement_residential_levels == BASEMENT_LEVELS_ALLOWED
+    # Neither storey cap moved.
+    assert with_cellar.floors == above_only.floors
+    assert with_cellar.residential_floors == above_only.residential_floors
+    assert with_cellar.height_m == pytest.approx(above_only.height_m)
+    # `gross_floor_area_m2` is above grade and did not move either; what grew
+    # is the floor area the density index is computed on.
+    assert with_cellar.gross_floor_area_m2 == pytest.approx(
+        above_only.gross_floor_area_m2
+    )
+    assert with_cellar.density_floor_area_m2 == pytest.approx(
+        with_cellar.gross_floor_area_m2 + with_cellar.footprint_m2
+    )
+    assert with_cellar.total_dwellings > above_only.total_dwellings
+
+
+def test_the_cellar_is_the_plate_above_it_and_moves_no_footprint():
+    """Flat under the rest of the building: one footprint, and *Taux
+    d'implantation* has nothing further to say about the basement."""
+    program = solve_program(
+        column(density_max=None),
+        Lot(area_m2=400.0, frontage_m=12.0),
+        ECONOMICS,
+        parking=NO_PARKING,
+        investment=UNDISCOUNTED,
+    )
+    assert program.footprint_m2 <= 400.0 * 0.70 + 1e-9
+    assert program.basement_residential_area_m2 == pytest.approx(
+        program.footprint_m2 * program.basement_residential_levels
+    )
+    assert program.basement_area_m2 == pytest.approx(
+        program.basement_residential_area_m2
+    )
+
+
+def test_the_density_cap_counts_the_cellar_and_not_the_parkade_under_it():
+    # The two halves of article 38 1 in one answer: a dug *stall* is outside
+    # the *superficie de plancher* and a dug *dwelling* is inside it. Both are
+    # below grade, and only one of them is charged.
+    program = solve_program(
+        column(density_max=2.0),
+        Lot(area_m2=400.0, frontage_m=12.0),
+        ECONOMICS,
+        parking=STRUCTURED_ONLY,
+        investment=UNDISCOUNTED,
+    )
+    assert program.solved
+    assert program.underground_stalls > 0
+    assert program.underground_area_m2 > 0.0
+    assert program.density_floor_area_m2 <= 800.0 + 1e-9
+    assert program.density_floor_area_m2 == pytest.approx(
+        program.gross_floor_area_m2 + program.basement_area_m2
+    )
+
+
+def test_a_column_that_authorises_no_level_below_the_rdc_digs_no_cellar():
+    program = solve_program(
+        column(
+            levels=frozenset({BuildingLevel.GROUND}),
+            floors_min=0,
+            density_max=None,
+        ),
+        Lot(area_m2=400.0, frontage_m=12.0),
+        ECONOMICS,
+        parking=NO_PARKING,
+        investment=UNDISCOUNTED,
+    )
+    assert program.residential_floors == 1
+    assert program.basement_levels == 0
+    assert program.basement_area_m2 == 0.0
+    assert program.density_floor_area_m2 == pytest.approx(program.gross_floor_area_m2)
+
+
+def test_the_rdc_and_its_cellar_are_one_storey_and_one_level_below():
+    # The 91 Villeray columns that enumerate their levels rather than saying
+    # "tous": *Inferieurs au RDC* used to buy a second above-grade storey and
+    # be charged three metres for it. Now it buys the level it names.
+    program = solve_program(
+        column(
+            levels=frozenset({BuildingLevel.GROUND, BuildingLevel.BELOW_GROUND}),
+            floors_min=0,
+            density_max=None,
+        ),
+        Lot(area_m2=400.0, frontage_m=12.0),
+        ECONOMICS,
+        parking=NO_PARKING,
+        investment=UNDISCOUNTED,
+    )
+    assert program.residential_floors == 1
+    assert program.basement_residential_levels == 1
+    assert program.height_m == pytest.approx(RESIDENTIAL_STOREY_HEIGHT_M)
+    assert program.density_floor_area_m2 == pytest.approx(2 * program.footprint_m2)
+
+
+def test_a_cellar_dwelling_is_dearer_to_build_and_leases_for_less():
+    # The one place the model says which level a dwelling is on, and the reason
+    # it has to: the two rates differ. Every figure below is the program's own
+    # split, priced at the two module constants.
+    program = solve_program(
+        column(density_max=None),
+        Lot(area_m2=400.0, frontage_m=12.0),
+        ECONOMICS,
+        parking=NO_PARKING,
+        investment=UNDISCOUNTED,
+    )
+    assert program.basement_dwellings > 0
+    assert program.above_grade_dwellings > 0
+    assert program.total_dwellings == (
+        program.above_grade_dwellings + program.basement_dwellings
+    )
+    premium = 1 + BELOW_GRADE_COST_PREMIUM
+    discount = 1 - BELOW_GRADE_RENT_DISCOUNT_PCT / 100.0
+    assert program.construction_cost_cad == pytest.approx(
+        sum(
+            UNIT_AREAS_SQFT[unit_type] * RESIDENTIAL_COST_PER_SQFT_CAD * quantity
+            for unit_type, quantity in program.above_grade_units.items()
+        )
+        + sum(
+            UNIT_AREAS_SQFT[unit_type]
+            * RESIDENTIAL_COST_PER_SQFT_CAD
+            * premium
+            * quantity
+            for unit_type, quantity in program.basement_units.items()
+        )
+    )
+    assert program.gross_revenue_cad == pytest.approx(
+        sum(
+            RENTS[unit_type] * (1 - VACANCY[unit_type] / 100.0) * quantity
+            for unit_type, quantity in program.above_grade_units.items()
+        )
+        + sum(
+            RENTS[unit_type] * (1 - VACANCY[unit_type] / 100.0) * discount * quantity
+            for unit_type, quantity in program.basement_units.items()
+        )
+    )
+
+
+def test_at_the_module_rates_a_cellar_dwelling_does_not_pay_for_itself():
+    """The default proforma's own answer, and worth pinning: the discount and
+    the premium together put a sous-sol unit under water at every class CMHC
+    prices, so the discounted objective builds none. It is a close call -
+    `BELOW_GRADE_RENT_DISCOUNT_PCT` has the break-evens - and a change to a
+    published rate that quietly flipped it should be visible here."""
+    program = solve_program(
+        column(density_max=None),
+        Lot(area_m2=400.0, frontage_m=12.0),
+        ECONOMICS,
+        parking=NO_PARKING,
+    )
+    assert program.solved
+    assert program.basement_dwellings == 0
+    assert "basement_unbuilt" in program.binding
+
+
+def test_a_cellar_that_is_spent_is_reported_as_the_cap_it_is():
+    program = solve_program(
+        column(density_max=None),
+        Lot(area_m2=400.0, frontage_m=12.0),
+        ECONOMICS,
+        parking=NO_PARKING,
+        investment=UNDISCOUNTED,
+    )
+    assert program.basement_levels == BASEMENT_LEVELS_ALLOWED
+    assert "basement_levels" in program.binding
+    assert "basement_unbuilt" not in program.binding
+
+
+@pytest.mark.parametrize("investment", [DEFAULT_INVESTMENT, UNDISCOUNTED])
+def test_an_empty_cellar_is_never_reported(investment):
+    """Nothing in the objective charges for the *plate* - a dwelling's
+    coefficient is on its count - so without a guard a parcel with density to
+    spare would report a sous-sol with nothing in it."""
+    program = solve_program(
+        column(density_max=None),
+        Lot(area_m2=400.0, frontage_m=12.0),
+        ECONOMICS,
+        parking=NO_PARKING,
+        investment=investment,
+    )
+    if program.basement_residential_levels:
+        assert program.basement_dwellings > 0
+    else:
+        assert program.basement_residential_area_m2 == 0.0
+
+
+def test_no_basement_solves_what_the_module_solved_before_the_cellar():
+    program = solve_program(
+        column(density_max=None),
+        Lot(area_m2=400.0, frontage_m=12.0),
+        ECONOMICS,
+        parking=NO_PARKING,
+        investment=UNDISCOUNTED,
+        basement_levels_allowed=NO_BASEMENT,
+    )
+    assert program.units == {"1_bedroom": 25}
+    assert program.basement_levels == 0
+    assert program.density_floor_area_m2 == pytest.approx(program.gross_floor_area_m2)
+    assert "basement_unbuilt" not in program.binding
+
+
+def test_the_cellar_is_stacked_under_the_rdc_and_over_the_parkade():
+    program = solve_program(
+        column(density_max=None),
+        Lot(area_m2=400.0, frontage_m=12.0),
+        ECONOMICS,
+        parking=STRUCTURED_ONLY,
+        investment=UNDISCOUNTED,
+    )
+    assert program.basement_residential_levels == 1
+    assert program.underground_levels > 0
+    stack = floor_stack(program)
+    cellar = [
+        entry
+        for entry in stack
+        if entry["position"] == "below_grade" and entry["use"] == "residential"
+    ]
+    assert len(cellar) == 1
+    # Immediately under the rez-de-chaussee, with the parking below it.
+    assert cellar[0]["to_level"] == -1
+    assert cellar[0]["dwellings"] == program.basement_dwellings
+    # Floor area the index counts, standing no metres - the one entry in the
+    # stack of which both are true.
+    assert cellar[0]["counts_as_floor_area"] is True
+    assert cellar[0]["storey_height_m"] == 0.0
+    parkade = [
+        entry
+        for entry in stack
+        if entry["position"] == "below_grade" and entry["use"] == "parking"
+    ]
+    assert parkade[0]["to_level"] < cellar[0]["from_level"]
+    assert parkade[0]["counts_as_floor_area"] is False
+
+
+def test_a_shop_at_grade_with_its_cellar_and_housing_over_it():
+    """The shape 90 of Villeray's 91 basement-marked columns are actually in.
+
+    A zone printing its commerce on *RDC* + *Inferieurs au RDC* and its housing
+    on *Tous les niveaux* is two columns and one building. The commerce gets
+    the storey and the cellar its rows name; the housing gets the rest, and
+    supplies the *En etage min* the commerce column could never pay on its
+    own. Before the cellar stopped being a storey the commerce could take two
+    above-grade storeys here, which is not what those rows say.
+    """
+    shop = ZoneColumn(
+        usages=("C.2",),
+        levels=frozenset({BuildingLevel.GROUND, BuildingLevel.BELOW_GROUND}),
+        floors_min=2,
+        floors_max=3,
+        site_coverage_max_pct=70.0,
+        density_max=4.5,
+        zone="C02-113",
+    )
+    housing = ZoneColumn(
+        usages=("H.7",),
+        levels=frozenset({BuildingLevel.ALL}),
+        floors_min=2,
+        floors_max=3,
+        site_coverage_max_pct=70.0,
+        density_max=4.5,
+        zone="C02-113",
+    )
+    program = solve_program(
+        ZoneEnvelope.of([shop, housing], frontage_m=15.0),
+        Lot(area_m2=500.0, frontage_m=15.0),
+        ECONOMICS,
+        parking=NO_PARKING,
+        investment=UNDISCOUNTED,
+    )
+    assert program.solved
+    # One above-grade storey of commerce - the RDC its rows name - and its
+    # cellar under it. Not two storeys, which is what the level rows bought
+    # while a cellar still counted as one.
+    assert program.commercial_floors == 1
+    assert program.basement_commercial_levels == 1
+    # The housing supplies the storeys the shop column's own minimum demands.
+    assert program.residential_floors >= 1
+    assert program.commercial_floors + program.residential_floors >= 2
+
+
+def test_a_column_whose_only_storey_is_the_rdc_cannot_meet_a_two_storey_minimum():
+    """Zone C02-113's lone column, and the one place the correction bites.
+
+    *RDC* and *Inferieurs au RDC* is one above-grade storey and one cellar,
+    and *En etage min* 2 asks for a second storey no usage at this column's
+    head may occupy. Named rather than returned as a bare INFEASIBLE, because
+    it is a contradiction between two rows of one column - which is what the
+    grid prints, and what counting the cellar as the storey used to hide.
+    """
+    program = solve_program(
+        ZoneColumn(
+            usages=("C.2",),
+            levels=frozenset({BuildingLevel.GROUND, BuildingLevel.BELOW_GROUND}),
+            floors_min=2,
+            floors_max=3,
+            site_coverage_max_pct=70.0,
+            density_max=4.5,
+            zone="C02-113",
+        ),
+        Lot(area_m2=500.0, frontage_m=15.0),
+        ECONOMICS,
+        parking=NO_PARKING,
+    )
+    assert not program.solved
+    assert program.binding == ("floors_min_exceeds_permitted_levels",)
+
+
+def test_the_below_grade_order_is_the_documented_one():
+    assert BASEMENT_STACK_ORDER == ("commercial", "industrial", "residential")
+
+
+def test_a_negative_below_grade_premium_is_refused():
+    with pytest.raises(ProgramError):
+        ConstructionCosts(below_grade_premium=-0.1)
+
+
+@pytest.mark.parametrize("discount", [-1.0, 101.0])
+def test_a_below_grade_discount_that_is_not_a_share_is_refused(discount):
+    with pytest.raises(ProgramError):
+        InvestmentAssumptions(below_grade_rent_discount_pct=discount)
+
+
+def test_a_negative_basement_allowance_is_refused():
+    with pytest.raises(ProgramError):
+        permitted_basement_levels({BuildingLevel.ALL}, allowed=-1)
 
 
 # -- maintenance: what age adds to an operating expense ratio ---------------
@@ -2674,13 +3160,25 @@ def test_the_stack_reconciles_with_the_columns_beside_it():
     above = [entry for entry in stack if entry["position"] == "above_grade"]
     below = [entry for entry in stack if entry["position"] == "below_grade"]
     assert sum(entry["floors"] for entry in above) == solved.floors
-    assert sum(entry["floors"] for entry in below) == solved.underground_levels
+    assert sum(entry["floors"] for entry in below) == (
+        solved.underground_levels + solved.basement_levels
+    )
     assert sum(entry["floor_area_m2"] for entry in above) == pytest.approx(
         solved.gross_floor_area_m2, abs=0.05
     )
     assert sum(entry["floor_area_m2"] for entry in below) == pytest.approx(
-        solved.underground_area_m2, abs=0.05
+        solved.underground_area_m2 + solved.basement_area_m2, abs=0.05
     )
+    # And the below-grade entries are not all the same kind of area: the usage
+    # levels are *superficie de plancher* and the parking under them is not, so
+    # `counts_as_floor_area` splits them and the two sums are the two columns
+    # on the program.
+    assert sum(
+        entry["floor_area_m2"] for entry in below if entry["counts_as_floor_area"]
+    ) == pytest.approx(solved.basement_area_m2, abs=0.05)
+    assert sum(
+        entry["floor_area_m2"] for entry in stack if entry["counts_as_floor_area"]
+    ) == pytest.approx(solved.density_floor_area_m2, abs=0.05)
     # The dug levels stand no metres, so the whole stack is the reported height.
     assert sum(entry["height_m"] for entry in stack) == pytest.approx(
         solved.height_m, abs=0.05
@@ -2700,3 +3198,139 @@ def test_the_stack_reconciles_with_the_columns_beside_it():
         sum(entry["stalls"] for entry in stack) + solved.surface_stalls
     )
     assert sum(entry["dwellings"] for entry in stack) == solved.total_dwellings
+
+
+# --------------------------------------------------------------------------
+# the yard has a shape, not only an area
+# --------------------------------------------------------------------------
+#
+# `surface_stall_area x stalls + footprint <= lot area` is an area against an
+# area, and every test above satisfies it on parcels whose shape nobody asked
+# about. `Lot.parkable_area_m2` is the second ceiling - the largest
+# parking-shaped rectangle the parcel actually holds, measured off the cadastre
+# by `massing.parking_capacity_m2` - and these are what it changes.
+
+
+def _yard_test_column(**overrides):
+    """A column that parks on the ground unless something stops it.
+
+    60/60 coverage on a 300 m2 lot pins the plate at 180 m2 and leaves 120 m2
+    of yard, which is the same envelope
+    `test_the_yard_is_spent_before_the_structure` uses - so what differs
+    between these tests and that one is the parcel's shape and nothing else.
+    """
+    return column(
+        max_dwellings=5,
+        density_max=None,
+        site_coverage_min_pct=60.0,
+        site_coverage_max_pct=60.0,
+        **overrides,
+    )
+
+
+def _yard_program(lot, **overrides):
+    return solve_program(
+        _yard_test_column(),
+        lot,
+        ECONOMICS,
+        parking=ParkingRules(stalls_per_dwelling=2.0),
+        investment=UNDISCOUNTED,
+        **overrides,
+    )
+
+
+def test_an_unmeasured_yard_is_bounded_on_area_alone():
+    """`None` is what every caller passed before this existed, and still works."""
+    program = _yard_program(Lot(area_m2=300.0, frontage_m=12.0))
+    assert program.surface_stalls == 4
+    assert program.solved
+
+
+def test_a_parcel_that_holds_no_parking_puts_the_stalls_in_structure():
+    """0.0 is a measurement, not an absence - and a sharp one.
+
+    The same 300 m2 lot and the same 120 m2 of yard, on a parcel four metres
+    wide. Nothing about the *area* has changed and the area constraint is as
+    satisfied as it was; what has changed is that no car can stand on it. Every
+    stall the dwellings owe is still provided, because the by-law asks for them
+    however awkward the parcel is - they are just provided at eight to ten
+    times the price.
+    """
+    program = _yard_program(Lot(area_m2=300.0, frontage_m=12.0, parkable_area_m2=0.0))
+    assert program.solved
+    assert program.surface_stalls == 0
+    assert program.total_stalls == 2 * program.total_dwellings
+    assert program.total_stalls == (
+        program.underground_stalls + program.above_grade_stalls + program.garage_stalls
+    )
+
+
+def test_the_yard_shape_is_reported_as_the_binding_cap():
+    """No printed norm says "your lot is the wrong shape", so this column does."""
+    shaped = _yard_program(Lot(area_m2=300.0, frontage_m=12.0, parkable_area_m2=0.0))
+    assert "surface_parking_shape" in shaped.binding
+
+    # And it is not reported where the yard's shape is not what stopped it: a
+    # parcel measured to hold far more parking than the program wants is bound
+    # by something else, whatever that is.
+    roomy = _yard_program(
+        Lot(area_m2=300.0, frontage_m=12.0, parkable_area_m2=5_000.0)
+    )
+    assert "surface_parking_shape" not in roomy.binding
+
+
+def test_a_measured_yard_rations_the_stalls_between_the_two_bounds():
+    """Whichever of shape and area is tighter is the one that binds."""
+    stall_m2 = SURFACE_STALL_AREA_SQFT * M2_PER_SQFT
+    # Room for two stalls in the shape, against four in the area.
+    program = _yard_program(
+        Lot(area_m2=300.0, frontage_m=12.0, parkable_area_m2=2.5 * stall_m2)
+    )
+    assert program.surface_stalls == 2
+    assert program.total_stalls == 2 * program.total_dwellings
+
+
+def test_a_generous_shape_never_buys_more_than_the_area_allows():
+    """The new bound only ever tightens - it cannot conjure yard."""
+    program = _yard_program(
+        Lot(area_m2=300.0, frontage_m=12.0, parkable_area_m2=10_000.0)
+    )
+    assert program.surface_stalls == 4
+    assert program.surface_stalls * SURFACE_STALL_AREA_SQFT * M2_PER_SQFT <= 120.0
+
+
+def test_surface_area_is_the_ground_the_model_reserved():
+    """What `lot_building_massing` draws, rather than the nominal product.
+
+    The area the model actually held, so a rectangle of exactly it can be drawn
+    on the parcel. It is floor area of no kind: not in the gross, not in the
+    footprint, and not under the building either.
+    """
+    program = _yard_program(Lot(area_m2=300.0, frontage_m=12.0))
+    stall_m2 = SURFACE_STALL_AREA_SQFT * M2_PER_SQFT
+    assert program.surface_area_m2 == pytest.approx(
+        program.surface_stalls * stall_m2, abs=0.05
+    )
+    assert program.surface_area_m2 > 0
+    assert program.surface_area_m2 + program.footprint_m2 <= 300.0
+    # Not floor area, and not part of the plate.
+    assert program.gross_floor_area_m2 == pytest.approx(
+        program.footprint_m2 * program.floors
+    )
+
+
+def test_a_program_with_no_surface_stalls_reserves_no_ground():
+    program = solve_program(
+        column(max_dwellings=12, density_max=None),
+        Lot(area_m2=2000.0, frontage_m=25.0),
+        ECONOMICS,
+        parking=NO_PARKING,
+    )
+    assert program.surface_stalls == 0
+    assert program.surface_area_m2 == 0.0
+
+
+@pytest.mark.parametrize("parkable", [-1.0, -0.01])
+def test_a_negative_parkable_area_is_refused(parkable):
+    with pytest.raises(ProgramError, match="parkable area must not be negative"):
+        Lot(area_m2=300.0, frontage_m=12.0, parkable_area_m2=parkable)

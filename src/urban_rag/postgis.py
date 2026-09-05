@@ -3850,6 +3850,51 @@ def fetch_lot_buildable_setbacks(
     )
 
 
+#: `rag.lots`, for the two assets that need a parcel's *shape* rather than its
+#: area. Deliberately narrow: this is read to fit rectangles onto, so the
+#: attributes jsonb and the lot number's neighbours are weight nobody uses.
+_LOT_GEOMETRY_COLUMNS = (
+    "lot_uid",
+    "lot_number",
+    "neighborhood",
+    "area_m2 AS lot_area_m2",
+)
+
+
+def fetch_lot_polygons(
+    connection: "Connection", *, neighborhood: str, scrape_date: str
+) -> gpd.GeoDataFrame:
+    """This partition's cadastral parcels, as shapes to fit things onto.
+
+    The one read here that goes back to `rag.lots` rather than to a silver or
+    gold table, and it is needed twice for the same reason: a surface stall
+    stands on the *parcel*, not on the buildable envelope. A setback is a
+    margin a building keeps, so the ground a car can use includes the margins,
+    and no downstream table carries the lot boundary - `silver.lot_frontage`
+    carries an edge, `silver.lot_buildable_setbacks` carries what is left after
+    the margins come off. This carries the parcel.
+
+    `lot_development_programs` reads it to measure `parkable_area_m2` before it
+    solves, and `lot_building_massing` reads it to draw the parking afterwards.
+    Ordered by `lot_uid` so a run's log is stable rather than in whatever order
+    the planner returns.
+
+    A lot whose geometry is NULL comes back with a null shape rather than being
+    filtered out, so a caller counting rows against `rag.lots` sees the same
+    number; both callers read a missing shape as "not measured".
+    """
+    return _fetch_partition(
+        connection,
+        _LOT_GEOMETRY_COLUMNS,
+        """
+        FROM rag.lots
+        WHERE neighborhood = %s AND scrape_date = %s::date
+        ORDER BY lot_uid
+        """,
+        [neighborhood, scrape_date],
+    )
+
+
 def fetch_lot_profiles(
     connection: "Connection", *, neighborhood: str, scrape_date: str
 ) -> gpd.GeoDataFrame:

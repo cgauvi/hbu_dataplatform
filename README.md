@@ -92,6 +92,12 @@ construction, in EPSG:4326 and ready to put on a map beside the cadastre.
 Its `footprint_fit_pct` is a check on the solver rather than a decoration —
 `solve_program` caps a footprint on the lesser of two *areas* and never asks
 whether a building of that area has a shape the parcel can take.
+It draws the parking as a *second* polygon, into
+`gold.lot_surface_parking`: a surface stall is not a building, so it is
+fitted onto the parcel rather than into the setback envelope, at least one
+stall deep. That shape check also runs upstream, where it can act - a
+parcel too narrow to stand a car on cannot park on the ground at all, and
+its programme has to dig, deck or bay the stalls instead.
 `make massing`, and [docs/massing.md](docs/massing.md).
 
 ### Seven assets are blocked

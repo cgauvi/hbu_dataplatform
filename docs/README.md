@@ -30,5 +30,5 @@ reasons the code reads it the way it does.
 | [street-frontage.md](street-frontage.md) | The *géobase double*, and how much street each lot actually fronts on |
 | [lot-profiles.md](lot-profiles.md) | `gold.lot_profiles` — every lot in the borough, one row each |
 | [opportunities.md](opportunities.md) | `gold.lot_investment_opportunities` — the under-built lots worth looking at first, faceted by investment thesis and ranked on yield on cost |
-| [massing.md](massing.md) | `gold.lot_building_massing` — the proposed building drawn as a rectangle inside its own setback envelope, and the fit percentage that says whether the solved footprint has a shape |
+| [massing.md](massing.md) | `gold.lot_building_massing` — the proposed building drawn as a rectangle inside its own setback envelope, and the fit percentage that says whether the solved footprint has a shape; plus `gold.lot_surface_parking`, the asphalt on the yard it leaves, which is a second polygon because a surface stall is not a building |
 | [corpus.md](corpus.md) | The zoning PDFs fetched, chunked and embedded; the DuckDB and pgvector stores that answer against them |

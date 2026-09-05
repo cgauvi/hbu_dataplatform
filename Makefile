@@ -340,14 +340,19 @@ opportunities: | $(UV_SYNC_STAMP) ## Rank DATE x NEIGHBORHOOD's under-built lots
 	$(DAGSTER) asset materialize --select gold/lot_investment_opportunities --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE) \
 		--config-json '{"ops":{"gold__lot_investment_opportunities":{"config":{"dominant_share":$(DOMINANT_SHARE),"mixed_min_share":$(MIXED_MIN_SHARE),"land_value_factor":$(LAND_FACTOR),"top_n":$(TOP_N)}}}}'
 
-# Needs gold.lot_building_massing (hbu_infra sql/022) applied, and both `hbu`
+# Needs gold.lot_building_massing (hbu_infra sql/022) and gold.lot_surface_parking
+# (sql/024) applied - this one asset writes both, the building and the asphalt
+# on the yard it leaves - and both `hbu`
 # and `setbacks` run first for the same partition: the first supplies the
 # footprint to draw, the second the envelope to draw it inside. Without the
 # setbacks every row comes back no_buildable_geometry rather than a rectangle
 # with the margins ignored. The output is a geoparquet of polygons in
 # EPSG:4326 - open it in QGIS beside silver/lot_buildable_setbacks and the
-# cadastre. RATIOS is the aspect ratios to try, squarest first, as a JSON
-# list; footprint_fit_pct below 100 is the column to sort on.
+# cadastre. rag.lots is read too, for the parcel outlines the surface parking is
+# fitted onto; without it every row is no_lot_geometry and the buildings are
+# drawn regardless. RATIOS is the aspect ratios to try, squarest first, as a JSON
+# list; footprint_fit_pct below 100 is the column to sort on, and
+# surface_parking_fit_pct is the same question about the yard.
 massing: | $(UV_SYNC_STAMP) ## Draw DATE x NEIGHBORHOOD's HBU buildings as map polygons
 	$(DAGSTER) asset materialize --select gold/lot_building_massing --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE) \
 		--config-json '{"ops":{"gold__lot_building_massing":{"config":{"aspect_ratios":$(RATIOS)}}}}'

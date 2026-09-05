@@ -470,8 +470,16 @@ class ProgramConfig(Config):
         "Carries the mix of dwellings by CMHC bedroom class, the storeys "
         "split into residential, commercial, industrial and above-grade "
         "parking, the underground levels, the footprint and gross floor "
-        "area, the stalls by where they were put - dug, decked, bayed into the "
+        "area, the sous-sol of usage beside it - basement_area_m2, which "
+        "neither storey cap sees and which the density index counts, so "
+        "density_floor_area_m2 rather than gross_floor_area_m2 is what "
+        "Densite was tested against - the stalls by where they were put - "
+        "dug, decked, bayed into the "
         "ground floor, or standing on the yard the footprint leaves - "
+        "surface_area_m2 for the ground those last ones take (floor area of "
+        "no kind, and not part of the footprint either), parkable_area_m2 for "
+        "the largest parking-shaped rectangle the parcel actually holds, "
+        "which is what stops a four-metre lot from parking on its own width, "
         "floor_stack saying what "
         "stands on each storey as runs of identical levels, what each part "
         "costs to "
@@ -510,6 +518,9 @@ def lot_development_programs(
             f"{neighborhood} {scrape_date}; there is nothing to solve."
         )
     envelopes = _with_buildable_area(context, store, envelopes, neighborhood, scrape_date)
+    envelopes = _with_parkable_area(
+        context, postgis, envelopes, neighborhood, scrape_date
+    )
 
     economics, suppressed = unit_economics(
         _read(
@@ -624,12 +635,37 @@ def lot_development_programs(
             "num_with_commercial": int((solved["commercial_floors"] > 0).sum()),
             "num_with_industrial": int((solved["industrial_floors"] > 0).sum()),
             "num_digging": int((solved["underground_levels"] > 0).sum()),
+            # The other reason to dig, and the one the density index counts: a
+            # sous-sol of usage. At the module's own rates a cellar dwelling
+            # does not pay for itself and a cellar shop does, so a borough
+            # reporting these on its housing is one where a rent or a cost
+            # moved - see `program.BELOW_GRADE_RENT_DISCOUNT_PCT` for how close
+            # that call is.
+            "num_with_basement": int((solved["basement_levels"] > 0).sum()),
+            "total_basement_dwellings": int(solved["basement_dwellings"].sum()),
+            "total_basement_floor_area_ha": round(
+                float(solved["basement_area_m2"].sum()) / 10_000.0, 2
+            ),
             "num_with_buildable_area": int(frame["buildable_area_m2"].notna().sum()),
             # Rows the setbacks asset has not measured are capped on Taux
             # d'implantation alone, which overstates a shallow parcel. Under a
             # few percent is ordinary; the whole borough means that asset has
             # not run for this partition.
             "num_without_buildable_area": int(frame["buildable_area_m2"].isna().sum()),
+            # The yard's *shape*, measured off the cadastre. A row without it
+            # has its surface stalls bounded on area alone, which is what every
+            # run did before this existed; a row measuring zero sits on a
+            # parcel no car can stand on, and its program had to dig, deck or
+            # bay the stalls instead - `binding` says `surface_parking_shape`
+            # on exactly those.
+            "num_with_parkable_area": _notna_count(frame, "parkable_area_m2"),
+            "num_without_parkable_area": len(frame)
+            - _notna_count(frame, "parkable_area_m2"),
+            "num_unparkable_lots": _zero_count(frame, "parkable_area_m2"),
+            "num_surface_parking": int((solved["surface_stalls"] > 0).sum()),
+            "total_surface_parking_ha": round(
+                float(solved["surface_area_m2"].sum()) / 10_000.0, 2
+            ),
             "total_dwellings": int(solved["num_dwellings"].sum()),
             "total_gross_floor_area_ha": round(
                 float(solved["gross_floor_area_m2"].sum()) / 10_000.0, 2
@@ -1126,6 +1162,107 @@ def _with_buildable_area(
         on=list(_ENVELOPE_KEYS),
         how="left",
     )
+
+
+def _notna_count(frame: pd.DataFrame, column: str) -> int:
+    """How many rows carry ``column``, on a frame that may not have it at all.
+
+    An absent column is zero rows rather than a KeyError: `parkable_area_m2` is
+    optional by design, and the metadata that reports how optional it turned
+    out to be must not be the thing that fails the run.
+    """
+    if column not in frame.columns:
+        return 0
+    return int(frame[column].notna().sum())
+
+
+def _zero_count(frame: pd.DataFrame, column: str) -> int:
+    """How many rows measured ``column`` at exactly zero - see `_notna_count`."""
+    if column not in frame.columns:
+        return 0
+    return int((pd.to_numeric(frame[column], errors="coerce") == 0).sum())
+
+
+def _with_parkable_area(
+    context: AssetExecutionContext,
+    postgis: PostgisResource,
+    envelopes: pd.DataFrame,
+    neighborhood: str,
+    scrape_date: str,
+) -> pd.DataFrame:
+    """The envelopes, plus the shape of the yard each parcel could park on.
+
+    `solve_program` bounds surface stalls at ``stall area x stalls + footprint
+    <= lot area``, which is an area against an area and is satisfied on a
+    parcel four metres wide - where no car can stand at any price.
+    `massing.parking_capacity_m2` is the same question asked of the parcel's
+    *shape*: the largest rectangle at least one stall deep that fits inside the
+    boundary. Merged on here so `Lot.parkable_area_m2` reaches the solver, and
+    at the **lot** grain rather than the (lot, zone, column) one the setbacks
+    use - a parcel has one boundary however many columns govern it, so it is
+    measured once per lot and broadcast.
+
+    Read from `rag.lots` rather than from a parquet because that is where a
+    parcel keyed on `lot_uid` lives: `bronze/neighborhood_lots` is the Infolot
+    scrape, which predates the uid and cannot be joined to an envelope.
+
+    Optional the way `_with_buildable_area` is optional, and for a stronger
+    reason. Failing the partition when the cadastre is unreachable would cost
+    a borough its programs over one bound; leaving the column absent restores
+    exactly the behaviour every run had before this existed - surface stalls
+    bounded on area alone - and says so in the log. What it costs is named
+    there too, because "the yard was never measured" and "the yard measured
+    zero" are different answers and only one of them is in the data.
+    """
+    from urban_rag.massing import parking_capacity_m2, to_metric
+    from urban_rag.postgis import fetch_lot_polygons
+
+    try:
+        with postgis.connect() as connection:
+            lots = fetch_lot_polygons(
+                connection, neighborhood=neighborhood, scrape_date=scrape_date
+            )
+    except (PostgresUnavailable, MissingRelation) as exc:
+        context.log.warning(
+            "rag.lots could not be read for %s %s (%s), so every surface "
+            "stall is bounded on the yard's *area* alone - a four-metre "
+            "parcel will still be allowed to park on it. Load the cadastre "
+            "for this partition to bound it on the yard's shape as well.",
+            neighborhood,
+            scrape_date,
+            exc,
+        )
+        return envelopes
+
+    if lots.empty:
+        context.log.warning(
+            "rag.lots holds no parcel for %s %s, so no yard shape was "
+            "measured and every surface stall is bounded on area alone",
+            neighborhood,
+            scrape_date,
+        )
+        return envelopes
+
+    # In metres once, for the whole borough: the fit is a rectangle against a
+    # boundary and a rectangle in square degrees is not a rectangle.
+    projected = to_metric(lots)
+    capacity = {
+        row.lot_uid: parking_capacity_m2(row.geometry)
+        for row in projected.itertuples(index=False)
+        if row.geometry is not None and not row.geometry.is_empty
+    }
+    measured = envelopes["lot_uid"].map(capacity)
+    unparkable = int((measured == 0).sum())
+    context.log.info(
+        "%s %s: yard shape measured on %d of %d envelope row(s); %d row(s) "
+        "sit on a parcel that holds no surface stall at all",
+        neighborhood,
+        scrape_date,
+        int(measured.notna().sum()),
+        len(envelopes),
+        unparkable,
+    )
+    return envelopes.assign(parkable_area_m2=measured)
 
 
 def _binding_counts(programs: pd.DataFrame) -> dict[str, int]:

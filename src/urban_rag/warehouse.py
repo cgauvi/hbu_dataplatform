@@ -383,6 +383,25 @@ TABLES: dict[str, Table] = {
         source="sql/022_gold_lot_building_massing.sql",
         geometry="geom",
     ),
+    # The other polygon that asset draws, and the reason it is a second *table*
+    # rather than a second geometry column on the one above: a `Table` carries
+    # one geometry because `_copy_frame` skips a row without one, and which row
+    # to skip is a different answer for each shape. A lot whose building fits
+    # and whose parking does not belongs in the massing table and not here; a
+    # lot that parks underground belongs in the massing table and not here
+    # either; and neither is a hole in the massing.
+    #
+    # Same asset, same key, published in the same transaction - so the two are
+    # never visible apart - and a surface stall is emphatically not part of the
+    # massing: no floor area, no storey, no height. A map extruding this to
+    # `height_m` would raise a solid where there is asphalt.
+    "lot_surface_parking": Table(
+        asset="lot_building_massing",
+        name="lot_surface_parking",
+        keys=("lot_uid",),
+        source="sql/024_gold_lot_surface_parking.sql",
+        geometry="geom",
+    ),
     # The one table here keyed by a *pixel* rather than by a parcel: five map
     # layers dissolved onto the Web Mercator tile grid, one row per (layer,
     # cell). Its natural key is the cell address, and `layer` leads it because
