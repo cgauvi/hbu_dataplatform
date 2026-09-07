@@ -212,9 +212,16 @@ def _layers() -> dict[str, LayerSpec]:
         LayerSpec(
             name="capacity",
             source=(
+                # On lot_number, not on lot_uid. The uid is a bigserial minted
+                # fresh on every load of rag.lots, so a reload behind an
+                # already-materialized gold partition orphans it - and here
+                # that does not draw the wrong cells, it writes none at all:
+                # the seed dissolves nothing, the run prunes the partition,
+                # and the map's utilisation layer loses its low zooms as well
+                # as its high ones. The cadastral number survives a reload.
                 "rag.lots l "
                 "JOIN gold.lot_redevelopment_gap g "
-                "  ON g.lot_uid = l.lot_uid "
+                "  ON g.lot_number = l.lot_number "
                 " AND g.neighborhood = l.neighborhood "
                 " AND g.scrape_date = l.scrape_date"
             ),
