@@ -59,7 +59,7 @@ from urban_rag.frames import write_frame
 from urban_rag.frontage_assets import LOT_FRONTAGE_FILE, lot_frontage
 from urban_rag.layers import key_prefix
 from urban_rag.partitions import scrape_partitions
-from urban_rag.postgis import MIN_ZONE_OVERLAP_M2
+from urban_rag.postgis import MIN_ZONE_OVERLAP_M2, MIN_ZONE_PCT_OF_LOT
 from urban_rag.program import (
     ProgramError,
     ZoneColumn,
@@ -74,7 +74,12 @@ from urban_rag.rag_assets import DOCUMENTS_FILE, linked_documents
 from urban_rag.resources import ParquetStore, PdfCache, PostgisResource
 from urban_rag.storage import clear_parquet, filesystem, join, storage_options
 from urban_rag.warehouse import MissingRelation, publish, published_metadata
-from urban_rag.zoning_grid import GridColumn, GridParseError, parse_grid_pdf
+from urban_rag.zoning_grid import (
+    ZONE_FIELDS,
+    GridColumn,
+    GridParseError,
+    parse_grid_pdf,
+)
 
 GROUP = "silver_zoning"
 
@@ -132,49 +137,68 @@ class EnvelopeConfig(Config):
     Zone polygons and cadastral polygons are drawn by two publishers and agree
     only approximately, so a parcel on a zone boundary picks up a sliver of the
     neighbouring zone - a fraction of a percent of its area, and not a set of
-    rules anybody would build under. Two cutoffs, and they are different in
-    kind, which is why they are two.
+    rules anybody would build under. Two cutoffs, and they measure the sliver
+    differently, which is why they are two. A zone has to clear both.
 
-    **`min_pct_of_lot` is a judgement**, and its default keeps every overlap:
-    how much of a parcel a zone should govern before it counts as governing it
-    is an argument about the borough, not about the data. `pct_of_lot` is on
-    every row, so a table written at 0 can be read back at any threshold, and
-    one written at 5 cannot be read back at 0.
-
-    **`min_overlap_m2` is an artefact filter**, and its default drops rows,
-    because there is no threshold it could be read back at. A clip of under a
+    **`min_overlap_m2` measures the sliver absolutely.** A clip of under a
     square metre is the two publishers' lines missing each other by
     centimetres along a lot line; it is not a small amount of governing, it is
     a survey disagreement wearing a zone's number. Parc Jarry is the case to
     picture - 1.59 km2 carrying 31 envelope rows over 14 zones, its own E04-019
     covering 98.3% of it and one of the other thirteen covering 0.000022%, a
     few square centimetres of a residential zone at the corner of the park.
-    `governing_zone` already stops such a row from *answering* for a lot (see
-    `urban_rag.hbu`); this stops it from being written, priced and solved
-    first.
+    A percentage would never catch that one: 0.000022% of a park is still
+    0.000022% of a duplex lot as far as a ratio is concerned, but the ratio
+    reads the same for a corner nobody could stand in and for a strip somebody
+    could build a wall along.
 
-    Absolute rather than proportional because the artefact has an absolute
-    size, while a percentage means one thing on a 200 m2 duplex parcel and
-    quite another on the park. A parcel smaller than the cutoff itself would
-    lose every zone to it and go out as unzoned - there is no such development
-    site, and `num_lots_unzoned` reports it either way.
+    **`min_pct_of_lot` measures it proportionally**, and that is what catches
+    the sliver a square metre cannot. Lot 6 291 714 is 438 m2 with 437.23 of
+    them in H03-126 and 1.19 in C03-130 - 0.27% of the parcel, and 19% more
+    than the absolute cutoff. Under `min_overlap_m2` alone that lot went out
+    carrying two zones, and the commercial grid governing a quarter of a per
+    cent of it was priced and solved beside the residential one governing the
+    rest.
 
-    `silver.lot_features` keeps both kinds of row on purpose - see
+    **One per cent is a judgement, and this is where it is made.** How much of
+    a parcel a zone should govern before it counts as governing it is an
+    argument about the borough rather than about the data, and it used to
+    default to 0 so that a table written once could be read back at any
+    threshold. That argument was settled against the borough instead: at 1%,
+    Villeray-Saint-Michel-Parc-Extension loses 930 of 28 850 lot x zone pairs
+    and 668 of its 2 529 supposedly split lots, and every pair it loses is a
+    boundary artefact. `pct_of_lot` is still on every row of
+    `silver.lot_features`, so the reading back is still possible one table
+    upstream - it is the *envelope* that should not be written for a zone
+    nobody could build under.
+
+    A parcel losing every zone this way goes out as unzoned - 110 of them in
+    the borough, park and right-of-way remnants whose only zoning was a corner
+    clipped off the block beside them, which is a truer answer than a
+    neighbour's grid. `num_lots_unzoned` reports it either way.
+
+    `silver.lot_features` keeps every row on purpose - see
     005_silver_lot_features.sql - so nothing is lost upstream by cutting here.
-    The value is `postgis.MIN_ZONE_OVERLAP_M2`, which `compute_lot_profiles`
-    reads too, and hbu_infra's `rag.search_at_lot_number` and hbu_rag_map's
-    `queries.MIN_ZONE_OVERLAP_M2` are the same square metre in the repos that
-    cannot import it - so the zone the map shows, the zone the corpus answers
-    from and the zone the solver priced cannot disagree.
+    The values are `postgis.MIN_ZONE_OVERLAP_M2` and
+    `postgis.MIN_ZONE_PCT_OF_LOT`, which `compute_lot_profiles` reads too, and
+    hbu_infra's `rag.search_at_lot_number` and hbu_rag_map's
+    `queries.MIN_ZONE_OVERLAP_M2` / `queries.MIN_ZONE_PCT_OF_LOT` are the same
+    two numbers in the repos that cannot import them - so the zone the map
+    shows, the zone the corpus answers from and the zone the solver priced
+    cannot disagree.
     """
 
     min_pct_of_lot: float = Field(
-        default=0.0,
+        default=MIN_ZONE_PCT_OF_LOT,
         ge=0.0,
         le=100.0,
         description=(
             "A zone gives a lot an envelope row when it covers at least this "
-            "percentage of it. 0 keeps every overlap the join found."
+            "percentage of it. Guards against the sliver a cadastral boundary "
+            "and a zoning boundary produce where they disagree, in the "
+            "measure `min_overlap_m2` cannot see - a square metre of a zone on "
+            "a 438 m2 lot is 0.27% of it. 0 keeps every overlap the join "
+            "found."
         ),
     )
     min_overlap_m2: float = Field(
@@ -349,9 +373,10 @@ def zoning_grid_columns(
         "minimum lot width, site coverage, density, dwelling ceiling, heights "
         "and margins. Joins building_lot_intersections' lot x feature side to "
         "zoning_grid_columns on the zone number, and lot_frontage on the lot. "
-        "A zone clipping under min_overlap_m2 (1 m2) of a lot is dropped "
-        "rather than given a row: that is the cadastre and the zoning layer "
-        "disagreeing by centimetres, not a zone anybody could build under. "
+        "A zone clipping under min_overlap_m2 (1 m2) or min_pct_of_lot (1%) "
+        "of a lot is dropped rather than given a row: that is the cadastre "
+        "and the zoning layer disagreeing by centimetres, not a zone anybody "
+        "could build under. "
         "governs_residential marks the column select_residential_column picks "
         "for that lot's width. Writes silver/lot_zoning_envelopes/"
         f"<YYYY-MM-DD>/<neighborhood>/{LOT_ENVELOPES_FILE} and upserts "
@@ -405,13 +430,14 @@ def lot_zoning_envelopes(
     num_slivers = len(zoning) - len(covered)
     if num_slivers:
         context.log.info(
-            "%s %s: dropped %d lot x zone pair(s) covering under %g m2 of "
-            "their lot - the cadastre and the zoning layer disagreeing, not a "
-            "zone that governs anything",
+            "%s %s: dropped %d lot x zone pair(s) covering under %g m2 or "
+            "under %g%% of their lot - the cadastre and the zoning layer "
+            "disagreeing, not a zone that governs anything",
             neighborhood,
             scrape_date,
             num_slivers,
             config.min_overlap_m2,
+            config.min_pct_of_lot,
         )
     if "lot_number" not in covered.columns:
         # Added to `postgis._LOT_FEATURE_COLUMNS` after some partitions were
@@ -626,6 +652,12 @@ def _column_row(column: GridColumn) -> dict:
             else None
         ),
         **{name: getattr(column, name) for name in NORM_FIELDS},
+        # Stated once for the zone and repeated on every column of its grid -
+        # the heritage sector, the PIIA sector, the PAE flag and the cited
+        # articles. Carried here so a screen downstream can read "is this
+        # zone a secteur d'interet patrimonial" off the zone it already joins
+        # to, rather than re-parsing the PDF to find out.
+        **{name: getattr(column, name) for name in ZONE_FIELDS},
         "solver_ready": zone_column is not None,
         "solver_error": solver_error,
         "parse_notes": json.dumps(list(column.notes), ensure_ascii=False),
@@ -670,11 +702,13 @@ def _governing(envelopes: pd.DataFrame) -> dict[str, pd.Series]:
     `select_governing_column` is the rule, and it is called rather than
     reimplemented: a grid authorises a family in more than one column and
     distinguishes them by *Largeur du terrain min*, so the column that governs
-    a parcel is the widest minimum it still satisfies - decided once per
-    family, because a zone's Habitation rule and its Commerce rule are two
-    rules and a lot is governed by each. The choice is made within one zone at
-    a time, because two zones covering the same lot are two separate readings
-    of it and `pct_of_lot` is what says which is the real one.
+    a parcel is the widest minimum it still satisfies - and, among the columns
+    a zone prints at that same width, the one permitting the most dwellings.
+    Decided once per family, because a zone's Habitation rule and its Commerce
+    rule are two rules and a lot is governed by each. The choice is made within
+    one zone at a time, because two zones covering the same lot are two
+    separate readings of it and `pct_of_lot` is what says which is the real
+    one.
 
     False on every row of a lot with no measured frontage and a width minimum -
     the missing frontage reads as 0, which excludes the column rather than
@@ -715,16 +749,21 @@ def _as_zone_column(row: pd.Series) -> ZoneColumn:
     """Rebuild the solver's input from a row of the table.
 
     Only the fields `select_governing_column` reads are filled in - the
-    usages, which its `permits` predicate tests, and the width minimum -
-    which is why this is private to `_governing` and not the table's public
-    inverse. A row is turned back into a full `ZoneColumn` by whoever solves
-    it, from the columns this asset wrote.
+    usages, which its `permits` predicate tests, the width minimum, and the
+    printed *Nombre de logements maximal*, which is half of the ceiling that
+    separates two columns written for one width. That is why this is private
+    to `_governing` and not the table's public inverse. A row is turned back
+    into a full `ZoneColumn` by whoever solves it, from the columns this asset
+    wrote.
     """
     return ZoneColumn(
         usages=tuple(json.loads(row["usages"])),
         floors_max=int(row["floors_max"]),
         min_lot_width_m=(
             None if pd.isna(row["min_lot_width_m"]) else float(row["min_lot_width_m"])
+        ),
+        max_dwellings=(
+            None if pd.isna(row["max_dwellings"]) else int(row["max_dwellings"])
         ),
         zone=row["feature_id"],
     )

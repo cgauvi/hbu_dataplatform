@@ -212,6 +212,30 @@ _INTEGER_FIELDS = frozenset({"floors_min", "floors_max", "max_dwellings"})
 #: would be read as columns if the scan ran on.
 _END_LABEL = "patrimoine"
 
+#: The rows below *Patrimoine* that are read, and the field each fills. They
+#: are stated once for the zone rather than per column, so every `GridColumn`
+#: of the page carries the same four values. Matched on the *start* of the
+#: normalised label, because one template prints the legend in the label -
+#: ``Secteur d'interet patrimonial (A, AA, B, F)`` - and the same row is still
+#: the same row.
+#:
+#: What the values look like in this borough's grids (632 read, 2026-09):
+#: *Secteur d'interet patrimonial* is ``-`` or ``Oui`` (once ``A``); *PIIA
+#: (secteur)* is ``-`` or a sector number, ``2`` to ``6``, occasionally two;
+#: *PAE* is ``-`` or ``Oui``; *Articles vises* is ``-`` or a list of article
+#: numbers of by-law 01-283. ``-`` becomes ``None``, as everywhere else here.
+_ZONE_LABELS: Mapping[str, str] = {
+    "secteur d'interet patrimonial": "heritage_sector",
+    "piia (secteur)": "piia_sector",
+    "pae": "pae",
+    "articles vises": "specific_articles",
+}
+
+#: The zone-level fields, in the order the grid prints them. Exported so the
+#: asset that flattens a column can carry them by name, the way `NORM_FIELDS`
+#: carries the per-column ones.
+ZONE_FIELDS: tuple[str, ...] = tuple(_ZONE_LABELS.values())
+
 
 class GridParseError(ValueError):
     """A page that does not yield a grid, or a column the solver cannot use."""
@@ -256,6 +280,18 @@ class GridColumn:
     rear_margin_min_m: float | None = None
     only_permitted_usages: str | None = None
     excluded_usages: str | None = None
+
+    #: Stated once for the zone, below *Patrimoine*, and repeated on every
+    #: column of the page - see `_ZONE_LABELS`. ``heritage_sector`` is what
+    #: the grid prints against *Secteur d'interet patrimonial* (``Oui`` where
+    #: the zone is one); ``piia_sector`` is the PIIA sector number the zone
+    #: falls in, where the discretionary by-law applies; ``pae`` marks a zone
+    #: under a *plan d'amenagement d'ensemble*; ``specific_articles`` lists
+    #: the *dispositions particulieres* of by-law 01-283 the zone cites.
+    heritage_sector: str | None = None
+    piia_sector: str | None = None
+    pae: str | None = None
+    specific_articles: str | None = None
 
     #: Cells that were printed but could not be read, as ``label: text``. A
     #: column with notes is still returned - see the module docstring.
@@ -378,6 +414,8 @@ def parse_grid_page(rows: Sequence[Sequence[_Cell]]) -> list[GridColumn]:
     not a zone with no norms.
     """
     zone = _zone(rows)
+    # Read before the scan is cut at *Patrimoine*: these rows are below it.
+    zone_fields = _zone_fields(rows)
     rows = list(_grid_block(rows))
 
     centers = _column_centers(rows)
@@ -390,6 +428,7 @@ def parse_grid_page(rows: Sequence[Sequence[_Cell]]) -> list[GridColumn]:
             "column_index": index,
             "usages_by_category": {},
             "levels": set(),
+            **zone_fields,
         }
         for index in range(len(centers))
     ]
@@ -585,6 +624,42 @@ def _grid_block(rows: Iterable[Sequence[_Cell]]) -> Iterator[Sequence[_Cell]]:
         if _normalize(row[0].text) == _END_LABEL:
             return
         yield row
+
+
+def _zone_fields(rows: Sequence[Sequence[_Cell]]) -> dict[str, str | None]:
+    """The zone-level rows below *Patrimoine*, as the fields of `_ZONE_LABELS`.
+
+    Each of these rows is a label and one value printed somewhere of its own,
+    so the value is whatever cells follow the label rather than what lands in
+    a column band - the bands are the grid's, and this is not the grid. A
+    page with no *Patrimoine* row at all fills nothing, which is what an
+    older template that does not print the block should read as.
+
+    The first match wins for each field: the *Secteur d'interet patrimonial*
+    label recurs inside the footnote that qualifies it (*... assujetties au
+    Chapitre VIII du Titre II intitule Secteurs d'interet patrimonial ...*),
+    and that line is prose rather than a value.
+    """
+    fields: dict[str, str | None] = {name: None for name in ZONE_FIELDS}
+    seen: set[str] = set()
+    below = False
+    for row in rows:
+        label = _normalize(row[0].text)
+        if not below:
+            below = label == _END_LABEL
+            continue
+        for prefix, name in _ZONE_LABELS.items():
+            if name in seen or not label.startswith(prefix):
+                continue
+            # ``pae`` would otherwise match a footnote beginning with the
+            # word; a label is the prefix, or the prefix and a legend.
+            rest = label[len(prefix):].strip()
+            if rest and not rest.startswith("("):
+                continue
+            seen.add(name)
+            value = " ".join(cell.text.strip() for cell in row[1:]).strip()
+            fields[name] = None if _normalize(value) in _ABSENT else value
+    return fields
 
 
 def _column_centers(rows: Sequence[Sequence[_Cell]]) -> list[float]:

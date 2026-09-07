@@ -242,6 +242,7 @@ import math
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
+import numpy as np
 import pandas as pd
 
 from urban_rag.comparables import (
@@ -249,6 +250,8 @@ from urban_rag.comparables import (
     IncomeAssumptions,
     is_road_use_code,
 )
+from dataclasses import replace as _replace
+
 from urban_rag.program import (
     BASEMENT_LEVELS_ALLOWED,
     DEFAULT_CONSTRUCTION,
@@ -262,6 +265,7 @@ from urban_rag.program import (
     ConstructionCosts,
     DevelopmentProgram,
     InvestmentAssumptions,
+    RetainedBuilding,
     Lot,
     NonResidentialEconomics,
     ParkingRules,
@@ -494,6 +498,7 @@ CANDIDATE_COLUMNS: tuple[str, ...] = (
     "primary_frontage_m",
     "buildable_area_m2",
     "parkable_area_m2",
+    "placeable_area_m2",
 )
 
 #: The columns a chosen program brings across from its candidate row. The lot's
@@ -513,6 +518,7 @@ _CHOSEN_COLUMNS: tuple[str, ...] = (
     "governs_commercial",
     "governs_industrial",
     "buildable_area_m2",
+    "placeable_area_m2",
     *PROGRAM_COLUMNS,
 )
 
@@ -622,6 +628,8 @@ class ProgramAssumptions:
             "below_grade_rent_discount_pct": (
                 self.investment.below_grade_rent_discount_pct
             ),
+            "construction_months": self.investment.construction_months,
+            "lease_up_months": self.investment.lease_up_months,
             "below_grade_cost_premium": self.construction.below_grade_premium,
             "basement_levels_allowed": self.basement_levels_allowed,
             "max_seconds": self.max_seconds,
@@ -733,6 +741,14 @@ def lot_of(row: Mapping) -> Lot:
     is the same on every candidate row of it. A measured **0.0** is not absence
     and must not be collapsed into it: it says this parcel parks no car on the
     ground, and `_float_or_none` is careful to return it rather than None.
+
+    `placeable_area_m2` is absent on the same terms again, and it belongs to a
+    zoning column the way `buildable_area_m2` does rather than to the lot: it
+    is the largest rectangle that fits inside *that column's* margins, so a
+    parcel governed by two columns with different setbacks has two of them.
+    Absent, the footprint stays capped on the two area norms alone and the
+    yard on ``lot area - footprint``. A measured **0.0** again says something
+    rather than nothing - these margins hold no building at all.
     """
     return Lot(
         area_m2=float(row["lot_area_m2"]),
@@ -740,6 +756,7 @@ def lot_of(row: Mapping) -> Lot:
         lot_number=_text_or_none(row.get("lot_number")),
         buildable_area_m2=_float_or_none(row.get("buildable_area_m2")),
         parkable_area_m2=_float_or_none(row.get("parkable_area_m2")),
+        placeable_area_m2=_float_or_none(row.get("placeable_area_m2")),
     )
 
 
@@ -952,13 +969,25 @@ def governing_zone(envelopes: pd.DataFrame) -> pd.Series:
     place first. A frame carrying no `pct_of_lot` - a hand-built one in a test
     - leaves every zone in, since there is nothing to rank them by.
 
-    **The smallest of those slivers no longer reach here.**
-    `EnvelopeConfig.min_overlap_m2` drops a zone clipping under a square metre
-    of a lot before `lot_zoning_envelopes` writes a row for it - the few square
-    centimetres at the corner of the park above is one of them. That changes
-    the counts quoted here, which were measured before it: this still decides
-    every case, and now has fewer to decide. Nothing about the rule changes,
-    since the rows removed are the ones it was already ranking last.
+    **The slivers no longer reach here.** `EnvelopeConfig.min_overlap_m2` drops
+    a zone clipping under a square metre of a lot before
+    `lot_zoning_envelopes` writes a row for it - the few square centimetres at
+    the corner of the park above is one of them - and `min_pct_of_lot` drops
+    one clipping under a per cent of it, which is the same artefact in the
+    measure a square metre cannot see: 1.19 m2 of a commercial zone on the
+    438 m2 of lot 6 291 714 is over the absolute cutoff and a quarter of a per
+    cent of the parcel. That changes the counts quoted here, which were
+    measured before either: this still decides every case, and now has fewer
+    to decide. Nothing about the rule changes, since the rows removed are the
+    ones it was already ranking last.
+
+    The rows removed were not always ranking last *and losing*, though, which
+    is why this matters beyond tidiness. `_chosen` sorts on coverage first but
+    only among the candidates that produced a solvable program, so a sliver
+    won whenever the zone actually covering the lot produced none - a grid
+    that would not parse, or one authorising only Equipements collectifs. Over
+    Villeray-Saint-Michel-Parc-Extension that was 182 parcels, 114 of which had
+    the real zone sitting right there and unchosen.
     """
     if "lot_uid" not in envelopes.columns or "feature_id" not in envelopes.columns:
         return pd.Series(dtype="object")
@@ -1748,6 +1777,11 @@ _EXISTING_COLUMNS: tuple[str, ...] = (
     "building_age_years",
     "maintenance_premium",
     "effective_operating_expense_ratio",
+    # What the enhancement solve stands on: the roll's storey count is the
+    # plate's divisor, and the year is what the shortlist's teardown screen
+    # reads. Carried here so the gap row says what the building is.
+    "num_storeys",
+    "year_built",
 )
 
 
@@ -1802,6 +1836,8 @@ def use_gap(
     frame["hbu_unit_area_m2"] = _numeric(frame, "unit_area_m2")
 
     frame["existing_num_dwellings"] = _numeric(joined, "num_dwellings")
+    frame["existing_num_storeys"] = _numeric(joined, "num_storeys")
+    frame["existing_year_built"] = _numeric(joined, "year_built")
     frame["hbu_num_dwellings"] = _numeric(frame, "num_dwellings")
     frame["dwelling_gap"] = frame["hbu_num_dwellings"] - frame["existing_num_dwellings"]
 
@@ -1848,8 +1884,13 @@ def use_gap(
     investment = investment or DEFAULT_INVESTMENT
     frame["hbu_npv_cad"] = _numeric(frame, "npv_cad")
     frame["hbu_present_value_cad"] = _numeric(frame, "present_value_cad")
+    # The standing building earns from today, so its stream is not pushed out
+    # by a build or a lease-up: `hold_pv_factor`, not the delayed
+    # `annual_pv_factor` the proposal's `npv_cad` was solved on. That
+    # difference is the whole of what a rebuild gives up while the site is a
+    # hole in the ground, and it is in the gain below by construction.
     frame["existing_present_value_cad"] = (
-        frame["existing_annual_stabilised_noi_cad"] * investment.annual_pv_factor
+        frame["existing_annual_stabilised_noi_cad"] * investment.hold_pv_factor
     )
     frame["redevelopment_npv_gain_cad"] = frame["hbu_npv_cad"] - frame[
         "existing_present_value_cad"
@@ -1936,6 +1977,106 @@ def investment_assumptions_of(hbu: pd.DataFrame) -> InvestmentAssumptions:
                     "new_build_rent_premium_pct", default.new_build_rent_premium_pct
                 )
             ),
+            below_grade_rent_discount_pct=float(
+                payload.get(
+                    "below_grade_rent_discount_pct",
+                    default.below_grade_rent_discount_pct,
+                )
+            ),
+            construction_months=int(
+                payload.get("construction_months", default.construction_months)
+            ),
+            lease_up_months=int(
+                payload.get("lease_up_months", default.lease_up_months)
+            ),
+        )
+    except (ProgramError, TypeError, ValueError):
+        return default
+
+
+def program_assumptions_of(hbu: pd.DataFrame) -> ProgramAssumptions:
+    """The whole `ProgramAssumptions` the chosen programs were solved with.
+
+    `investment_assumptions_of` widened to every field `as_metadata` writes,
+    for the one caller that has to solve again on the same terms: the
+    enhancement in `solve_enhancements` prices its addition at the rates the
+    rebuild was priced at, or the two futures are not comparable. Falls back
+    to the module defaults field by field where a key is absent - an older
+    partition - and wholesale where the payload cannot be read.
+    """
+    default = ProgramAssumptions()
+    if hbu.empty or "program_assumptions" not in hbu.columns:
+        return default
+    values = hbu["program_assumptions"].dropna()
+    if not len(values):
+        return default
+    try:
+        payload = json.loads(values.iloc[0])
+    except (TypeError, ValueError):
+        return default
+    if not isinstance(payload, dict):
+        return default
+
+    def number(name: str, fallback):
+        value = payload.get(name)
+        return fallback if value is None else value
+
+    try:
+        parking = default.parking
+        parking = ParkingRules(
+            stalls_per_dwelling=float(number("stalls_per_dwelling", parking.stalls_per_dwelling)),
+            stalls_per_1000_sqft=float(number("stalls_per_1000_sqft", parking.stalls_per_1000_sqft)),
+            underground_area_sqft=float(number("underground_stall_area_sqft", parking.underground_area_sqft)),
+            above_grade_area_sqft=float(number("above_grade_stall_area_sqft", parking.above_grade_area_sqft)),
+            surface_area_sqft=float(number("surface_stall_area_sqft", parking.surface_area_sqft)),
+            garage_area_sqft=float(number("garage_stall_area_sqft", parking.garage_area_sqft)),
+            underground_cost_cad=float(number("underground_stall_cost_cad", parking.underground_cost_cad)),
+            above_grade_cost_cad=float(number("above_grade_stall_cost_cad", parking.above_grade_cost_cad)),
+            surface_cost_cad=float(number("surface_stall_cost_cad", parking.surface_cost_cad)),
+            garage_cost_cad=float(number("garage_stall_cost_cad", parking.garage_cost_cad)),
+            amortization_months=int(number("amortization_months", parking.amortization_months)),
+            max_underground_levels=int(number("max_underground_levels", parking.max_underground_levels)),
+            max_surface_stalls=(
+                None if payload.get("max_surface_stalls") is None
+                else int(payload["max_surface_stalls"])
+            ),
+            max_garage_stalls=(
+                None if payload.get("max_garage_stalls") is None
+                else int(payload["max_garage_stalls"])
+            ),
+        )
+        costs = default.construction
+        construction = ConstructionCosts(
+            residential_cost_per_sqft=float(number("residential_cost_per_sqft_cad", costs.residential_cost_per_sqft)),
+            commercial_cost_per_sqft=float(number("commercial_cost_per_sqft_cad", costs.commercial_cost_per_sqft)),
+            industrial_cost_per_sqft=float(number("industrial_cost_per_sqft_cad", costs.industrial_cost_per_sqft)),
+            below_grade_premium=float(number("below_grade_cost_premium", costs.below_grade_premium)),
+            amortization_months=int(number("amortization_months", costs.amortization_months)),
+        )
+        rents = default.non_residential
+        non_residential = NonResidentialEconomics(
+            commercial_per_sqft_year=float(number("commercial_rent_per_sqft_year_cad", rents.commercial_per_sqft_year)),
+            industrial_per_sqft_year=float(number("industrial_rent_per_sqft_year_cad", rents.industrial_per_sqft_year)),
+            commercial_vacancy_pct=float(number("commercial_vacancy_pct", rents.commercial_vacancy_pct)),
+            industrial_vacancy_pct=float(number("industrial_vacancy_pct", rents.industrial_vacancy_pct)),
+        )
+        storeys = default.heights
+        heights = StoreyHeights(
+            residential_m=float(number("residential_storey_height_m", storeys.residential_m)),
+            commercial_m=float(number("commercial_storey_height_m", storeys.commercial_m)),
+            industrial_m=float(number("industrial_storey_height_m", storeys.industrial_m)),
+            above_grade_parking_m=float(number("above_grade_parking_storey_height_m", storeys.above_grade_parking_m)),
+        )
+        return ProgramAssumptions(
+            parking=parking,
+            construction=construction,
+            non_residential=non_residential,
+            heights=heights,
+            investment=investment_assumptions_of(hbu),
+            basement_levels_allowed=int(
+                number("basement_levels_allowed", default.basement_levels_allowed)
+            ),
+            max_seconds=float(number("max_seconds", default.max_seconds)),
         )
     except (ProgramError, TypeError, ValueError):
         return default
@@ -2068,3 +2209,385 @@ def _text_or_none(value) -> str | None:
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return None
     return str(value)
+
+
+# --------------------------------------------------------------------------
+# the second future: the building stays and grows
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class EnhancementRules:
+    """What an addition costs in time and disruption, and how far it may go.
+
+    ``construction_months`` and ``lease_up_months`` are the addition's own -
+    shorter than a rebuild's, because the shell is there - and push the added
+    income out the way `InvestmentAssumptions` pushes a rebuild's.
+    ``disruption_share`` is the share of the standing building's NOI lost
+    while the works are on: tenants decanted from the top floor, the yard a
+    site, a shop behind hoarding. ``addition_cost_premium`` and
+    ``max_added_storeys`` are `RetainedBuilding`'s, stated once here for the
+    borough. ``max_seconds`` bounds each CP-SAT run, as `ProgramAssumptions.
+    max_seconds` bounds the rebuild's.
+    """
+
+    construction_months: int = 9
+    lease_up_months: int = 3
+    disruption_share: float = 0.25
+    addition_cost_premium: float = 1.5
+    max_added_storeys: int = 1
+    max_seconds: float = 5.0
+
+    def __post_init__(self) -> None:
+        if self.construction_months < 0 or self.lease_up_months < 0:
+            raise ValueError("the enhancement's months must not be negative")
+        if not 0.0 <= self.disruption_share <= 1.0:
+            raise ValueError("disruption_share is a share of NOI and must be in [0, 1]")
+        if self.addition_cost_premium <= 0:
+            raise ValueError("addition_cost_premium must be positive")
+        if self.max_added_storeys < 0:
+            raise ValueError("max_added_storeys must not be negative")
+        if self.max_seconds <= 0:
+            raise ValueError("max_seconds must be positive")
+
+    def as_metadata(self) -> dict[str, object]:
+        return {
+            "enhance_construction_months": self.construction_months,
+            "enhance_lease_up_months": self.lease_up_months,
+            "enhance_disruption_share": self.disruption_share,
+            "addition_cost_premium": self.addition_cost_premium,
+            "max_added_storeys": self.max_added_storeys,
+            "enhance_max_seconds": self.max_seconds,
+        }
+
+
+#: Why a lot has no enhancement program, beside CP-SAT's own statuses.
+ENHANCEMENT_STATUSES: tuple[str, ...] = (
+    "OPTIMAL",
+    "FEASIBLE",
+    "INFEASIBLE",
+    "UNKNOWN",
+    "ERROR",
+    "no_building",  # nothing stands, or the roll states no storey count
+    "not_underbuilt",  # the envelope holds no more than what stands
+    "no_program",  # the rebuild was not solved, so there is nothing to grow toward
+    "no_envelope",  # the governing zone's columns could not be rebuilt
+)
+
+#: What `solve_enhancements` writes, in reading order. Every money figure is
+#: the addition's own; the whole building's floor is `enhance_gross_floor_
+#: area_m2` and what it adds is `enhance_added_floor_area_m2`.
+ENHANCEMENT_COLUMNS: tuple[str, ...] = (
+    "enhance_status",
+    "enhance_solved",
+    "enhance_solve_error",
+    "enhance_floors",
+    "enhance_added_storeys",
+    "enhance_footprint_m2",
+    "enhance_gross_floor_area_m2",
+    "enhance_added_floor_area_m2",
+    "enhance_added_dwellings",
+    "enhance_num_dwellings",
+    "enhance_units",
+    "enhance_added_commercial_area_m2",
+    "enhance_added_industrial_area_m2",
+    "enhance_surface_stalls",
+    "enhance_capital_cost_cad",
+    "enhance_added_annual_gross_income_cad",
+    "enhance_added_annual_stabilised_noi_cad",
+    "enhance_present_value_cad",
+    "enhance_npv_cad",
+    "enhance_disruption_cad",
+    "enhance_gain_cad",
+    "enhance_binding",
+)
+
+#: The three things an owner can do with a lot, and what each is worth.
+FUTURES: tuple[str, ...] = ("hold", "enhance", "rebuild")
+FUTURE_COLUMNS: tuple[str, ...] = (
+    "hold_value_cad",
+    "enhance_value_cad",
+    "rebuild_value_cad",
+    "best_future",
+)
+
+
+def retained_building_of(
+    existing: Mapping, rules: EnhancementRules | None = None
+) -> RetainedBuilding | None:
+    """The roll's building, as the block the enhancement builds on.
+
+    ``None`` where there is nothing to retain: no floor, or no storey count
+    to divide it by. The plate is floor over storeys - the roll states no
+    footprint - which is exact for a plex and generous for a building with a
+    setback storey; the BDOI footprint on `lot_profiles` is the better number
+    where that asset has run, and is the obvious next input here.
+    """
+    rules = rules or EnhancementRules()
+    storeys = _int_or_none(existing.get("num_storeys"))
+    residential = _float_or_none(existing.get("residential_floor_area_m2")) or 0.0
+    commercial = _float_or_none(existing.get("commercial_floor_area_m2")) or 0.0
+    industrial = _float_or_none(existing.get("industrial_floor_area_m2")) or 0.0
+    floor = residential + commercial + industrial
+    if floor <= 0.0 or storeys is None or storeys < 1:
+        return None
+    gross = _float_or_none(existing.get("gross_income_cad")) or 0.0
+    return RetainedBuilding(
+        footprint_m2=floor / storeys,
+        storeys=storeys,
+        residential_floor_area_m2=residential,
+        commercial_floor_area_m2=commercial,
+        industrial_floor_area_m2=industrial,
+        dwellings=_int_or_none(existing.get("num_dwellings")) or 0,
+        monthly_gross_revenue_cad=gross / MONTHS_PER_YEAR,
+        max_added_storeys=rules.max_added_storeys,
+        addition_cost_premium=rules.addition_cost_premium,
+    )
+
+
+def envelope_of(group: pd.DataFrame) -> ZoneEnvelope | None:
+    """One zone's envelope rows, as the `ZoneEnvelope` `_envelope_row` solves.
+
+    The governing half of `_envelope_row`, factored out so the enhancement
+    can be solved against exactly the rule-set the rebuild was: the asset's
+    own `governs_*` flags pick each family's column, and a zone where nothing
+    governs falls back the same way. ``None`` where no row parses.
+    """
+    parsed: list[tuple[dict, ZoneColumn]] = []
+    for record in group.to_dict("records"):
+        try:
+            parsed.append((record, zone_column_of(record)))
+        except (ProgramError, ValueError, KeyError):
+            continue
+    if not parsed:
+        return None
+    governing: dict[str, ZoneColumn | None] = {}
+    for family in USE_FAMILIES:
+        governing[family] = next(
+            (
+                zone_column
+                for record, zone_column in parsed
+                if _flag(record, f"governs_{family}")
+                and _flag(record, f"permits_{family}")
+            ),
+            None,
+        )
+    envelope = ZoneEnvelope(
+        residential=governing["residential"],
+        commercial=governing["commercial"],
+        industrial=governing["industrial"],
+    )
+    if envelope.is_empty:
+        envelope = ZoneEnvelope.of([zone_column for _, zone_column in parsed], 0.0)
+        if envelope.is_empty:
+            envelope = ZoneEnvelope.single(parsed[0][1])
+    return envelope
+
+
+def _enhancement_row(program, retained: RetainedBuilding, *, disruption: float) -> dict:
+    """One enhancement's answer, flattened."""
+    solved = program.status in ("OPTIMAL", "FEASIBLE")
+    nothing_added = solved and program.added_floor_area_m2 <= 0.0
+    added_commercial = max(
+        program.commercial_area_m2 - retained.commercial_floor_area_m2, 0.0
+    )
+    added_industrial = max(
+        program.industrial_area_m2 - retained.industrial_floor_area_m2, 0.0
+    )
+    npv = program.npv_cad if solved else 0.0
+    return {
+        "enhance_status": program.status,
+        "enhance_solved": solved,
+        "enhance_solve_error": None,
+        "enhance_floors": program.floors if solved else 0,
+        "enhance_added_storeys": max(program.floors - retained.storeys, 0) if solved else 0,
+        "enhance_footprint_m2": program.footprint_m2 if solved else 0.0,
+        "enhance_gross_floor_area_m2": program.gross_floor_area_m2 if solved else 0.0,
+        "enhance_added_floor_area_m2": program.added_floor_area_m2 if solved else 0.0,
+        "enhance_added_dwellings": program.total_dwellings if solved else 0,
+        "enhance_num_dwellings": (
+            program.total_dwellings + retained.dwellings if solved else retained.dwellings
+        ),
+        "enhance_units": json.dumps(dict(program.units), ensure_ascii=False),
+        "enhance_added_commercial_area_m2": added_commercial if solved else 0.0,
+        "enhance_added_industrial_area_m2": added_industrial if solved else 0.0,
+        "enhance_surface_stalls": program.surface_stalls if solved else 0,
+        "enhance_capital_cost_cad": program.total_capital_cost_cad if solved else 0.0,
+        "enhance_added_annual_gross_income_cad": (
+            program.gross_revenue_cad * MONTHS_PER_YEAR if solved else 0.0
+        ),
+        "enhance_added_annual_stabilised_noi_cad": (
+            program.annual_stabilised_noi_cad if solved else 0.0
+        ),
+        "enhance_present_value_cad": program.present_value_cad if solved else 0.0,
+        "enhance_npv_cad": npv,
+        "enhance_disruption_cad": disruption if solved else 0.0,
+        "enhance_gain_cad": (npv - disruption) if solved else None,
+        "enhance_binding": json.dumps(
+            list(program.binding) + (["nothing_pencils"] if nothing_added else []),
+            ensure_ascii=False,
+        ),
+    }
+
+
+_NO_ENHANCEMENT: dict = {
+    "enhance_status": None,
+    "enhance_solved": False,
+    "enhance_solve_error": None,
+    "enhance_floors": 0,
+    "enhance_added_storeys": 0,
+    "enhance_footprint_m2": 0.0,
+    "enhance_gross_floor_area_m2": 0.0,
+    "enhance_added_floor_area_m2": 0.0,
+    "enhance_added_dwellings": 0,
+    "enhance_num_dwellings": 0,
+    "enhance_units": "{}",
+    "enhance_added_commercial_area_m2": 0.0,
+    "enhance_added_industrial_area_m2": 0.0,
+    "enhance_surface_stalls": 0,
+    "enhance_capital_cost_cad": 0.0,
+    "enhance_added_annual_gross_income_cad": 0.0,
+    "enhance_added_annual_stabilised_noi_cad": 0.0,
+    "enhance_present_value_cad": 0.0,
+    "enhance_npv_cad": 0.0,
+    "enhance_disruption_cad": 0.0,
+    "enhance_gain_cad": None,
+    "enhance_binding": "[]",
+}
+
+
+def solve_enhancements(
+    hbu: pd.DataFrame,
+    existing: pd.DataFrame,
+    envelopes: pd.DataFrame,
+    economics: UnitEconomics,
+    *,
+    assumptions: ProgramAssumptions | None = None,
+    rules: EnhancementRules | None = None,
+) -> pd.DataFrame:
+    """One `solve_program` per lot with a building and room above it, the
+    building retained.
+
+    ``hbu`` is `select_highest_best_use`'s output - the rebuild, and the zone
+    it was solved in; ``existing`` is `lot_assessment_comparables`, the
+    building that stands; ``envelopes`` is `lot_zoning_envelopes`, from which
+    the zone's rule-set is rebuilt exactly as the rebuild saw it. The addition
+    is priced on ``assumptions`` - the rebuild's own rates, read back off the
+    hbu rows by `program_assumptions_of` - with the timing and the premium
+    swapped for ``rules``'.
+
+    Solved only where it can mean something: a solved rebuild, a building the
+    roll gives a floor and a storey count for, and an envelope holding more
+    than stands. Every other lot keeps a row with its `enhance_status` saying
+    which of those it lacked. Returns `ENHANCEMENT_COLUMNS` indexed like
+    ``hbu``.
+    """
+    assumptions = assumptions or ProgramAssumptions()
+    rules = rules or EnhancementRules()
+    investment = _replace(
+        assumptions.investment,
+        construction_months=rules.construction_months,
+        lease_up_months=rules.lease_up_months,
+    )
+    key = "NO_LOT" if "NO_LOT" in existing.columns else "lot_number"
+    by_number: dict = {}
+    if not existing.empty and key in existing.columns:
+        by_number = {
+            str(number): record
+            for number, record in zip(
+                existing[key], existing.drop_duplicates(key).to_dict("records")
+            )
+        } if len(existing) == len(existing.drop_duplicates(key)) else {
+            str(record[key]): record
+            for record in existing.drop_duplicates(key).to_dict("records")
+        }
+    grouped = (
+        {
+            (uid, feature): group
+            for (uid, feature), group in envelopes.groupby(
+                ["lot_uid", "feature_id"], sort=False
+            )
+        }
+        if not envelopes.empty and {"lot_uid", "feature_id"} <= set(envelopes.columns)
+        else {}
+    )
+
+    rows: list[dict] = []
+    for record in hbu.to_dict("records"):
+        if record.get("hbu_status") != "solved" or not record.get("solved", True):
+            rows.append({**_NO_ENHANCEMENT, "enhance_status": "no_program"})
+            continue
+        standing = by_number.get(str(record.get("lot_number")))
+        retained = retained_building_of(standing, rules) if standing else None
+        if retained is None:
+            rows.append({**_NO_ENHANCEMENT, "enhance_status": "no_building"})
+            continue
+        proposed = _float_or_none(record.get("gross_floor_area_m2")) or 0.0
+        if proposed <= retained.floor_area_m2:
+            rows.append({**_NO_ENHANCEMENT, "enhance_status": "not_underbuilt"})
+            continue
+        group = grouped.get((record.get("lot_uid"), record.get("feature_id")))
+        envelope = envelope_of(group) if group is not None else None
+        if envelope is None:
+            rows.append({**_NO_ENHANCEMENT, "enhance_status": "no_envelope"})
+            continue
+        try:
+            program = solve_program(
+                envelope,
+                lot_of(record),
+                economics,
+                parking=assumptions.parking,
+                construction=assumptions.construction,
+                non_residential=assumptions.non_residential,
+                heights=assumptions.heights,
+                investment=investment,
+                basement_levels_allowed=0,
+                max_seconds=rules.max_seconds,
+                retained=retained,
+            )
+        except (ProgramError, ValueError, KeyError) as exc:
+            rows.append(
+                {**_NO_ENHANCEMENT, "enhance_status": "ERROR", "enhance_solve_error": str(exc)}
+            )
+            continue
+        # What the works cost the building that keeps earning: a share of its
+        # NOI for the months the site is one. Undiscounted, because it is
+        # spent in the first year, where a dollar is a dollar.
+        standing_noi = _float_or_none(standing.get("net_operating_income_cad")) or 0.0
+        disruption = (
+            standing_noi * rules.disruption_share * rules.construction_months
+            / MONTHS_PER_YEAR
+        )
+        rows.append(_enhancement_row(program, retained, disruption=disruption))
+    frame = pd.DataFrame(rows, columns=list(ENHANCEMENT_COLUMNS))
+    frame.index = hbu.index
+    return frame
+
+
+def three_futures(frame: pd.DataFrame) -> pd.DataFrame:
+    """What holding, enhancing and rebuilding are each worth to the owner.
+
+    All three on one footing - the land excluded, since the owner holds it in
+    every future - and before the site's own costs, which `urban_rag.
+    opportunities` adds when it prices the buyer. ``hold`` is the standing
+    building's discounted NOI; ``enhance`` is that plus the addition's own
+    NPV less the disruption; ``rebuild`` is the proposal's NPV, whose income
+    starts only after the build and the lease-up. ``best_future`` is the
+    largest, ``hold`` on a tie and wherever nothing else was solved.
+    """
+    hold = _numeric(frame, "existing_present_value_cad").fillna(0.0)
+    gain = _numeric(frame, "enhance_gain_cad")
+    enhance = (hold + gain).where(gain.notna())
+    rebuild = _numeric(frame, "hbu_npv_cad")
+    values = pd.DataFrame(
+        {"hold": hold, "enhance": enhance, "rebuild": rebuild}, index=frame.index
+    )
+    # `hold` is never null, so the row-wise max has a value everywhere and the
+    # ties go to holding by column order.
+    best = values.fillna(-np.inf).idxmax(axis=1)
+    result = pd.DataFrame(index=frame.index)
+    result["hold_value_cad"] = hold.round(2)
+    result["enhance_value_cad"] = enhance.round(2)
+    result["rebuild_value_cad"] = rebuild.round(2)
+    result["best_future"] = best.astype("object")
+    return result

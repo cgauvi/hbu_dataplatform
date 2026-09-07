@@ -71,6 +71,9 @@ def grid_pdf(
     dwellings: tuple[str, ...] = ("", ""),
     front_margin: tuple[str, ...] = ("2,5/3,5", "2,5/3,5"),
     columns: tuple[float, ...] = COLUMNS,
+    heritage: str = "-",
+    piia: str = "3",
+    articles: str = "-",
 ) -> bytes:
     """A one-page PDF of a grid carrying the rows this parser reads."""
     items: list[tuple[float, float, str]] = []
@@ -120,11 +123,11 @@ def grid_pdf(
     # Below Patrimoine every value is stated once for the zone, centred
     # somewhere of its own. None of it may reach a column.
     line("Secteur d’intérêt patrimonial")
-    items.append((_at(427.0, "-"), top + LEADING, "-"))
+    items.append((_at(427.0, heritage), top + LEADING, heritage))
     line("Articles visés")
-    items.append((_at(316.0, "-"), top + LEADING, "-"))
+    items.append((_at(316.0, articles), top + LEADING, articles))
     line("PIIA (secteur)")
-    items.append((_at(327.0, "3"), top + LEADING, "3"))
+    items.append((_at(327.0, piia), top + LEADING, piia))
     line("PAE")
     items.append((_at(328.0, "-"), top + LEADING, "-"))
 
@@ -370,3 +373,26 @@ def test_prose_that_mentions_a_grid_is_not_a_grid():
         parse_grid_pdf(resolution)
 
     assert parse_grid_pdf(grid_pdf())
+
+
+# -- the rows below Patrimoine -----------------------------------------------
+
+
+def test_the_zone_level_rows_are_read_and_repeated_on_every_column():
+    """*Secteur d'interet patrimonial*, *PIIA (secteur)*, *PAE* and *Articles
+    vises* are stated once for the zone; every column of the grid carries the
+    same four values, and a ``-`` is none."""
+    columns = parse_grid_pdf(grid_pdf())
+    assert len(columns) == 2
+    for column in columns:
+        assert column.heritage_sector is None
+        assert column.piia_sector == "3"
+        assert column.pae is None
+        assert column.specific_articles is None
+
+
+def test_a_heritage_sector_is_read_as_printed():
+    columns = parse_grid_pdf(grid_pdf(heritage="Oui", piia="-", articles="665.62"))
+    assert columns[0].heritage_sector == "Oui"
+    assert columns[0].piia_sector is None
+    assert columns[0].specific_articles == "665.62"

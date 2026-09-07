@@ -417,7 +417,12 @@ def test_an_outdated_view_names_the_file_to_re_apply():
 
 
 def test_the_document_join_drops_a_zone_that_clips_the_lot():
-    """A square metre of the block next door is not one of a lot's documents."""
+    """A square metre of the block next door is not one of a lot's documents.
+
+    Both cutoffs reach the statement, because a clip can be over one and under
+    the other: 1.19 m2 of a neighbouring zone clears the square metre and is
+    0.27% of a 438 m2 parcel.
+    """
     cursor = FakeCursor()
     compute(cursor)
 
@@ -427,6 +432,7 @@ def test_the_document_join_drops_a_zone_that_clips_the_lot():
         if "INSERT INTO gold_lot_profiles_load" in statement
     )
     assert select["min_overlap_m2"] == postgis.MIN_ZONE_OVERLAP_M2
+    assert select["min_pct_of_lot"] == postgis.MIN_ZONE_PCT_OF_LOT
 
     statement = next(
         statement
@@ -434,11 +440,12 @@ def test_the_document_join_drops_a_zone_that_clips_the_lot():
         if "INSERT INTO gold_lot_profiles_load" in statement
     )
     assert "ld.overlap_area_m2 >= %(min_overlap_m2)s" in statement
+    assert "ld.pct_of_lot >= %(min_pct_of_lot)s" in statement
 
 
-def test_the_document_cutoff_can_be_turned_off():
+def test_the_document_cutoffs_can_be_turned_off():
     cursor = FakeCursor()
-    compute(cursor, min_overlap_m2=0.0)
+    compute(cursor, min_overlap_m2=0.0, min_pct_of_lot=0.0)
 
     select = next(
         params
@@ -446,6 +453,7 @@ def test_the_document_cutoff_can_be_turned_off():
         if "INSERT INTO gold_lot_profiles_load" in statement
     )
     assert select["min_overlap_m2"] == 0.0
+    assert select["min_pct_of_lot"] == 0.0
 
 
 def test_every_missing_relation_is_reported_at_once():

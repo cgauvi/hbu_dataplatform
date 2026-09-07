@@ -128,16 +128,32 @@ question, not to the geometry. `pct_of_lot` is the column to filter on, and
 genuinely split between two zones has two real rows, and no ranking will tell
 you which of those is the artifact.
 
-The questions this platform asks answer at one square metre, and
-`overlap_area_m2` on `rag.lot_documents` is what lets them. It is deliberately
-a different shape of cutoff from `pct_of_lot`: how much of a lot a zone should
-govern before it counts is a judgement about the borough, and a percentage
-states it, but whether a zone reaches the lot at all is not — below a square
-metre the two surveys have simply missed each other, on a 200 m² duplex parcel
-and on Parc Jarry alike. `postgis.MIN_ZONE_OVERLAP_M2` is that value here,
-`EnvelopeConfig.min_overlap_m2` and `compute_lot_profiles` read it, and
-`rag.search_at_lot_number(..., min_overlap_m2 => 1)` is its default in the
-corpus search. Pass 0 to any of them to get every overlap back.
+The questions this platform asks answer at one square metre **and** one per
+cent, and `overlap_area_m2` and `pct_of_lot` on `rag.lot_documents` are what
+let them. The two cutoffs are deliberately different shapes, and a zone has to
+clear both, because neither catches what the other does.
+
+Below a square metre the two surveys have simply missed each other, on a 200 m²
+duplex parcel and on Parc Jarry alike — and on the park a percentage would
+never see it, since a few square centimetres of 1.59 km² is 0.000022% and no
+sane threshold sits under that. Below one per cent the clip is large enough to
+measure and still too small to govern: lot 6 291 714 is 438 m² with 437.23 of
+them in H03-126 and 1.19 in C03-130, which clears the square metre and is a
+quarter of a per cent of the parcel. Until both cutoffs applied, that lot came
+back carrying a commercial grid beside its residential one.
+
+`postgis.MIN_ZONE_OVERLAP_M2` and `postgis.MIN_ZONE_PCT_OF_LOT` are those
+values here; `EnvelopeConfig` and `compute_lot_profiles` read them, and
+`rag.search_at_lot_number(..., min_pct_of_lot => 1, min_overlap_m2 => 1)` is
+their default in the corpus search. Pass 0 to any of them to get every overlap
+back.
+
+One per cent is a judgement rather than a property of the data, and it was made
+against the borough: over Villeray-Saint-Michel-Parc-Extension it drops 930 of
+28 850 lot × zone pairs, takes the lots reported as split between two zones from
+2 529 to 1 861, and leaves 110 parcels — park and right-of-way remnants whose
+only zoning was a corner clipped off the block beside them — with no zone at
+all, which is a truer answer than a neighbour's grid.
 
 **Layers are loaded under the file slug, not the Spectrum path.** A feature
 parquet carries `source_table = /19_VSMPE/Reglement_urbanisme/VSP_REG_ZONE`,

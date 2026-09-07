@@ -190,7 +190,38 @@ LAYERS ?= ["capacity","streets","lots","buildings","massing"]
 DOMINANT_SHARE ?= 0.85
 MIXED_MIN_SHARE ?= 0.15
 LAND_FACTOR ?= 1.0
+# The factor scales the whole assessed value (land and building) into the
+# yield's denominator and the buyer's price; MARKET_FACTOR is its name and
+# LAND_FACTOR the one it had.
+MARKET_FACTOR ?= $(LAND_FACTOR)
 TOP_N ?= 25
+# The second axis of the same asset - why the site is acquirable: the
+# teardown screen, the heritage switches, the per-square-metre costs each site
+# thesis carries in its denominator, and the shortlist length per site thesis.
+# Every default is explained, with its source, in docs/site-theses.md.
+TEARDOWN_MAX_YEAR ?= 1960
+TEARDOWN_MAX_BUILT_SHARE ?= 0.4
+MIN_STOREY_HEADROOM ?= 2
+EXCLUDE_HERITAGE_SECTORS ?= true
+EXCLUDE_PIIA_SECTORS ?= false
+DEMOLITION_COST_M2 ?= 150
+DEMOLITION_COST_NONRES_M2 ?= 250
+SITE_ASSESSMENT_COST ?= 12000
+REMEDIATION_RES_M2 ?= 150
+REMEDIATION_NONRES_M2 ?= 75
+ADDITION_PREMIUM ?= 1.5
+REQUIRE_POSITIVE_NPV ?= true
+SITE_TOP_N ?= 25
+# The rebuild's timing in the solve (make programs) and the enhancement's in
+# the gap (make hbu): months to build and to fill, the share of the standing
+# income lost during an addition's works, and how many storeys the structure
+# takes. docs/site-theses.md, "Three futures, not one".
+CONSTRUCTION_MONTHS ?= 18
+LEASE_UP_MONTHS ?= 6
+ENHANCE_MONTHS ?= 9
+ENHANCE_LEASE_UP ?= 3
+DISRUPTION_SHARE ?= 0.25
+MAX_ADDED_STOREYS ?= 1
 
 IMAGE ?= urban-rag
 TAG ?= latest
@@ -321,14 +352,14 @@ lot-profiles: | $(UV_SYNC_STAMP) ## Materialize lot_profiles for DATE x NEIGHBOR
 # side; see urban_rag.hbu_assets.ProgramConfig for the rest.
 programs: | $(UV_SYNC_STAMP) ## Materialize lot_development_programs for DATE x NEIGHBORHOOD
 	$(DAGSTER) asset materialize --select silver/lot_development_programs --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE) \
-		--config-json '{"ops":{"silver__lot_development_programs":{"config":{"stalls_per_dwelling":$(STALLS_PER_DWELLING),"residential_cost_per_sqft_cad":$(RES_COST_SQFT),"operating_expense_ratio":$(OPEX),"discount_rate_pct":$(DISCOUNT_PCT),"hold_years":$(HOLD_YEARS),"terminal_cap_rate_pct":$(TERMINAL_CAP_PCT),"new_build_rent_premium_pct":$(RENT_PREMIUM_PCT)}}}}'
+		--config-json '{"ops":{"silver__lot_development_programs":{"config":{"stalls_per_dwelling":$(STALLS_PER_DWELLING),"residential_cost_per_sqft_cad":$(RES_COST_SQFT),"operating_expense_ratio":$(OPEX),"discount_rate_pct":$(DISCOUNT_PCT),"hold_years":$(HOLD_YEARS),"terminal_cap_rate_pct":$(TERMINAL_CAP_PCT),"new_build_rent_premium_pct":$(RENT_PREMIUM_PCT),"construction_months":$(CONSTRUCTION_MONTHS),"lease_up_months":$(LEASE_UP_MONTHS)}}}}'
 
 # Needs gold.lot_highest_best_use and gold.lot_redevelopment_gap (hbu_infra
 # sql/018, sql/019) applied, and `programs` run first for the same partition.
 # lot_redevelopment_gap also needs `comparables` for the same partition - the
 # assessment side it compares against.
-hbu: | $(UV_SYNC_STAMP) ## Materialize lot_highest_best_use and lot_redevelopment_gap for DATE x NEIGHBORHOOD
-	$(DAGSTER) asset materialize --select gold/lot_highest_best_use,gold/lot_redevelopment_gap --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
+hbu: | $(UV_SYNC_STAMP) ## Materialize lot_highest_best_use and lot_redevelopment_gap (with the enhancement solve) for DATE x NEIGHBORHOOD
+	$(DAGSTER) asset materialize --select gold/lot_highest_best_use,gold/lot_redevelopment_gap --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE) 		--config-json '{"ops":{"gold__lot_redevelopment_gap":{"config":{"enhance_construction_months":$(ENHANCE_MONTHS),"enhance_lease_up_months":$(ENHANCE_LEASE_UP),"enhance_disruption_share":$(DISRUPTION_SHARE),"addition_cost_premium":$(ADDITION_PREMIUM),"max_added_storeys":$(MAX_ADDED_STOREYS)}}}}'
 
 # Needs gold.lot_investment_opportunities (hbu_infra sql/021) applied and
 # `hbu` run first for the same partition. Ranks the under-built lots within
@@ -336,9 +367,9 @@ hbu: | $(UV_SYNC_STAMP) ## Materialize lot_highest_best_use and lot_redevelopmen
 # over one parquet, so it is cheap to re-run at a different threshold.
 # DOMINANT_SHARE / MIXED_MIN_SHARE move the facet lines, LAND_FACTOR costs
 # the land at something other than the roll, TOP_N sets the shortlist length.
-opportunities: | $(UV_SYNC_STAMP) ## Rank DATE x NEIGHBORHOOD's under-built lots by thesis
+opportunities: | $(UV_SYNC_STAMP) ## Rank DATE x NEIGHBORHOOD's under-built lots by thesis, and file each under its site thesis
 	$(DAGSTER) asset materialize --select gold/lot_investment_opportunities --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE) \
-		--config-json '{"ops":{"gold__lot_investment_opportunities":{"config":{"dominant_share":$(DOMINANT_SHARE),"mixed_min_share":$(MIXED_MIN_SHARE),"land_value_factor":$(LAND_FACTOR),"top_n":$(TOP_N)}}}}'
+		--config-json '{"ops":{"gold__lot_investment_opportunities":{"config":{"dominant_share":$(DOMINANT_SHARE),"mixed_min_share":$(MIXED_MIN_SHARE),"market_value_factor":$(MARKET_FACTOR),"top_n":$(TOP_N),"teardown_max_year_built":$(TEARDOWN_MAX_YEAR),"teardown_max_built_share":$(TEARDOWN_MAX_BUILT_SHARE),"min_storey_headroom":$(MIN_STOREY_HEADROOM),"exclude_heritage_sectors":$(EXCLUDE_HERITAGE_SECTORS),"exclude_piia_sectors":$(EXCLUDE_PIIA_SECTORS),"demolition_cost_cad_per_m2":$(DEMOLITION_COST_M2),"demolition_cost_cad_per_m2_nonresidential":$(DEMOLITION_COST_NONRES_M2),"site_assessment_cost_cad":$(SITE_ASSESSMENT_COST),"remediation_cost_cad_per_m2_residential":$(REMEDIATION_RES_M2),"remediation_cost_cad_per_m2_nonresidential":$(REMEDIATION_NONRES_M2),"addition_cost_premium":$(ADDITION_PREMIUM),"require_positive_npv":$(REQUIRE_POSITIVE_NPV),"site_top_n":$(SITE_TOP_N)}}}}'
 
 # Needs gold.lot_building_massing (hbu_infra sql/022) and gold.lot_surface_parking
 # (sql/024) applied - this one asset writes both, the building and the asphalt

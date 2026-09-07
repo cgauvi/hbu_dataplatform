@@ -88,14 +88,20 @@ from urban_rag.envelope_assets import LOT_ENVELOPES_FILE, lot_zoning_envelopes
 from urban_rag.frames import write_frame
 from urban_rag.frontage_assets import ROAD_LOTS_FILE, lot_frontage
 from urban_rag.hbu import (
+    ENHANCEMENT_COLUMNS,
+    FUTURE_COLUMNS,
     HBU_STATUSES,
-    ProgramAssumptions,
     cadastral_road_lots,
+    EnhancementRules,
     investment_assumptions_of,
     operating_expense_ratio_of,
+    program_assumptions_of,
+    ProgramAssumptions,
     road_parcel_lots,
     select_highest_best_use,
+    solve_enhancements,
     solve_envelopes,
+    three_futures,
     unit_economics,
     use_gap,
 )
@@ -179,6 +185,8 @@ _GAP_OUTPUT_COLUMNS = (
     "floor_area_gap_sqft",
     "hbu_unit_area_m2",
     "existing_num_dwellings",
+    "existing_num_storeys",
+    "existing_year_built",
     "hbu_num_dwellings",
     "dwelling_gap",
     "existing_annual_gross_income_cad",
@@ -209,6 +217,11 @@ _GAP_OUTPUT_COLUMNS = (
     "existing_dominant_use_code",
     "existing_dominant_use_description",
     "existing_dominant_income_class",
+    # The second future - the building stays and grows - and the verdict
+    # across all three. See `hbu.solve_enhancements` and `hbu.three_futures`.
+    *ENHANCEMENT_COLUMNS,
+    *FUTURE_COLUMNS,
+    "enhance_assumptions",
 )
 
 
@@ -375,6 +388,27 @@ class ProgramConfig(Config):
             "building's proforma."
         ),
     )
+    construction_months: int = Field(
+        default=18,
+        ge=0,
+        description=(
+            "Months from the first dollar of capital to a building ready to "
+            "let. Nothing is collected during them and the whole income "
+            "stream - the annuity and the sale - is pushed out by that much; "
+            "the capital is still spent at day one. 18 is a wood-frame "
+            "mid-rise on a cleared lot; 0 is the building standing on day "
+            "one, which every solve assumed before this existed."
+        ),
+    )
+    lease_up_months: int = Field(
+        default=6,
+        ge=0,
+        description=(
+            "Months from ready to stabilised, with the rent filling linearly, "
+            "so half of them are lost on average and the stream is pushed out "
+            "by half again."
+        ),
+    )
     max_seconds: float = Field(
         default=ProgramAssumptions().max_seconds,
         gt=0.0,
@@ -382,6 +416,39 @@ class ProgramConfig(Config):
             "Seconds CP-SAT may spend on one envelope. Nearly every model here "
             "solves in milliseconds; this bounds the handful that do not, and "
             "num_not_optimal is what says whether it was reached."
+        ),
+    )
+    below_grade_cost_premium: float = Field(
+        default=ConstructionCosts().below_grade_premium,
+        ge=0.0,
+        description=(
+            "What a plate below grade costs over the same plate above it, as "
+            "a fraction of the rate that applies - the excavation, the "
+            "shoring, the waterproofing and the ventilation a sous-sol needs "
+            "and the storey above it does not."
+        ),
+    )
+    below_grade_rent_discount_pct: float = Field(
+        default=InvestmentAssumptions().below_grade_rent_discount_pct,
+        ge=0.0,
+        le=100.0,
+        description=(
+            "What space below grade leases for under the space above it. With "
+            "the cost premium beside it this decides whether a sous-sol is "
+            "built at all, and for the dwellings the margin is a few points: "
+            "at the module defaults a cellar unit is just under water at every "
+            "class CMHC prices, while a cellar shop clears comfortably."
+        ),
+    )
+    basement_levels_allowed: int = Field(
+        default=ProgramAssumptions().basement_levels_allowed,
+        ge=0,
+        description=(
+            "Below-grade levels of usage a program may take where the grid's "
+            "Niveaux de batiment autorises rows authorise any - one cellar by "
+            "default, and 0 to ask what the borough is worth built entirely "
+            "above grade. A modelling bound, not a norm: the grid names the "
+            "level and never counts them."
         ),
     )
 
@@ -425,6 +492,7 @@ class ProgramConfig(Config):
                 residential_cost_per_sqft=self.residential_cost_per_sqft_cad,
                 commercial_cost_per_sqft=self.commercial_cost_per_sqft_cad,
                 industrial_cost_per_sqft=self.industrial_cost_per_sqft_cad,
+                below_grade_premium=self.below_grade_cost_premium,
                 amortization_months=self.amortization_months,
             ),
             non_residential=NonResidentialEconomics(
@@ -445,7 +513,11 @@ class ProgramConfig(Config):
                 terminal_cap_rate_pct=self.terminal_cap_rate_pct,
                 operating_expense_ratio=self.operating_expense_ratio,
                 new_build_rent_premium_pct=self.new_build_rent_premium_pct,
+                below_grade_rent_discount_pct=self.below_grade_rent_discount_pct,
+                construction_months=self.construction_months,
+                lease_up_months=self.lease_up_months,
             ),
+            basement_levels_allowed=self.basement_levels_allowed,
             max_seconds=self.max_seconds,
         )
 
@@ -480,6 +552,10 @@ class ProgramConfig(Config):
         "no kind, and not part of the footprint either), parkable_area_m2 for "
         "the largest parking-shaped rectangle the parcel actually holds, "
         "which is what stops a four-metre lot from parking on its own width, "
+        "placeable_area_m2 for the largest rectangle that fits inside the "
+        "zone's margins - the cap that makes the footprint one the massing "
+        "can actually draw, and the basis of the yard the surface stalls are "
+        "rationed against (lot area less that rectangle, charged whole), "
         "floor_stack saying what "
         "stands on each storey as runs of identical levels, what each part "
         "costs to "
@@ -518,6 +594,7 @@ def lot_development_programs(
             f"{neighborhood} {scrape_date}; there is nothing to solve."
         )
     envelopes = _with_buildable_area(context, store, envelopes, neighborhood, scrape_date)
+    envelopes = _with_placeable_area(context, store, envelopes, neighborhood, scrape_date)
     envelopes = _with_parkable_area(
         context, postgis, envelopes, neighborhood, scrape_date
     )
@@ -636,11 +713,14 @@ def lot_development_programs(
             "num_with_industrial": int((solved["industrial_floors"] > 0).sum()),
             "num_digging": int((solved["underground_levels"] > 0).sum()),
             # The other reason to dig, and the one the density index counts: a
-            # sous-sol of usage. At the module's own rates a cellar dwelling
-            # does not pay for itself and a cellar shop does, so a borough
-            # reporting these on its housing is one where a rent or a cost
-            # moved - see `program.BELOW_GRADE_RENT_DISCOUNT_PCT` for how close
-            # that call is.
+            # sous-sol of usage. Expect these to be commerce and industry
+            # almost entirely - a dwelling may only cellar where the grid marks
+            # *Inferieurs au RDC* (91 of Villeray's 1 555 columns) and even
+            # there does not pay for itself at the module's own rates, so a
+            # borough reporting `total_basement_dwellings` above zero is one
+            # where a rent or a cost moved. See
+            # `program.BELOW_GRADE_RENT_DISCOUNT_PCT` for how close that call
+            # is and `program.BASEMENT_LEVELS` for the permission.
             "num_with_basement": int((solved["basement_levels"] > 0).sum()),
             "total_basement_dwellings": int(solved["basement_dwellings"].sum()),
             "total_basement_floor_area_ha": round(
@@ -662,6 +742,15 @@ def lot_development_programs(
             "num_without_parkable_area": len(frame)
             - _notna_count(frame, "parkable_area_m2"),
             "num_unparkable_lots": _zero_count(frame, "parkable_area_m2"),
+            # The envelope's *shape*: the largest rectangle its margins hold,
+            # which is the cap that makes the solved program one the massing
+            # can draw. A row without it is capped on the two area norms alone
+            # and may be a plate that fits nowhere; a row measuring zero sits
+            # in margins that hold no building, and its program is empty.
+            "num_with_placeable_area": _notna_count(frame, "placeable_area_m2"),
+            "num_without_placeable_area": len(frame)
+            - _notna_count(frame, "placeable_area_m2"),
+            "num_unbuildable_envelopes": _zero_count(frame, "placeable_area_m2"),
             "num_surface_parking": int((solved["surface_stalls"] > 0).sum()),
             "total_surface_parking_ha": round(
                 float(solved["surface_area_m2"].sum()) / 10_000.0, 2
@@ -886,10 +975,85 @@ def lot_highest_best_use(
     )
 
 
+class GapConfig(Config):
+    """How the second future is priced: the addition's timing, what the works
+    cost the building that keeps earning, and how far the structure may go.
+
+    Every field is a stated assumption, recorded on every row as
+    `enhance_assumptions`, and `urban_rag.hbu.EnhancementRules` is what says
+    why each default is what it is. The rebuild's own timing is on
+    `ProgramConfig`, because it is the solve's objective; this is the
+    enhancement's, because that solve happens here.
+    """
+
+    enhance_construction_months: int = Field(
+        default=EnhancementRules().construction_months,
+        ge=0,
+        description=(
+            "Months the addition takes to build - shorter than a rebuild, the "
+            "shell being there."
+        ),
+    )
+    enhance_lease_up_months: int = Field(
+        default=EnhancementRules().lease_up_months,
+        ge=0,
+        description="Months the added floor takes to fill, linearly.",
+    )
+    enhance_disruption_share: float = Field(
+        default=EnhancementRules().disruption_share,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Share of the standing building's NOI lost while the works are "
+            "on: tenants decanted, a shop behind hoarding."
+        ),
+    )
+    addition_cost_premium: float = Field(
+        default=EnhancementRules().addition_cost_premium,
+        gt=0.0,
+        description=(
+            "What a square foot of addition costs as a multiple of new build - "
+            "the shoring, the tie-ins, the crane over an occupied site."
+        ),
+    )
+    max_added_storeys: int = Field(
+        default=EnhancementRules().max_added_storeys,
+        ge=0,
+        description=(
+            "Storeys the structure takes on top of what stands. One is a "
+            "wood-frame plex's; the grid's own ceiling still applies."
+        ),
+    )
+    enhance_max_seconds: float = Field(
+        default=EnhancementRules().max_seconds,
+        gt=0.0,
+        description="Seconds CP-SAT may spend on one enhancement.",
+    )
+
+    def rules(self) -> EnhancementRules:
+        return EnhancementRules(
+            construction_months=self.enhance_construction_months,
+            lease_up_months=self.enhance_lease_up_months,
+            disruption_share=self.enhance_disruption_share,
+            addition_cost_premium=self.addition_cost_premium,
+            max_added_storeys=self.max_added_storeys,
+            max_seconds=self.enhance_max_seconds,
+        )
+
+
 @asset(
     key_prefix=key_prefix("lot_redevelopment_gap"),
     partitions_def=scrape_partitions,
-    deps=[lot_highest_best_use, lot_assessment_comparables],
+    deps=[
+        lot_highest_best_use,
+        lot_assessment_comparables,
+        # The enhancement is solved here, against the zone's own rule-set and
+        # the borough's rents - the same three inputs the rebuild was solved
+        # on, read again so the two futures are priced on one footing.
+        lot_zoning_envelopes,
+        average_rents,
+        vacancy_rates,
+    ],
     group_name=GOLD_GROUP,
     kinds={"parquet", "postgres"},
     description=(
@@ -922,6 +1086,7 @@ def lot_highest_best_use(
 )
 def lot_redevelopment_gap(
     context: AssetExecutionContext,
+    config: GapConfig,
     store: ParquetStore,
     postgis: PostgisResource,
 ) -> MaterializeResult:
@@ -956,6 +1121,48 @@ def lot_redevelopment_gap(
     computed = use_gap(
         hbu, existing, operating_expense_ratio=opex, investment=investment
     )
+
+    # The second future. The standing building is retained and the solver
+    # adds to it, on the rebuild's own rates read back off its rows and the
+    # addition's own timing from this run's config - see `hbu.solve_
+    # enhancements`. Then the three futures side by side and the owner's
+    # verdict among them, before the site's own costs, which the shortlist
+    # adds when it prices the buyer.
+    envelopes = _read(
+        store,
+        lot_zoning_envelopes,
+        LOT_ENVELOPES_FILE,
+        neighborhood=neighborhood,
+        scrape_date=scrape_date,
+    )
+    economics, _suppressed = unit_economics(
+        _read(
+            store,
+            average_rents,
+            AVERAGE_RENTS_FILE,
+            neighborhood=neighborhood,
+            scrape_date=scrape_date,
+        ),
+        _read(
+            store,
+            vacancy_rates,
+            VACANCY_FILE,
+            neighborhood=neighborhood,
+            scrape_date=scrape_date,
+        ),
+    )
+    rules = config.rules()
+    enhancements = solve_enhancements(
+        computed,
+        existing,
+        envelopes,
+        economics,
+        assumptions=program_assumptions_of(hbu),
+        rules=rules,
+    )
+    computed = pd.concat([computed, enhancements], axis=1)
+    computed = pd.concat([computed, three_futures(computed)], axis=1)
+    computed["enhance_assumptions"] = json.dumps(rules.as_metadata(), ensure_ascii=False)
     # Narrowed to the comparison itself - see `_GAP_OUTPUT_COLUMNS`. `use_gap`
     # carries the whole hbu frame along for a caller holding it in memory; a
     # reader of the table wants gold.lot_highest_best_use for the envelope and
@@ -1001,6 +1208,35 @@ def lot_redevelopment_gap(
             "num_with_assessment": matched,
             "num_without_assessment": len(frame) - matched,
             "num_underbuilt": underbuilt,
+            # The second future, by the numbers: how many lots could be
+            # solved with their building retained, how many of those additions
+            # pay after the disruption, and which future wins where.
+            "num_enhancements_solved": int(frame["enhance_solved"].sum()),
+            "num_enhancements_paying": int(
+                (frame["enhance_gain_cad"].fillna(0.0) > 0).sum()
+            ),
+            "enhancement_status_counts": MetadataValue.json(
+                {
+                    str(name): int(count)
+                    for name, count in frame["enhance_status"]
+                    .value_counts(dropna=True)
+                    .items()
+                }
+            ),
+            "total_enhancement_added_dwellings": _sum_int(
+                frame, "enhance_added_dwellings"
+            ),
+            "total_enhancement_added_floor_ha": _sum_ha(
+                frame, "enhance_added_floor_area_m2"
+            ),
+            "total_enhancement_gain_millions": _sum_millions(frame, "enhance_gain_cad"),
+            "best_future_counts": MetadataValue.json(
+                {
+                    str(name): int(count)
+                    for name, count in frame["best_future"].value_counts(dropna=True).items()
+                }
+            ),
+            "enhance_assumptions": MetadataValue.json(rules.as_metadata()),
             "pct_underbuilt": round(100.0 * underbuilt / len(frame), 1)
             if len(frame)
             else 0.0,
@@ -1162,6 +1398,116 @@ def _with_buildable_area(
         on=list(_ENVELOPE_KEYS),
         how="left",
     )
+
+
+def _with_placeable_area(
+    context: AssetExecutionContext,
+    store: ParquetStore,
+    envelopes: pd.DataFrame,
+    neighborhood: str,
+    scrape_date: str,
+) -> pd.DataFrame:
+    """The envelopes, plus the largest building each column's margins hold.
+
+    `_with_buildable_area` above merges the envelope's *area*, and an area is
+    not a footprint: an 8 886 m2 envelope shaped like a skewed parallelogram
+    takes no rectangle above about 5 519 m2, and `solve_program` capped on the
+    area alone will price the 8 886 and hand `lot_building_massing` a plate to
+    shrink afterwards - by which point the dwellings and the NPV are already
+    computed on ground the parcel never had. `massing.placeable_area_m2` asks
+    the same question `fit_rectangle` will ask later, before the solve instead
+    of after it, so the two agree by construction.
+
+    Read from the setbacks **geoparquet** rather than from the table, because
+    what is needed here is the polygon and `_with_buildable_area` keeps only
+    the number. At the (lot, zone, column) grain the envelope belongs to - a
+    margin is printed in a zoning column, so a lot governed by two columns with
+    different setbacks has two envelopes and two answers, unlike
+    `parkable_area_m2`, which is the parcel's own shape and is broadcast.
+
+    Optional exactly as its two neighbours are, and the fallback is the
+    behaviour every run had before this existed: the footprint capped on the
+    two area norms and the yard on ``lot area - footprint``. Cached on the
+    envelope's WKB because a grid whose columns print the same four margins
+    carves the same polygon in each of them, and the fit is the expensive part
+    of this asset's setup.
+    """
+    import geopandas as gpd
+
+    from urban_rag.massing import placeable_area_m2, to_metric
+
+    partition_dir = store.partition_dir(
+        lot_buildable_setbacks.key.path[-1], scrape_date, neighborhood
+    )
+    path = join(partition_dir, LOT_SETBACKS_FILE)
+    if not filesystem(path).exists(path):
+        context.log.warning(
+            "%s is missing, so no envelope's shape was measured: every "
+            "footprint is capped on area alone and may be a plate that fits "
+            "nowhere on its parcel - materialize %s for this partition",
+            path,
+            lot_buildable_setbacks.key.path[-1],
+        )
+        return envelopes
+
+    try:
+        setbacks = gpd.read_parquet(path, storage_options=storage_options(path))
+    except ValueError as exc:
+        # A plain parquet where a geoparquet was expected: the envelope's area
+        # is in the file and its polygon is not, so there is nothing to fit a
+        # rectangle in. Warned rather than raised for the reason the missing
+        # file above is - the area caps still work, and the shape cap is the
+        # improvement rather than the contract.
+        context.log.warning(
+            "%s carries no geometry (%s), so no envelope's shape was "
+            "measured: every footprint is capped on area alone and may be a "
+            "plate that fits nowhere on its parcel - re-materialize %s for "
+            "this partition",
+            path,
+            exc,
+            lot_buildable_setbacks.key.path[-1],
+        )
+        return envelopes
+
+    missing = [name for name in _ENVELOPE_KEYS if name not in setbacks.columns]
+    if missing:
+        raise Failure(
+            f"{path} has no {', '.join(missing)} column - it was not written "
+            f"by {lot_buildable_setbacks.key.path[-1]}."
+        )
+
+    # In metres once, for the whole borough: a rectangle fitted in square
+    # degrees is not a rectangle, and is not the one the massing will draw.
+    projected = to_metric(setbacks)
+    cache: dict[bytes, float] = {}
+    measured: dict[tuple, float] = {}
+    for row in projected.itertuples(index=False):
+        geometry = row.geometry
+        if geometry is None or geometry.is_empty:
+            continue
+        key = geometry.wkb
+        area = cache.get(key)
+        if area is None:
+            area = placeable_area_m2(geometry)
+            cache[key] = area
+        measured[(row.lot_uid, row.feature_id, row.column_index)] = area
+
+    keys = pd.MultiIndex.from_frame(envelopes[list(_ENVELOPE_KEYS)])
+    placeable = pd.Series(
+        [measured.get(key) for key in keys], index=envelopes.index, dtype="float64"
+    )
+    unbuildable = int((placeable == 0).sum())
+    context.log.info(
+        "%s %s: envelope shape measured on %d of %d row(s) from %d distinct "
+        "polygon(s); %d row(s) sit in margins that hold no building at all",
+        neighborhood,
+        scrape_date,
+        int(placeable.notna().sum()),
+        len(envelopes),
+        len(cache),
+        unbuildable,
+    )
+    return envelopes.assign(placeable_area_m2=placeable)
 
 
 def _notna_count(frame: pd.DataFrame, column: str) -> int:

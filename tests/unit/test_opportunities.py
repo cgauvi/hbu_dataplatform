@@ -24,7 +24,16 @@ from dagster import Failure, MultiPartitionKey, materialize
 
 from asset_helpers import materialization_metadata, stub_publish
 from urban_rag import opportunity_assets
-from urban_rag.hbu_assets import LOT_GAP_FILE, lot_redevelopment_gap
+from urban_rag.comparables_assets import (
+    LOT_COMPARABLES_FILE,
+    lot_assessment_comparables,
+)
+from urban_rag.hbu_assets import (
+    LOT_GAP_FILE,
+    LOT_HBU_FILE,
+    lot_highest_best_use,
+    lot_redevelopment_gap,
+)
 from urban_rag.frames import write_frame
 from urban_rag.opportunities import (
     COMMERCIAL,
@@ -205,7 +214,7 @@ def test_the_land_factor_scales_only_the_land():
         }
     )
 
-    assert yield_on_cost_pct(frame, land_value_factor=1.5).iloc[0] == pytest.approx(
+    assert yield_on_cost_pct(frame, market_value_factor=1.5).iloc[0] == pytest.approx(
         100.0 * 120_000.0 / (1_500_000.0 + 600_000.0)
     )
 
@@ -407,13 +416,51 @@ BOROUGH = [
 
 @pytest.fixture
 def borough(store):
+    """The gap partition, plus the two the second axis reads beside it.
+
+    The HBU and comparables files are the thinnest frames the asset accepts -
+    a storey count and a footprint per lot, a year and a storey count per
+    number - so these tests stay about the first axis. The zone columns file
+    is left out: it is the one optional input, and `test_site_theses.py`
+    covers both its presence and its absence.
+    """
+    gap = gap_frame(BOROUGH)
     write_frame(
-        gap_frame(BOROUGH),
+        gap,
         join(
             store.partition_dir(
                 lot_redevelopment_gap.key.path[-1], DATE, NEIGHBORHOOD
             ),
             LOT_GAP_FILE,
+        ),
+    )
+    write_frame(
+        pd.DataFrame(
+            {
+                "lot_uid": gap["lot_uid"],
+                "floors": 6,
+                "footprint_m2": 180.0,
+                "grid_zone": "H01-001",
+                "feature_id": "H01-001",
+                "source_table": "ZONAGE",
+            }
+        ),
+        join(
+            store.partition_dir(
+                lot_highest_best_use.key.path[-1], DATE, NEIGHBORHOOD
+            ),
+            LOT_HBU_FILE,
+        ),
+    )
+    write_frame(
+        pd.DataFrame(
+            {"lot_number": gap["lot_number"], "year_built": 1950, "num_storeys": 2}
+        ),
+        join(
+            store.partition_dir(
+                lot_assessment_comparables.key.path[-1], DATE, NEIGHBORHOOD
+            ),
+            LOT_COMPARABLES_FILE,
         ),
     )
     return store
@@ -494,21 +541,21 @@ def test_every_row_records_the_thresholds_behind_its_facet(borough):
         borough,
         dominant_share=0.9,
         mixed_min_share=0.10,
-        land_value_factor=1.3,
+        market_value_factor=1.3,
         top_n=2,
     )
 
     payload = json.loads(written(borough)["screen_assumptions"].iloc[0])
     assert payload["dominant_share"] == 0.9
     assert payload["mixed_min_share"] == 0.10
-    assert payload["land_value_factor"] == 1.3
+    assert payload["market_value_factor"] == 1.3
     assert payload["top_n"] == 2
 
 
 def test_the_land_factor_moves_every_yield(borough):
     run(borough)
     at_roll = written(borough)["yield_on_cost_pct"].dropna()
-    run(borough, land_value_factor=2.0)
+    run(borough, market_value_factor=2.0)
     dearer = written(borough)["yield_on_cost_pct"].dropna()
 
     assert (dearer < at_roll).all()

@@ -765,6 +765,66 @@ FRONTAGE_NO_BUFFER = 0.0
 #: `test_no_parcel_is_a_sliver_away_from_the_street` pins.
 _SLIVER_GAP_M = 0.5
 
+#: The reaches the *fallback* measure tries, in metres and in order, on the
+#: lots the shared edge above leaves with nothing at all.
+#:
+#: **Why there is a fallback at all.** The shared edge is exact and it is the
+#: right measure, but it answers only where the cadastre lets it: a parcel has
+#: frontage when it abuts the road lot, and a parcel separated from the
+#: roadway by a *third* parcel abuts nothing. Villeray has that arrangement in
+#: quantity - lot 6 291 714 reads 19.06 m of boulevard Pie-IX under the old
+#: measure and nothing under this one, because two road-widening strips of
+#: 38.9 m2 and 23.2 m2 lie between it and the roadway, and a strip carrying no
+#: geobase side inside it is not a road lot. On 2026-09-01 that left 560 lots
+#: the solver still prices with no frontage at all, and a missing frontage is
+#: not neutral downstream: `envelope_assets` reads it as 0 m, every *Largeur du
+#: terrain min* column drops out, and the parcel is quietly held to the
+#: narrowest rule its zone prints.
+#:
+#: **So the buffer comes back, and only here.** It measures nothing that the
+#: shared edge already measured - a lot with a step-1 row never reaches this -
+#: which is what keeps `FRONTAGE_NO_BUFFER`'s argument intact: no tolerance is
+#: added to any parcel that has a real edge, and the borough-wide tax that
+#: argument is about is never levied. What is left is a choice between an
+#: estimate and a null on the parcels that would otherwise carry nothing, and
+#: an estimate is what the reader downstream can act on.
+#:
+#: Two tries, 8 m then 16 m. Eight is past the widening strips (2.72 m of
+#: separation on the subject lot) and past the setback the old measure needed
+#: 10 m to clear, while staying under half a Villeray roadway, so a side of the
+#: *far* pavement cannot be the nearest one. Sixteen doubles it for the parcels
+#: set back further, and it is the last try: a lot that faces no street line
+#: within 16 m is not a parcel a reach can rescue, and widening further starts
+#: crediting interior lots with the street beyond their neighbours. The tier
+#: that produced a row is written to `silver.lot_frontage.buffer_m`, so which
+#: measure answered is on the row rather than inferred.
+DEFAULT_FRONTAGE_FALLBACK_BUFFERS_M: tuple[float, ...] = (8.0, 16.0)
+
+#: How much of a boundary segment has to run *along* a street side for the
+#: fallback to read it as frontage, as a share of the segment's own length.
+#:
+#: A reach wide enough to find the street is also wide enough to find the
+#: lot's own side boundaries, and this is what throws them back out - the
+#: problem the old measure solved by chopping the boundary into one-metre
+#: pieces and testing each for parallelism. The cadastre already carries the
+#: pieces: a parcel is stored as vertices, so `ST_DumpSegments` hands back the
+#: front edge, the two side edges and the rear as four straight segments, and
+#: no chopping is needed.
+#:
+#: The test on one segment is its *projection* onto the street side - the
+#: distance between the closest points of its two endpoints - over its own
+#: length. A segment running parallel to the side projects onto its full
+#: length and scores 1; one running square away from it projects onto almost
+#: nothing and scores 0. That is `cos(theta)` without an azimuth to unwrap, so
+#: 0.707 is 45 degrees, the same reading the old measure kept.
+#:
+#: Worth knowing where it is imperfect: a side shorter than the segment it is
+#: being compared against saturates at its own endpoints and scores low, so a
+#: parcel facing a stub of street line can be refused frontage the reach did
+#: reach. That is the conservative direction, and it is why the threshold is
+#: 45 degrees rather than something tighter.
+FRONTAGE_PARALLEL_RATIO = 0.7071067811865476
+
 #: How many of the lots that faced no street a run names. The count is the
 #: measure of how bad a partition is; this sample is only where to start
 #: looking, so it is small enough to read in a log line and in asset metadata.
@@ -782,12 +842,193 @@ _FRONTAGE_RELATIONS: tuple[tuple[str, str], ...] = (
 )
 
 
+#: The fallback measure, run once per reach in `DEFAULT_FRONTAGE_FALLBACK_BUFFERS_M`.
+#:
+#: Reads the two temp tables `compute_lot_frontage` has already built and the
+#: partition of `silver.lot_frontage` it has already written, which is what
+#: makes this the *second* step rather than a second measure: `candidates` is
+#: every non-road parcel that came out of step one with no row, and a tier
+#: after the first sees only what the tier before it could not place.
+_FALLBACK_FRONTAGE_SELECT = """
+    WITH candidates AS (
+        SELECT l.lot_uid, l.lot_number, l.neighborhood, l.scrape_date,
+               l.geom, l.lot_perimeter_m
+        FROM _frontage_lots l
+        -- A road lot fronts on nothing here for the same reason it fronts on
+        -- nothing in step one: it is the street.
+        WHERE NOT EXISTS (
+            SELECT 1 FROM _frontage_road_sides r WHERE r.road_lot_uid = l.lot_uid
+        )
+          AND NOT EXISTS (
+              SELECT 1 FROM silver.lot_frontage f
+              WHERE f.lot_uid = l.lot_uid
+                AND f.neighborhood = l.neighborhood
+                AND f.scrape_date = l.scrape_date
+          )
+    ),
+    -- The parcel's own straight edges, as surveyed. The old measure cut the
+    -- boundary into one-metre pieces to have something to test for
+    -- parallelism; the cadastre stores the pieces already, and a rectangular
+    -- lot dumps into exactly the four edges a reader would name.
+    segments AS (
+        SELECT c.lot_uid, seg.geom
+        FROM candidates c
+        CROSS JOIN LATERAL ST_DumpSegments(c.geom) AS seg
+        WHERE ST_Length(seg.geom) > 0
+    ),
+    -- Which of those edges face a street, and which street that is. The side
+    -- is chosen per edge and nearest-first, so a corner parcel's two edges
+    -- name their own streets and neither of them can name the far pavement of
+    -- one road - at these reaches the near side is always closer.
+    faced AS (
+        SELECT s.lot_uid, s.geom, ST_Length(s.geom) AS edge_m,
+               near.cote_rue_id, near.street_name
+        FROM segments s
+        CROSS JOIN LATERAL (
+            SELECT f.cote_rue_id, f.street_name, f.geom
+            FROM _frontage_sides f
+            WHERE ST_DWithin(f.geom, s.geom, %(buffer_m)s::double precision)
+            ORDER BY f.geom <-> s.geom
+            LIMIT 1
+        ) AS near
+        -- Wholly inside the reach, not merely touching it: a side boundary
+        -- running away from the street has one end near it and one end far,
+        -- and this is the first of the two tests that drops it.
+        WHERE ST_DWithin(
+                  near.geom, ST_StartPoint(s.geom), %(buffer_m)s::double precision
+              )
+          AND ST_DWithin(
+                  near.geom, ST_EndPoint(s.geom), %(buffer_m)s::double precision
+              )
+          -- And the second: how much of the edge's length projects onto the
+          -- street. See `FRONTAGE_PARALLEL_RATIO`.
+          AND ST_Distance(
+                  ST_ClosestPoint(near.geom, ST_StartPoint(s.geom)),
+                  ST_ClosestPoint(near.geom, ST_EndPoint(s.geom))
+              ) >= %(parallel_ratio)s::double precision * ST_Length(s.geom)
+    ),
+    -- One row per (lot, street side), ranked and merged exactly as step one
+    -- does it, so a fallback row is the same shape of answer as an exact one
+    -- and `frontage_rank` means what it means everywhere else.
+    measured AS (
+        SELECT
+            c.scrape_date,
+            c.neighborhood,
+            c.lot_uid,
+            c.lot_number,
+            f.cote_rue_id,
+            max(f.street_name) AS street_name,
+            sum(f.edge_m) AS frontage_m,
+            c.lot_perimeter_m,
+            row_number() OVER (
+                PARTITION BY c.lot_uid
+                ORDER BY sum(f.edge_m) DESC, f.cote_rue_id
+            ) AS frontage_rank,
+            ST_Transform(ST_LineMerge(ST_Collect(f.geom)), 4326) AS geom
+        FROM faced f
+        JOIN candidates c ON c.lot_uid = f.lot_uid
+        GROUP BY c.scrape_date, c.neighborhood, c.lot_uid, c.lot_number,
+                 c.lot_perimeter_m, f.cote_rue_id
+    )
+    SELECT
+        scrape_date, neighborhood, lot_uid, cote_rue_id, lot_number,
+        street_name,
+        -- The reach that answered, on the row. `FRONTAGE_NO_BUFFER` marks the
+        -- exact rows; anything else marks an estimate and says how wide a one.
+        %(buffer_m)s::double precision, frontage_m, lot_perimeter_m,
+        CASE WHEN lot_perimeter_m > 0
+             THEN 100.0 * frontage_m / lot_perimeter_m
+             ELSE 0.0
+        END,
+        frontage_rank,
+        geom
+    FROM measured
+    WHERE frontage_m > 0
+"""
+
+
+def _measure_fallback_frontage(
+    cursor: "Cursor",
+    *,
+    neighborhood: str,
+    scrape_date: str,
+    buffers_m: Sequence[float],
+    parallel_ratio: float = FRONTAGE_PARALLEL_RATIO,
+) -> dict[str, object]:
+    """Step two: reach for a street on the lots step one placed nowhere.
+
+    One pass per reach, widest last, each one seeing only the parcels the pass
+    before it could not place - so a lot gets at most as many tries as
+    ``buffers_m`` is long, and the narrowest reach that finds its street is the
+    one that measures it. That ordering is the whole of the "progressively
+    larger" part: a parcel is never measured at 16 m when 8 m would have done,
+    because at 8 m it already has a row and drops out of `candidates`.
+
+    ``prune=False`` on every pass, which is what makes this additive: step one
+    has already published its partition and pruned it, and a pass here inserts
+    the rows for parcels that partition does not mention and touches nothing
+    else. Running with an empty ``buffers_m`` therefore leaves the exact
+    measure exactly as it was, which is the configuration to reach for when a
+    partition should carry no estimates at all.
+
+    Returns the counts the caller reports: rows written, lots placed, and the
+    same split by reach, since "how many needed 16 m" is the number that says
+    whether the ladder is the right shape for a borough.
+    """
+    written = 0
+    by_buffer: dict[str, int] = {}
+    for buffer_m in buffers_m:
+        result = warehouse.upsert_select(
+            cursor,
+            "lot_frontage",
+            (
+                "scrape_date",
+                "neighborhood",
+                "lot_uid",
+                "cote_rue_id",
+                "lot_number",
+                "street_name",
+                "buffer_m",
+                "frontage_m",
+                "lot_perimeter_m",
+                "pct_of_perimeter",
+                "frontage_rank",
+                "geom",
+            ),
+            _FALLBACK_FRONTAGE_SELECT,
+            {
+                "buffer_m": float(buffer_m),
+                "parallel_ratio": float(parallel_ratio),
+            },
+            neighborhood=neighborhood,
+            scrape_date=scrape_date,
+            prune=False,
+        )
+        written += int(result["upserted"])
+        cursor.execute(
+            """
+            SELECT count(DISTINCT lot_uid) FROM silver.lot_frontage
+            WHERE neighborhood = %s AND scrape_date = %s::date
+              AND buffer_m = %s::double precision
+            """,
+            [neighborhood, scrape_date, float(buffer_m)],
+        )
+        (placed,) = cursor.fetchone()
+        by_buffer[f"{float(buffer_m):g}"] = int(placed)
+    return {
+        "frontages": written,
+        "lots": sum(by_buffer.values()),
+        "by_buffer": by_buffer,
+    }
+
+
 def compute_lot_frontage(
     connection: "Connection",
     *,
     neighborhood: str,
     scrape_date: str,
     min_street_m: float = DEFAULT_ROAD_LOT_MIN_STREET_M,
+    fallback_buffers_m: Sequence[float] = DEFAULT_FRONTAGE_FALLBACK_BUFFERS_M,
 ) -> dict[str, object]:
     """(Re)compute `silver.lot_frontage` for one (neighborhood, scrape_date).
 
@@ -857,12 +1098,35 @@ def compute_lot_frontage(
     column to filter on when a question wants *the* street a lot fronts on
     rather than every street it touches. A corner lot legitimately has two.
 
-    A road lot gets no row of its own and is not counted among the lots facing
-    nothing - a street does not front on itself. A lot with no row shares no
-    boundary with any road lot: a genuine interior parcel, one reached only by
-    a lane, or a street snapshot that stops short of it. The caller gets the
-    count and a sample; see the `lots_without_frontage` key in the returned
-    dict, which `frontage_assets` surfaces as metadata.
+    **Two steps, and the second one only runs where the first found nothing.**
+    Everything above is step one and it is unchanged. What it cannot answer is
+    a parcel that abuts no road lot because a *third* parcel lies between it
+    and the roadway - a road-widening strip, most often - and Villeray has
+    those in quantity: 560 lots the solver still prices came out of step one
+    with no frontage at all on 2026-09-01, which downstream reads as 0 m and
+    holds the parcel to the narrowest column its zone prints. So those lots,
+    and only those, are measured again with a reach: the boundary segments
+    running within `FRONTAGE_PARALLEL_RATIO` of parallel to a street side and
+    wholly within it, at 8 m and then at 16 m, stopping at whichever tier first
+    places the lot. See `DEFAULT_FRONTAGE_FALLBACK_BUFFERS_M` for why those two
+    numbers, `FRONTAGE_PARALLEL_RATIO` for why a reach needs an angle test, and
+    `_measure_fallback_frontage` for the pass itself.
+
+    The two are told apart on the row rather than by provenance: `buffer_m` is
+    `FRONTAGE_NO_BUFFER` on an exact edge and the reach that found it on an
+    estimate. Nothing measured exactly is touched, so the argument under
+    `FRONTAGE_NO_BUFFER` - that a tolerance taxes every parcel in the borough
+    to insure against a survey gap - still holds: no parcel with a real edge
+    pays anything. ``fallback_buffers_m=()`` turns the second step off and
+    gives back exactly the table this function wrote before it existed.
+
+    A road lot gets no row of its own, from either step, and is not counted
+    among the lots facing nothing - a street does not front on itself. A lot
+    with no row after both steps shares no boundary with any road lot *and*
+    faces no street line within 16 m: a genuine interior parcel, one reached
+    only by a lane, or a street snapshot that stops short of it. The caller
+    gets the count and a sample; see the `lots_without_frontage` key in the
+    returned dict, which `frontage_assets` surfaces as metadata.
 
     **The road lots themselves come back too**, under `road_lots`, and that is
     not a by-product. "This parcel is the roadway" is a fact the rest of the
@@ -1086,6 +1350,16 @@ def compute_lot_frontage(
         scrape_date=scrape_date,
     )
 
+    # Step two, on the parcels step one placed nowhere. After the upsert above
+    # rather than beside it, because "still has no row" is a question about the
+    # published partition and this is the statement that makes it answerable.
+    fallback = _measure_fallback_frontage(
+        cursor,
+        neighborhood=neighborhood,
+        scrape_date=scrape_date,
+        buffers_m=fallback_buffers_m,
+    )
+
     cursor.execute(
         """
         SELECT count(DISTINCT lot_uid), count(DISTINCT cote_rue_id),
@@ -1178,8 +1452,17 @@ def compute_lot_frontage(
     (num_lots_near_road_without_frontage,) = cursor.fetchone()
 
     return {
-        "frontages": result["upserted"],
+        "frontages": result["upserted"] + int(fallback["frontages"]),
         "pruned": result["pruned"],
+        # The two steps, told apart. `frontages` above is the table; these say
+        # how much of it is the exact edge and how much is a reach, which is
+        # the split to watch: a partition where the fallback places thousands
+        # of lots is one where the road lots are not being found, and the fix
+        # is upstream rather than a wider reach.
+        "frontages_exact": result["upserted"],
+        "frontages_from_buffer": int(fallback["frontages"]),
+        "lots_from_buffer": int(fallback["lots"]),
+        "lots_by_buffer": fallback["by_buffer"],
         "lots_matched": int(lots_matched),
         "streets_matched": int(streets_matched),
         "total_frontage_m": float(total_frontage_m),
@@ -2025,17 +2308,54 @@ DEFAULT_MAX_BUILT_AREA_M2 = 30.0
 #: cutoff belongs to the question being asked - and this is the value each
 #: question that asks "which zone governs this lot" answers at.
 #:
-#: Absolute rather than proportional because the artefact has an absolute size,
-#: while a percentage means one thing on a 200 m2 duplex parcel and quite
-#: another on Parc Jarry. That is what separates it from
-#: `EnvelopeConfig.min_pct_of_lot`, which is a judgement about the borough and
-#: is why that one defaults to keeping everything and this one does not.
+#: Absolute because one half of the artefact has an absolute size: a survey
+#: disagreement measured in centimetres, times the length of a lot line, is
+#: the same few square metres on a 200 m2 duplex parcel and on Parc Jarry.
+#: `MIN_ZONE_PCT_OF_LOT` is the other half, and the two are applied together
+#: because neither catches what the other does.
 #:
 #: Read by `EnvelopeConfig.min_overlap_m2` and by `compute_lot_profiles`.
 #: hbu_infra's `rag.search_at_lot_number` and hbu_rag_map's
 #: `queries.MIN_ZONE_OVERLAP_M2` are the same square metre in the two repos
 #: that cannot import this one.
 MIN_ZONE_OVERLAP_M2 = 1.0
+
+#: How much of a lot a zone has to cover, as a percentage of the lot, before
+#: it counts as covering it at all.
+#:
+#: The proportional half of the same artefact cutoff, and it exists because a
+#: square metre is not a large number on a lot line. Lot 6 291 714 in
+#: Villeray-Saint-Michel-Parc-Extension is 438 m2 and the case to picture: the
+#: cadastre and the zoning layer put 437.23 m2 of it in H03-126 and 1.19 m2 -
+#: 0.27 per cent - in C03-130. That sliver clears `MIN_ZONE_OVERLAP_M2` by a
+#: fifth of a square metre and is still the two publishers missing each other,
+#: so the parcel was reported as straddling two zones and priced twice over: a
+#: commercial grid governing a quarter of a per cent of it standing beside the
+#: residential one governing the rest, as though an owner had a choice.
+#:
+#: Proportional because the other half of the artefact scales with the parcel:
+#: 1.19 m2 is noise on a 438 m2 duplex lot, while the same 1.19 m2 on a 40 m2
+#: remnant would be three per cent of it and worth stating. A percentage is
+#: what tells those two apart, and a square metre is what tells apart the few
+#: centimetres at the corner of a park from a genuine 0.5 per cent of it.
+#:
+#: **One per cent, and it is a judgement rather than a property of the data.**
+#: It was chosen against the borough: over Villeray-Saint-Michel-Parc-Extension
+#: it removes 930 of 28 850 lot x zone pairs, takes the count of lots reported
+#: as split between two zones from 2 529 to 1 861, and leaves 110 parcels with
+#: no zone at all - large ones, park and right-of-way remnants whose only
+#: zoning was a corner clipped off the block beside them, and which are more
+#: honestly reported as unzoned than as governed by a neighbour's grid. It
+#: also settles 233 highest-and-best-use rows over 182 parcels that were
+#: decided on a zone governing under one per cent of the lot - 114 of those
+#: parcels had the real zone sitting right there and unchosen, and the other
+#: 68 had nothing but the sliver.
+#:
+#: Read wherever `MIN_ZONE_OVERLAP_M2` is, and always beside it: a zone has to
+#: clear both. hbu_infra's `rag.search_at_lot_number` and hbu_rag_map's
+#: `queries.MIN_ZONE_PCT_OF_LOT` are the same one per cent in the two repos
+#: that cannot import this one.
+MIN_ZONE_PCT_OF_LOT = 1.0
 
 #: The relations `compute_lot_profiles` reads, and the hbu_infra file that
 #: creates each. Checked up front so a partition fails naming what to apply
@@ -2138,6 +2458,7 @@ def compute_lot_profiles(
     scrape_date: str,
     max_built_area_m2: float = DEFAULT_MAX_BUILT_AREA_M2,
     min_overlap_m2: float = MIN_ZONE_OVERLAP_M2,
+    min_pct_of_lot: float = MIN_ZONE_PCT_OF_LOT,
     vacancy_rates: dict | None = None,
     average_rents: dict | None = None,
     construction_costs: dict | None = None,
@@ -2153,9 +2474,13 @@ def compute_lot_profiles(
     * `silver.lot_frontage`  -> `primary_*` and `secondary_*`, `num_frontages`
     * `rag.lot_documents` -> `doc_*` and the `documents` array
 
-    That third one is read at `min_overlap_m2`: a zone clipping under a square
-    metre of a parcel contributes no document to it, because it is not a zone
-    the parcel is in. See `MIN_ZONE_OVERLAP_M2`.
+    That third one is read at `min_overlap_m2` *and* `min_pct_of_lot`: a zone
+    clipping under a square metre of a parcel, or under one per cent of it,
+    contributes no document to it, because it is not a zone the parcel is in.
+    The two cutoffs are both needed and neither implies the other - a square
+    metre is nothing on a park and a real share of a remnant, one per cent is
+    a hand's breadth on a duplex lot and half a hectare on Parc Jarry. See
+    `MIN_ZONE_OVERLAP_M2` and `MIN_ZONE_PCT_OF_LOT`.
 
     A fourth table joins without a CTE, because it is the one input that
     already arrives at this grain:
@@ -2360,13 +2685,18 @@ def compute_lot_profiles(
             -- the feature that covers most of the lot is what makes
             -- `num_documents` a count of documents rather than of overlaps.
             --
-            -- The area cutoff is what keeps it a count of documents that
-            -- *apply*. A parcel clipping a square metre of the block next door
-            -- picks up that block's grid, and it lands in `documents` and in
-            -- `num_documents` looking exactly like the grid of the zone the
+            -- The two area cutoffs are what keep it a count of documents
+            -- that *apply*. A parcel clipping a square metre of the block next
+            -- door picks up that block's grid, and it lands in `documents` and
+            -- in `num_documents` looking exactly like the grid of the zone the
             -- parcel is actually in. `doc_id` and the other flattened columns
             -- were already safe - they take the highest `pct_of_lot` - so this
             -- is the array and the count, which nothing else was guarding.
+            --
+            -- Both, because a sliver can be large in one measure and not the
+            -- other: 1.19 square metres of a commercial zone on a 438 square
+            -- metre residential parcel clears the absolute cutoff and is
+            -- still a survey disagreement.
             SELECT DISTINCT ON (ld.lot_uid, ld.source_table, ld.doc_id)
                    ld.lot_uid, ld.source_table, ld.doc_id, ld.url, ld.title,
                    ld.feature_id, ld.pct_of_lot
@@ -2374,6 +2704,7 @@ def compute_lot_profiles(
              WHERE ld.neighborhood = %(neighborhood)s
                AND ld.scrape_date = %(scrape_date)s::date
                AND ld.overlap_area_m2 >= %(min_overlap_m2)s
+               AND ld.pct_of_lot >= %(min_pct_of_lot)s
              ORDER BY ld.lot_uid, ld.source_table, ld.doc_id, ld.pct_of_lot DESC
         ),
         docs AS (
@@ -2668,6 +2999,7 @@ def compute_lot_profiles(
             "scrape_date": scrape_date,
             "threshold": threshold,
             "min_overlap_m2": min_overlap_m2,
+            "min_pct_of_lot": min_pct_of_lot,
             "vacancy_rates": Jsonb(vacancy_rates or {}),
             "average_rents": Jsonb(average_rents or {}),
             "construction_costs": Jsonb(construction_costs or {}),

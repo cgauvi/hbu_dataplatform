@@ -1169,7 +1169,13 @@ def stub_lots(monkeypatch):
 
 
 def write_upstreams(
-    store, *, rows=None, setbacks=True, comparables=None, road_lots=None
+    store,
+    *,
+    rows=None,
+    setbacks=True,
+    setback_geom=None,
+    comparables=None,
+    road_lots=None,
 ):
     """Every parquet partition the three assets read.
 
@@ -1202,18 +1208,31 @@ def write_upstreams(
         ),
     )
     if setbacks:
+        setback_rows = [
+            {
+                "lot_uid": row["lot_uid"],
+                "feature_id": row["feature_id"],
+                "column_index": row["column_index"],
+                "buildable_area_m2": 240.0,
+            }
+            for row in (rows or [ENVELOPE])
+        ]
+        # A plain frame by default, which is what a partition written before
+        # the shape cap existed holds: the area is in the file and the polygon
+        # is not, and `_with_placeable_area` degrades to the area caps. Pass
+        # ``setback_geom`` for the geoparquet a current run writes.
+        if setback_geom is None:
+            setback_frame = pd.DataFrame(setback_rows)
+        else:
+            import geopandas as gpd
+
+            setback_frame = gpd.GeoDataFrame(
+                setback_rows,
+                geometry=[setback_geom for _ in setback_rows],
+                crs="EPSG:4326",
+            )
         write_frame(
-            pd.DataFrame(
-                [
-                    {
-                        "lot_uid": row["lot_uid"],
-                        "feature_id": row["feature_id"],
-                        "column_index": row["column_index"],
-                        "buildable_area_m2": 240.0,
-                    }
-                    for row in (rows or [ENVELOPE])
-                ]
-            ),
+            setback_frame,
             join(
                 store.partition_dir(
                     lot_buildable_setbacks.key.path[-1], DATE, NEIGHBORHOOD
@@ -1277,6 +1296,94 @@ def test_programs_asset_writes_and_publishes(store, stub_publish):
     assert metadata["num_candidates"].value == 1
     assert metadata["num_solved"].value == 1
     assert metadata["num_with_buildable_area"].value == 1
+
+
+def _envelope_polygon(shape):
+    """``shape``, given in metres near the borough, as the WGS84 the file holds.
+
+    `lot_buildable_setbacks` writes EPSG:4326 and `_with_placeable_area`
+    projects it back, so a fixture that skipped the round trip would be
+    measuring a rectangle in square degrees - which is the mistake the
+    projection exists to prevent, and worth exercising rather than assuming.
+    """
+    import geopandas as gpd
+    from shapely.affinity import translate
+
+    from urban_rag.comparables import METRIC_CRS
+
+    # An arbitrary origin inside MTM zone 8, so the shape lands where the
+    # projection is defined rather than at its far edge.
+    placed = translate(shape, xoff=298_000.0, yoff=5_040_000.0)
+    return (
+        gpd.GeoSeries([placed], crs=METRIC_CRS).to_crs("EPSG:4326").iloc[0]
+    )
+
+
+def test_the_envelope_shape_caps_the_footprint(store):
+    """The margins leave 240 m2 and no building of it: 6 x 40 is a corridor.
+
+    `buildable_area_m2` says 240 either way - the number in the file is what
+    the setbacks asset computed and this fixture does not touch it - so what
+    separates this from `test_programs_asset_writes_and_publishes` is the
+    polygon beside it and nothing else. A 6 m strip holds no rectangle of 240,
+    and before this cap existed the solve priced one anyway.
+    """
+    from shapely.geometry import box
+
+    write_upstreams(store, setback_geom=_envelope_polygon(box(0, 0, 6, 40)))
+    result = run(store, lot_development_programs)
+    assert result.success
+
+    frame = pd.read_parquet(
+        join(
+            store.partition_dir(
+                lot_development_programs.key.path[-1], DATE, NEIGHBORHOOD
+            ),
+            LOT_PROGRAMS_FILE,
+        )
+    )
+    row = frame.iloc[0]
+    assert row["buildable_area_m2"] == 240.0
+    # 6 m across takes no rectangle of 240 at any ratio this module draws, so
+    # the measurement lands well under the area beside it.
+    assert 0 < row["placeable_area_m2"] < 240.0
+    assert row["footprint_m2"] <= row["placeable_area_m2"] + 0.01
+    # Which is the whole assertion: without the cap the plate is the 240, and
+    # `lot_building_massing` would be left to shrink it afterwards. Which
+    # *norm* gets named for it is `test_program.py`'s to pin down.
+    assert row["footprint_m2"] < 240.0
+
+    metadata = materialization_metadata(result, lot_development_programs)
+    assert metadata["num_with_placeable_area"].value == 1
+    assert metadata["num_unbuildable_envelopes"].value == 0
+
+
+def test_a_setbacks_file_with_no_geometry_warns_and_still_solves(store):
+    """A partition written before the shape cap is ordinary, not broken.
+
+    The default fixture is exactly that file - the area column and no polygon -
+    so this pins the fallback the other asset tests are all running through:
+    the footprint stays capped on the two area norms, and the column is absent
+    rather than zero, which are different answers.
+    """
+    write_upstreams(store)
+    result = run(store, lot_development_programs)
+    assert result.success
+
+    frame = pd.read_parquet(
+        join(
+            store.partition_dir(
+                lot_development_programs.key.path[-1], DATE, NEIGHBORHOOD
+            ),
+            LOT_PROGRAMS_FILE,
+        )
+    )
+    assert frame.iloc[0]["solved"]
+    assert pd.isna(frame.iloc[0]["placeable_area_m2"])
+
+    metadata = materialization_metadata(result, lot_development_programs)
+    assert metadata["num_with_placeable_area"].value == 0
+    assert metadata["num_without_placeable_area"].value == 1
 
 
 def test_programs_asset_without_setbacks_warns_and_still_solves(store):

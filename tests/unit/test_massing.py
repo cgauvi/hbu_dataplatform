@@ -630,6 +630,96 @@ def test_no_parcel_no_capacity():
     assert massing.parking_capacity_m2(Polygon()) == 0.0
 
 
+# ---- and the same question asked of the building --------------------------
+#
+# `placeable_area_m2` is `parking_capacity_m2`'s counterpart for the plate, and
+# `solve_program` takes it as the cap that makes the footprint it prices one
+# this module can actually draw.
+
+
+@pytest.mark.parametrize("name", list(ENVELOPES))
+def test_placeable_area_never_exceeds_the_envelope(name):
+    """A bound has to be a bound before it is anything else."""
+    envelope = ENVELOPES[name]
+    assert massing.placeable_area_m2(envelope) <= envelope.area + 1e-9
+
+
+def test_a_rectangular_envelope_on_the_ratio_ladder_places_whole():
+    """A square holds itself, so the cap costs a regular parcel nothing."""
+    envelope = ENVELOPES["roomy square"]
+    assert massing.placeable_area_m2(envelope) == pytest.approx(
+        envelope.area, rel=1e-6
+    )
+
+
+@pytest.mark.parametrize("name", ["narrow deep", "rotated"])
+def test_a_rectangle_off_the_ratio_ladder_places_a_little_under(name):
+    """And the shortfall is `DEFAULT_ASPECT_RATIOS`, not the search.
+
+    9 x 28 is a ratio of 3.11 and 11 x 26 of 2.36; neither is a rung, so
+    neither envelope places the whole of itself even though it is a rectangle.
+    Unlike `parking_capacity_m2`, which has `_RECTANGULAR_TOLERANCE` to settle
+    exactly this case, this number has no shortcut - and must not grow one.
+    It is the area `fit_rectangle` will place, and a cap the placer cannot draw
+    to would hand the massing a plate to shrink, which is the whole thing it
+    exists to stop.
+    """
+    envelope = ENVELOPES[name]
+    placed = massing.placeable_area_m2(envelope)
+    assert 0.8 * envelope.area < placed < envelope.area
+
+
+def test_an_awkward_envelope_places_far_less_than_its_area():
+    """The whole reason the column exists.
+
+    An L of 500 m2 holds no rectangle anywhere near 500, and it is exactly this
+    gap that `solve_program` was pricing before it had this number: the area
+    caps allow the 500, no building of it fits, and the massing shrank the
+    plate afterwards with the economics already computed on the full one.
+    """
+    envelope = ENVELOPES["L shape"]
+    placed = massing.placeable_area_m2(envelope)
+    assert envelope.area == pytest.approx(500.0)
+    assert placed < 0.75 * envelope.area
+
+
+def test_placeable_area_agrees_with_what_the_placer_draws():
+    """The point of measuring it with the same search at the same settings.
+
+    A footprint capped here has to be one `fit_rectangle` accepts whole later,
+    or the cap has bought nothing: the solve would still be handing the massing
+    a plate to shrink.
+    """
+    for name in ENVELOPES:
+        envelope = ENVELOPES[name]
+        placed = massing.placeable_area_m2(envelope)
+        if placed < massing.MIN_FOOTPRINT_M2:
+            continue
+        assert fit_rectangle(envelope, placed).status == "fitted"
+
+
+def test_placeable_area_measures_one_building():
+    """A split envelope is reported at its better half, not at both.
+
+    The same approximation `parking_capacity_m2` makes, and a firmer one: a
+    building is one massing or it is nothing, while parking honestly comes in
+    patches and gets `PARKING_MAX_BAYS` of them.
+    """
+    envelope = ENVELOPES["split"]
+    placed = massing.placeable_area_m2(envelope)
+    assert envelope.area == pytest.approx(144.0 + 320.0)
+    # Inside the better lobe, not across both - and short of even that one,
+    # because 16 x 20 is a ratio of 1.25 and `DEFAULT_ASPECT_RATIOS` does not
+    # carry it. That is the placer's own ladder rather than a second
+    # approximation: a cap this module could not draw to would buy nothing.
+    assert 144.0 < placed <= 320.0 + 1e-9
+
+
+def test_no_envelope_no_placeable_area():
+    assert massing.placeable_area_m2(None) == 0.0
+    assert massing.placeable_area_m2(Polygon()) == 0.0
+
+
 # ---- drawing it -----------------------------------------------------------
 
 

@@ -54,12 +54,33 @@ beside it, and "no row here" cannot stand in for it either: that says roadway
 *or* landlocked parcel, and those two want opposite treatment. Hence a file of
 its own. See `ROAD_LOTS_FILE`, and `hbu.select_highest_best_use` for the gate.
 
-A lot that shares no boundary with any road lot gets no row: a true interior
-parcel, one reached only by a lane, or a street snapshot that stopped short. A
-road lot gets no row either - a street does not front on itself - and is left
-out of the coverage denominator rather than reported as landlocked. The count,
-the share and a sample of the lot numbers are logged as a warning and published
-as metadata rather than left to be noticed; see `num_lots_without_frontage`.
+**A lot that shares no boundary with any road lot is measured a second time,
+with a reach.** The exact measure answers only where the cadastre lets it, and
+in Villeray it often does not: a road-widening strip between the parcel and the
+roadway is a parcel of its own, carries no geobase side inside it, and is
+therefore not a road lot - so lot 6 291 714 abuts nothing and comes back with
+no frontage though it faces 19 m of boulevard Pie-IX. On 2026-09-01 that left
+560 lots the solver still prices with none, and downstream a missing frontage
+is not a null: `envelope_assets` reads it as 0 m and holds the parcel to the
+narrowest column its zone prints.
+
+So step two spends the reach the exact measure refuses - on those lots only.
+The boundary segments running within 45 degrees of parallel to a street side
+and lying wholly within the reach are the frontage, tried at 8 m and then at
+16 m, stopping at whichever first places the lot. Nothing a road lot already
+answered is touched, so the argument for measuring the shared edge exactly is
+untouched too: no parcel with a real edge pays a tolerance. `buffer_m` on the
+row says which step answered - 0 for the edge, 8 or 16 for a reach - and
+`FrontageConfig.fallback_buffers_m` is where the ladder is set or turned off.
+See `postgis.DEFAULT_FRONTAGE_FALLBACK_BUFFERS_M`.
+
+A lot with no row after both steps abuts no road lot *and* faces no street line
+within 16 m: a true interior parcel, one reached only by a lane, or a street
+snapshot that stopped short. A road lot gets no row from either step - a street
+does not front on itself - and is left out of the coverage denominator rather
+than reported as landlocked. The count, the share and a sample of the lot
+numbers are logged as a warning and published as metadata rather than left to
+be noticed; see `num_lots_without_frontage`.
 
 **This asset loads nothing.** Both sides of the join are already in Postgres
 when it runs: `rag.lots` because `building_lot_intersections` put it there, and
@@ -77,11 +98,13 @@ database, a run fails naming the file to apply, which is why this asset is
 registered and given a job but left off the daily schedules. See
 `urban_rag.definitions`, and `lot_profiles` for the same posture.
 
-The `buffer_m` column that table carries is written as **0** now, and that is
-both true and useful: nothing is allowed between the lot line and the street,
-because the boundary has to *be* the road lot's edge. It also dates a
-partition - rows saying 3.0 or 10.0 were measured the old way and are reporting
-a different quantity from rows saying 0.
+The `buffer_m` column that table carries says which of the two steps produced
+the row. **0** is the exact measure and the great majority of the table:
+nothing was allowed between the lot line and the street, because the boundary
+*is* the road lot's edge. **8** or **16** is a step-two estimate, and the
+number is how far the reach had to go to find a street side. It still dates a
+partition too - rows saying 3.0 or 10.0 predate all of this and were measured
+the old way, borough-wide, which is a different quantity from either.
 """
 
 import geopandas as gpd
@@ -102,6 +125,7 @@ from urban_rag.layers import key_prefix
 from urban_rag.partitions import scrape_partitions
 from urban_rag.hbu import ROAD_LOT_FLAG_COLUMN
 from urban_rag.postgis import (
+    DEFAULT_FRONTAGE_FALLBACK_BUFFERS_M,
     DEFAULT_ROAD_LOT_MIN_STREET_M,
     ROAD_LOT_COLUMNS,
     MissingRelation,
@@ -132,20 +156,24 @@ ROAD_LOTS_FILE = "road_lots.parquet"
 
 
 class FrontageConfig(Config):
-    """How much street line has to run inside a parcel for it to be a road.
+    """How a parcel is recognised as a road, and how far step two may reach.
 
-    Config rather than a constant for the reason `lot_profiles` makes its shed
-    cutoff config: it is a judgement about how far the two publishers may
-    disagree before a geobase side clipping the corner of an ordinary parcel
-    would be read as that parcel being a street.
+    Config rather than constants for the reason `lot_profiles` makes its shed
+    cutoff config: both are judgements about how far the two publishers may
+    disagree, and neither is a fact the data settles.
 
-    It is not the old `buffer_m` under a new name, and the difference is the
-    whole point of the change. `buffer_m` decided what every lot in the borough
-    *measured*, so the table moved when it moved. This decides only which
-    parcels are the roadway, and the fixture separates those from everything
-    else by two orders of magnitude - road lots carry 105 to 325 m of street
-    line, every other parcel carries none - so no real parcel sits near it and
-    the frontages do not move with it.
+    `min_street_m` is not the old `buffer_m` under a new name, and the
+    difference is the whole point of the change. `buffer_m` decided what every
+    lot in the borough *measured*, so the table moved when it moved. This
+    decides only which parcels are the roadway, and the fixture separates those
+    from everything else by two orders of magnitude - road lots carry 105 to
+    325 m of street line, every other parcel carries none - so no real parcel
+    sits near it and the frontages do not move with it.
+
+    `fallback_buffers_m` is a reach, and it is one on purpose - but it is
+    spent only where the exact measure came back with nothing, so it still
+    cannot move a frontage the cadastre already answered. Empty turns step two
+    off entirely and gives back the one-step table.
     """
 
     min_street_m: float = Field(
@@ -154,6 +182,14 @@ class FrontageConfig(Config):
         description=(
             "How much geobase double street line must run inside a parcel for "
             "that parcel to count as the roadway, in metres."
+        ),
+    )
+    fallback_buffers_m: list[float] = Field(
+        default=list(DEFAULT_FRONTAGE_FALLBACK_BUFFERS_M),
+        description=(
+            "How far step two reaches for a street on the lots that share no "
+            "boundary with a road lot, in metres, tried in order and stopping "
+            "at the first that places the lot. Empty disables step two."
         ),
     )
 
@@ -218,6 +254,7 @@ def lot_frontage(
                 neighborhood=neighborhood,
                 scrape_date=scrape_date,
                 min_street_m=config.min_street_m,
+                fallback_buffers_m=tuple(config.fallback_buffers_m),
             )
             num_streets = int(result["num_streets"])
             if num_streets == 0:
@@ -295,6 +332,22 @@ def lot_frontage(
         result["max_frontage_m"],
         path,
     )
+    if int(result["lots_from_buffer"]):
+        # Said out loud rather than left in metadata, because these are the
+        # rows a reader should treat differently: an estimate from a reach, on
+        # a parcel the cadastre could not answer for exactly.
+        context.log.info(
+            "%s %s: %d lot(s) shared no boundary with a road lot and were "
+            "measured against a buffered street side instead (%s) - their "
+            "rows carry that reach in buffer_m",
+            neighborhood,
+            scrape_date,
+            int(result["lots_from_buffer"]),
+            ", ".join(
+                f"{count} at {buffer_m} m"
+                for buffer_m, count in result["lots_by_buffer"].items()
+            ),
+        )
 
     # Every lot in a Montreal borough that is not itself a road is expected to
     # face a street. The ones that do not are named rather than only counted: a
@@ -369,6 +422,22 @@ def lot_frontage(
             else 0.0,
             "num_streets_matched": int(result["streets_matched"]),
             "num_rows_pruned": int(result["pruned"]),
+            # The two steps, told apart. The exact count is the measure; the
+            # buffered one is the rescue, and it is the number to watch rather
+            # than to admire - a partition where thousands of lots need a
+            # reach is one whose road lots are not being identified, and the
+            # fix for that is upstream, not a wider ladder.
+            "num_frontages_exact": int(result["frontages_exact"]),
+            "num_frontages_from_buffer": int(result["frontages_from_buffer"]),
+            "num_lots_from_buffer": int(result["lots_from_buffer"]),
+            # Which reach placed them, tier by tier. "how many needed 16 m" is
+            # what says whether the ladder is the right shape for a borough:
+            # a tail piling up on the last rung means the parcels beyond it
+            # are being lost, and one that never fires means it is decoration.
+            "lots_by_buffer_m": MetadataValue.json(result["lots_by_buffer"]),
+            "fallback_buffers_m": MetadataValue.json(
+                list(config.fallback_buffers_m)
+            ),
             "total_frontage_km": round(result["total_frontage_m"] / 1000.0, 2),
             "max_frontage_m": round(result["max_frontage_m"], 1),
             "mean_frontage_m": round(result["total_frontage_m"] / lots_matched, 1)

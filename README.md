@@ -86,6 +86,20 @@ area gap by residential/commercial/industrial class, in m² and sqft, and the
 two incomes reconciled onto one stated definition of NOI. `make programs` and
 `make hbu` run the three by hand.
 
+`lot_redevelopment_gap` now prices **three futures** per lot on one footing:
+keep the building, keep it and grow it (a second CP-SAT solve with the
+standing building retained), or clear the lot and build the programme, whose
+income starts only after the build and the lease-up. `docs/site-theses.md`.
+
+`lot_investment_opportunities` turns the gap into two shortlists: an
+**investment thesis** — what you would build — ranked on yield on cost, and a
+**site thesis** — why the parcel is acquirable: `brownfield`, `teardown`,
+`infill` or `improvement`, each costing its own demolition, remediation or
+addition, with a heritage sector read off the grid's own *Patrimoine* row
+keeping a lot out of the two that demolish. `make opportunities`, and
+[docs/opportunities.md](docs/opportunities.md) and
+[docs/site-theses.md](docs/site-theses.md).
+
 `lot_building_massing` then draws the answer: one rectangle per lot, fitted
 inside that lot's setback envelope so the margins are respected by
 construction, in EPSG:4326 and ready to put on a map beside the cadastre.

@@ -37,6 +37,7 @@ from urban_rag.frontage_assets import (
     lot_frontage,
 )
 from urban_rag.postgis import (
+    DEFAULT_FRONTAGE_FALLBACK_BUFFERS_M,
     DEFAULT_ROAD_LOT_MIN_STREET_M,
     FRONTAGE_NO_BUFFER,
     ROAD_LOT_COLUMNS,
@@ -118,6 +119,8 @@ def stub_postgis(
     max_frontage_m=30.0,
     lots_without_frontage=("3 790 556", "3 790 557"),
     road_lots=None,
+    frontages_from_buffer=0,
+    lots_by_buffer=None,
 ):
     """Patched on the class: Dagster rebuilds the resource before the run."""
     calls: dict[str, object] = {}
@@ -126,10 +129,34 @@ def stub_postgis(
     def connect(self):
         yield object()
 
-    def compute_lot_frontage(connection, *, neighborhood, scrape_date, min_street_m):
-        calls["compute"] = (neighborhood, scrape_date, min_street_m)
+    def compute_lot_frontage(
+        connection,
+        *,
+        neighborhood,
+        scrape_date,
+        min_street_m,
+        fallback_buffers_m=(),
+    ):
+        # The ladder rides in the same tuple rather than in a key of its own:
+        # `test_nothing_is_loaded_here` reads `set(calls)` to prove this asset
+        # loads nothing, and an argument recorded is not a call made.
+        calls["compute"] = (
+            neighborhood,
+            scrape_date,
+            min_street_m,
+            tuple(fallback_buffers_m),
+        )
+        placed = {} if lots_by_buffer is None else dict(lots_by_buffer)
         return {
             "frontages": frontages,
+            # The two steps, told apart. `frontages` is the whole table, so the
+            # exact count is what is left once the reach's rows are taken off
+            # it - stated that way round here so a stub configured with a
+            # fallback cannot make the three disagree.
+            "frontages_exact": frontages - frontages_from_buffer,
+            "frontages_from_buffer": frontages_from_buffer,
+            "lots_from_buffer": sum(placed.values()),
+            "lots_by_buffer": placed,
             "lots_matched": lots_matched,
             "streets_matched": streets_matched,
             "total_frontage_m": total_frontage_m,
@@ -201,10 +228,11 @@ def materialize_partition(store, *, run_config=None):
     )
 
 
-def config_for(min_street_m: float) -> dict:
-    return {
-        "ops": {"silver__lot_frontage": {"config": {"min_street_m": min_street_m}}}
-    }
+def config_for(min_street_m: float, fallback_buffers_m=None) -> dict:
+    config: dict = {"min_street_m": min_street_m}
+    if fallback_buffers_m is not None:
+        config["fallback_buffers_m"] = list(fallback_buffers_m)
+    return {"ops": {"silver__lot_frontage": {"config": config}}}
 
 
 def test_the_partition_is_loaded_measured_and_written(store, monkeypatch, tmp_path):
@@ -409,6 +437,73 @@ def test_a_configured_road_lot_cutoff_reaches_the_query(store, monkeypatch):
     materialize_partition(store, run_config=config_for(5.0))
 
     assert calls["compute"][2] == 5.0
+
+
+def test_the_default_reach_ladder_is_the_one_postgis_declares(store, monkeypatch):
+    """Two tries, 8 m then 16 m - and the asset does not restate them."""
+    calls = stub_postgis(monkeypatch)
+    write_streets(store)
+
+    materialize_partition(store)
+
+    assert calls["compute"][3] == DEFAULT_FRONTAGE_FALLBACK_BUFFERS_M
+
+
+def test_a_configured_reach_ladder_reaches_the_query(store, monkeypatch):
+    calls = stub_postgis(monkeypatch)
+    write_streets(store)
+
+    materialize_partition(
+        store, run_config=config_for(1.0, fallback_buffers_m=[4.0, 12.0, 30.0])
+    )
+
+    assert calls["compute"][3] == (4.0, 12.0, 30.0)
+
+
+def test_the_second_step_can_be_turned_off_entirely(store, monkeypatch):
+    """An empty ladder is the one-step table: the exact edge and nothing else.
+
+    Worth being able to ask for. The reach is an estimate, and a partition
+    feeding a question that should only ever see measured frontage is better
+    off with the nulls - `envelope_assets` reads a missing frontage as 0 m,
+    which is conservative, where an estimate that is wrong is not.
+    """
+    calls = stub_postgis(monkeypatch)
+    write_streets(store)
+
+    materialize_partition(store, run_config=config_for(1.0, fallback_buffers_m=[]))
+
+    assert calls["compute"][3] == ()
+
+
+def test_metadata_separates_the_measured_frontages_from_the_reached_ones(
+    store, monkeypatch
+):
+    """The split is the number to watch, so it is on the materialisation.
+
+    A handful of lots needing a reach is the cadastre being awkward. Thousands
+    of them is the road lots not being identified at all, and that is a
+    different problem with a different fix - so the two counts are published
+    apart rather than added up into `num_frontages`.
+    """
+    stub_postgis(
+        monkeypatch,
+        frontages=10,
+        frontages_from_buffer=3,
+        lots_by_buffer={"8": 2, "16": 1},
+    )
+    write_streets(store)
+
+    metadata = materialization_metadata(materialize_partition(store), lot_frontage)
+
+    assert metadata["num_frontages"].value == 10
+    assert metadata["num_frontages_exact"].value == 7
+    assert metadata["num_frontages_from_buffer"].value == 3
+    assert metadata["num_lots_from_buffer"].value == 3
+    assert metadata["lots_by_buffer_m"].data == {"8": 2, "16": 1}
+    assert metadata["fallback_buffers_m"].data == list(
+        DEFAULT_FRONTAGE_FALLBACK_BUFFERS_M
+    )
 
 
 def test_the_rows_record_that_no_buffer_was_used(store, monkeypatch, tmp_path):

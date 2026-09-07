@@ -28,7 +28,11 @@ import pytest
 
 from conftest import NEIGHBORHOOD, SCRAPE_DATE
 
-from urban_rag.postgis import DEFAULT_ROAD_LOT_MIN_STREET_M, compute_lot_frontage
+from urban_rag.postgis import (
+    DEFAULT_FRONTAGE_FALLBACK_BUFFERS_M,
+    DEFAULT_ROAD_LOT_MIN_STREET_M,
+    compute_lot_frontage,
+)
 
 #: The lot every assertion here is about, and the street side it fronts on.
 LOT_NUMBER = "3 790 556"
@@ -59,6 +63,17 @@ SETBACK_M = 3.48
 #: marginal - see `test_the_road_lots_are_the_ones_the_street_runs_through`.
 NUM_ROAD_LOTS = 14
 NUM_LOTS = 164
+
+#: The one parcel in the slice the shared edge cannot place: 320 m2, hemmed in
+#: by neighbours on both sides, meeting road lot 3 946 205 at a single point,
+#: and running 14.33 m along the ruelle at its rear. Step one gives it nothing
+#: and step two gives it that 14.33 m - see the two tests named for it.
+LANDLOCKED_LOT_NUMBER = "3 790 483"
+
+#: The reaches step two tries, as the module under test ships them. Read rather
+#: than restated, so a change to the ladder shows up here as a failing
+#: assertion about *behaviour* instead of a passing test about nothing.
+FALLBACK_BUFFERS_M = DEFAULT_FRONTAGE_FALLBACK_BUFFERS_M
 
 
 @pytest.fixture
@@ -367,27 +382,98 @@ def test_the_setback_behind_the_geobase_no_longer_costs_the_lot(connection, meas
 # -- every lot -------------------------------------------------------------
 
 
-def test_all_but_one_lot_faces_a_street(connection, measured):
-    """A lot in a Montreal borough that faces no street is a finding.
+def test_exactly_one_lot_shares_no_boundary_with_a_road_lot(connection, loaded):
+    """Step one on its own, which is what `fallback_buffers_m=()` runs.
 
-    Some are real - a landlocked remnant, a parcel served off a lane - but a
-    lot with no frontage is far more often the measure failing to reach it,
-    which is what a too-narrow buffer looked like here. In this slice exactly
-    one parcel is the real thing, and it is asserted by name so that a second
-    one appearing is a test failure rather than a rounding of the count.
+    A lot in a Montreal borough that faces no street is a finding. Some are
+    real - a landlocked remnant, a parcel served off a lane - but a lot with no
+    frontage is far more often the measure failing to reach it, which is what a
+    too-narrow buffer looked like here. In this slice exactly one parcel is the
+    real thing, and it is asserted by name so that a second one appearing is a
+    test failure rather than a rounding of the count.
 
     Lot 3 790 483 is a 320 m2 interior parcel: 22.36 m against a neighbour on
     each side, 14.33 m against lot 3 790 509 - one of the borough's ruelles -
     at the rear, and a single *point* of contact with the corner of road lot
-    3 946 205. A point is not a frontage, and the run is right to give it none.
-    The old buffer measure credited it with street it does not have.
+    3 946 205. A point is not a frontage, and step one is right to give it
+    none.
     """
+    with connection.transaction():
+        result = compute_lot_frontage(
+            connection,
+            neighborhood=NEIGHBORHOOD,
+            scrape_date=SCRAPE_DATE,
+            min_street_m=DEFAULT_ROAD_LOT_MIN_STREET_M,
+            fallback_buffers_m=(),
+        )
+
     flagged = lots_without_frontage(connection)
 
-    assert flagged == ["3 790 483"], (
+    assert flagged == [LANDLOCKED_LOT_NUMBER], (
         f"{len(flagged)} of {NUM_LOTS - NUM_ROAD_LOTS} non-road lot(s) share "
         f"no boundary with a road lot: {', '.join(flagged)}"
     )
+    assert result["frontages_from_buffer"] == 0, "step two was asked for nothing"
+    assert result["lots_by_buffer"] == {}
+
+
+def test_the_reach_places_the_lot_the_shared_edge_could_not(connection, measured):
+    """Step two, on the one parcel in the slice that needs it.
+
+    The lot touches road lot 3 946 205 at a single point and shares an edge
+    with nothing else that is a street, so step one leaves it with no row - and
+    a lot with no row is read as 0 m of frontage downstream, which holds it to
+    the narrowest column its zone prints. It is not landlocked: 14.33 m of its
+    boundary runs along the ruelle at its rear, and that is what step two
+    measures, at the first reach that finds a street side.
+
+    The number is the parcel's own rear boundary and not a share of a buffer:
+    it is the same 14.33 m the polygon has against lot 3 790 509. What the
+    reach did was find the street line to compare it against; the angle test
+    is what kept the two 22.36 m side boundaries out of it, which is precisely
+    what the old borough-wide buffer failed to do.
+    """
+    (row,) = frontages_for(connection, LANDLOCKED_LOT_NUMBER)
+    cote_rue_id, street_name, frontage_m, _, _, rank, buffer_m, _ = row
+
+    assert frontage_m == pytest.approx(14.33, abs=0.05)
+    assert rank == 1
+    # The reach that answered, on the row - and the first rung, not the second.
+    assert buffer_m == FALLBACK_BUFFERS_M[0]
+    assert street_name, "a fallback row names its street like any other"
+
+    assert measured["lots_from_buffer"] == 1
+    assert measured["lots_by_buffer"] == {"8": 1, "16": 0}
+    assert lots_without_frontage(connection) == []
+
+
+def test_the_reach_never_touches_a_lot_the_edge_already_measured(connection, measured):
+    """The whole of `FRONTAGE_NO_BUFFER`'s argument, kept intact.
+
+    A tolerance applied borough-wide adds twice itself to every parcel, which
+    is why the exact measure has none. Step two is not that: it runs only on
+    the parcels step one placed nowhere, so every lot with a real shared edge
+    still reports the edge, to the millimetre, with `buffer_m` 0 beside it.
+    """
+    (row,) = frontages_for(connection, LOT_NUMBER)
+
+    assert row[2] == pytest.approx(FRONTAGE_M, abs=0.05)
+    assert row[6] == 0.0
+
+    cursor = connection.cursor()
+    cursor.execute(
+        """
+        SELECT count(DISTINCT lot_uid) FILTER (WHERE buffer_m = 0),
+               count(DISTINCT lot_uid) FILTER (WHERE buffer_m > 0)
+        FROM silver.lot_frontage
+        WHERE neighborhood = %s AND scrape_date = %s::date
+        """,
+        [NEIGHBORHOOD, SCRAPE_DATE],
+    )
+    exact, reached = cursor.fetchone()
+
+    assert reached == 1, "one parcel in this slice needs the reach"
+    assert exact == NUM_LOTS - NUM_ROAD_LOTS - reached
 
 
 def test_the_run_reports_the_lots_it_could_not_place(connection, loaded):
@@ -398,6 +484,10 @@ def test_the_run_reports_the_lots_it_could_not_place(connection, loaded):
     turns into a warning and into the `lots_without_frontage` metadata: a share
     on its own says a partition is bad, and the numbers say which rows to look
     at.
+
+    Step two is off, because this is a test about what step one reports when it
+    fails. What step two does to a partition this broken is its own question -
+    see `test_the_reach_does_not_paper_over_a_run_that_found_no_road_lot`.
     """
     with connection.transaction():
         result = compute_lot_frontage(
@@ -405,6 +495,7 @@ def test_the_run_reports_the_lots_it_could_not_place(connection, loaded):
             neighborhood=NEIGHBORHOOD,
             scrape_date=SCRAPE_DATE,
             min_street_m=10_000.0,
+            fallback_buffers_m=(),
         )
 
     sample = result["lots_without_frontage"]
@@ -420,6 +511,49 @@ def test_the_run_reports_the_lots_it_could_not_place(connection, loaded):
     assert len(sample) < len(every), "the sample is capped, so it is not the set"
     assert sample == every[: len(sample)]
     assert len(every) == result["num_lots"] - result["lots_matched"]
+
+
+def test_the_reach_does_not_paper_over_a_run_that_found_no_road_lot(
+    connection, loaded
+):
+    """It *does* place the lots - and the metadata is what says not to trust it.
+
+    A cutoff no parcel can meet leaves step one with nothing, and step two then
+    measures the whole slice against buffered street lines, road lots included,
+    because with no road lot identified there is none to exclude. That is the
+    honest consequence of "retry whatever step one could not place" and it is
+    deliberately not guarded against with a second threshold: what a broken
+    partition needs is to be visible, not to be silently narrowed.
+
+    So it is visible. `frontages_exact` is 0, every metre in the table came
+    from a reach, and every row carries a non-zero `buffer_m` saying so. A
+    reader - or `frontage_assets`, which logs the split - can tell this
+    partition from one where the cadastre answered.
+    """
+    with connection.transaction():
+        result = compute_lot_frontage(
+            connection,
+            neighborhood=NEIGHBORHOOD,
+            scrape_date=SCRAPE_DATE,
+            min_street_m=10_000.0,
+        )
+
+    assert result["num_road_lots"] == 0, "no parcel holds 10 km of street line"
+    assert result["frontages_exact"] == 0, "step one placed nothing"
+    assert result["frontages_from_buffer"] == result["frontages"]
+    assert result["lots_from_buffer"] > 0
+
+    cursor = connection.cursor()
+    cursor.execute(
+        """
+        SELECT count(*) FROM silver.lot_frontage
+        WHERE neighborhood = %s AND scrape_date = %s::date AND buffer_m = 0
+        """,
+        [NEIGHBORHOOD, SCRAPE_DATE],
+    )
+    (exact_rows,) = cursor.fetchone()
+
+    assert exact_rows == 0, "no row claims to be an exact edge"
 
 
 def test_no_lot_is_given_more_frontage_than_it_has_boundary(connection, measured):

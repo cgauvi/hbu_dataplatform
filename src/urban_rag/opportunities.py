@@ -28,7 +28,7 @@ compares two sites on, and it lets a small cheap parcel beat a large dear one:
 judgement in the formula. A developer pays for the ground as well as the
 building, and leaving it out would rank a $4M teardown beside an empty lot as
 though they cost the same to acquire. The roll's assessed value is what this
-platform has for that - not a market price, and `land_value_factor` is where a
+platform has for that - not a market price, and `market_value_factor` is where a
 reader who knows the year's *facteur comparatif* puts it. `is_land_assessed`
 says whether a row had one at all, because a lot the roll never reached has its
 land counted at nothing and would otherwise rank absurdly well.
@@ -44,12 +44,26 @@ two sorts. That is why it is its own asset: a change to what counts as
 "mixed-use", or to the land factor, should cost a sort over a parquet file and
 not a borough of CP-SAT models.
 
+**A second axis says why the site is acquirable.** `investment_thesis` names
+what you would build; `site_thesis` names why the parcel is on the market at
+all - the improvement is obsolete (`teardown`), the use standing on it is one
+the contaminated-land regime presumes against (`brownfield`), nothing stands
+on it (`infill`), or the building stays and gains a storey or a rear annex
+(`improvement`). Those are predicates over the roll's year and storey count,
+the solver's storeys and footprint, the use code, and the grid's own
+*Patrimoine* rows - so a lot in a *secteur d'interet patrimonial* is kept out
+of the two theses that demolish. Each thesis costs its own denominator -
+demolition, characterisation and remediation, or the premium an addition pays
+over new build - and is ranked within itself on that yield, the way the first
+axis is. See `SiteRules` and `rank_site_opportunities`.
+
 Deliberately free of Dagster imports, mirroring `urban_rag.hbu`,
 `urban_rag.comparables` and `urban_rag.program`.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import numpy as np
@@ -220,7 +234,7 @@ def assign_thesis(frame: pd.DataFrame, rules: ThesisRules | None = None) -> pd.S
 
 
 def yield_on_cost_pct(
-    frame: pd.DataFrame, *, land_value_factor: float = 1.0
+    frame: pd.DataFrame, *, market_value_factor: float = 1.0
 ) -> pd.Series:
     """Stabilised NOI over what it costs to get there, in percent.
 
@@ -235,7 +249,7 @@ def yield_on_cost_pct(
     """
     noi = _numeric(frame, "hbu_annual_stabilised_noi_cad")
     cost = _numeric(frame, "hbu_total_capital_cost_cad")
-    land = _numeric(frame, "existing_total_assessed_value") * float(land_value_factor)
+    land = _numeric(frame, "existing_total_assessed_value") * float(market_value_factor)
     # A lot the roll never reached has no assessed value. Treating that as land
     # costing nothing would rank it top of every facet, so the whole row is
     # null instead and `is_land_assessed` says why.
@@ -247,7 +261,7 @@ def rank_opportunities(
     frame: pd.DataFrame,
     *,
     rules: ThesisRules | None = None,
-    land_value_factor: float = 1.0,
+    market_value_factor: float = 1.0,
     top_n: int = 25,
 ) -> pd.DataFrame:
     """``frame`` with its thesis, its yield, and its rank within that thesis.
@@ -273,14 +287,14 @@ def rank_opportunities(
     thesis = assign_thesis(frame, rules)
     land = _numeric(frame, "existing_total_assessed_value")
     cost = _numeric(frame, "hbu_total_capital_cost_cad")
-    yields = yield_on_cost_pct(frame, land_value_factor=land_value_factor)
+    yields = yield_on_cost_pct(frame, market_value_factor=market_value_factor)
 
     result = pd.DataFrame(index=frame.index)
     result["investment_thesis"] = thesis
     result["is_land_assessed"] = land.notna()
     result["yield_on_cost_pct"] = yields.round(4)
     result["total_project_cost_cad"] = (
-        cost + land * float(land_value_factor)
+        cost + land * float(market_value_factor)
     ).round(2)
 
     rankable = (
@@ -353,6 +367,795 @@ def thesis_summary(frame: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+# --------------------------------------------------------------------------
+# The second axis: why the site is acquirable
+# --------------------------------------------------------------------------
+
+#: The site theses, in **precedence order**: the first that fires names the
+#: lot in `site_thesis`, and the others survive as booleans. Brownfield leads
+#: because it changes the cost side the most and a gas station is a gas station
+#: whatever else is true of it; teardown before infill because a lot with a
+#: building on it is not empty; improvement last because keeping the building
+#: is what is left once nothing argues for removing it.
+BROWNFIELD = "brownfield"
+TEARDOWN = "teardown"
+INFILL = "infill"
+IMPROVEMENT = "improvement"
+NO_SITE_THESIS = "none"
+
+SITE_THESES: tuple[str, ...] = (BROWNFIELD, TEARDOWN, INFILL, IMPROVEMENT)
+SITE_THESIS_VALUES: tuple[str, ...] = (*SITE_THESES, NO_SITE_THESIS)
+
+#: The boolean each site thesis writes, so a reader can ask "is this also a
+#: teardown" of a lot filed under brownfield.
+SITE_FLAG_COLUMNS: Mapping[str, str] = {
+    BROWNFIELD: "is_brownfield_site",
+    TEARDOWN: "is_teardown_site",
+    INFILL: "is_infill_site",
+    IMPROVEMENT: "is_improvement_site",
+}
+
+#: CUBF prefixes whose activities carry a contamination presumption under
+#: Quebec's *Reglement sur la protection et la rehabilitation des terrains*:
+#: every manufacturing category (2000-3999), motor-vehicle transport yards and
+#: garages (42xx), salvage and recycling (487x), vehicle sales and service
+#: stations (55xx), dry cleaning (6231), warehousing (63xx) and automotive
+#: repair (64xx). A prefix rather than a code list because the roll's leaves
+#: are numerous and the presumption attaches to the family. The regulation
+#: lists activities by SCIAN, and the codebook `cubf_use_codes` snapshots
+#: carries the SCIAN correspondence, so a join can replace this list; a stated
+#: list is what a screen can be read back against today.
+DEFAULT_BROWNFIELD_USE_PREFIXES: tuple[str, ...] = (
+    "2", "3", "42", "487", "55", "6231", "63", "64",
+)
+
+#: What the grid prints where a zone-level row does not apply, lower-cased.
+#: Anything else against *Secteur d'interet patrimonial* is read as a sector,
+#: so ``A`` - one grid in the borough - counts as well as ``Oui``.
+_ABSENT_TEXT = {"", "-", "--", "non", "no", "s.o.", "n/a", "na", "none", "nan"}
+
+
+@dataclass(frozen=True)
+class SiteRules:
+    """Where the lines fall for the four site theses, and what each costs.
+
+    Every field is a judgement about a mandate rather than a property of the
+    data, and every row records them in `screen_assumptions`, the rule
+    `ThesisRules` follows.
+
+    **The teardown screen.** ``teardown_max_year_built`` is the youngest a
+    building may be and still be presumed obsolete - 1960 takes in the
+    borough's inter-war and post-war plexes and leaves the 1960s stock, which
+    in this borough is largely built to its envelope anyway.
+    ``teardown_max_built_share`` is how little of the envelope the standing
+    floor may fill: 0.4 means the building is under two-fifths of what the
+    lot could carry. ``min_storey_headroom`` is the storeys the governing
+    envelope allows above what stands; below two, a teardown is a like-for-
+    like replacement rather than a development, and over 85% of this
+    borough's lots have none at all. All three have to hold at once.
+
+    **The brownfield screen** is the use code alone - see
+    `DEFAULT_BROWNFIELD_USE_PREFIXES` - and deliberately not the under-built
+    test: a gas station built to its envelope is still a conversion play,
+    because what changes is the use rather than the floor.
+
+    **Heritage.** ``exclude_heritage_sectors`` keeps every lot whose governing
+    zone prints *Secteur d'interet patrimonial: Oui* out of the two theses
+    that demolish; the borough's demolition by-law refers those to committee,
+    and a contributing building is generally refused. ``exclude_piia_sectors``
+    does the same for a zone under the discretionary PIIA by-law and defaults
+    off: a PIIA is an architectural review of what is built, not a bar on
+    removing what stands, and it covers close to half the borough's zones. It
+    is flagged (`has_piia_review`) rather than screened.
+    ``demolition_review_year`` is the year below which the *Loi sur le
+    patrimoine culturel* obliges a municipality's demolition by-law to apply -
+    1940 - and a building older than that is flagged
+    `demolition_review_required`; ``exclude_demolition_review`` turns that
+    flag into a screen too.
+
+    **The costs** are per square metre and stated, not surveyed per lot:
+    ``demolition_cost_cad_per_m2`` over the standing gross floor of a
+    residential building and ``demolition_cost_cad_per_m2_nonresidential``
+    over anything else - masonry, slab, and the abatement a commercial or
+    industrial shell usually carries; ``site_assessment_cost_cad`` once per
+    brownfield site, for the Phase I and II characterisation the regime
+    requires on a change of use;
+    ``remediation_cost_cad_per_m2_residential`` and ``_nonresidential`` over
+    the lot, because the residential criterion is the stricter one and a
+    rebuild to commerce or industry cleans to a lower bar;
+    ``addition_cost_premium`` is what a storey or an annex costs per square
+    metre over new build, for the shoring, the tie-ins and the occupied site.
+    See docs/site-theses.md for where each default comes from.
+
+    **The improvement screen.** ``improvement_max_added_storeys`` caps the
+    storeys added on top of the standing building (one is what a plex owner
+    does; two is steel); ``improvement_min_floor_m2`` is the smallest addition
+    worth filing - below it a permit and a crane swamp the arithmetic.
+
+    ``require_positive_npv`` is the rankability screen, the role
+    `is_underbuilt` plays on the first axis: a lot keeps its site thesis
+    whatever the verdict, and is *ranked* only where redeveloping beats
+    holding (or, for an improvement, where the addition earns anything).
+    Turned off, a borough whose industrial programs all lose money still gets
+    its industrial teardowns ordered.
+    """
+
+    teardown_max_year_built: int = 1960
+    teardown_max_built_share: float = 0.40
+    min_storey_headroom: int = 2
+    brownfield_use_prefixes: tuple[str, ...] = DEFAULT_BROWNFIELD_USE_PREFIXES
+    exclude_heritage_sectors: bool = True
+    exclude_piia_sectors: bool = False
+    demolition_review_year: int = 1940
+    exclude_demolition_review: bool = False
+    demolition_cost_cad_per_m2: float = 150.0
+    demolition_cost_cad_per_m2_nonresidential: float = 250.0
+    site_assessment_cost_cad: float = 12_000.0
+    remediation_cost_cad_per_m2_residential: float = 150.0
+    remediation_cost_cad_per_m2_nonresidential: float = 75.0
+    addition_cost_premium: float = 1.5
+    improvement_max_added_storeys: int = 1
+    improvement_min_floor_m2: float = 40.0
+    require_positive_npv: bool = True
+
+    def __post_init__(self) -> None:
+        if not 0.0 < self.teardown_max_built_share <= 1.0:
+            raise ValueError(
+                "teardown_max_built_share is a share of the envelope and must "
+                f"be in (0, 1], got {self.teardown_max_built_share!r}"
+            )
+        if self.min_storey_headroom < 0:
+            raise ValueError("min_storey_headroom must not be negative")
+        if self.improvement_max_added_storeys < 0:
+            raise ValueError("improvement_max_added_storeys must not be negative")
+        for name in (
+            "demolition_cost_cad_per_m2",
+            "demolition_cost_cad_per_m2_nonresidential",
+            "site_assessment_cost_cad",
+            "remediation_cost_cad_per_m2_residential",
+            "remediation_cost_cad_per_m2_nonresidential",
+            "improvement_min_floor_m2",
+        ):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} must not be negative")
+        if self.addition_cost_premium <= 0:
+            raise ValueError("addition_cost_premium must be positive")
+        prefixes = tuple(
+            str(prefix).strip() for prefix in self.brownfield_use_prefixes
+        )
+        if not prefixes or any(not prefix for prefix in prefixes):
+            raise ValueError("brownfield_use_prefixes must be non-empty codes")
+        object.__setattr__(self, "brownfield_use_prefixes", prefixes)
+
+    def as_metadata(self) -> dict[str, object]:
+        return {
+            "teardown_max_year_built": self.teardown_max_year_built,
+            "teardown_max_built_share": self.teardown_max_built_share,
+            "min_storey_headroom": self.min_storey_headroom,
+            "brownfield_use_prefixes": list(self.brownfield_use_prefixes),
+            "exclude_heritage_sectors": self.exclude_heritage_sectors,
+            "exclude_piia_sectors": self.exclude_piia_sectors,
+            "demolition_review_year": self.demolition_review_year,
+            "exclude_demolition_review": self.exclude_demolition_review,
+            "demolition_cost_cad_per_m2": self.demolition_cost_cad_per_m2,
+            "demolition_cost_cad_per_m2_nonresidential": (
+                self.demolition_cost_cad_per_m2_nonresidential
+            ),
+            "site_assessment_cost_cad": self.site_assessment_cost_cad,
+            "remediation_cost_cad_per_m2_residential": (
+                self.remediation_cost_cad_per_m2_residential
+            ),
+            "remediation_cost_cad_per_m2_nonresidential": (
+                self.remediation_cost_cad_per_m2_nonresidential
+            ),
+            "addition_cost_premium": self.addition_cost_premium,
+            "improvement_max_added_storeys": self.improvement_max_added_storeys,
+            "improvement_min_floor_m2": self.improvement_min_floor_m2,
+            "require_positive_npv": self.require_positive_npv,
+        }
+
+
+def storey_headroom(frame: pd.DataFrame) -> pd.Series:
+    """The storeys the governing envelope allows above what stands.
+
+    The solver's own storey count less the roll's, so it respects both the
+    grid's *En etage* and its height in metres - whichever stopped the
+    building first. Null where either side is missing: a lot with no building
+    has no headroom to state, because there is nothing to add to.
+    """
+    return _numeric(frame, "hbu_floors") - _numeric(frame, "existing_num_storeys")
+
+
+def built_share(frame: pd.DataFrame) -> pd.Series:
+    """How much of the proposed floor already stands, as a share.
+
+    Null where the solver proposed no floor: a share of nothing is not a
+    share, and a lot with no program is not under-built either.
+    """
+    proposed = _numeric(frame, "hbu_floor_area_m2")
+    standing = _numeric(frame, "existing_floor_area_m2").fillna(0.0)
+    return standing / proposed.where(proposed > _MIN_PROGRAM_FLOOR_M2)
+
+
+def heritage_flags(
+    frame: pd.DataFrame, rules: SiteRules | None = None
+) -> pd.DataFrame:
+    """What the zone and the roll say about removing the standing building.
+
+    Four booleans. `is_heritage_sector` reads the grid's *Secteur d'interet
+    patrimonial*; `has_piia_review` its *PIIA (secteur)*;
+    `demolition_review_required` is the sector or a building older than
+    `SiteRules.demolition_review_year`; `is_demolition_restricted` is which of
+    those the rules turn into a screen.
+    """
+    rules = rules or SiteRules()
+    heritage = _present(frame, "heritage_sector")
+    piia = _present(frame, "piia_sector")
+    year = _numeric(frame, "existing_year_built")
+    old = (year < float(rules.demolition_review_year)).fillna(False).astype("bool")
+    review = heritage | old
+    restricted = (
+        (heritage & rules.exclude_heritage_sectors)
+        | (piia & rules.exclude_piia_sectors)
+        | (review & rules.exclude_demolition_review)
+    )
+    return pd.DataFrame(
+        {
+            "is_heritage_sector": heritage,
+            "has_piia_review": piia,
+            "demolition_review_required": review.astype("bool"),
+            "is_demolition_restricted": restricted.astype("bool"),
+        },
+        index=frame.index,
+    )
+
+
+def brownfield_use(
+    frame: pd.DataFrame, rules: SiteRules | None = None
+) -> pd.Series:
+    """Whether the dominant use code is one the contaminated-land regime
+    presumes against - see `DEFAULT_BROWNFIELD_USE_PREFIXES`."""
+    rules = rules or SiteRules()
+    prefixes = tuple(rules.brownfield_use_prefixes)
+    return _use_code_text(frame).map(
+        lambda code: bool(code) and code.startswith(prefixes)
+    ).astype("bool")
+
+
+def improvement_program(
+    frame: pd.DataFrame, rules: SiteRules | None = None
+) -> pd.DataFrame:
+    """The storey or annex the standing building could gain, and what it earns.
+
+    Two sources, and the row says which. Where the gap table carries an
+    **enhancement solve** - `hbu.solve_enhancements`, the same CP-SAT model
+    with the standing building retained - its answer is the program: the
+    storeys and floor it added, what that cost at the addition premium, and
+    the stabilised NOI the new floor earns. Where it does not (a partition
+    from before the solve, or a lot it could not be run on) the program is
+    the **estimate**: the standing footprint - the roll's floor area over
+    its storey count - repeated up to ``improvement_max_added_storeys``
+    times and no higher than the solver's own storey count, plus an annex on
+    the ground the solver's footprint covers and the standing one does not,
+    the two capped at the floor gap and priced at the solver's NOI and
+    capital cost per square metre times ``addition_cost_premium``.
+
+    A lot the roll states no storey count for gets no estimate: guessing a
+    footprint would put an invented building on the shortlist.
+    """
+    rules = rules or SiteRules()
+    floor = _numeric(frame, "existing_floor_area_m2")
+    storeys = _numeric(frame, "existing_num_storeys")
+    hbu_floors = _numeric(frame, "hbu_floors")
+    hbu_floor = _numeric(frame, "hbu_floor_area_m2")
+    hbu_footprint = _numeric(frame, "hbu_footprint_m2")
+    gap = _numeric(frame, "floor_area_gap_m2")
+    noi = _numeric(frame, "hbu_annual_stabilised_noi_cad")
+    capex = _numeric(frame, "hbu_total_capital_cost_cad")
+
+    footprint = floor / storeys.where(storeys >= 1.0)
+    added_storeys = (hbu_floors - storeys).clip(
+        lower=0.0, upper=float(rules.improvement_max_added_storeys)
+    )
+    storey_floor = added_storeys * footprint
+    annex_floor = (hbu_footprint - footprint).clip(lower=0.0) * storeys.clip(
+        upper=hbu_floors
+    )
+    total = (storey_floor.fillna(0.0) + annex_floor.fillna(0.0)).where(
+        footprint.notna()
+    )
+    estimate = pd.concat([total, gap], axis=1).min(axis=1, skipna=False)
+    estimate = estimate.where(floor > 0.0).clip(lower=0.0)
+    denominator = hbu_floor.where(hbu_floor > _MIN_PROGRAM_FLOOR_M2)
+    estimate_noi = estimate * (noi / denominator)
+    estimate_cost = (
+        estimate * (capex / denominator) * float(rules.addition_cost_premium)
+    )
+
+    solved = _boolean(frame, "enhance_solved")
+    solve_floor = _numeric(frame, "enhance_added_floor_area_m2")
+    solve_storeys = _numeric(frame, "enhance_added_storeys")
+    solve_cost = _numeric(frame, "enhance_capital_cost_cad")
+    solve_noi = _numeric(frame, "enhance_added_annual_stabilised_noi_cad")
+
+    improvement = estimate.mask(solved, solve_floor)
+    added = added_storeys.mask(solved, solve_storeys)
+    added_cost = estimate_cost.mask(solved, solve_cost)
+    added_noi = estimate_noi.mask(solved, solve_noi)
+    yield_pct = (
+        100.0 * added_noi / added_cost.where(added_cost.abs() > _MIN_DENOMINATOR)
+    )
+    source = pd.Series(
+        np.where(solved, "solve", np.where(improvement.notna(), "estimate", "none")),
+        index=frame.index,
+        dtype="object",
+    )
+    return pd.DataFrame(
+        {
+            "existing_footprint_m2": footprint.round(2),
+            "improvement_source": source,
+            "improvement_added_storeys": added.round(0).astype("Int64"),
+            "improvement_floor_m2": improvement.round(2),
+            "improvement_cost_cad": added_cost.round(2),
+            "improvement_noi_cad": added_noi.round(2),
+            "improvement_yield_pct": yield_pct.round(4),
+        },
+        index=frame.index,
+    )
+
+
+def site_costs(
+    frame: pd.DataFrame, use: pd.Series, rules: SiteRules | None = None
+) -> pd.DataFrame:
+    """What clearing the site costs, before anything is built on it.
+
+    Demolition of the standing floor on every lot that has some, at the rate
+    for the building's class; and on a contamination-risk use, the Phase I
+    and II characterisation once and the remediation over the lot, to the
+    residential criterion where the proposal includes housing and the lower
+    one otherwise. ``site_costs_cad`` is the three added up, and is what the
+    rebuild carries that the hold and the enhancement do not.
+    """
+    rules = rules or SiteRules()
+    floor = _numeric(frame, "existing_floor_area_m2").fillna(0.0)
+    lot_area = _numeric(frame, "lot_area_m2").fillna(0.0)
+    brownfield = use.astype("bool").to_numpy()
+
+    is_residential = (
+        _text(frame, "existing_dominant_income_class").str.lower() == RESIDENTIAL
+    ).to_numpy()
+    demolition_rate = np.where(
+        is_residential,
+        float(rules.demolition_cost_cad_per_m2),
+        float(rules.demolition_cost_cad_per_m2_nonresidential),
+    )
+    demolition = pd.Series(
+        np.where(floor.to_numpy() > 0.0, floor.to_numpy() * demolition_rate, 0.0),
+        index=frame.index,
+    )
+    assessment = pd.Series(
+        np.where(brownfield, float(rules.site_assessment_cost_cad), 0.0),
+        index=frame.index,
+    )
+    proposed = _numeric(frame, "hbu_floor_area_m2")
+    residential = _numeric(frame, "hbu_residential_floor_area_m2").fillna(0.0)
+    to_housing = (
+        (residential / proposed.where(proposed > _MIN_PROGRAM_FLOOR_M2)) > 0.0
+    ).fillna(False).to_numpy()
+    rate = np.where(
+        to_housing,
+        float(rules.remediation_cost_cad_per_m2_residential),
+        float(rules.remediation_cost_cad_per_m2_nonresidential),
+    )
+    remediation = pd.Series(
+        np.where(brownfield, lot_area.to_numpy() * rate, 0.0), index=frame.index
+    )
+    return pd.DataFrame(
+        {
+            "demolition_cost_cad": demolition.round(2),
+            "site_assessment_cost_cad": assessment.round(2),
+            "remediation_cost_cad": remediation.round(2),
+            "site_costs_cad": (demolition + assessment + remediation).round(2),
+        },
+        index=frame.index,
+    )
+
+
+#: The three things that can be done with a lot, in the order a tie resolves.
+FUTURES: tuple[str, ...] = ("hold", "enhance", "rebuild")
+#: The buyer's fourth: walk away, where no future clears the discount rate at
+#: the price. Not a future the owner has - holding costs an owner nothing.
+NO_FUTURE = "none"
+
+
+def futures_economics(
+    frame: pd.DataFrame,
+    costs: pd.DataFrame,
+    rules: SiteRules | None = None,
+    *,
+    market_value_factor: float = 1.0,
+) -> pd.DataFrame:
+    """Hold, enhance and rebuild, priced for the owner and for a buyer.
+
+    **The owner** holds the land in every future, so it cancels: the three
+    values are the gap table's - the standing building's discounted NOI, that
+    plus the addition's gain, the proposal's NPV with its income pushed out
+    by the build - with the site's own costs taken off the rebuild here.
+    ``owner_gain_*`` is each against holding, and ``owner_best_future`` the
+    largest, ``hold`` on a tie.
+
+    **The buyer** pays for the land and the building first. The price is the
+    larger of what the roll says the property is worth, scaled by
+    ``market_value_factor`` for what the roll misses, and what the standing
+    income is worth to whoever holds it: a seller keeps the better of the
+    two. Each future's ``buyer_npv_*`` is its value less that price;
+    ``residual_price_*`` is the most a buyer could pay and still clear the
+    discount rate, which is the value itself; ``buyer_yield_*`` is the
+    stabilised NOI of the future over everything paid to reach it.
+    ``buyer_best_future`` is the largest NPV, ``hold`` on a tie, and ``none``
+    where even the largest is below zero: at that price the buyer walks.
+
+    Every buyer column is null where the roll never assessed the lot - there
+    is no price to pay - and every enhance column where no enhancement was
+    solved.
+    """
+    rules = rules or SiteRules()
+    existing_pv = _numeric(frame, "existing_present_value_cad")
+    hold = _numeric(frame, "hold_value_cad")
+    hold = hold.where(hold.notna(), existing_pv).fillna(0.0)
+
+    enhance_gain = _numeric(frame, "enhance_gain_cad")
+    enhance_value = (hold + enhance_gain).where(enhance_gain.notna())
+
+    rebuild_raw = _numeric(frame, "rebuild_value_cad")
+    rebuild_raw = rebuild_raw.where(rebuild_raw.notna(), _numeric(frame, "hbu_npv_cad"))
+    rebuild_raw = rebuild_raw.where(
+        rebuild_raw.notna(), hold + _numeric(frame, "redevelopment_npv_gain_cad")
+    )
+    site = _numeric(costs, "site_costs_cad").fillna(0.0)
+    rebuild_value = rebuild_raw - site
+
+    owner_gain_rebuild = rebuild_value - hold
+    owner = pd.DataFrame(
+        {
+            "hold": pd.Series(0.0, index=frame.index),
+            "enhance": enhance_gain,
+            "rebuild": owner_gain_rebuild,
+        }
+    )
+    owner_best = owner.fillna(-np.inf).idxmax(axis=1)
+
+    assessed = _numeric(frame, "existing_total_assessed_value") * float(market_value_factor)
+    acquisition = pd.concat([assessed, hold], axis=1).max(axis=1).where(assessed.notna())
+
+    buyer_hold = hold - acquisition
+    buyer_enhance = enhance_value - acquisition
+    buyer_rebuild = rebuild_value - acquisition
+    buyer = pd.DataFrame(
+        {"hold": buyer_hold, "enhance": buyer_enhance, "rebuild": buyer_rebuild}
+    )
+    # The largest NPV, and only where it clears zero: a buyer whose every
+    # future loses money at the price has a fourth option the owner does not,
+    # which is not to buy. `none` says so; the least-bad loss is not a best.
+    filled = buyer.fillna(-np.inf)
+    buyer_best = filled.idxmax(axis=1).where(filled.max(axis=1) >= 0.0, NO_FUTURE)
+    buyer_best = buyer_best.where(acquisition.notna())
+
+    existing_noi = _numeric(frame, "existing_annual_stabilised_noi_cad").fillna(0.0)
+    added_noi = _numeric(frame, "enhance_added_annual_stabilised_noi_cad")
+    enhance_capex = _numeric(frame, "enhance_capital_cost_cad")
+    hbu_noi = _numeric(frame, "hbu_annual_stabilised_noi_cad")
+    hbu_capex = _numeric(frame, "hbu_total_capital_cost_cad")
+
+    def yield_pct(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
+        return 100.0 * numerator / denominator.where(denominator.abs() > _MIN_DENOMINATOR)
+
+    return pd.DataFrame(
+        {
+            "owner_hold_value_cad": hold.round(2),
+            "owner_enhance_value_cad": enhance_value.round(2),
+            "owner_rebuild_value_cad": rebuild_value.round(2),
+            "owner_gain_enhance_cad": enhance_gain.round(2),
+            "owner_gain_rebuild_cad": owner_gain_rebuild.round(2),
+            "owner_best_future": owner_best.astype("object"),
+            "acquisition_cost_cad": acquisition.round(2),
+            "buyer_npv_hold_cad": buyer_hold.round(2),
+            "buyer_npv_enhance_cad": buyer_enhance.round(2),
+            "buyer_npv_rebuild_cad": buyer_rebuild.round(2),
+            "buyer_yield_hold_pct": yield_pct(existing_noi, acquisition).round(4),
+            "buyer_yield_enhance_pct": yield_pct(
+                existing_noi + added_noi, acquisition + enhance_capex
+            ).round(4),
+            "buyer_yield_rebuild_pct": yield_pct(
+                hbu_noi, acquisition + hbu_capex + site
+            ).round(4),
+            "residual_price_enhance_cad": enhance_value.round(2),
+            "residual_price_rebuild_cad": rebuild_value.round(2),
+            "buyer_best_future": buyer_best.astype("object"),
+        },
+        index=frame.index,
+    )
+
+
+def assign_site_thesis(
+    frame: pd.DataFrame,
+    rules: SiteRules | None = None,
+    futures: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Which site theses fire on each lot, and the one that names it.
+
+    Returns the four `SITE_FLAG_COLUMNS`, the heritage flags,
+    `is_brownfield_use`, `storey_headroom`, `built_share`, the improvement
+    program and `site_thesis` - the first of `SITE_THESES` whose flag is set,
+    or ``none``.
+
+    ``futures`` is `futures_economics`' frame, and with it the teardown
+    follows the money: a lot whose enhancement is worth more to its owner
+    than its rebuild is not a teardown however old the building, and is
+    filed under `improvement` instead. Without it - a caller holding only
+    the gap - the thresholds decide alone.
+    """
+    rules = rules or SiteRules()
+    heritage = heritage_flags(frame, rules)
+    restricted = heritage["is_demolition_restricted"]
+    has_program = (
+        _numeric(frame, "hbu_floor_area_m2") > _MIN_PROGRAM_FLOOR_M2
+    ).fillna(False)
+    underbuilt = _boolean(frame, "is_underbuilt")
+    floor = _numeric(frame, "existing_floor_area_m2")
+    dwellings = _numeric(frame, "existing_num_dwellings").fillna(0.0)
+    year = _numeric(frame, "existing_year_built")
+    headroom = storey_headroom(frame)
+    share = built_share(frame)
+    use = brownfield_use(frame, rules)
+    program = improvement_program(frame, rules)
+
+    built = (floor > 0.0).fillna(False)
+    standing = built | year.notna()
+    empty = ~built & (dwellings <= 0.0)
+
+    enhance_beats_rebuild = pd.Series(False, index=frame.index)
+    if futures is not None:
+        gain_enhance = _numeric(futures, "owner_gain_enhance_cad")
+        gain_rebuild = _numeric(futures, "owner_gain_rebuild_cad")
+        enhance_beats_rebuild = (
+            gain_enhance.notna() & gain_rebuild.notna() & (gain_enhance > gain_rebuild)
+        )
+
+    is_brownfield = use & has_program & ~restricted
+    is_teardown = (
+        standing
+        & has_program
+        & underbuilt
+        & (year <= float(rules.teardown_max_year_built)).fillna(False)
+        & (share <= rules.teardown_max_built_share).fillna(False)
+        & (headroom >= float(rules.min_storey_headroom)).fillna(False)
+        & ~restricted
+        & ~enhance_beats_rebuild
+    )
+    is_infill = empty & has_program & underbuilt
+    is_improvement = (
+        built
+        & has_program
+        & underbuilt
+        & (
+            program["improvement_floor_m2"] >= float(rules.improvement_min_floor_m2)
+        ).fillna(False)
+    )
+
+    flags = {
+        SITE_FLAG_COLUMNS[BROWNFIELD]: is_brownfield.astype("bool"),
+        SITE_FLAG_COLUMNS[TEARDOWN]: is_teardown.astype("bool"),
+        SITE_FLAG_COLUMNS[INFILL]: is_infill.astype("bool"),
+        SITE_FLAG_COLUMNS[IMPROVEMENT]: is_improvement.astype("bool"),
+    }
+    thesis = pd.Series(NO_SITE_THESIS, index=frame.index, dtype="object")
+    # Reverse precedence, so the earlier thesis overwrites the later one.
+    for name in reversed(SITE_THESES):
+        thesis = thesis.mask(flags[SITE_FLAG_COLUMNS[name]], name)
+
+    result = pd.DataFrame(index=frame.index)
+    result["storey_headroom"] = headroom.round(0).astype("Int64")
+    result["built_share"] = share.round(4)
+    result["is_brownfield_use"] = use
+    for column in heritage.columns:
+        result[column] = heritage[column]
+    for column, flag in flags.items():
+        result[column] = flag
+    result["site_thesis"] = thesis.astype("object")
+    for column in program.columns:
+        result[column] = program[column]
+    return result
+
+
+def site_yield_on_cost_pct(
+    frame: pd.DataFrame,
+    assigned: pd.DataFrame,
+    rules: SiteRules | None = None,
+    *,
+    market_value_factor: float = 1.0,
+    costs: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Each site thesis's own denominator, and the yield on it.
+
+    For the three theses that clear the ground the numerator is the proposed
+    building's stabilised NOI, as on the first axis, and the denominator is
+    construction plus the property at its assessed value plus what the site
+    itself costs - `site_costs`. For an improvement the building stays, so
+    the yield is the addition's own: what the added floor earns over what it
+    costs, from `improvement_program`.
+
+    ``site_total_project_cost_cad`` is the denominator, kept so the yield is
+    checkable from the row; on an improvement it is the addition's cost.
+    """
+    rules = rules or SiteRules()
+    if costs is None:
+        costs = site_costs(frame, assigned["is_brownfield_use"], rules)
+    noi = _numeric(frame, "hbu_annual_stabilised_noi_cad")
+    capex = _numeric(frame, "hbu_total_capital_cost_cad")
+    land = _numeric(frame, "existing_total_assessed_value") * float(market_value_factor)
+    basis = capex + land + _numeric(costs, "site_costs_cad").fillna(0.0)
+    cleared = 100.0 * noi / basis.where(basis.abs() > _MIN_DENOMINATOR)
+
+    improving = assigned["site_thesis"] == IMPROVEMENT
+    site_yield = cleared.mask(improving, _numeric(assigned, "improvement_yield_pct"))
+    total = basis.mask(improving, _numeric(assigned, "improvement_cost_cad"))
+    return pd.DataFrame(
+        {
+            "demolition_cost_cad": costs["demolition_cost_cad"],
+            "site_assessment_cost_cad": costs["site_assessment_cost_cad"],
+            "remediation_cost_cad": costs["remediation_cost_cad"],
+            "site_total_project_cost_cad": total.round(2),
+            "site_yield_on_cost_pct": site_yield.round(4),
+        },
+        index=frame.index,
+    )
+
+
+def rank_site_opportunities(
+    frame: pd.DataFrame,
+    *,
+    rules: SiteRules | None = None,
+    market_value_factor: float = 1.0,
+    top_n: int = 25,
+) -> pd.DataFrame:
+    """``frame`` filed under its site thesis, costed, priced for the owner and
+    the buyer, and ranked within the thesis.
+
+    Returns everything `assign_site_thesis`, `site_yield_on_cost_pct` and
+    `futures_economics` add, plus ``site_thesis_rank``,
+    ``is_top_site_opportunity`` and ``num_ranked_in_site_thesis``, indexed
+    like ``frame``.
+
+    **Rank is within the site thesis**, on that thesis's own yield, for the
+    reason `rank_opportunities` ranks within the first axis. The tiebreak is
+    the owner's verdict - what rebuilding adds over holding, the site's costs
+    in, on the three theses that clear the ground; what the addition adds on
+    an improvement - and then `lot_uid`, so a re-run of an unchanged
+    partition produces the same list.
+
+    **Only lots where the play pays are ranked** when
+    `SiteRules.require_positive_npv` holds: that same verdict above zero. A
+    lot filed under a thesis and left unranked is the inventory saying "the
+    site condition holds and the arithmetic does not", which is an answer.
+    """
+    rules = rules or SiteRules()
+    use = brownfield_use(frame, rules)
+    costs = site_costs(frame, use, rules)
+    futures = futures_economics(
+        frame, costs, rules, market_value_factor=market_value_factor
+    )
+    assigned = assign_site_thesis(frame, rules, futures)
+    economics = site_yield_on_cost_pct(
+        frame, assigned, rules, market_value_factor=market_value_factor, costs=costs
+    )
+    result = pd.concat([assigned, economics, futures], axis=1)
+
+    thesis = result["site_thesis"]
+    improving = thesis == IMPROVEMENT
+    rebuild_gain = _numeric(futures, "owner_gain_rebuild_cad")
+    enhance_gain = _numeric(futures, "owner_gain_enhance_cad")
+    improvement_verdict = enhance_gain.where(
+        enhance_gain.notna(), _numeric(result, "improvement_noi_cad")
+    )
+    verdict = rebuild_gain.mask(improving, improvement_verdict)
+    result["site_verdict_cad"] = verdict.round(2)
+    yields = _numeric(result, "site_yield_on_cost_pct")
+
+    rankable = thesis.isin(SITE_THESES) & yields.notna()
+    if rules.require_positive_npv:
+        rankable &= (verdict > 0.0).fillna(False)
+
+    order = pd.DataFrame(
+        {
+            "thesis": thesis,
+            "yield": yields,
+            "verdict": verdict,
+            "tie": _numeric(frame, "lot_uid"),
+        }
+    )[rankable].sort_values(
+        ["thesis", "yield", "verdict", "tie"],
+        ascending=[True, False, False, True],
+        kind="stable",
+    )
+    ranks = order.groupby("thesis", sort=False).cumcount() + 1
+    result["site_thesis_rank"] = ranks.reindex(frame.index).astype("Int64")
+    result["is_top_site_opportunity"] = (
+        result["site_thesis_rank"].notna()
+        & (result["site_thesis_rank"] <= int(top_n))
+    )
+    counts = order.groupby("thesis", sort=False).size()
+    result["num_ranked_in_site_thesis"] = (
+        thesis.map(counts).where(rankable).astype("Int64")
+    )
+    return result
+
+
+def site_thesis_summary(frame: pd.DataFrame) -> pd.DataFrame:
+    """One row per site thesis: how many lots, how many pay, what they yield.
+
+    Every thesis in `SITE_THESES` gets a row whether or not any lot fell in
+    it, for the reason `thesis_summary` does: an empty facet is an answer.
+    ``total_verdict_cad`` is `site_verdict_cad` summed over the ranked lots -
+    the owner's gain over holding, in dollars, on every thesis.
+    """
+    ranked = (
+        frame[frame["site_thesis_rank"].notna()]
+        if "site_thesis_rank" in frame
+        else frame
+    )
+    rows = []
+    for thesis in SITE_THESES:
+        in_thesis = frame[frame["site_thesis"] == thesis]
+        scored = ranked[ranked["site_thesis"] == thesis]
+        top = (
+            scored[scored["is_top_site_opportunity"]]
+            if "is_top_site_opportunity" in scored
+            else scored
+        )
+        rows.append(
+            {
+                "site_thesis": thesis,
+                "num_lots": int(len(in_thesis)),
+                "num_ranked": int(len(scored)),
+                "num_top": int(len(top)),
+                "median_site_yield_on_cost_pct": _median(
+                    scored, "site_yield_on_cost_pct"
+                ),
+                "best_site_yield_on_cost_pct": _max(scored, "site_yield_on_cost_pct"),
+                "total_verdict_cad": _total(scored, "site_verdict_cad"),
+                "top_project_cost_cad": _total(top, "site_total_project_cost_cad"),
+                "ranked_lot_area_ha": round(
+                    float(_numeric(scored, "lot_area_m2").sum()) / 10_000.0, 2
+                ),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def futures_summary(frame: pd.DataFrame) -> pd.DataFrame:
+    """One row per future: how many lots it wins for the owner and for a
+    buyer, and what those wins are worth. The borough-level read of the
+    three futures, for the run's metadata."""
+    rows = []
+    for future in FUTURES:
+        owner_wins = frame[frame.get("owner_best_future", pd.Series(dtype=object)) == future]
+        buyer_wins = frame[frame.get("buyer_best_future", pd.Series(dtype=object)) == future]
+        rows.append(
+            {
+                "future": future,
+                "owner_wins": int(len(owner_wins)),
+                "buyer_wins": int(len(buyer_wins)),
+                "owner_gain_cad": (
+                    _total(owner_wins, f"owner_gain_{future}_cad")
+                    if future != "hold" else 0.0
+                ),
+                "buyer_npv_cad": _total(buyer_wins, f"buyer_npv_{future}_cad"),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def _numeric(frame: pd.DataFrame, column: str) -> pd.Series:
     """One column as float64, or all-NaN when the frame does not carry it."""
     if column not in frame.columns:
@@ -370,6 +1173,34 @@ def _boolean(frame: pd.DataFrame, column: str) -> pd.Series:
     if column not in frame.columns:
         return pd.Series(False, index=frame.index, dtype="bool")
     return frame[column].fillna(False).astype("bool")
+
+
+def _text(frame: pd.DataFrame, column: str) -> pd.Series:
+    """One column as stripped text, with every kind of missing as ``""``."""
+    if column not in frame.columns:
+        return pd.Series("", index=frame.index, dtype="object")
+    values = frame[column].astype("object").where(frame[column].notna(), "")
+    return values.map(lambda value: str(value).strip()).astype("object")
+
+
+def _present(frame: pd.DataFrame, column: str) -> pd.Series:
+    """Whether a zone-level text row states anything - see `_ABSENT_TEXT`."""
+    return _text(frame, column).map(
+        lambda value: value.lower() not in _ABSENT_TEXT
+    ).astype("bool")
+
+
+def _use_code_text(frame: pd.DataFrame) -> pd.Series:
+    """`existing_dominant_use_code` as the four-character string it is.
+
+    A parquet round trip can hand a code back as ``1000.0``; the comparables
+    module makes the same repair on the way in, and this is that repair again
+    for a frame that skipped it.
+    """
+    codes = _text(frame, "existing_dominant_use_code")
+    return codes.map(
+        lambda code: code[:-2] if code.endswith(".0") and code[:-2].isdigit() else code
+    )
 
 
 def _median(frame: pd.DataFrame, column: str) -> float | None:

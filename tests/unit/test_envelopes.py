@@ -104,8 +104,21 @@ def write_documents(store, *, urls=(GRID_URL,), feature_ids=(["C01-001"],)):
     )
 
 
-def write_lot_features(store, *, lot_uids=(1,), zones=("C01-001",), pct=(100.0,)):
-    """The lot x feature side of `building_lot_intersections`."""
+def write_lot_features(
+    store,
+    *,
+    lot_uids=(1,),
+    zones=("C01-001",),
+    pct=(100.0,),
+    lot_area_m2=400.0,
+):
+    """The lot x feature side of `building_lot_intersections`.
+
+    ``lot_area_m2`` is what turns a percentage into square metres, and it is a
+    parameter because the two artefact cutoffs are only telling apart on lots
+    of different sizes: 0.2% is 0.8 m2 of a 400 m2 parcel and 4 m2 of a
+    2 000 m2 one, so which cutoff a row falls to depends on the denominator.
+    """
     frame = gpd.GeoDataFrame(
         {
             "lot_feature_uid": list(range(1, len(lot_uids) + 1)),
@@ -116,8 +129,8 @@ def write_lot_features(store, *, lot_uids=(1,), zones=("C01-001",), pct=(100.0,)
             "feature_id": list(zones),
             "neighborhood": [NEIGHBORHOOD] * len(lot_uids),
             "scrape_date": [DATE] * len(lot_uids),
-            "lot_area_m2": [400.0] * len(lot_uids),
-            "overlap_area_m2": [400.0 * p / 100.0 for p in pct],
+            "lot_area_m2": [lot_area_m2] * len(lot_uids),
+            "overlap_area_m2": [lot_area_m2 * p / 100.0 for p in pct],
             "pct_of_lot": list(pct),
         },
         geometry=[Polygon([(0, 0), (0, 0.001), (0.001, 0.001), (0.001, 0)])]
@@ -430,15 +443,20 @@ def test_a_sliver_of_a_neighbouring_zone_can_be_configured_away(
 def test_a_square_metre_of_a_neighbouring_zone_is_not_an_envelope(
     store, cache, stub_pdfs
 ):
-    """The artefact cutoff, which unlike `min_pct_of_lot` is on by default.
+    """The absolute cutoff, doing what the proportional one cannot.
 
-    0.2% of a 400 m2 lot is 0.8 m2 - the cadastre and the zoning layer missing
-    each other along a lot line, not a second set of rules. It goes out
-    without being configured away, and the percentage cutoff would not have
-    caught it: at its default of 0 every overlap is kept.
+    A 40 m2 remnant, 1.5% of which - 0.6 m2 - is the block next door's zone.
+    The percentage clears `min_pct_of_lot` comfortably and the clip is still
+    the cadastre and the zoning layer missing each other along a lot line, so
+    it is `min_overlap_m2` that has to catch it. That is why both cutoffs
+    exist and why a row has to clear both.
     """
     write_lot_features(
-        store, lot_uids=(1, 1), zones=("C01-001", "C01-009"), pct=(99.8, 0.2)
+        store,
+        lot_uids=(1, 1),
+        zones=("C01-001", "C01-009"),
+        pct=(98.5, 1.5),
+        lot_area_m2=40.0,
     )
     write_frontage(store)
 
@@ -456,7 +474,41 @@ def test_a_square_metre_of_a_neighbouring_zone_is_not_an_envelope(
     assert metadata["num_sliver_pairs_dropped"].value == 1
 
 
-def test_the_artefact_cutoff_can_be_turned_off(store, cache, stub_pdfs):
+def test_a_zone_over_a_square_metre_but_under_one_per_cent_is_not_an_envelope(
+    store, cache, stub_pdfs
+):
+    """The proportional cutoff, doing what the absolute one cannot.
+
+    Lot 6 291 714 of Villeray-Saint-Michel-Parc-Extension to the square metre:
+    438 m2, of which the two publishers put 437.23 in H03-126 and 1.19 in
+    C03-130. That 1.19 m2 is 19% more than `min_overlap_m2` and 0.27% of the
+    parcel, so before `min_pct_of_lot` had a default the lot went out carrying
+    two zones - and a commercial grid governing a quarter of a per cent of it
+    was priced and solved beside the residential one governing the rest.
+    """
+    write_lot_features(
+        store,
+        lot_uids=(1, 1),
+        zones=("C01-001", "C01-009"),
+        pct=(99.727457, 0.272543),
+        lot_area_m2=438.42,
+    )
+    write_frontage(store)
+
+    result = materialize_both(
+        store, cache, stub_pdfs, feature_ids=["C01-001", "C01-009"]
+    )
+    frame = read_envelopes(store)
+    assert frame["feature_id"].unique().tolist() == ["C01-001"]
+    assert len(frame) == 2
+
+    metadata = materialization_metadata(result, lot_zoning_envelopes)
+    assert metadata["min_pct_of_lot"].value == 1.0
+    assert metadata["num_sliver_pairs_dropped"].value == 1
+
+
+def test_the_artefact_cutoffs_can_be_turned_off(store, cache, stub_pdfs):
+    """Both of them, and both are needed: 0.8 m2 is also 0.2% of the lot."""
     write_lot_features(
         store, lot_uids=(1, 1), zones=("C01-001", "C01-009"), pct=(99.8, 0.2)
     )
@@ -469,7 +521,9 @@ def test_the_artefact_cutoff_can_be_turned_off(store, cache, stub_pdfs):
         feature_ids=["C01-001", "C01-009"],
         run_config={
             "ops": {
-                "silver__lot_zoning_envelopes": {"config": {"min_overlap_m2": 0.0}}
+                "silver__lot_zoning_envelopes": {
+                    "config": {"min_overlap_m2": 0.0, "min_pct_of_lot": 0.0}
+                }
             }
         },
     )
@@ -520,7 +574,7 @@ def test_metadata_counts_what_is_solvable(store, cache, stub_pdfs):
     assert metadata["num_governing_envelopes"].value == 1
     assert metadata["num_solvable_envelopes"].value == 1
     assert metadata["num_lots_solvable"].value == 1
-    assert metadata["min_pct_of_lot"].value == 0.0
+    assert metadata["min_pct_of_lot"].value == 1.0
     assert metadata["min_overlap_m2"].value == 1.0
     assert metadata["num_sliver_pairs_dropped"].value == 0
     assert metadata["num_duplicate_rows_dropped"].value == 0

@@ -85,7 +85,7 @@ A lot that is neither dominant nor mixed — a 60/40 residential/industrial spli
 
 ```
 yield_on_cost_pct = 100 × hbu_annual_stabilised_noi_cad
-                        / (hbu_total_capital_cost_cad + land × land_value_factor)
+                        / (hbu_total_capital_cost_cad + assessed value × market_value_factor)
 ```
 
 **Why not the raw NOI gap.** Ranking on `annual_stabilised_noi_gap_cad` sorts on
@@ -102,9 +102,11 @@ second, rather than a weighted score nobody can defend line by line.
 **The land is in the denominator**, at its assessed value, and that is the one
 judgement in the formula. A developer pays for the ground as well as the
 building; leaving it out would rank a $4M teardown beside an empty lot as though
-they cost the same to acquire. `land_value_factor` scales it — 1.0 costs the
-land at the roll, honest for the same reason
-[`market_value_factor`](comparables.md) defaults there.
+they cost the same to acquire. `market_value_factor` scales it — 1.0 costs the
+property at the roll, honest for the same reason the comparables'
+[`market_value_factor`](comparables.md) defaults there. It scales the roll's
+*whole* value, land and building, since that is what `rl0404a` is; it was
+called `land_value_factor` until the buyer's price was built on it.
 
 `is_land_assessed` is false where the roll never reached the lot. Its land would
 otherwise be counted at nothing and it would rank top of every facet, so the
@@ -135,6 +137,25 @@ than a different table.
 the rank, so changing the shortlist length moves that column and nothing else —
 the cheapest of these settings to change your mind about.
 
+## The second axis: why the site is acquirable
+
+`investment_thesis` says what you would build. `site_thesis` says why the
+parcel is on the market at all — `brownfield`, `teardown`, `infill` or
+`improvement`, resolved in that order, with a boolean per thesis so the ones
+that also held are kept. Each carries its own cost into its own yield —
+demolition, characterisation and remediation, or the premium an addition pays
+over new build — and is ranked within itself as `site_thesis_rank`, with
+`is_top_site_opportunity` marking the first `site_top_n`. A lot whose
+governing zone is a *secteur d'intérêt patrimonial* is kept out of the two
+theses that demolish, and a PIIA review is flagged on the rest.
+
+That axis reads three inputs this page does not mention — the roll's year and
+storey count, the solver's storeys and footprint, and the grid's *Patrimoine*
+rows — and it has its own page: [site-theses.md](site-theses.md). The same
+page has the **three futures** — keep, enhance (a second solve with the
+building retained), tear down and rebuild — priced for the owner and for a
+buyer, which is where the acquisition price at the market factor lives.
+
 ## It is its own asset because it is cheap
 
 Every input is a column `lot_redevelopment_gap` already wrote, so this is a
@@ -148,6 +169,9 @@ It also carries a **curated subset** of the gap row rather than all of it. The
 per-class square-foot conversions, the binding caps, the parking and the storey
 counts stay in `sql/019` and `sql/018`, one join away on `lot_uid`; what is here
 is what a screening question needs to decide whether to open the parcel at all.
+The second axis adds the few columns its screens read — year built, storeys,
+the solver's storeys and footprint, the zone and its heritage rows — so a row
+explains its own `site_thesis`.
 No geometry either — join `gold.lot_profiles` on `lot_number` for that.
 
 ## Reading a run
@@ -168,10 +192,11 @@ take to build.
 ## Where it sits
 
 ```
+envelopes       →  silver/zoning_grid_columns        (the grids, heritage rows included)
 programs        →  silver/lot_development_programs   (the solve, expensive)
 hbu             →  gold/lot_highest_best_use         (the choice)
                    gold/lot_redevelopment_gap        (the comparison)
-opportunities   →  gold/lot_investment_opportunities (the shortlist)
+opportunities   →  gold/lot_investment_opportunities (the two shortlists)
 ```
 
 No schedule yet, like the rest of the HBU chain — see

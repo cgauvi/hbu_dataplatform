@@ -1069,6 +1069,75 @@ def _fit_one_bay(
     return best
 
 
+def placeable_area_m2(
+    buildable: BaseGeometry | None,
+    *,
+    aspect_ratios: Sequence[float] = DEFAULT_ASPECT_RATIOS,
+    grid_steps: int = GRID_STEPS,
+    shrink_steps: int = SHRINK_STEPS,
+    min_footprint_m2: float = MIN_FOOTPRINT_M2,
+) -> float:
+    """The largest single building ``buildable`` actually holds, in square metres.
+
+    The counterpart of `parking_capacity_m2` for the building, and the answer
+    to a question `buildable_area_m2` cannot be asked: an envelope's *area* is
+    not a footprint it can take. A skewed parallelogram, an L, a wedge and a
+    rectangle of one area hold very different buildings, and `solve_program`
+    capping a footprint on the area alone will price a plate that fits nowhere
+    on the parcel - which `lot_building_massing` then reports as `shrunk`,
+    after the economics have already been computed on it.
+
+    So this is the same rectangle `fit_rectangle` would draw, measured before
+    the solve rather than after it, and handed to `solve_program` as
+    `Lot.placeable_area_m2`. Deliberately the **same search** at the **same
+    settings** the massing asset runs - `GRID_STEPS` and `SHRINK_STEPS`, not
+    the coarser `CAPACITY_*` pair `parking_capacity_m2` uses. The coarse grid
+    reads a Villeray envelope about a quarter low, and a quarter off the
+    footprint cap is a quarter off the borough; more to the point, the whole
+    value of this number is that the program the solver prices is the program
+    the placer can draw, and two different searches would not agree.
+
+    Asked as ``fit_rectangle(buildable, buildable.area)``: no rectangle can
+    hold more area than the envelope it sits in, so the full-size pass either
+    settles it outright - a square envelope takes a square of its own area - or
+    fails on every ratio and the shrink search returns the best of them. That
+    is the maximum over the ratios and both angles.
+
+    It lands **under** the true largest rectangle, which is the direction a
+    feasibility bound has to err in, and by more than the bisection alone would
+    cost: `DEFAULT_ASPECT_RATIOS` is a ladder of four rungs, so an envelope
+    proportioned between two of them - a 9 x 28 m Villeray envelope is 3.11:1
+    and there is no such rung - is reported at the best rung that fits inside
+    it, a few percent short of its own area. That is deliberate rather than
+    tolerated: this is the area `fit_rectangle` will place, and a cap the
+    placer cannot draw to would hand the massing a plate to shrink, which is
+    the whole thing the cap exists to stop.
+
+    **It is a bound on one building, and that is a real restriction.** A parcel
+    that would take two 400 m2 blocks and no single 800 m2 one is reported at
+    400. That is the same choice `fit_rectangle` makes and for the same reason
+    - this module draws one massing per lot - and unlike the parking, which
+    honestly comes in patches and gets `PARKING_MAX_BAYS` of them, a building
+    split in two is a different program rather than the same one rearranged.
+
+    Returns 0.0 for an envelope with no geometry and for one that holds nothing
+    worth calling a building, which is the reading `Lot.placeable_area_m2`
+    gives a missing envelope and the conservative one.
+    """
+    polygon = _largest_part(buildable)
+    if polygon is None or polygon.is_empty or polygon.area <= 0:
+        return 0.0
+    fitted = fit_rectangle(
+        polygon,
+        polygon.area,
+        aspect_ratios=aspect_ratios,
+        grid_steps=grid_steps,
+        shrink_steps=shrink_steps,
+        min_footprint_m2=min_footprint_m2,
+    )
+    return float(fitted.placed_footprint_m2)
+
+
 def parking_capacity_m2(
     lot: BaseGeometry | None,
     *,
