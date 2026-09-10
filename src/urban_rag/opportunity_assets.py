@@ -38,8 +38,8 @@ three things the gap table does not carry, and this asset joins them in:
   the two are materialized together and share a generation by construction;
 * the governing zone's *Secteur d'interet patrimonial* and *PIIA (secteur)*
   rows, from `zoning_grid_columns`, on the zone - so a building in a heritage
-  sector is kept out of the two theses that demolish, and a PIIA review is
-  marked on the rest.
+  sector or a PIIA sector is kept out of the two theses that demolish, and
+  falls to `improvement`, where the building stays.
 
 Each site thesis carries its own costs into its own yield - demolition,
 characterisation and remediation, or the premium an addition pays over new
@@ -86,7 +86,12 @@ from urban_rag.comparables_assets import (
 )
 from urban_rag.envelope_assets import ZONE_COLUMNS_FILE, zoning_grid_columns
 from urban_rag.frames import write_frame
-from urban_rag.hbu import ENHANCEMENT_COLUMNS, FUTURE_COLUMNS
+from urban_rag.hbu import (
+    ENHANCEMENT_COLUMNS,
+    FUTURE_COLUMNS,
+    EnhancementRules,
+    investment_assumptions_of,
+)
 from urban_rag.hbu_assets import (
     GOLD_GROUP,
     LOT_GAP_FILE,
@@ -108,6 +113,7 @@ from urban_rag.opportunities import (
     thesis_summary,
 )
 from urban_rag.partitions import scrape_partitions
+from urban_rag.proforma import ProformaAssumptions, Timing
 from urban_rag.rag.pgvector import PostgresUnavailable
 from urban_rag.resources import ParquetStore, PostgisResource
 from urban_rag.storage import clear_parquet, filesystem, join, storage_options
@@ -125,10 +131,21 @@ LOT_OPPORTUNITIES_FILE = "lot_investment_opportunities.parquet"
 #: whether to open the parcel.
 _CARRIED: tuple[str, ...] = (
     "lot_uid",
+    # The zone, and the other half of the key. A shortlist row is a piece of
+    # ground rather than a parcel: a lot a zoning boundary crosses has two
+    # programs, two yields and two theses, and collapsing them would mean
+    # throwing one away. `lot_number` is what groups them back on a screen.
+    "feature_id",
     "lot_number",
     "neighborhood",
     "scrape_date",
+    # The parcel, then the ground this row was solved over, then how many
+    # pieces the parcel has and whether this is the biggest - the three a
+    # reader needs to know one row is not the whole lot.
     "lot_area_m2",
+    "piece_area_m2",
+    "num_lot_zones",
+    "is_primary_zone",
     "primary_frontage_m",
     "hbu_status",
     "is_underbuilt",
@@ -153,7 +170,19 @@ _CARRIED: tuple[str, ...] = (
     "hbu_residential_floor_area_m2",
     "hbu_commercial_floor_area_m2",
     "hbu_industrial_floor_area_m2",
+    # The two non-residential plates with their cellars, which the three above
+    # exclude. The lease-up in `proforma.returns` is measured on these.
+    "hbu_commercial_floor_area_with_cellar_m2",
+    "hbu_industrial_floor_area_with_cellar_m2",
     "hbu_annual_stabilised_noi_cad",
+    # That NOI by the family that earns it. The three floor-area columns above
+    # do not answer the same question - commerce earns several times what
+    # housing does per square foot - and the returns below are weighted on
+    # income: `proforma.returns` blends the exit cap and lengths the lease-up
+    # by exactly these three.
+    "hbu_residential_noi_cad",
+    "hbu_commercial_noi_cad",
+    "hbu_industrial_noi_cad",
     "hbu_total_capital_cost_cad",
     # The gap between the two, which is what makes it an opportunity.
     "dwelling_gap",
@@ -176,9 +205,13 @@ _CARRIED: tuple[str, ...] = (
 
 #: What the roll's side adds, from `lot_assessment_comparables`, and the names
 #: it takes here - prefixed like every other existing-side column of the gap.
+#: The neighbours' cap rate rides along for the reader: the screen holds the
+#: yield against the area's *market* cap, and this is what the roll implies
+#: for the lots around it, which is a different and lower number.
 _ROLL_COLUMNS: dict[str, str] = {
     "year_built": "existing_year_built",
     "num_storeys": "existing_num_storeys",
+    "comparable_cap_rate_pct": "comparable_cap_rate_pct",
 }
 
 #: What the solver's side adds, from `lot_highest_best_use`, and the names it
@@ -188,6 +221,11 @@ _PROGRAM_COLUMNS: dict[str, str] = {
     "floors": "hbu_floors",
     "footprint_m2": "hbu_footprint_m2",
     "grid_zone": "grid_zone",
+    # Whether the rebuild only exists with its parking waived, and the stalls
+    # it owes if so. On the shortlist because a reader pricing the rebuild
+    # column has to know it stands on a variance before calling anyone.
+    "parking_waived": "hbu_parking_waived",
+    "waived_stalls": "hbu_waived_stalls",
 }
 
 #: The zone-level rows read off the grid, from `zoning_grid_columns`.
@@ -301,11 +339,13 @@ class OpportunityConfig(Config):
         ),
     )
     exclude_piia_sectors: bool = Field(
-        default=False,
+        default=True,
         description=(
-            "Do the same for a zone under the PIIA by-law. Off by default: a "
-            "PIIA reviews the architecture, it does not bar demolition, and it "
-            "covers close to half the borough."
+            "Do the same for a zone under the PIIA by-law. On by default: the "
+            "review's subject is how a replacement building meets the street, "
+            "so a demolition-and-rebuild is what it exists to refuse. The lot "
+            "keeps its improvement thesis - the standing building may still "
+            "gain a storey."
         ),
     )
     demolition_review_year: int = Field(
@@ -319,6 +359,18 @@ class OpportunityConfig(Config):
     exclude_demolition_review: bool = Field(
         default=False,
         description="Turn demolition_review_required into a screen as well.",
+    )
+    unassessed_vacant_max_coverage: float = Field(
+        default=0.05,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "On ground the roll never listed - no unit, value, floor, "
+            "dwelling or use code - the share of the piece a measured "
+            "building footprint may cover and the piece still be read as a "
+            "lane, a park remnant or a street sliver rather than an infill "
+            "site. 0 turns the screen off."
+        ),
     )
     demolition_cost_cad_per_m2: float = Field(
         default=150.0,
@@ -391,6 +443,134 @@ class OpportunityConfig(Config):
         description="Lots per site thesis that is_top_site_opportunity marks.",
     )
 
+    # -- the returns ----------------------------------------------------------
+    soft_cost_pct: float = Field(
+        default=ProformaAssumptions().soft_cost_pct,
+        ge=0.0,
+        description=(
+            "Architecture, engineering, permits, fees, legal, marketing and "
+            "overhead, as a share of hard cost. 15 to 25 on a Montreal "
+            "wood-frame mid-rise."
+        ),
+    )
+    contingency_pct: float = Field(
+        default=ProformaAssumptions().contingency_pct,
+        ge=0.0,
+        description="Contingency on the hard cost, as a share of it.",
+    )
+    builders_risk_pct: float = Field(
+        default=ProformaAssumptions().builders_risk_pct,
+        ge=0.0,
+        description="Course-of-construction insurance, as a share of hard cost.",
+    )
+    selling_cost_pct: float = Field(
+        default=ProformaAssumptions().selling_cost_pct,
+        ge=0.0,
+        lt=100.0,
+        description="Brokerage and legal on the sale that ends the hold, as a share of the price.",
+    )
+    absorption_units_per_month: float = Field(
+        default=ProformaAssumptions().absorption_units_per_month,
+        gt=0.0,
+        description=(
+            "Dwellings a new building leases a month. The lease-up used in "
+            "the IRR is the longer of the solve's months and the dwellings "
+            "over this."
+        ),
+    )
+    commercial_absorption_sqft_per_month: float = Field(
+        default=ProformaAssumptions().commercial_absorption_sqft_per_month,
+        gt=0.0,
+        description=(
+            "Square feet of commercial floor a new building leases a month. "
+            "The lease-up is the longest of the solve's months, the dwellings "
+            "over their rate, and each non-residential floor over this."
+        ),
+    )
+    industrial_absorption_sqft_per_month: float = Field(
+        default=ProformaAssumptions().industrial_absorption_sqft_per_month,
+        gt=0.0,
+        description="Square feet of industrial floor leased a month, as above.",
+    )
+    market_cap_rate_pct: float | None = Field(
+        default=None,
+        gt=0.0,
+        description=(
+            "What stabilised residential income sells at in the area, in "
+            "percent. None reads the terminal cap the solve sold at; the two "
+            "spreads below put the other families over it."
+        ),
+    )
+    commercial_cap_rate_spread_bps: float = Field(
+        default=ProformaAssumptions().commercial_cap_rate_spread_bps,
+        ge=0.0,
+        description=(
+            "Basis points commercial income trades over the residential cap. "
+            "The cap a mixed building is valued and screened at is the two "
+            "spreads blended by how much of its NOI each family earns. Zero "
+            "values every family at the residential cap."
+        ),
+    )
+    industrial_cap_rate_spread_bps: float = Field(
+        default=ProformaAssumptions().industrial_cap_rate_spread_bps,
+        ge=0.0,
+        description="Basis points industrial income trades over it, as above.",
+    )
+    min_yoc_spread_bps: float = Field(
+        default=ProformaAssumptions().min_yoc_spread_bps,
+        ge=0.0,
+        description=(
+            "Basis points the all-in yield on cost must clear over the market "
+            "cap rate to pass the yield screen; a good candidate passes it or "
+            "the IRR hurdle."
+        ),
+    )
+    hurdle_irr_spread_bps: float = Field(
+        default=ProformaAssumptions().hurdle_irr_spread_bps,
+        ge=0.0,
+        description=(
+            "Basis points the thesis's own future must clear over the cap its "
+            "income mix exits at, from the buyer's chair. A spread and not a "
+            "level because in this flat-NOI model the cap rate IS the "
+            "unlevered return on buying the finished building - so the cap is "
+            "indifference and a hurdle set at it prices development risk at "
+            "zero. Makes the hurdle per lot: 5.5 for an apartment block "
+            "exiting at 4.5, 7.25 for a retail scheme exiting at 6.25."
+        ),
+    )
+    hurdle_irr_pct: float | None = Field(
+        default=None,
+        description=(
+            "Flat unlevered IRR hurdle on every lot, overriding the spread "
+            "above. None derives it per lot. 12 is the institutional "
+            "convention and is a LEVERED, growth-carrying number this module "
+            "cannot reach: with no rent growth and no financing it needs a 12 "
+            "pct yield on cost, 750 bps over the cap. Set it only to "
+            "reproduce an outside convention, knowing that."
+        ),
+    )
+
+    def proforma(self) -> ProformaAssumptions:
+        return ProformaAssumptions(
+            soft_cost_pct=self.soft_cost_pct,
+            contingency_pct=self.contingency_pct,
+            builders_risk_pct=self.builders_risk_pct,
+            selling_cost_pct=self.selling_cost_pct,
+            absorption_units_per_month=self.absorption_units_per_month,
+            commercial_absorption_sqft_per_month=(
+                self.commercial_absorption_sqft_per_month
+            ),
+            industrial_absorption_sqft_per_month=(
+                self.industrial_absorption_sqft_per_month
+            ),
+            market_cap_rate_pct=self.market_cap_rate_pct,
+            commercial_cap_rate_spread_bps=self.commercial_cap_rate_spread_bps,
+            industrial_cap_rate_spread_bps=self.industrial_cap_rate_spread_bps,
+            min_yoc_spread_bps=self.min_yoc_spread_bps,
+            hurdle_irr_spread_bps=self.hurdle_irr_spread_bps,
+            hurdle_irr_pct=self.hurdle_irr_pct,
+        )
+
     def rules(self) -> ThesisRules:
         """The thesis thresholds this run classifies with."""
         return ThesisRules(
@@ -423,6 +603,7 @@ class OpportunityConfig(Config):
             addition_cost_premium=self.addition_cost_premium,
             improvement_max_added_storeys=self.improvement_max_added_storeys,
             improvement_min_floor_m2=self.improvement_min_floor_m2,
+            unassessed_vacant_max_coverage=self.unassessed_vacant_max_coverage,
             require_positive_npv=self.require_positive_npv,
         )
 
@@ -457,8 +638,8 @@ class OpportunityConfig(Config):
         "improvement (a storey or an annex on the building that stays), "
         "resolved in that order and each carrying its own demolition, "
         "remediation or addition cost into site_yield_on_cost_pct; a lot in a "
-        "heritage sector is kept out of the two that demolish, and a PIIA "
-        "review is flagged. site_thesis_rank orders each site thesis on that "
+        "heritage sector or a PIIA sector is kept out of the two that "
+        "demolish. site_thesis_rank orders each site thesis on that "
         "yield and is_top_site_opportunity marks the first site_top_n. Each "
         "lot's three futures - keep, enhance, tear down and rebuild - are "
         "priced twice beside that: for the owner, land cancelling, as "
@@ -518,6 +699,27 @@ def lot_investment_opportunities(
 
     rules = config.rules()
     site_rules = config.site_rules()
+    proforma = config.proforma()
+    # The timing the two futures were solved with, read off the rows they
+    # were solved on - the rebuild's off the HBU row's program_assumptions,
+    # the enhancement's off the gap's enhance_assumptions - so the IRR moves
+    # the same money the NPV did.
+    investment = investment_assumptions_of(hbu)
+    rebuild_timing = Timing(
+        construction_months=investment.construction_months,
+        lease_up_months=investment.lease_up_months,
+        hold_years=investment.hold_years,
+        terminal_cap_rate_pct=investment.terminal_cap_rate_pct,
+        discount_rate_pct=investment.discount_rate_pct,
+    )
+    enhance_rules = _enhancement_rules_of(gap)
+    enhance_timing = Timing(
+        construction_months=enhance_rules.construction_months,
+        lease_up_months=enhance_rules.lease_up_months,
+        hold_years=investment.hold_years,
+        terminal_cap_rate_pct=investment.terminal_cap_rate_pct,
+        discount_rate_pct=investment.discount_rate_pct,
+    )
     ranked = rank_opportunities(
         inputs,
         rules=rules,
@@ -529,6 +731,9 @@ def lot_investment_opportunities(
         rules=site_rules,
         market_value_factor=config.market_value_factor,
         top_n=config.site_top_n,
+        proforma=proforma,
+        rebuild_timing=rebuild_timing,
+        enhance_timing=enhance_timing,
     )
     joined = [
         *(name for name in _ROLL_COLUMNS.values()),
@@ -555,6 +760,14 @@ def lot_investment_opportunities(
             **site_rules.as_metadata(),
             "site_top_n": config.site_top_n,
             "heritage_source": "zoning_grid_columns" if heritage_known else "absent",
+            **proforma.as_metadata(),
+            "rebuild_construction_months": rebuild_timing.construction_months,
+            "rebuild_lease_up_months": rebuild_timing.lease_up_months,
+            "enhance_construction_months": enhance_timing.construction_months,
+            "enhance_lease_up_months": enhance_timing.lease_up_months,
+            "hold_years": rebuild_timing.hold_years,
+            "terminal_cap_rate_pct": rebuild_timing.terminal_cap_rate_pct,
+            "discount_rate_pct": rebuild_timing.discount_rate_pct,
         },
         ensure_ascii=False,
     )
@@ -695,6 +908,12 @@ def lot_investment_opportunities(
             "num_demolition_restricted_lots": int(
                 frame["is_demolition_restricted"].sum()
             ),
+            # The lane screen: ground the roll never listed with under
+            # `unassessed_vacant_max_coverage` of it under a measured
+            # building, kept out of infill. 594 of VSMPE 2026-09-01's 1,051
+            # infill pieces; a borough where this is most of the infills was
+            # filing its ruelles.
+            "num_unassessed_vacant_lots": int(frame["is_unassessed_vacant"].sum()),
             # A grid printing ``-`` against the heritage row is a known
             # answer - not a sector - and is null here like everywhere else,
             # so "unknown" is the lots whose governing zone found no grid row
@@ -706,6 +925,28 @@ def lot_investment_opportunities(
                 frame["existing_num_storeys"].isna().sum()
             ),
             "num_brownfield_use_lots": int(frame["is_brownfield_use"].sum()),
+            # The returns, by the numbers: how many lots clear the cap rate,
+            # how many the hurdle, on their own thesis - a good candidate
+            # clears either - and what the IRRs look like where they exist.
+            # A borough with few good candidates is priced above what its
+            # envelopes earn, which is a finding rather than a fault.
+            "num_good_candidates": int(frame["is_good_candidate"].sum()),
+            "num_clearing_cap_rate": int(frame["clears_cap_rate"].sum()),
+            "num_clearing_hurdle": int(frame["clears_hurdle"].sum()),
+            "num_with_buyer_irr": int(frame["site_irr_pct"].notna().sum()),
+            **{
+                f"num_{row.site_thesis}_good_candidates": row.num_good_candidates
+                for row in site_summary.itertuples()
+            },
+            **{
+                f"median_{row.site_thesis}_site_irr_pct": (
+                    row.median_site_irr_pct
+                    if row.median_site_irr_pct is not None
+                    else "none ranked"
+                )
+                for row in site_summary.itertuples()
+            },
+            "proforma_assumptions": MetadataValue.json(proforma.as_metadata()),
             "site_thesis_summary": MetadataValue.md(
                 site_summary.to_markdown(index=False)
             ),
@@ -738,27 +979,83 @@ def lot_investment_opportunities(
     )
 
 
-def _join_program(inputs: pd.DataFrame, hbu: pd.DataFrame) -> None:
-    """The solver's storeys, footprint and zone, aligned on ``lot_uid``.
+def _enhancement_rules_of(gap: pd.DataFrame) -> EnhancementRules:
+    """The `EnhancementRules` the gap's enhancement solves ran with, read off
+    the `enhance_assumptions` object it writes on every row; the module
+    defaults where the partition predates it."""
+    default = EnhancementRules()
+    if gap.empty or "enhance_assumptions" not in gap.columns:
+        return default
+    values = gap["enhance_assumptions"].dropna()
+    if not len(values):
+        return default
+    try:
+        payload = json.loads(values.iloc[0])
+        return EnhancementRules(
+            construction_months=int(
+                payload.get("enhance_construction_months", default.construction_months)
+            ),
+            lease_up_months=int(
+                payload.get("enhance_lease_up_months", default.lease_up_months)
+            ),
+            disruption_share=float(
+                payload.get("enhance_disruption_share", default.disruption_share)
+            ),
+            addition_cost_premium=float(
+                payload.get("addition_cost_premium", default.addition_cost_premium)
+            ),
+            max_added_storeys=int(
+                payload.get("max_added_storeys", default.max_added_storeys)
+            ),
+        )
+    except (TypeError, ValueError):
+        return default
 
-    Gold to gold on the surrogate, which is safe here for the reason the map
-    is careful about elsewhere: the gap and the HBU parquet are written by
-    one `make hbu` and share a generation of `rag.lots` by construction. The
-    join keys to the zone (`feature_id`, `source_table`) ride along for
-    `_join_zones` and are dropped before the frame is written.
+
+def _join_program(inputs: pd.DataFrame, hbu: pd.DataFrame) -> None:
+    """The solver's storeys and footprint, aligned on ``(lot_uid, feature_id)``.
+
+    Gold to gold on the surrogate pair, which is safe here for the reason the
+    map is careful about elsewhere: the gap and the HBU parquet are written by
+    one `make hbu` and share a generation of `rag.lots` by construction.
+
+    **On the pair, not on `lot_uid` alone.** Both tables are one row per piece
+    of ground since `lot_zone_pieces`, and a lot two zones cut in two has two
+    rows in each. Joining on the lot would take whichever piece
+    `drop_duplicates` happened to keep and align it to both rows of the gap -
+    so the housing half of a split parcel would be shown the commercial half's
+    storeys. `source_table` rides along for `_join_zones` and is dropped before
+    the frame is written.
+
+    A gap frame with no `feature_id` - one written before the pieces existed -
+    falls back to the lot, which is exactly the old behaviour on a table that
+    had one row per lot anyway.
     """
+    keys = ["lot_uid", "feature_id"]
+    if "feature_id" not in inputs.columns or "feature_id" not in hbu.columns:
+        keys = ["lot_uid"]
     wanted = [*_PROGRAM_COLUMNS, "feature_id", "source_table"]
-    if hbu.empty or "lot_uid" not in hbu.columns or "lot_uid" not in inputs.columns:
+    if (
+        hbu.empty
+        or not set(keys) <= set(hbu.columns)
+        or not set(keys) <= set(inputs.columns)
+    ):
         for name in [*_PROGRAM_COLUMNS.values(), "feature_id", "source_table"]:
-            inputs[name] = None
+            if name not in inputs.columns:
+                inputs[name] = None
         return
     right = (
-        hbu.drop_duplicates("lot_uid")
-        .set_index("lot_uid")
-        .reindex(columns=wanted)
+        hbu.drop_duplicates(keys)
+        .set_index(keys)
+        .reindex(columns=[name for name in wanted if name not in keys])
         .rename(columns=_PROGRAM_COLUMNS)
     )
-    aligned = right.reindex(inputs["lot_uid"].to_numpy())
+    index = (
+        pd.MultiIndex.from_frame(inputs[keys])
+        if len(keys) > 1
+        else pd.Index(inputs[keys[0]].to_numpy())
+    )
+    aligned = right.reindex(index)
     aligned.index = inputs.index
     for name in aligned.columns:
         inputs[name] = aligned[name]
@@ -806,13 +1103,21 @@ def _join_zones(
     file had no row for - a lot with no solved program names none, and is
     counted - so the run can say how much of the borough the screen could
     judge.
+
+    **`source_table` is dropped afterwards and `feature_id` is not**, which is
+    the one asymmetry here. Both used to go: they were join keys borrowed from
+    the HBU row and the shortlist was one row per lot, so neither meant
+    anything on the output. Since `lot_zone_pieces` the zone is *half the
+    table's key* - a shortlist row is a piece of a lot - so dropping it leaves
+    a frame that cannot be written at all. `source_table` is still only a join
+    key and still goes.
     """
     known = not zones.empty and all(name in zones.columns for name in _ZONE_COLUMNS)
     keys = ["source_table", "feature_id"]
     if not known or any(name not in inputs.columns for name in keys):
         for name in _ZONE_COLUMNS:
             inputs[name] = None
-        inputs.drop(columns=[k for k in keys if k in inputs.columns], inplace=True)
+        _drop_join_keys(inputs, keys)
         return known, len(inputs)
     right = (
         zones.dropna(subset=["feature_id"])
@@ -828,8 +1133,24 @@ def _join_zones(
     aligned.index = inputs.index
     for name in _ZONE_COLUMNS:
         inputs[name] = aligned[name]
-    inputs.drop(columns=keys, inplace=True)
+    _drop_join_keys(inputs, keys)
     return True, len(inputs) - matched
+
+
+def _drop_join_keys(inputs: pd.DataFrame, keys: list[str]) -> None:
+    """Drop the zone join keys, keeping the one that is part of the table's key.
+
+    `feature_id` is half of `gold.lot_investment_opportunities`' natural key
+    since a development site became a piece of a lot rather than a lot, so it
+    stays however it got here. `source_table` is a join key and nothing else -
+    the layer slug the zone was read from - and does not belong on a shortlist
+    row.
+    """
+    keep = set(_CARRIED)
+    inputs.drop(
+        columns=[k for k in keys if k in inputs.columns and k not in keep],
+        inplace=True,
+    )
 
 
 def _read(

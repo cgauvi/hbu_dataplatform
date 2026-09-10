@@ -224,6 +224,28 @@ LOT_PROFILES_FILE = "lot_profiles.parquet"
 #: what to leave out rather than as what to take, so a norm added to
 #: `envelope_assets.NORM_FIELDS` reaches this column by being added there and
 #: nowhere else.
+#: Columns of an envelope row that describe the **lot** rather than the
+#: envelope, and are therefore lifted out of each entry: the profile already
+#: has one row per lot to carry them, and repeating them once per grid column
+#: is bytes nobody reads.
+#:
+#: **The frontage pair used to be here and no longer is**, which is the one
+#: entry in this set worth arguing. It belonged: `lot_zoning_envelopes` carried
+#: the *lot's* primary and secondary street on every row, so the three values
+#: were the same on each grid column and `compute_lot_profiles` pivots the same
+#: `silver.lot_frontage` itself for the profile's own copy.
+#:
+#: Since `lot_zone_pieces` they are the *piece's* street, re-ranked inside the
+#: ground each zone governs - and on a parcel a zoning boundary crosses the
+#: pieces face different streets. On lot 1 740 794 the C04-083 envelope fronts
+#: 19.8 m of Jarry and the H04-072 one 15.2 m of D'Hérelle, and the profile's
+#: own lot-level pair is one of those and not both. Excluding them would drop
+#: from each entry the very number its *Largeur du terrain min* was tested
+#: against, and leave a reader unable to see why two envelopes on one parcel
+#: govern differently. So they ride inside the entry now, where they vary.
+#:
+#: `piece_area_m2` is in the entry for the same reason and `lot_area_m2` is
+#: not: one is the ground that envelope governs, the other is the parcel.
 _ENVELOPE_LOT_COLUMNS = frozenset(
     {
         "lot_uid",
@@ -231,14 +253,7 @@ _ENVELOPE_LOT_COLUMNS = frozenset(
         "neighborhood",
         "scrape_date",
         "lot_area_m2",
-        "primary_frontage_m",
-        "primary_street_name",
-        "primary_cote_rue_id",
-        "secondary_frontage_m",
-        "secondary_street_name",
-        "secondary_cote_rue_id",
-        "num_frontages",
-        "frontage_buffer_m",
+        "lot_frontage_m",
     }
 )
 

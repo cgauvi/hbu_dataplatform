@@ -43,39 +43,44 @@ the kind of error that produces a confident answer rather than an exception.
 **Parking is where the envelope stops being one number.** Every dwelling owes
 stalls (`ParkingRules.stalls_per_dwelling`) and so does every thousand square
 feet of commerce or industry (`ParkingRules.stalls_per_1000_sqft`), and the
-four ways to provide them are not substitutes. Article 38 1° of by-law 01-283
-excludes *une aire de stationnement des véhicules [...] située en sous-sol, de
-même que leurs voies
-d'accès* from the *superficie de plancher* the density index is computed on -
-so an underground stall is invisible to the *Densité* cap and, being below
-grade, to *En étage* as well. An above-grade stall is neither: it sits in a
-storey that counts against both. The trade the solver is asked to make is
-therefore a real one - underground buys FSR back at a higher price per stall,
-above grade is cheaper per stall but is paid for in dwellings that no longer
-fit. Neither dominates, which is why both are decision variables.
+three ways to provide them are not substitutes, because each is rationed by a
+different thing and seen by a different cap:
 
-**And the third way is not to build a structure at all.** A stall can also
-stand on the ground the building does not cover, which is neither a storey nor
-*superficie de plancher* because it is not in a building: what *Taux
-d'implantation* caps is the footprint, and the rest of the parcel is a yard.
-`surface_stalls` is that, bounded by `lot area - footprint` and priced at
-`SURFACE_STALL_COST_CAD` - $6 105 against $48 125 and $60 300, because asphalt
-is what it is.
+- **surface** - a stall on the ground the building does not cover. Not in a
+  building, so neither a storey nor *superficie de plancher*: what *Taux
+  d'implantation* caps is the footprint, and the rest of the parcel is a yard.
+  Rationed by the parcel - its area, and its shape.
+- **integrated** - a bay in the building's own ground floor, `garage_stalls`.
+  Inside the plate *Taux d'implantation* caps and floor area the *Densité*
+  index counts, so every square metre of it is a square metre no dwelling
+  gets. Rationed by one plate: the ground floor.
+- **underground** - a dug level, `underground_stalls`. Article 38 1° of by-law
+  01-283 excludes *une aire de stationnement des véhicules [...] située en
+  sous-sol, de même que leurs voies d'accès* from the *superficie de plancher*
+  the density index is computed on, and article 43 excludes *une partie du
+  bâtiment qui est entièrement sous terre* from the site coverage - so a dug
+  stall is invisible to *Densité*, to *Taux d'implantation* and, being below
+  grade, to *En étage* and *Hauteur* as well. Rationed by the **parcel**, not
+  by the building's plate: the dug plate may run out under the yard to the
+  lot line (`ParkingRules.underground_lot_share`), which is what a real
+  parkade does and what article 43 is there to permit.
+
+`surface_stalls` is priced at `SURFACE_STALL_COST_CAD` - $6 105 against
+$15 450 for a bay and $60 300 for a dug stall, because asphalt is what it is.
 
 Leaving it out is what made this module answer a detached house with nothing.
 A grid printing ``H.1``, *En étage* 1/1 and *Taux d'implantation* 35 % permits
 one dwelling on one storey, so the class ceiling allows no second dwelling to
-share the stall and the single permitted storey is the dwelling's own - the
-above-grade deck has nowhere to stand. That left an underground level as the
-only provision the model knew, and one dwelling does not earn back a $60 300
-parkade stall, so the maximum of the objective was to build nothing: a lot
-whose zoning plainly allows a house came back as 0 m2 and 0 dwellings. The
-option that was missing is the one such a lot actually uses, and it is missing
-nowhere else in the pipeline - the cost guide `urban_rag.estimator` reads
-prices `surface_lot` beside the two parkades.
+share the stall. That left an underground level as the only provision the
+model knew, and one dwelling does not earn back a $60 300 parkade stall, so
+the maximum of the objective was to build nothing: a lot whose zoning plainly
+allows a house came back as 0 m2 and 0 dwellings. The option that was missing
+is the one such a lot actually uses, and it is missing nowhere else in the
+pipeline - the cost guide `urban_rag.estimator` reads prices `surface_lot`
+beside the two parkades.
 
 It is the cheapest stall by an order of magnitude, so the model now parks on
-grade wherever there is grade to park on, and digs or decks only where the
+grade wherever there is grade to park on, and bays or digs only where the
 coverage cap has left no yard. That is the trade a low-rise borough actually
 makes, and it is bounded the way the land is: a column allowing 70 % coverage
 of a 300 m2 lot leaves 90 m2 of yard and three stalls, after which the
@@ -95,13 +100,14 @@ must dig, deck, bay it into the ground floor, or build less; `binding` reports
 `surface_parking_shape` where the shape is what stopped it, because no printed
 norm will say so.
 
-The bound ignores the building, which it has to - the footprint is the decision
-it is an input to - so on that count it is generous. It is one rectangle rather
-than the several a real yard can hold, so on that count it is strict. Neither
-approximation is hidden: `massing.parking_capacity_m2` states both and says
-which bites where. What a *particular* answer can park, once its building
-stands on the parcel and up to three patches of asphalt are allowed, is
-`lot_building_massing`'s `surface_parking_fit_pct`.
+The bound is measured on the yard rather than on the parcel - ``parcel less the
+placeable rectangle``, opened by half a stall's depth - so it is the ground the
+answer will actually have, and `lot_building_massing` later paves that same
+region with that same function. `surface_parking_fit_pct` is therefore a check
+that can pass, where two separate searches had it under 100 on about half the
+borough. What it refuses is the ribbon and the sliver, and it refuses them
+squarely: 5.5 m clear in every direction is the strict reading of a stall, and
+a 3 m side yard parks nothing at any length.
 
 **And a footprint has a shape too, which is where the yard's area comes from.**
 The same criticism runs against the plate: *Taux d'implantation* and the
@@ -128,57 +134,65 @@ draw. Before this, the solve and `lot_building_massing` answered two different
 questions and only the second knew it - the massing shrank the plate to 78% and
 the dwellings, the NOI and the NPV stayed on the 100% that was never available.
 
-**And the fourth is inside the building without being a storey of it.** A
-closed garage in the ground floor - the attached garage of a house, the bay
-behind the door of anything larger - is `garage_stalls`, and it is the option
-that sits between the two extremes on every axis at once. It is *superficie de
-plancher*, so the *Densite* cap counts it where the yard and the dug level are
-invisible to both; it is under the plate, so *Taux d'implantation* counts it
-too; and it is not a storey, so *En etage* does not, which is the whole
-difference between it and the deck above. What it really costs the building is
-the floor area it takes from the dwellings - a bay is a square metre no
-dwelling gets - and `solve_program` says exactly that by putting the bays and
-the units in one inequality against the residential plates.
+**And the integrated bay is inside the building without being a storey of
+it.** A closed garage in the ground floor - the attached garage of a house,
+the bay behind the door of anything larger - is `garage_stalls`, and it is
+the option that sits between the two others on every axis at once. It is
+*superficie de plancher*, so the *Densite* cap counts it where the yard and
+the dug level are invisible to it; it is under the plate, so *Taux
+d'implantation* counts it too; and it is not a storey, so *En etage* does
+not. What it really costs the building is the floor area it takes from the
+dwellings - a bay is a square metre no dwelling gets - and `solve_program`
+says exactly that by putting the bays and the units in one inequality against
+the residential plates, and by bounding the bays at one plate: more than a
+ground floor's worth of bays is not a garage in a building, it is a parking
+structure, and this model does not build one.
 
 Its price is the one rate on this page the cost guide does not publish; see
 `GARAGE_STALL_COST_CAD` for what it is derived from and why a parkade rate is
 the wrong number for a garage door.
 
-So there are four provisions and no dominance among them, which is why all
-four are decision variables:
+So there are three provisions and no dominance among them, which is why all
+three are decision variables:
 
-=====================  ===========  =========  ==========  =======
-provision              rationed by  *Densite*  *En etage*  $/stall
-=====================  ===========  =========  ==========  =======
-surface                the yard     no         no            6 105
-garage (ground floor)  one plate    **yes**    no           15 450
-deck (a whole storey)  storeys      **yes**    **yes**      48 125
-underground            digging      no         no           60 300
-=====================  ===========  =========  ==========  =======
+====================  ===========  =========  ==============  ==========  =======
+provision             rationed by  *Densite*  *Implantation*  *En etage*  $/stall
+====================  ===========  =========  ==============  ==========  =======
+surface               the yard     no         no              no            6 105
+integrated (RDC bay)  one plate    **yes**    **yes**         no           15 450
+underground           the parcel   no         no              no           60 300
+====================  ===========  =========  ==============  ==========  =======
 
-Read down the last column and the ordering looks settled; read the two middle
+Read down the last column and the ordering looks settled; read the middle
 ones and it is not. The cheapest is spent first and runs out first, because
 what rations it is the very thing a coverage cap takes away - so a house on a
 big lot parks on the yard, a house on a tight one puts a garage in its ground
-floor and gives up part of a dwelling for it, and only a building whose plates
-and yard are both spoken for pays to dig. Any of the four combines with any
+floor and gives up part of a dwelling for it, and only a building whose plate
+and yard are both spoken for pays to dig. Any of the three combines with any
 other; the building owes one number of stalls and fills it from wherever it is
 cheapest at the margin.
 
-**One footprint, identical floors.** Every storey - residential, above-grade
-parking, underground - is the same plate, so the footprint is whatever the
-hungriest floor type needs and the model carries a single `footprint`
-variable. That is an assumption about the building, not a norm: a real garage
-would run wider than the tower above it (article 43 excludes *une partie du
-bâtiment qui est entièrement sous terre* from the site-coverage calculation,
-so it could), and modelling that would need a second footprint.
+**One footprint, identical floors - above grade.** Every storey is the same
+plate, so the footprint is whatever the hungriest floor type needs and the
+model carries a single `footprint` variable for the building. That is an
+assumption about the building, not a norm. The one plate that is **not** the
+footprint is the dug one: a parkade runs wider than the tower above it - under
+the yard, out to the margins - and article 43 is what lets it, by excluding
+*une partie du bâtiment qui est entièrement sous terre* from the site-coverage
+calculation. So the underground levels are bounded by the parcel
+(`ParkingRules.underground_lot_share` of `Lot.area_m2`) and not by
+`footprint`, which is also what makes them cheap to model: with the plate a
+constant, "the stalls fit in the levels dug" is a linear inequality and the
+model carries one product fewer. `DevelopmentProgram.underground_plate_m2`
+reports the plate the stalls actually took - ``underground_area_m2`` over
+``underground_levels`` - and it may exceed `footprint_m2`.
 
 **The storey cap is printed twice.** A grid states *En étage* and *Hauteur en
 mètre* side by side, and they are two ceilings on the same stack rather than
 one stated in two units: a storey is only a fixed number of metres if you say
 what is in it, and `StoreyHeights` is where that is said - three metres for a
-dwelling storey, four for commerce or for industry, three for an above-grade
-deck. Six storeys of housing clear an 18 m limit and four of commerce do not
+dwelling storey, four for commerce or for industry. Six storeys of housing
+clear an 18 m limit and four of commerce do not
 clear a 15, so a column printing ``6`` and ``15`` allows five of one or three
 of the other, and neither number is the storey row.
 
@@ -331,6 +345,20 @@ storey a mixed-use column allows. Whether it still wins is now a question
 about the parcel rather than a foregone conclusion, and that is the point of
 putting the ratio in.
 
+**And the mix is reported as income, not only as floor.** The answer carries
+`residential_gross_revenue_cad`, `commercial_gross_revenue_cad` and
+`industrial_gross_revenue_cad` beside the total they sum to, because the two
+ways of asking "how much of this building is retail" give very different
+answers and everything downstream wants the second. At the rates above a
+square foot of commerce earns about four times what a square foot of housing
+does, so a single retail storey under five of flats is a sixth of the floor
+and very nearly half the rent; and the basement plates are rented at a
+discount and stand outside `commercial_area_m2` entirely, so no area column
+here can be turned back into the split. `urban_rag.proforma` is what reads
+them - a lease-up and a cap rate are both weighted by which family earns the
+income, and a mixed building priced on the dwelling side of both is being
+priced as a building it is not.
+
 `NO_PARKING` and `NO_CONSTRUCTION_COST` strip either cost back out, which is
 what the tests that pin the rent arithmetic use so a change to a published
 rate cannot move a number that is about something else. `NO_NON_RESIDENTIAL`
@@ -343,7 +371,7 @@ from __future__ import annotations
 import math
 import re
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 
 import numpy as np
@@ -400,11 +428,12 @@ STALLS_PER_DWELLING = 0.5
 
 #: Stalls owed per thousand square feet of commercial or industrial floor. The
 #: same kind of assumption and a much heavier one: at three per thousand a
-#: 3 000 sq ft retail plate owes nine stalls, and nine above-grade stalls at
-#: `ABOVE_GRADE_STALL_AREA_SQFT` fill 2 700 sq ft - very nearly a second plate
-#: of the same size. Commerce that pays for its own parking storey is a
-#: different proposition from commerce that does not, and this ratio is the
-#: whole of the difference; it is one number precisely so it can be moved.
+#: 3 000 sq ft retail plate owes nine stalls, and nine stalls at
+#: `GARAGE_STALL_AREA_SQFT` fill 2 700 sq ft - very nearly a second plate of
+#: the same size, and more than a ground floor holds beside the shop. Commerce
+#: that pays for its own parking is a different proposition from commerce that
+#: does not, and this ratio is the whole of the difference; it is one number
+#: precisely so it can be moved.
 #:
 #: One rate for both, because the demand a use generates is about trips rather
 #: than about what the guide charges to build the floor - and because nothing
@@ -422,20 +451,62 @@ STALLS_PER_1000_SQFT = 3.0
 #: `SCALE x stalls >= demand`, so 13 dwellings at 0,5 owe 7 stalls, not 6.
 STALL_DEMAND_SCALE = 1_000_000
 
+#: What a rented stall earns a month, and what share of the stalls a building
+#: offers are actually rented. A stall was a pure cost to the objective until
+#: these existed - it earned nothing, so nothing of it survived to offset the
+#: price - which is why the model built exactly the stalls it owed and never
+#: one more. Priced into the objective through the same `pv_per_monthly_gross`
+#: a dwelling's rent goes through, so a stall is worth its rent over the hold
+#: less its capital, and a surface stall pays for itself several times over
+#: while a dug one still does not. Neither is a surveyed figure: $120 is a
+#: Montreal borough's ordinary monthly rate for an outdoor stall and 85 % is
+#: the ordinary take-up, and both are stated here so they can be moved.
+PARKING_STALL_RENT_CAD_MONTH = 120.0
+PARKING_STALL_OCCUPANCY_PCT = 85.0
+
+#: The most stalls the building's own occupants would rent - one per dwelling
+#: and the same rate per thousand square feet the demand ratio uses. This is
+#: the ceiling on *rented* stalls, and the whole reason a stall's rent can be
+#: in the objective at all: without it a stall on the yard pays for itself,
+#: and the solver would pave every square metre the coverage cap leaves for
+#: tenants who do not exist. It is also the coverage at which the absorption
+#: benefit below saturates: a second stall per dwelling leases nothing faster.
+MARKET_STALLS_PER_DWELLING = 1.0
+MARKET_STALLS_PER_1000_SQFT = STALLS_PER_1000_SQFT
+
+#: Months of lease-up a dwelling with a full stall saves over one with none.
+#: Parking leases a building faster, and with diminishing returns - the first
+#: quarter stall per dwelling is worth more than the last - so the saving is
+#: concave in coverage: ``saving(c) = S x (1 - (1 - c)^2)`` for coverage ``c``
+#: in stalls per dwelling over `MARKET_STALLS_PER_DWELLING`, capped at 1. It
+#: enters the objective through the present value: a shorter lease-up pushes
+#: the whole income stream out by less (`InvestmentAssumptions.delay_years`
+#: charges half the lease-up), so a dwelling at higher coverage is worth its
+#: rent through a slightly larger multiplier. At a 5 % discount rate two months
+#: of lease-up are about 0.4 % of a dwelling's present value - a real term and
+#: a small one, which is what the arithmetic says it is. Zero switches it off,
+#: and it is off by construction wherever `lease_up_months` is zero.
+PARKING_ABSORPTION_SAVING_MONTHS = 2.0
+
+#: How finely the concave saving is cut for the solver: four tranches of a
+#: quarter stall per dwelling each, valued at their marginal gain. The model
+#: fills the dearer tranches first on its own, because their coefficients are
+#: larger, so the curve needs no ordering constraints - only the tranches.
+PARKING_ABSORPTION_TRANCHES = 4
+
 #: Area one stall occupies, in square feet, including its share of the aisles
-#: and ramps reaching it. Underground is the larger of the two: the same car
-#: needs more structure around it below grade - columns on a grid the tower
-#: above dictates rather than the parking layout, plus the ramp that article
-#: 38 1° counts as part of the excluded area.
+#: and ramps reaching it. Underground is the larger: the same car needs more
+#: structure around it below grade - columns on a grid the tower above
+#: dictates rather than the parking layout, plus the ramp that article 38 1°
+#: counts as part of the excluded area.
 UNDERGROUND_STALL_AREA_SQFT = 400.0
-ABOVE_GRADE_STALL_AREA_SQFT = 300.0
 
 #: And the one that comes out of the yard rather than out of a floor plate: a
 #: stall painted on the ground the building does not cover, plus its share of
-#: the drive aisle reaching it. The same 300 sq ft as the above-grade deck,
-#: because it is the same rectangle and the same aisle - what differs is that
-#: nothing is built over it, so it is charged against `lot area - footprint`
-#: instead of against a storey.
+#: the drive aisle reaching it. 300 sq ft is the rectangle and the aisle of a
+#: self-parked stall at grade - what differs from a bay in the ground floor is
+#: that nothing is built over it, so it is charged against `lot area -
+#: footprint` instead of against a plate.
 SURFACE_STALL_AREA_SQFT = 300.0
 
 #: An enclosed bay inside the building's own ground floor - the attached garage
@@ -448,18 +519,28 @@ GARAGE_STALL_AREA_SQFT = 300.0
 
 #: Dollars per stall, Montreal, from the Altus Group Canadian Cost Guide as
 #: `urban_rag.estimator` publishes it: the midpoint of `parkade_ug`'s mtl
-#: `[51 925, 68 675]` and `parkade_ag`'s mtl `[38 500, 57 750]`, both flagged
-#: `perStall`. Underground is the dearer per stall *and* the larger per stall.
-#: Above grade would dominate it outright were the FSR it burns not the more
-#: expensive half of the bargain, which is what makes the choice a choice.
+#: `[51 925, 68 675]`, flagged `perStall`. The dearest stall in the model and
+#: the largest, and still routinely the right answer, because it is the one
+#: provision every printed cap ignores. The guide's `parkade_ag` rate beside
+#: it - an above-grade parking *structure*, $48 125 a stall - is deliberately
+#: not priced here: a deck of stalls is a storey *En etage* counts and floor
+#: area *Densite* counts both, and it is not one of the three provisions this
+#: module prices, which are the yard, the ground floor and the hole.
 UNDERGROUND_STALL_COST_CAD = 60_300.0
-ABOVE_GRADE_STALL_COST_CAD = 48_125.0
 
-#: The third rate off the same page, read the same way: the midpoint of
-#: `surface_lot`'s mtl `[3 960, 8 250]`, also `perStall`. Eight times under the
-#: above-grade parkade and ten under the dug one, which is the whole reason a
-#: low-density envelope can afford the parking its own program assumption asks
-#: of it.
+#: The share of the parcel a dug level may cover. Article 43 of 01-283
+#: excludes *une partie du bâtiment qui est entièrement sous terre* from the
+#: site coverage, so nothing in the grid confines a parkade to the plate above
+#: it - it runs out under the yard, and on a tight lot that is the whole
+#: reason it holds the stalls it holds. 1.0 is the lot line, which is the
+#: by-law's reading; a caller who wants the parkade kept off the margins passes
+#: less. A modelling bound, not a norm, like `MAX_UNDERGROUND_LEVELS` below.
+UNDERGROUND_LOT_SHARE = 1.0
+
+#: The second rate off the same page, read the same way: the midpoint of
+#: `surface_lot`'s mtl `[3 960, 8 250]`, also `perStall`. Ten times under the
+#: dug stall, which is the whole reason a low-density envelope can afford the
+#: parking its own program assumption asks of it.
 #:
 #: `urban_rag.estimator` ingests this rate with the other two and deliberately
 #: leaves it out of `PARKING_TYPE_IDS`, because a *lot profile* comparing an
@@ -488,8 +569,8 @@ SURFACE_STALL_COST_CAD = 6_105.0
 #:
 #: It is a *stated assumption*, like `STALLS_PER_DWELLING` above it, and it is
 #: one number precisely so it can be moved. Where it sits is what matters to
-#: the answer: dearer than asphalt, far under either structure. That ordering
-#: is the whole of what makes a garage the house's answer and a parkade the
+#: the answer: dearer than asphalt, a quarter of a dug stall. That ordering is
+#: the whole of what makes a garage the house's answer and a parkade the
 #: mid-rise's.
 GARAGE_SHELL_FRACTION = 0.20
 GARAGE_STALL_COST_CAD = 15_450.0
@@ -721,13 +802,6 @@ RESIDENTIAL_STOREY_HEIGHT_M = 3.0
 COMMERCIAL_STOREY_HEIGHT_M = 4.0
 INDUSTRIAL_STOREY_HEIGHT_M = 4.0
 
-#: An above-grade parking storey, which is the one storey type the three-and-
-#: four rule above says nothing about. It is above grade, so it is inside the
-#: height the by-law measures and cannot be zero; three metres is the figure a
-#: self-parking deck is laid out at, and it is the residential number rather
-#: than the commercial one because a garage carries no plenum.
-ABOVE_GRADE_PARKING_STOREY_HEIGHT_M = 3.0
-
 #: What an underground level adds to the building's height: nothing. Not an
 #: approximation but the definition - *hauteur en metre* is measured from grade
 #: up, so a level dug below it is outside the measurement the same way article
@@ -911,6 +985,37 @@ BASEMENT_LEVELS: frozenset[BuildingLevel] = frozenset(
 #: niveaux* plus the 91 that name the level, and housing digs only on those 91.
 UNRESTRICTED_LEVELS: frozenset[BuildingLevel] = frozenset({BuildingLevel.ALL})
 
+#: The rows that put a usage **on the ground floor**.
+#:
+#: Two: *Tous les niveaux*, which confines it to no storey and so not to that
+#: one, and *Rez-de-chaussee (RDC)*, which names it. Every other row in the
+#: block keeps the usage off the RDC - *Tous sauf le RDC* says so outright,
+#: *Immediatement superieur au RDC* names the storey above it, and *Inferieurs
+#: au RDC* names the level below.
+#:
+#: This is the set `permitted_floors` cannot express, and the reason it needed
+#: a companion. That function answers "how many storeys", which is enough to
+#: keep a usage inside its allowance and not enough to keep it off a
+#: particular level: a column marked *Tous sauf le RDC* on a six-storey grid
+#: authorises five storeys, and five storeys of housing standing alone stand
+#: on levels 1 to 5 - the RDC among them. `solve_program` reads this set to
+#: require that the ground floor go to a usage authorised on it, which is the
+#: half of the block that is about *placement* rather than about count.
+GROUND_FLOOR_LEVELS: frozenset[BuildingLevel] = frozenset(
+    {BuildingLevel.ALL, BuildingLevel.GROUND}
+)
+
+
+def authorises_ground_floor(levels: Iterable[BuildingLevel]) -> bool:
+    """Whether the rows marked for a column put its usages on the RDC.
+
+    `GROUND_FLOOR_LEVELS` is which rows those are and why. An empty set is
+    ``False``, like every other question asked of a column the grid left
+    blank: a usage no row authorises is authorised nowhere, the ground floor
+    included.
+    """
+    return bool(GROUND_FLOOR_LEVELS & frozenset(levels))
+
 
 def building_age_years(
     year_built,
@@ -999,6 +1104,11 @@ def effective_operating_expense_ratio(
 #: The most any effective ratio may reach. Strictly below 1 so an NOI stays
 #: positive where a gross income is - see `effective_operating_expense_ratio`.
 _MAX_EXPENSE_RATIO = 0.99
+
+#: Below a month's rent of a hundredth of a cent, a gross revenue is not a
+#: denominator - it is a program the solver declined to build, and a share of
+#: it is not a share of anything.
+_MIN_GROSS_REVENUE = 1e-4
 
 
 def is_residential_usage(usage: str) -> bool:
@@ -1219,6 +1329,25 @@ class ZoneColumn:
         """
         return permitted_floors(self.levels, self.floors_max)
 
+    @property
+    def authorises_ground_floor(self) -> bool:
+        """Whether this column's usages may stand on the RDC.
+
+        The other half of the *Niveaux* block, and the half
+        `permitted_floors_count` above cannot carry: it counts storeys, and a
+        count is silent about which of them a usage occupies. A column marked
+        *Tous sauf le RDC* is five storeys **and** a level it may not be on,
+        and only the second of those keeps a lone ``H`` column off the ground
+        floor. `solve_program` uses it to require that some usage authorised
+        here fill the RDC of any building that stands.
+
+        Marked per column like everything else in the block, so a column
+        headed ``H.2, C.2`` puts both of them on the ground floor or neither -
+        see `permitted_floors_count` on why that grain is the grid's and not
+        this module's.
+        """
+        return authorises_ground_floor(self.levels)
+
     def permitted_basement_levels(self, *, non_residential: bool = False) -> int:
         """Below-grade levels of usage the level rows allow this column.
 
@@ -1297,22 +1426,29 @@ class Lot:
     area. ``surface_stall_area x stalls + footprint <= area_m2`` is satisfied
     on a parcel four metres wide, where no car can stand at any price: 27.87 m2
     of yard is a stall's worth of *ground* only if 5.5 m of it lie in one
-    direction. This is the largest parking-shaped rectangle the parcel holds -
-    `massing.parking_capacity_m2` computes it - and it is a second, independent
+    direction. `massing.parking_capacity_m2` opens the yard by half a stall's
+    depth and measures what survives, so this is the ground a car can actually
+    stand on - at whatever shape that leaves - and it is a second, independent
     ceiling on `surface_stalls`.
 
-    It is a bound on the parcel rather than on any one answer: no building is
-    subtracted, because at solve time the footprint is the decision this is an
-    input to. That makes it generous - no chosen program will have this much
-    yard once its plate is down - while the single rectangle it measures makes
-    it strict on a parcel whose open ground comes in two lobes. Both directions
-    are `massing.parking_capacity_m2`'s to explain; what matters here is that
-    it is not a pure relaxation, so a program can in principle be refused
-    parking an odd-shaped parcel could have pieced together. What it refuses
-    squarely is the ribbon, the sliver and the tail of the L.
-    `lot_building_massing` asks the exact question afterwards, with a building
-    actually placed and up to three patches of asphalt allowed, and reports
-    `surface_parking_fit_pct`.
+    **It is measured on the yard this answer will have, not on the parcel.**
+    That is new, and it is what `placeable_area_m2` below made possible: with
+    the building's rectangle fixed before the solve there is a plate to
+    subtract, so the number here is ``parcel - plate``, opened. Before that
+    there was no building to take off and the bound had to be the bare parcel,
+    which overstated every yard by whatever the plate would go on to cover -
+    and, being a single *rectangle*, understated the ones that wrap a building,
+    since a ring or an L is not a rectangle. Generous in one direction and
+    strict in the other, and both errors are gone.
+
+    What remains strict is the by-law dimension, and deliberately: 5.5 m clear
+    in every direction, so the ribbon, the sliver and the tail of the L park
+    nothing at any length and those programs dig, deck or bay their stalls
+    instead. `binding` reports `surface_parking_shape` where that is what
+    stopped them. `lot_building_massing` draws the same region afterwards with
+    the same function, so `surface_parking_fit_pct` is now a check that can
+    pass rather than the 51.7 pct it reported when the two were separate
+    searches.
 
     ``None`` means nobody measured, and leaves the stalls bounded by the area
     arithmetic alone - which is what every caller did before this existed.
@@ -1419,17 +1555,12 @@ class StoreyHeights:
     #: storey cap.
     commercial_m: float = COMMERCIAL_STOREY_HEIGHT_M
     industrial_m: float = INDUSTRIAL_STOREY_HEIGHT_M
-    #: Metres per above-grade parking storey. Above grade, therefore measured;
-    #: see `ABOVE_GRADE_PARKING_STOREY_HEIGHT_M` for why it is the residential
-    #: figure and not the commercial one.
-    above_grade_parking_m: float = ABOVE_GRADE_PARKING_STOREY_HEIGHT_M
 
     def __post_init__(self) -> None:
         for name in (
             "residential_m",
             "commercial_m",
             "industrial_m",
-            "above_grade_parking_m",
         ):
             value = getattr(self, name)
             if value <= 0:
@@ -1453,10 +1584,6 @@ class StoreyHeights:
         return _scale_height(self.industrial_m)
 
     @property
-    def above_grade_parking_cm(self) -> int:
-        return _scale_height(self.above_grade_parking_m)
-
-    @property
     def shortest_cm(self) -> int:
         """The cheapest storey to spend a metric cap on.
 
@@ -1468,28 +1595,25 @@ class StoreyHeights:
             self.residential_cm,
             self.commercial_cm,
             self.industrial_cm,
-            self.above_grade_parking_cm,
         )
 
     def height_m(
         self,
         *,
         residential: int = 0,
-        above_grade_parking: int = 0,
         commercial: int = 0,
         industrial: int = 0,
     ) -> float:
         """What a storey split stands, in metres. The underground is not in it."""
         return _unscale_height(
             self.residential_cm * residential
-            + self.above_grade_parking_cm * above_grade_parking
             + self.commercial_cm * commercial
             + self.industrial_cm * industrial
         )
 
 
-#: Three metres a dwelling storey, four a commercial or industrial one, three
-#: an above-grade deck, nothing below grade.
+#: Three metres a dwelling storey, four a commercial or industrial one,
+#: nothing below grade.
 DEFAULT_STOREY_HEIGHTS = StoreyHeights()
 
 
@@ -1498,36 +1622,38 @@ class ParkingRules:
     """What the dwellings owe in stalls, and what a stall costs to provide.
 
     Two rows of numbers that look alike and are not. The *areas* are what a
-    stall takes out of a floor plate, and the underground one is larger; the
-    *costs* are what a stall takes out of the objective, and the underground
-    one is also larger. Underground is worse on both counts and is still
-    routinely the right answer, because the third column - the one that has no
-    field here because it is the by-law's rather than the builder's - is that
-    an underground stall consumes no *superficie de plancher* and no storey.
-    That exclusion is article 38 1° of 01-283 and it is applied in
-    `solve_program`, not here: this dataclass is the price list, and the
-    by-law is the reason the price list is worth consulting.
+    stall takes out of the ground it stands on, and the underground one is
+    the largest; the *costs* are what a stall takes out of the objective, and
+    the underground one is also the largest. Underground is worse on both
+    counts and is still routinely the right answer, because the third column
+    - the one that has no field here because it is the by-law's rather than
+    the builder's - is that an underground stall consumes no *superficie de
+    plancher*, no site coverage and no storey. Those exclusions are articles
+    38 1° and 43 of 01-283 and they are applied in `solve_program`, not here:
+    this dataclass is the price list, and the by-law is the reason the price
+    list is worth consulting.
 
     The surface stall is the cheap one on both rows and takes its area out of
-    neither: it stands on the yard, so what it is charged against is
+    no plate at all: it stands on the yard, so what it is charged against is
     ``lot area - footprint``. It wins wherever the coverage cap leaves ground
     to stand on, which is the point - a house does not dig a parkade - and it
     runs out exactly where a tight envelope has covered the parcel.
 
-    The garage is the fourth, and the one that is *inside* the building without
-    being a storey of it: an enclosed bay carved out of the ground floor, so it
-    is *superficie de plancher* the density index counts and it sits under the
+    The garage is the one that is *inside* the building without being a storey
+    of it: an enclosed bay carved out of the ground floor, so it is
+    *superficie de plancher* the density index counts and it sits under the
     footprint *Taux d'implantation* caps. What it costs the building is the
     floor area it takes from the dwellings, and what it costs the budget is
     `GARAGE_STALL_COST_CAD` - the one rate here the guide does not price.
 
-    Four provisions and no dominance among them, which is the point of having
-    all four: the yard is cheapest but is spent by the coverage cap, the garage
-    is next but eats the plate the dwellings wanted and stops at one storey,
-    the deck buys a whole storey of stalls at once and pays *En etage* for it,
-    and the dug level is dearest and is the only one the by-law lets the
-    density cap ignore. Any of them combines with any other - the building owes
-    one number of stalls and provides it from wherever it likes.
+    Three provisions and no dominance among them, which is the point of having
+    all three: the yard is cheapest but is spent by the coverage cap, the
+    garage is next but eats the plate the dwellings wanted and stops at one
+    plate, and the dug level is dearest and is the only one the by-law lets
+    every cap ignore - and the only one not confined to the building's own
+    plate, since `underground_lot_share` lets it run out under the yard. Any
+    of them combines with any other - the building owes one number of stalls
+    and provides it from wherever it likes.
 
     Defaults are the module constants, so `ParkingRules()` is the program the
     constants describe. `NO_PARKING` is the same object with the ratio at
@@ -1545,20 +1671,25 @@ class ParkingRules:
     stalls_per_1000_sqft: float = STALLS_PER_1000_SQFT
     #: Square feet a stall occupies, aisles and ramps included. The surface one
     #: comes out of the yard rather than out of a plate; the garage one comes
-    #: out of a plate without adding one.
+    #: out of a plate without adding one; the underground one comes out of a
+    #: plate of its own, under the parcel.
     underground_area_sqft: float = UNDERGROUND_STALL_AREA_SQFT
-    above_grade_area_sqft: float = ABOVE_GRADE_STALL_AREA_SQFT
     surface_area_sqft: float = SURFACE_STALL_AREA_SQFT
     garage_area_sqft: float = GARAGE_STALL_AREA_SQFT
     #: Dollars of capital per stall.
     underground_cost_cad: float = UNDERGROUND_STALL_COST_CAD
-    above_grade_cost_cad: float = ABOVE_GRADE_STALL_COST_CAD
     surface_cost_cad: float = SURFACE_STALL_COST_CAD
     garage_cost_cad: float = GARAGE_STALL_COST_CAD
     #: Months that capital is spread over to be subtractable from a rent.
     amortization_months: int = AMORTIZATION_MONTHS
     #: The deepest the model may dig. A modelling bound, not a norm.
     max_underground_levels: int = MAX_UNDERGROUND_LEVELS
+    #: How wide it may dig, as a share of `Lot.area_m2`: the plate of a dug
+    #: level is bounded by this and **not** by the building's footprint. 1.0
+    #: is the lot line - see `UNDERGROUND_LOT_SHARE` for why that is the
+    #: by-law's reading - and 0 forbids digging as surely as
+    #: ``max_underground_levels=0`` does.
+    underground_lot_share: float = UNDERGROUND_LOT_SHARE
     #: The most stalls the model may stand on the yard, or ``None`` for as
     #: many as the land holds - which is the usual answer, because the land is
     #: already the bound and `solve_program` already enforces it.
@@ -1574,6 +1705,22 @@ class ParkingRules:
     #: floor holds - which `solve_program` already bounds at one storey - and
     #: ``0`` for a building that keeps its ground floor whole.
     max_garage_stalls: int | None = None
+    #: What a stall earns. `monthly_rent_cad` a month per rented stall,
+    #: `occupancy_pct` of the rentable stalls rented, and the two market
+    #: ratios saying how many the occupants would rent at all - the ceiling
+    #: on the stalls that earn, and the reason the yard is not paved for rent.
+    #: See `PARKING_STALL_RENT_CAD_MONTH` and its neighbours for the numbers
+    #: and `solve_program` for how they enter the objective. Setting the rent
+    #: to zero returns the stall to a pure cost; setting both market ratios to
+    #: zero also stops the model building a stall nothing owes.
+    monthly_rent_cad: float = PARKING_STALL_RENT_CAD_MONTH
+    occupancy_pct: float = PARKING_STALL_OCCUPANCY_PCT
+    market_stalls_per_dwelling: float = MARKET_STALLS_PER_DWELLING
+    market_stalls_per_1000_sqft: float = MARKET_STALLS_PER_1000_SQFT
+    #: Months of lease-up saved at a full stall per dwelling, concave in the
+    #: coverage below it - see `PARKING_ABSORPTION_SAVING_MONTHS`. Zero
+    #: switches the absorption term off.
+    absorption_saving_months: float = PARKING_ABSORPTION_SAVING_MONTHS
 
     def __post_init__(self) -> None:
         if self.stalls_per_dwelling < 0:
@@ -1588,17 +1735,20 @@ class ParkingRules:
             )
         for name in (
             "underground_area_sqft",
-            "above_grade_area_sqft",
             "surface_area_sqft",
             "garage_area_sqft",
             "underground_cost_cad",
-            "above_grade_cost_cad",
             "surface_cost_cad",
             "garage_cost_cad",
         ):
             value = getattr(self, name)
             if value < 0:
                 raise ProgramError(f"{name} must not be negative, got {value}")
+        if not 0.0 <= self.underground_lot_share <= 1.0:
+            raise ProgramError(
+                f"underground_lot_share is a share of the parcel and must be in "
+                f"[0, 1], got {self.underground_lot_share!r}"
+            )
         if self.amortization_months <= 0:
             raise ProgramError(
                 f"amortization_months must be positive, got {self.amortization_months}"
@@ -1618,6 +1768,20 @@ class ParkingRules:
                 f"max_garage_stalls must not be negative, "
                 f"got {self.max_garage_stalls}"
             )
+        for name in (
+            "monthly_rent_cad",
+            "market_stalls_per_dwelling",
+            "market_stalls_per_1000_sqft",
+            "absorption_saving_months",
+        ):
+            value = getattr(self, name)
+            if value < 0:
+                raise ProgramError(f"{name} must not be negative, got {value}")
+        if not 0.0 <= self.occupancy_pct <= 100.0:
+            raise ProgramError(
+                f"occupancy_pct is a share of the stalls and must be in "
+                f"[0, 100], got {self.occupancy_pct!r}"
+            )
 
     @property
     def required(self) -> bool:
@@ -1629,48 +1793,125 @@ class ParkingRules:
         """
         return self.stalls_per_dwelling > 0 or self.stalls_per_1000_sqft > 0
 
+    @property
+    def monthly_revenue_per_stall(self) -> float:
+        """What one stall the building offers earns a month, take-up applied."""
+        return self.monthly_rent_cad * self.occupancy_pct / 100.0
+
+    @property
+    def stalls_pay(self) -> bool:
+        """Whether a stall nothing owes can still be worth building - because
+        it rents, or because it leases the dwellings faster."""
+        return self.monthly_revenue_per_stall > 0 or self.absorption_saving_months > 0
+
+    @property
+    def ceiling_stalls_per_dwelling(self) -> float:
+        """The most stalls a dwelling can be given: what it owes, or what its
+        occupant would rent where a stall is worth building for its own sake."""
+        return max(
+            self.stalls_per_dwelling,
+            self.market_stalls_per_dwelling if self.stalls_pay else 0.0,
+        )
+
+    @property
+    def ceiling_stalls_per_1000_sqft(self) -> float:
+        """The same ceiling per thousand square feet of non-residential floor."""
+        return max(
+            self.stalls_per_1000_sqft,
+            self.market_stalls_per_1000_sqft if self.stalls_pay else 0.0,
+        )
+
+    @property
+    def parks(self) -> bool:
+        """Whether the model may place a stall at all - something owes one, or
+        something would rent one. `NO_PARKING` is the rules under which this
+        is false, and every stall variable then has a domain of ``{0}``."""
+        return self.ceiling_stalls_per_dwelling > 0 or self.ceiling_stalls_per_1000_sqft > 0
+
+    def lease_up_months_saved(self, coverage: float) -> float:
+        """Months of lease-up saved at ``coverage`` - stalls per dwelling as a
+        share of `market_stalls_per_dwelling`, clamped to [0, 1].
+
+        Concave with diminishing returns: ``S x (1 - (1 - c)^2)``, so the
+        first quarter stall saves 44 % of the full saving and the last 6 %.
+        """
+        c = min(max(coverage, 0.0), 1.0)
+        return self.absorption_saving_months * (1.0 - (1.0 - c) ** 2)
+
     def monthly_cost(
         self,
         *,
-        underground: int,
-        above_grade: int,
+        underground: int = 0,
         surface: int = 0,
         garage: int = 0,
     ) -> float:
         """What this many stalls costs a month, at the stated horizon."""
         capital = self.capital_cost(
-            underground=underground,
-            above_grade=above_grade,
-            surface=surface,
-            garage=garage,
+            underground=underground, surface=surface, garage=garage
         )
         return capital / self.amortization_months
 
     def capital_cost(
         self,
         *,
-        underground: int,
-        above_grade: int,
+        underground: int = 0,
         surface: int = 0,
         garage: int = 0,
     ) -> float:
         """What this many stalls costs to build, in dollars."""
         return (
             underground * self.underground_cost_cad
-            + above_grade * self.above_grade_cost_cad
             + surface * self.surface_cost_cad
             + garage * self.garage_cost_cad
         )
+
+    def stalls_owed(
+        self, *, dwellings: int, non_residential_area_sqft: float
+    ) -> int:
+        """The stalls a building of this mix owes, rounded up once in aggregate.
+
+        The same reading the solver's demand constraint gives the two ratios:
+        one number of stalls for the whole building, so a half owed by the
+        retail and a half owed by the housing are one stall between them. It
+        is what `solve_program` reports as `waived_stalls` where the parking
+        was taken off a model it made infeasible - the size of the variance
+        the program is then standing on.
+        """
+        owed = (
+            self.stalls_per_dwelling * dwellings
+            + self.stalls_per_1000_sqft * non_residential_area_sqft / 1000.0
+        )
+        return math.ceil(owed - 1e-9) if owed > 1e-9 else 0
+
+    @property
+    def waived(self) -> ParkingRules:
+        """These rules with nothing owed: both ratios at zero, the price list kept.
+
+        What `solve_program` re-solves with when the stalls are what stopped
+        a parcel. Nothing is owed any more, but the market ratios, the rent
+        and the absorption saving are kept: a stall that fits and pays is
+        still built, and `waived_stalls` counts only the shortfall between
+        what the original ratios owed and what the relaxed program provides.
+        Under `NO_PARKING`, whose market ratios are zero too, this changes
+        nothing.
+        """
+        return replace(self, stalls_per_dwelling=0.0, stalls_per_1000_sqft=0.0)
 
 
 #: The program the module constants describe: half a stall a dwelling, priced
 #: and sized as the cost guide and the by-law leave them.
 DEFAULT_PARKING = ParkingRules()
 
-#: No stalls owed by anything, and none priced - the envelope question on its
-#: own. Both ratios, so a column that authorises commerce is asked the same
-#: question a bare Habitation column is.
-NO_PARKING = ParkingRules(stalls_per_dwelling=0.0, stalls_per_1000_sqft=0.0)
+#: No stalls owed by anything, none rented, and none priced - the envelope
+#: question on its own. All four ratios, so a column that authorises commerce
+#: is asked the same question a bare Habitation column is, and no stall is
+#: built for its rent either: every stall variable has a domain of ``{0}``.
+NO_PARKING = ParkingRules(
+    stalls_per_dwelling=0.0,
+    stalls_per_1000_sqft=0.0,
+    market_stalls_per_dwelling=0.0,
+    market_stalls_per_1000_sqft=0.0,
+)
 
 
 @dataclass(frozen=True)
@@ -2166,6 +2407,25 @@ class InvestmentAssumptions:
             * self.annual_pv_factor
         )
 
+    def pv_per_monthly_gross_at(self, lease_up_months: float) -> float:
+        """`pv_per_monthly_gross` with the lease-up replaced, fractional months allowed.
+
+        What a dwelling's rent is worth when parking leases it faster: the
+        same annuity and sale, pushed out by the build and half of *this*
+        lease-up rather than the stated one. `solve_program` prices the
+        absorption tranches as differences between successive values of this.
+        """
+        delay_years = (
+            self.construction_months + max(lease_up_months, 0.0) / 2.0
+        ) / MONTHS_PER_YEAR
+        delay = (1.0 + self.discount_rate_pct / 100.0) ** -delay_years
+        return (
+            MONTHS_PER_YEAR
+            * (1.0 - self.operating_expense_ratio)
+            * self.hold_pv_factor
+            * delay
+        )
+
 
 #: The proforma the module constants describe.
 DEFAULT_INVESTMENT = InvestmentAssumptions()
@@ -2219,12 +2479,12 @@ class DevelopmentProgram:
     #: tested against, and the underground levels are not in it - they are not
     #: measured from grade up, the same way they are not floor area.
     height_m: float = 0.0
-    #: The storey split behind `floors`. Residential floors carry the mix;
-    #: parking floors carry stalls and nothing else; the other two carry the
-    #: usages the column authorises beside the housing, and are zero on a
-    #: column that authorises none.
+    #: The storey split behind `floors`. Residential floors carry the mix and
+    #: the garage bays; the other two carry the usages the column authorises
+    #: beside the housing, and are zero on a column that authorises none. No
+    #: storey is parking: a stall is on the yard, in the ground floor, or
+    #: under the parcel.
     residential_floors: int = 0
-    above_grade_parking_floors: int = 0
     commercial_floors: int = 0
     industrial_floors: int = 0
     #: Levels dug below grade **for parking**. Not storeys, and not floor
@@ -2257,20 +2517,31 @@ class DevelopmentProgram:
     basement_units: Mapping[str, int] = field(default_factory=dict)
     #: Stalls, by where they were put. Their sum meets the demand the
     #: dwellings and the non-residential floor generate between them, and any
-    #: mix of the four is allowed - the building owes one number of stalls.
+    #: mix of the three is allowed - the building owes one number of stalls.
     #: `surface_stalls` stand on the yard the footprint leaves: not a storey,
     #: not floor area, and not inside `underground_area_m2` either.
     #: `garage_stalls` are enclosed bays inside the ground floor - floor area
     #: the density cap counts, taken from what the dwellings could have used,
     #: and no storey of their own. They are inside `gross_floor_area_m2`,
     #: which is why `unit_area_m2` falls short of it by exactly their area.
+    #: `underground_stalls` are dug, on a plate of their own under the parcel.
     underground_stalls: int = 0
-    above_grade_stalls: int = 0
     surface_stalls: int = 0
     garage_stalls: int = 0
-    #: `footprint x underground_levels` - built, paid for, and invisible to
-    #: both the density cap and the storey cap.
+    #: The dug parking: `underground_stall_area x underground_stalls`, the
+    #: area the stalls and their ramps take, spread over `underground_levels`.
+    #: Built, paid for, and invisible to every cap - article 38 1° keeps it
+    #: out of the *superficie de plancher*, article 43 out of the site
+    #: coverage, and being below grade it is neither a storey nor a metre.
+    #: Stored as the area the *model* reserved, at `AREA_SCALE`'s hundredth of
+    #: a square metre, for the reason `garage_area_m2` below is.
     underground_area_m2: float = 0.0
+    #: The plate of one dug level: `underground_area_m2 / underground_levels`,
+    #: and 0 where nothing is dug. Bounded by `ParkingRules.underground_lot_share`
+    #: of the parcel and **not** by `footprint_m2` - a parkade runs out under
+    #: the yard - so it may be larger than the plate above it, which is the
+    #: one place in this program two plates differ.
+    underground_plate_m2: float = 0.0
     #: Floor area the enclosed bays take out of the ground floor. Stored rather
     #: than derived from `garage_stalls`, because the allowance a bay gets is
     #: `ParkingRules.garage_area_sqft` and a caller may have moved it - and
@@ -2320,6 +2591,23 @@ class DevelopmentProgram:
     #: `InvestmentAssumptions.rent_premium_factor` - because that is the rent
     #: every dollar figure on this object is built from.
     gross_revenue_cad: float = 0.0
+    #: The same figure split by the family that earns it, monthly, the three
+    #: summing to `gross_revenue_cad` exactly. Each includes its own basement
+    #: plate at `InvestmentAssumptions.below_grade_rent_factor`, which is why
+    #: they cannot be reconstructed downstream from the above-grade areas
+    #: beside them: `commercial_area_m2` is the plate *En etage* counts and a
+    #: sous-sol of shops is neither in it nor free of rent.
+    #:
+    #: Carried rather than derived because a mixed building's income is not
+    #: its floor split. At the module's own rates a square foot of retail
+    #: earns four times what a square foot of housing does, so the storey at
+    #: grade is a sixth of a six-storey building's floor and near half its
+    #: rent - and every question downstream that asks "how much of this
+    #: income is retail" (a blended cap rate, a lease-up, a thesis) wants the
+    #: second number. `urban_rag.proforma` is what reads them.
+    residential_gross_revenue_cad: float = 0.0
+    commercial_gross_revenue_cad: float = 0.0
+    industrial_gross_revenue_cad: float = 0.0
     #: The objective: discounted net profit, in dollars. The present value of
     #: the stabilised income (`present_value_cad`) less the capital in
     #: `total_capital_cost_cad`. Negative means the best program the envelope
@@ -2350,11 +2638,50 @@ class DevelopmentProgram:
     retained_floor_area_m2: float = 0.0
     retained_dwellings: int = 0
     retained_monthly_gross_cad: float = 0.0
+    #: Whether the stalls were waived to get a program at all. Set only where
+    #: the model was INFEASIBLE with the parking in it and solved once the
+    #: parking was taken out - so the stalls, and nothing the grid prints,
+    #: were what stopped this parcel - and only when `solve_program` was asked
+    #: to try. Every figure above is then a building providing no stall, and
+    #: `waived_stalls` is how many it owes at the stated ratios: the size of
+    #: the variance the program is standing on. Both stay at their defaults on
+    #: a program solved with its parking, and on one that was infeasible for
+    #: some other reason and stays so.
+    parking_waived: bool = False
+    waived_stalls: int = 0
+    #: The stalls that earn: at most `total_stalls`, and at most what the
+    #: occupants would rent at `ParkingRules.market_stalls_per_dwelling` and
+    #: its area counterpart. `parking_gross_revenue_cad` is their rent a
+    #: month at the stated take-up, and it is **inside** `gross_revenue_cad`
+    #: - which the three family lines therefore no longer sum to on a program
+    #: with rented stalls; they sum to the gross less this.
+    rented_stalls: int = 0
+    parking_gross_revenue_cad: float = 0.0
+    #: Stalls provided per dwelling, all stalls over all dwellings - so on a
+    #: mixed building it counts the commerce's stalls too, and on a building
+    #: with no dwelling it is zero. `lease_up_months_saved` is what that
+    #: coverage buys under `ParkingRules.lease_up_months_saved`, and
+    #: `absorption_value_cad` is the present value that saving added on the
+    #: dwellings' rent - inside `present_value_cad` and `npv_cad`, and zero
+    #: wherever the lease-up itself is.
+    parking_coverage: float = 0.0
+    lease_up_months_saved: float = 0.0
+    absorption_value_cad: float = 0.0
 
     @property
     def added_floor_area_m2(self) -> float:
-        """The floor this program adds to what stood: gross less retained."""
-        return max(self.gross_floor_area_m2 - self.retained_floor_area_m2, 0.0)
+        """The floor this program adds to what stood: gross less retained.
+
+        The gross sits on the solver's `AREA_SCALE` grid and the retained
+        floor is the roll's raw figure, so a standing building carried onto
+        the grid by `_ceil_scaled` (139.3 m² reads back as 139.31) shows up
+        here as a sub-centimetre addition that nobody built. Anything under
+        one grid unit is that residue, and is reported as nothing added -
+        which is what keeps `nothing_pencils`, the disruption charge and the
+        shortlist's "is there an addition" test agreeing with each other.
+        """
+        added = self.gross_floor_area_m2 - self.retained_floor_area_m2
+        return added if added >= 1.0 / AREA_SCALE else 0.0
 
     @property
     def is_enhancement(self) -> bool:
@@ -2429,12 +2756,7 @@ class DevelopmentProgram:
 
     @property
     def total_stalls(self) -> int:
-        return (
-            self.underground_stalls
-            + self.above_grade_stalls
-            + self.surface_stalls
-            + self.garage_stalls
-        )
+        return self.underground_stalls + self.surface_stalls + self.garage_stalls
 
 
     @property
@@ -2475,6 +2797,25 @@ class DevelopmentProgram:
         )
 
     @property
+    def non_residential_gross_revenue_cad(self) -> float:
+        """What the commerce and the industry earn a month, cellar included.
+
+        The income counterpart of `non_residential_area_m2`, and the number a
+        reader means by "how much of this building is retail" once they are
+        asking about money rather than about floor. On a mixed program the two
+        answer very differently - see the note on the three fields it sums.
+        """
+        return self.commercial_gross_revenue_cad + self.industrial_gross_revenue_cad
+
+    @property
+    def non_residential_income_share(self) -> float:
+        """That, over the whole gross. Zero on a building that earns nothing."""
+        gross = self.gross_revenue_cad
+        if gross <= _MIN_GROSS_REVENUE:
+            return 0.0
+        return self.non_residential_gross_revenue_cad / gross
+
+    @property
     def total_capital_cost_cad(self) -> float:
         """Dwellings, non-residential floors and stalls together, in dollars."""
         return (
@@ -2499,12 +2840,13 @@ class DevelopmentProgram:
 #: places one, because the grid it reads never says which usage belongs on
 #: which level (see `ZoneColumn.permitted_floors_count`). This is the stacking
 #: a reader assumes when nothing says otherwise: commerce at grade where there
-#: is any, industry behind it, the parking deck as a podium over both, and the
-#: housing on top of the lot. Changing it changes a drawing, never a number.
+#: is any, industry behind it, and the housing on top of the lot. Changing it
+#: changes a drawing, never a number. No storey is parking: the garage bays
+#: ride on the residential run, in its first level, and the dug levels are
+#: below grade.
 FLOOR_STACK_ORDER: tuple[str, ...] = (
     "commercial",
     "industrial",
-    "parking",
     "residential",
 )
 
@@ -2545,9 +2887,12 @@ def floor_stack(
     one per level, which is the module docstring's "one footprint, identical
     floors" arriving at its conclusion: every plate of a given use is the same
     plate, so a use is a single run however tall it is, and a fifteen-storey
-    tower over retail and a deck is four entries and not fifteen. An entry
-    spans ``from_level`` to ``to_level`` inclusive and says how many
-    ``floors`` that is.
+    tower over retail is two entries and not fifteen. An entry spans
+    ``from_level`` to ``to_level`` inclusive and says how many ``floors`` that
+    is. The one plate that is not the building's is the dug one:
+    ``floor_plate_m2`` on the below-grade parking run is
+    `DevelopmentProgram.underground_plate_m2`, which is bounded by the parcel
+    rather than by the footprint and may be wider than the storeys above it.
 
     **Levels are numbered from grade.** Level 1 is the *rez-de-chaussée* and
     there is no level 0; the dug levels are -1 downwards, so a building with
@@ -2576,18 +2921,24 @@ def floor_stack(
     **The surface stalls are not in here**, and that is the same distinction
     the levels are numbered by: this is a stack of storeys, and a stall on the
     yard is in no storey. So ``stalls`` over every entry is what is parked
-    *in the building* - `DevelopmentProgram.underground_stalls`,
-    `above_grade_stalls` and `garage_stalls` - and `total_stalls` is larger by
-    whatever is parked outdoors. A reader totalling the stack is counting the
-    building.
+    *in the building* - `DevelopmentProgram.underground_stalls` and
+    `garage_stalls` - and `total_stalls` is larger by whatever is parked
+    outdoors. A reader totalling the stack is counting the building.
 
     The garage bays ride on the **residential** run rather than a run of their
     own, because they are not a storey: they are floor area inside the ground
     floor of that run, so its ``floor_area_m2`` already contains them and
-    ``dwellings`` beside them is what is left after they are taken out. They
-    sit on the run whole for the same reason the dwelling mix does - the model
-    chose a building, not a plate - and the run's first level is the ground
-    floor they are on.
+    ``parking_area_m2`` says how much of it they are. ``dwellings`` beside
+    them is what stands on the rest. They sit on the run whole for the same
+    reason the dwelling mix does - the model chose a building, not a plate -
+    and the run's first level is the ground floor they are on. So a two-storey
+    house with two bays reads as one residential run of two levels whose
+    ``parking_area_m2`` is two bays' worth: the ground floor is that much
+    garage, and the dwellings have the rest of both plates.
+
+    ``parking_area_m2`` is on every entry for the same reason ``stalls`` is:
+    the whole of a below-grade parking run, the bays on the residential run,
+    and 0 on a storey that parks nothing.
 
     **Every entry has every key**, so ``jsonb_array_elements`` over a column of
     these needs no branch: ``stalls`` is 0 on a floor that parks nothing,
@@ -2600,7 +2951,7 @@ def floor_stack(
     are `gross_floor_area_m2`, `underground_area_m2` and `height_m` on the
     program itself.
     """
-    plate = program.footprint_m2
+    building_plate = program.footprint_m2
     stack: list[dict] = []
 
     def run(
@@ -2611,10 +2962,13 @@ def floor_stack(
         floors: int,
         storey_height_m: float,
         counts_as_floor_area: bool,
+        plate: float | None = None,
         stalls: int = 0,
+        parking_area_m2: float = 0.0,
         dwellings: int = 0,
         units: Mapping[str, int] | None = None,
     ) -> dict:
+        plate = building_plate if plate is None else plate
         return {
             "use": use,
             "position": position,
@@ -2627,6 +2981,7 @@ def floor_stack(
             "storey_height_m": round(storey_height_m, _STACK_PRECISION),
             "height_m": round(storey_height_m * floors, _STACK_PRECISION),
             "stalls": stalls,
+            "parking_area_m2": round(parking_area_m2, _STACK_PRECISION),
             "dwellings": dwellings,
             "units": dict(units or {}),
         }
@@ -2655,7 +3010,12 @@ def floor_stack(
                 floors=program.underground_levels,
                 storey_height_m=UNDERGROUND_LEVEL_HEIGHT_M,
                 counts_as_floor_area=False,
+                # The dug plate, not the building's: a parkade runs out under
+                # the yard, and this is the one run whose plate can be wider
+                # than the storeys over it.
+                plate=program.underground_plate_m2,
                 stalls=program.underground_stalls,
+                parking_area_m2=program.underground_area_m2,
             )
         )
         level += program.underground_levels
@@ -2679,11 +3039,6 @@ def floor_stack(
     above: dict[str, tuple[int, float, dict]] = {
         "commercial": (program.commercial_floors, heights.commercial_m, {}),
         "industrial": (program.industrial_floors, heights.industrial_m, {}),
-        "parking": (
-            program.above_grade_parking_floors,
-            heights.above_grade_parking_m,
-            {"stalls": program.above_grade_stalls},
-        ),
         "residential": (
             program.residential_floors,
             heights.residential_m,
@@ -2694,7 +3049,11 @@ def floor_stack(
                 # `total_dwellings` rather than counting the sous-sol twice.
                 "dwellings": program.above_grade_dwellings,
                 "units": program.above_grade_units,
+                # The integrated bays: in the first level of this run, which
+                # is the ground floor, and floor area already inside its
+                # `floor_area_m2`.
                 "stalls": program.garage_stalls,
+                "parking_area_m2": program.garage_area_m2,
             },
         ),
     }
@@ -2967,6 +3326,19 @@ class ZoneEnvelope:
             (column.permitted_floors_count for column in self.columns), default=0
         )
 
+    @property
+    def authorises_ground_floor(self) -> bool:
+        """Whether **any** governing column may occupy the RDC.
+
+        Any, not all, and that is the point rather than a looseness: the
+        ground floor is one storey and one usage fills it, so a zone whose
+        commerce is marked *Rez-de-chaussee* and whose housing is marked *Tous
+        sauf le RDC* has a legal ground floor - the shop's. `False` here says
+        the grid authorises nothing on the RDC of this lot, and a building
+        with storeys has one whether the grid provides for it or not.
+        """
+        return any(column.authorises_ground_floor for column in self.columns)
+
     def permitted_basement_levels(self, *, non_residential: bool = False) -> int:
         """The loosest basement allowance any governing column states.
 
@@ -3058,6 +3430,7 @@ def solve_program(
     basement_levels_allowed: int = BASEMENT_LEVELS_ALLOWED,
     max_seconds: float = 10.0,
     retained: RetainedBuilding | None = None,
+    waive_parking_if_empty: bool = False,
 ) -> DevelopmentProgram:
     """The program maximising discounted net profit on ``lot``.
 
@@ -3076,22 +3449,18 @@ def solve_program(
                                           every floor
     ``residential_floors``                within *En étage min* .. storeys the
                                           level rows allow this usage
-    ``parking_floors``                    above-grade parking storeys, 0 or
-                                          more
     ``commercial_floors``                 0 unless the column's usages include
                                           a ``C`` class
     ``industrial_floors``                 0 unless they include an ``I`` class
-    ``floors``                            the four added up, within
+    ``floors``                            the three added up, within
                                           *En étage max*
     ``underground_levels``                0 .. `max_underground_levels`; not
                                           storeys, and not floor area
     ``basement_*_levels``                 0 .. `permitted_basement_levels`;
                                           not storeys, and **floor area**
     ``residential_area``                  ``footprint x residential_floors``
-    ``parking_area``                      ``footprint x parking_floors``
     ``commercial_area``                   ``footprint x commercial_floors``
     ``industrial_area``                   ``footprint x industrial_floors``
-    ``underground_area``                  ``footprint x underground_levels``
     ``basement_*_area``                   ``footprint x`` each cellar level -
                                           the same plate, flat under the
                                           building
@@ -3099,7 +3468,7 @@ def solve_program(
                                           `StoreyHeights`, within *Hauteur en
                                           mètre*; the underground levels add
                                           nothing to it
-    ``gross``                             the four above-grade areas
+    ``gross``                             the three above-grade areas
     ``density_area``                      ``gross`` plus the cellar's usage
                                           plates, within *Densité* x lot area
     ``sum(area_t x n_t) <= residential``  the dwellings fit in their storeys
@@ -3110,19 +3479,27 @@ def solve_program(
                                           the surface ones on
                                           ``lot area - footprint``, the garage
                                           ones inside one plate and inside the
-                                          dwellings' own allowance
+                                          dwellings' own allowance, the dug
+                                          ones inside ``underground_lot_share
+                                          x lot area x underground_levels``,
+                                          which is the parcel and not the
+                                          plate
     ====================================  ===================================
 
-    Five products of decision variables now rather than one, and they share
-    the ``footprint`` factor, which is what makes ``gross`` a plain sum of four
-    of them instead of a sixth multiplication.
+    Six products of decision variables, and they share the ``footprint``
+    factor, which is what makes ``gross`` a plain sum of three of them instead
+    of a seventh multiplication. The dug parking is deliberately **not** a
+    product: its plate is bounded by the parcel, a constant, so "the stalls
+    fit in the levels dug" is linear in the level count and the hole is
+    reported as the area the stalls took (`underground_area_m2`) over the
+    levels it took them in (`underground_plate_m2`).
 
     **Two ceilings on the same stack.** *En étage* counts storeys and
     *Hauteur en mètre* measures them, and a grid states both. They are not the
     same cap because the storeys are not the same height: a residential plate
-    stands 3 m, a commercial or industrial one 4 m, an above-grade deck 3 m, so
-    ``6`` storeys and ``15`` metres is five of housing or three of commerce and
-    never six of anything. Both are linear in the storey counts, which is why
+    stands 3 m, a commercial or industrial one 4 m, so ``6`` storeys and ``15``
+    metres is five of housing or three of commerce and never six of anything.
+    Both are linear in the storey counts, which is why
     the metric one adds a constraint and no new product - the expensive part of
     this model is the areas, and the height does not touch them.
 
@@ -3133,12 +3510,13 @@ def solve_program(
     metric cap is where the housing wins a storey back. `binding` reports
     ``height_max`` where the answer is sitting against it.
 
-    **What the density cap does and does not see.** ``underground_area`` is
-    built and paid for and appears in neither the *Densité* constraint nor the
-    storey count, which is article 38 1° of 01-283 - *une aire de
-    stationnement des véhicules [...] située en sous-sol, de même que leurs
-    voies d'accès* - expressed as the one place the two parking options stop
-    being interchangeable.
+    **What the density cap does and does not see.** The dug parking is built
+    and paid for and appears in neither the *Densité* constraint nor the
+    storey count nor the footprint, which is article 38 1° of 01-283 - *une
+    aire de stationnement des véhicules [...] située en sous-sol, de même que
+    leurs voies d'accès* - and article 43 - *une partie du bâtiment qui est
+    entièrement sous terre* - expressed as the one place the parking options
+    stop being interchangeable.
 
     The cellar's *usage* plates are the other side of that same article, and
     the reason ``density_area`` sits beside ``gross``. What 38 1° excludes is
@@ -3149,30 +3527,33 @@ def solve_program(
     `BELOW_GRADE_COST_PREMIUM` and `BELOW_GRADE_RENT_DISCOUNT_PCT` are that
     price, and the module docstring has what the pair does to the answer.
 
-    **Why the choice is not trivial.** An underground stall is bigger and
-    dearer than an above-grade one, so with a slack envelope the solver puts
-    the parking above grade and pockets the difference. Tighten *Densité*
-    until a parking storey costs a dwelling worth more than the price gap and
-    it digs instead. Both behaviours are the model working.
+    **Why the choice is not trivial.** A dug stall is the dearest and the
+    largest, and the only one every cap ignores; a bay is a quarter of the
+    price and is paid for again in the floor it takes from the dwellings;
+    asphalt is cheapest and is spent by the coverage cap. So the ordering is
+    three deep: park on the ground the footprint leaves; when the coverage cap
+    has taken the ground, put bays in the ground floor and pay for them in the
+    dwellings they displace; and only when the plate is full too pay for a
+    hole. What rations the first is the land, what rations the second is a
+    plate, and both run out on exactly the envelopes that can afford the
+    structure. A detached house on a large lot reaches neither. Leaving the
+    cheap two out is what made such a house solve to nothing at all; the
+    module docstring has that failure in full, and the table there is the
+    three provisions against the caps each one answers to.
 
-    Both are also the *structured* answers, and the two cheap ones sit under
-    them. So the ordering is four deep: park on the ground the footprint
-    leaves; when the coverage cap has taken the ground, put bays in the ground
-    floor and pay for them in the dwellings they displace; and only when the
-    plates are full too pay for a deck or a hole. What rations the first is the
-    land, what rations the second is a plate, and both run out on exactly the
-    envelopes that can afford the structure. A detached house on a large lot
-    reaches neither. Leaving both out is what made such a house solve to
-    nothing at all; the module docstring has that failure in full, and the
-    table there is the four provisions against the caps each one answers to.
+    The hole is rationed by the parcel rather than by the plate. A tight
+    footprint on a wide lot digs one level under the yard rather than several
+    under the building, which is what a real parkade does and what article 43
+    is there to permit - and the levels come back as the fewest that hold the
+    stalls at `underground_lot_share` of the lot.
 
     Commerce and industry sharpen that choice rather than adding to it. At
     `stalls_per_1000_sqft` a non-residential plate owes roughly its own area
-    back in stalls, so above grade it costs two storeys of envelope to get
-    one storey of rent - and the density cap, which the retail floor is
-    already inside, has to hold both. Underground, only the retail floor
-    counts. A mixed-use column with a tight *Densité* is where the model digs
-    first.
+    back in stalls, and above grade the only place for them is the ground
+    floor the dwellings would have used - so the density cap, which the retail
+    floor is already inside, has to hold both. Underground, only the retail
+    floor counts. A mixed-use column with a tight *Densité* is where the model
+    digs first.
 
     **What is being maximised.** Discounted net profit: each dwelling
     contributes its effective proforma rent through
@@ -3218,9 +3599,9 @@ def solve_program(
     the parcel: at these rents and these rates, nothing pencils.
 
     Every cap is skipped where the grid does not state one. All storeys are
-    identical, and a storey is dwellings, parking, commerce or industry and
-    never two of them - both by assumption, and both the reason the envelope
-    collapses to a single footprint and a handful of counts.
+    identical, and a storey is dwellings, commerce or industry and never two
+    of them - both by assumption, and both the reason the envelope collapses
+    to a single footprint and a handful of counts.
 
     ``basement_levels_allowed`` is the cellar's counterpart of
     `ParkingRules.max_underground_levels`, and a modelling bound in exactly
@@ -3229,10 +3610,60 @@ def solve_program(
     `BASEMENT_LEVELS_ALLOWED` is the default and says why it is one level.
 
     A minimum - on density, coverage or storeys - can make the model
-    infeasible, and so now can the parking: a lot with no room for the stalls
-    its dwellings owe has no program at this ratio. That is a real answer
+    infeasible, and so can the parking: a lot with no room for the stalls
+    its floor owes has no program at this ratio. That is a real answer
     about the parcel rather than a bug, and `NO_PARKING` is how to ask the
     question without it. The status says which.
+
+    **What a stall is worth.** A stall costs its capital and earns its rent:
+    `ParkingRules.monthly_revenue_per_stall` through the same
+    `pv_per_monthly_gross` a dwelling's rent goes through, on the stalls the
+    occupants would rent - at most `market_stalls_per_dwelling` per dwelling
+    and `market_stalls_per_1000_sqft` per thousand square feet of shop or
+    workshop, whichever of the three provisions they stand in. That ceiling
+    is what lets the rent into the objective at all: a surface stall pays
+    for itself several times over, and without it the model would pave the
+    yard for tenants who do not exist. So the stall variables' domains run
+    to the *larger* of what is owed and what would rent, the model provides
+    at least what is owed and may build more where more pays, and
+    `rented_stalls` and `parking_gross_revenue_cad` report the result. The
+    parking rent is inside `gross_revenue_cad`.
+
+    **Parking leases the dwellings faster.** Coverage - stalls per dwelling,
+    against the market ratio - shortens the lease-up by
+    `ParkingRules.lease_up_months_saved`, a concave curve with diminishing
+    returns, and a shorter lease-up is a larger present-value multiplier on
+    every dwelling's rent (`InvestmentAssumptions.pv_per_monthly_gross_at`).
+    Linear in the model by tranches: the coverage is cut into
+    `PARKING_ABSORPTION_TRANCHES` slices of a quarter stall per dwelling,
+    each dwelling of each class may be assigned to each slice, the slices a
+    class fills are bounded by its dwellings and the stalls they consume by
+    the stalls provided, and each slice is priced at the *marginal* gain in
+    present value of that class's rent between its coverage and the one
+    below. Concavity makes the marginal gains decrease, so the solver fills
+    the slices in order without being told to, and the dearer dwellings
+    first. It is a term on the dwellings' rent only - a shop's absorption is
+    `urban_rag.proforma`'s to price - and it is exactly zero wherever the
+    lease-up is, so a proforma with no lease-up is unchanged by it.
+
+    **Waiving the parking.** ``waive_parking_if_empty`` asks a second
+    question when the first answer is an empty parcel: ``INFEASIBLE`` from
+    CP-SAT itself - never the named contradictions above, which are two
+    printed rows disagreeing and have nothing to do with a stall - or a
+    solved program that builds nothing (`nothing_pencils`: no dwelling and
+    no non-residential floor, or on an enhancement no floor added). The
+    model is then solved again under `ParkingRules.waived`, the same rules
+    with nothing owed. A program that builds something without the
+    obligation was stopped by the obligation and by nothing else - by the
+    stalls having nowhere to stand, or by their price exceeding what the
+    floor they serve earns - and it is returned as what it is: the building
+    the envelope holds, still carrying whatever stalls fit and pay, with
+    `parking_waived` set and `waived_stalls` counting the shortfall against
+    the original ratios. One that is still empty comes back unchanged. Off
+    by default so the module keeps answering the question it is asked;
+    `urban_rag.hbu` turns it on for the borough, where a parcel reported as
+    holding nothing is a worse answer than one that says which variance it
+    would take.
 
     **A zone, not a column.** The first argument may be a `ZoneEnvelope` - the
     governing column of each family a zone authorises - and that is the form
@@ -3262,6 +3693,41 @@ def solve_program(
             "collectifs column is deliberately not a proforma"
         )
     column = envelope
+
+    def _waived(relaxed: DevelopmentProgram) -> DevelopmentProgram:
+        """The relaxed program marked as such, with the shortfall counted on
+        the whole building it built - the retained shop's floor included on
+        an enhancement, since that is what the demand constraint read."""
+        owed = parking.stalls_owed(
+            dwellings=relaxed.total_dwellings,
+            non_residential_area_sqft=(
+                relaxed.commercial_area_sqft
+                + relaxed.industrial_area_sqft
+                + relaxed.basement_commercial_area_sqft
+                + relaxed.basement_industrial_area_sqft
+            ),
+        )
+        return replace(
+            relaxed,
+            parking_waived=True,
+            waived_stalls=max(owed - relaxed.total_stalls, 0),
+        )
+
+    def _relaxed() -> DevelopmentProgram:
+        return solve_program(
+            column,
+            lot,
+            economics,
+            unit_areas_sqft=unit_areas_sqft,
+            parking=parking.waived,
+            construction=construction,
+            non_residential=non_residential,
+            heights=heights,
+            investment=investment,
+            basement_levels_allowed=basement_levels_allowed,
+            max_seconds=max_seconds,
+            retained=retained,
+        )
 
     # *Hauteur en mètre*, as centimetres. Rounded the way each bound wants to
     # be read: a maximum floors so a building may not exceed it by a rounding,
@@ -3341,6 +3807,50 @@ def solve_program(
             lot,
             status="INFEASIBLE",
             binding=("floors_min_exceeds_permitted_levels",),
+        )
+
+    if retained is None and not envelope.authorises_ground_floor and (
+        column.floors_min >= 1
+        or not any(
+            permitted_basement_levels(
+                governing.levels,
+                non_residential=family != "residential",
+                allowed=basement_levels_allowed,
+            )
+            for family, governing in (
+                ("residential", envelope.residential),
+                ("commercial", envelope.commercial),
+                ("industrial", envelope.industrial),
+            )
+            if governing is not None
+        )
+    ):
+        # A building of storeys has a ground floor, and no column here
+        # authorises a usage on it: every governing column is marked *Tous
+        # sauf le RDC*, *Immediatement superieur au RDC* or *Inferieurs au
+        # RDC*. Named rather than left to CP-SAT for the reason the check
+        # above is - the caller reads which pair of rows disagreed instead of
+        # diagnosing a bare INFEASIBLE.
+        #
+        # Two ways for that to be a contradiction rather than an answer, and
+        # the second is why this is not simply gated on *En etage min*. Either
+        # the grid demands a storey it will let nothing stand on; or it allows
+        # no cellar either, and then there is nowhere on the parcel a priced
+        # usage may go at all. What is left out is the case in between - no
+        # storey demanded and a cellar allowed - because that grid is not
+        # contradicting itself, it is describing a sous-sol: a lone column
+        # marked *Inferieurs au RDC* authorises a below-grade level and no
+        # storeys, and the model below is free to build exactly that.
+        #
+        # Rebuilds only, which is what `retained is None` says: an enhancement
+        # keeps a ground floor that already stands, and no grid asks for an
+        # existing building to be reconstituted to conform. The constraint
+        # below is exempted on the same ground and at more length.
+        return _empty_program(
+            column,
+            lot,
+            status="INFEASIBLE",
+            binding=("no_usage_permitted_on_ground_floor",),
         )
 
     # The metric cap, read as the storey count it allows *each* usage. Read
@@ -3509,7 +4019,6 @@ def solve_program(
     # bounded by the level rows on top of that, the same way the dwellings
     # are - they are usages of this column, and the rows are the column's.
     spare_floors = max(column.floors_max - res_floors_min, 0)
-    parking_floors_hi = spare_floors
     commercial_floors_hi = (
         min(spare_floors, envelope.commercial.permitted_floors_count)
         if envelope.commercial is not None
@@ -3525,9 +4034,6 @@ def solve_program(
         # dwellings. A four-metre plate gets fewer of them than the housing
         # does out of the identical number of metres, which is the whole of
         # what a metric cap adds to a storey cap.
-        parking_floors_hi = min(
-            parking_floors_hi, height_cap_cm // heights.above_grade_parking_cm
-        )
         commercial_floors_hi = min(
             commercial_floors_hi, height_cap_cm // heights.commercial_cm
         )
@@ -3537,14 +4043,24 @@ def solve_program(
     # An underground level is not a storey and stands no metres, so nothing
     # here narrows it - `UNDERGROUND_LEVEL_HEIGHT_M` is that zero, and the
     # reason a lot whose *Hauteur* binds digs rather than stops.
-    underground_levels_hi = parking.max_underground_levels if parking.required else 0
+    underground_levels_hi = parking.max_underground_levels if parking.parks else 0
+    # The dug plate, as a constant: `underground_lot_share` of the parcel,
+    # floored so a rounding never lets a level exceed the lot. Not the
+    # footprint - article 43 keeps a fully buried level out of the coverage
+    # cap, so nothing in the grid ties the parkade to the plate above it - and
+    # not a variable, which is what keeps the stalls-fit-in-the-hole
+    # constraint below linear. A share of zero forbids digging, and the level
+    # domain says so rather than leaving the solver to prove it.
+    underground_plate_hi = _floor_scaled(lot.area_m2 * parking.underground_lot_share)
+    if underground_plate_hi <= 0:
+        underground_levels_hi = 0
 
     # The standing building, as bounds. Its plate is the least the footprint
     # may be - an annex widens it, nothing narrows it - and a plate the caps
     # cannot hold is a non-conforming building the grid would not let stand
     # again, which is an answer about the parcel and not about the solver.
-    # Nothing goes under it or on a deck over it, and no bay is carved out of
-    # its ground floor; the additions park on the yard or not at all.
+    # Nothing goes under it and no bay is carved out of its ground floor; the
+    # additions park on the yard or not at all.
     retained_residential_scaled = 0
     retained_commercial_scaled = 0
     retained_industrial_scaled = 0
@@ -3563,7 +4079,6 @@ def solve_program(
         retained_commercial_scaled = _ceil_scaled(retained.commercial_floor_area_m2)
         retained_industrial_scaled = _ceil_scaled(retained.industrial_floor_area_m2)
         retained_dwellings = retained.dwellings
-        parking_floors_hi = 0
         underground_levels_hi = 0
         res_basement_hi = com_basement_hi = ind_basement_hi = 0
         basement_residential_hi = 0
@@ -3594,6 +4109,23 @@ def solve_program(
         / (AREA_SCALE * M2_PER_SQFT)
         * STALL_DEMAND_SCALE
     )
+    # The market's ratios beside the by-law's, at the same scale: what the
+    # occupants would rent, which bounds the stalls that earn, and the
+    # larger of the two pairs, which bounds the stalls that may be built.
+    market_ratio = round(parking.market_stalls_per_dwelling * STALL_DEMAND_SCALE)
+    market_area_ratio = round(
+        parking.market_stalls_per_1000_sqft
+        / 1000.0
+        / (AREA_SCALE * M2_PER_SQFT)
+        * STALL_DEMAND_SCALE
+    )
+    ceiling_ratio = round(parking.ceiling_stalls_per_dwelling * STALL_DEMAND_SCALE)
+    ceiling_area_ratio = round(
+        parking.ceiling_stalls_per_1000_sqft
+        / 1000.0
+        / (AREA_SCALE * M2_PER_SQFT)
+        * STALL_DEMAND_SCALE
+    )
 
     # The most non-residential floor this envelope could hold, which is what
     # bounds the stalls it could owe. Both caps apply: the storeys the level
@@ -3606,12 +4138,14 @@ def solve_program(
 
     # Ceiling division: a part stall is a stall, which is how a ratio is read
     # everywhere one is written into a by-law.
+    # On the ceiling ratios rather than the owed ones: a stall that rents or
+    # leases the building faster may be worth building beyond what is owed,
+    # and the domain has to admit it for the objective to be asked.
     stalls_hi = -(
-        -(stall_ratio * dwellings_hi + area_stall_ratio * non_residential_area_hi)
+        -(ceiling_ratio * dwellings_hi + ceiling_area_ratio * non_residential_area_hi)
         // STALL_DEMAND_SCALE
     )
     underground_stall_area = _scale_area(parking.underground_area_sqft * M2_PER_SQFT)
-    above_grade_stall_area = _scale_area(parking.above_grade_area_sqft * M2_PER_SQFT)
     surface_stall_area = _scale_area(parking.surface_area_sqft * M2_PER_SQFT)
     garage_stall_area = _scale_area(parking.garage_area_sqft * M2_PER_SQFT)
     # The parcel itself, which is what the surface stalls are charged against
@@ -3626,7 +4160,6 @@ def solve_program(
     residential_floors = model.NewIntVar(
         res_floors_min, res_floors_allowed, "residential_floors"
     )
-    parking_floors = model.NewIntVar(0, parking_floors_hi, "parking_floors")
     commercial_floors = model.NewIntVar(0, commercial_floors_hi, "commercial_floors")
     industrial_floors = model.NewIntVar(0, industrial_floors_hi, "industrial_floors")
     underground_levels = model.NewIntVar(0, underground_levels_hi, "underground_levels")
@@ -3653,10 +4186,7 @@ def solve_program(
     if height_cap_cm is not None:
         floors_hi = min(floors_hi, height_cap_cm // heights.shortest_cm)
     floors = model.NewIntVar(column.floors_min, floors_hi, "floors")
-    model.Add(
-        floors
-        == residential_floors + parking_floors + commercial_floors + industrial_floors
-    )
+    model.Add(floors == residential_floors + commercial_floors + industrial_floors)
     # Whether each family is built at all. These are what make one model do
     # the work of three: a column's norms bind the building only when the
     # family it heads is present, so the pure-Habitation and pure-Commerce
@@ -3707,9 +4237,9 @@ def solve_program(
     # every zone in a borough that prints one usage per column - all three
     # families fall in one group and this is exactly the sum it always was.
     #
-    # The parking is *not* in these sums: a stall is not one of the usages the
-    # grid marks these rows for, and the storey it sits in is bounded by
-    # *En etage max* alone - which is the constraint above.
+    # The parking is *not* in these sums as a storey of its own, because no
+    # storey is parking: the bays sit inside the residential storeys, which
+    # are, and the dug levels are below grade, which the rows do not reach.
     for group, group_column in _families_by_column(governing):
         model.Add(
             sum(usage_floors[family] for family in group)
@@ -3730,6 +4260,61 @@ def solve_program(
             )
         )
 
+    # **The ground floor goes to a usage authorised on it.** The rows above
+    # are read as a count and a count cannot say that: a column marked *Tous
+    # sauf le RDC* on a six-storey grid authorises five storeys, and five
+    # storeys of housing standing alone stand on levels 1 to 5 - the RDC
+    # among them. `permitted_floors_count` is satisfied and the grid is not.
+    #
+    # So the families whose column keeps them off the ground floor
+    # (`GROUND_FLOOR_LEVELS` is which rows do not) may fill at most every
+    # storey but one, and the storey they leave is the RDC. What fills it is
+    # whatever else the zone authorises there - the shop of a *Rez-de-chaussee*
+    # column, the housing of a *Tous les niveaux* one - and this says only
+    # that something must.
+    #
+    # **One inequality over all of them, not one per column.** A building has
+    # a single ground floor, so two columns both marked *Tous sauf le RDC*
+    # are denied the same storey rather than one each; summing them separately
+    # would let the two of them fill the building between them and leave the
+    # RDC to neither. On the borough's ordinary shape - one such column, the
+    # ``H`` of a high street - the two readings coincide.
+    #
+    # The parking is not in this sum for the reason it is not in the ones
+    # above: no storey is parking. A ground floor that is nothing but garage
+    # bays is still a *residential* storey here, and still one the ``H``
+    # column may not put on the RDC - which is the answer the module gave
+    # before this constraint and the reason it needed one.
+    #
+    # **Rebuilds only.** An enhancement is a building that already stands, on
+    # a ground floor that is already occupied and already lawful - as of right
+    # where the grid always allowed it, and as a droit acquis where the zoning
+    # changed under it. Holding the addition to this rule would ask the owner
+    # of a three-storey walk-up to put a shop under it before adding a fourth,
+    # which is not a thing the *Niveaux* block says; and where the zone
+    # authorises no other family it would refuse the enhancement outright.
+    # `retained.storeys` is the standing building and the addition goes on
+    # top, which is above the RDC by construction, so the level rows are
+    # already satisfied by the only storeys this solve is choosing.
+    ground_excluded = [
+        usage_floors[family]
+        for family, governing_column in governing.items()
+        if governing_column is not None
+        and not governing_column.authorises_ground_floor
+    ]
+    if retained is not None:
+        ground_excluded = []
+    if ground_excluded:
+        # Reified on the building standing at all: an optimum that builds
+        # nothing has no ground floor to fill, and `floors - 1` would read as
+        # -1 and make "nothing pencils" infeasible. `floors_min >= 1` makes
+        # this literal constant true, and the check above has already refused
+        # the case where that is unsatisfiable.
+        standing = model.NewBoolVar("has_storeys")
+        model.Add(floors >= 1).OnlyEnforceIf(standing)
+        model.Add(floors == 0).OnlyEnforceIf(standing.Not())
+        model.Add(sum(ground_excluded) + standing <= floors)
+
     # *En étage min* is not one of those allowances. The level rows say which
     # storeys a family may occupy and are read per column above; the minimum
     # says how tall the *building* must be, and every usage storey pays it
@@ -3740,8 +4325,10 @@ def solve_program(
     # "retail at grade, two storeys minimum" is describing a building with
     # something above the shop, not a contradiction.
     #
-    # The parking is still not in the sum: a stall is not a usage, and a
-    # building may not meet its storey minimum with a garage.
+    # Every storey is a usage storey now that no storey is parking, so this
+    # sum is `floors`; it is kept as the usage total because that is what the
+    # minimum is a statement about, and a reader changing the storey types
+    # should find the rule where it is stated.
     usage_floor_total = residential_floors + commercial_floors + industrial_floors
     if retained is not None:
         # The building stands its storeys whatever the addition does, and the
@@ -3752,10 +4339,8 @@ def solve_program(
     if column.floors_min:
         # The loosest minimum any governing column states, owed whatever the
         # building turns out to be made of. Unconditional, unlike the per-family
-        # tightenings below, because without it a model that used no family at
-        # all could meet *En étage min* with parking storeys and hand back a
-        # garage - the storeys the dwellings' own domain used to guarantee
-        # before the mix became a decision.
+        # tightenings below: the storeys the dwellings' own domain used to
+        # guarantee before the mix became a decision.
         model.Add(usage_floor_total >= column.floors_min)
 
     # The storey and footprint norms each column states, imposed the same way:
@@ -3791,11 +4376,6 @@ def solve_program(
     )
     model.AddMultiplicationEquality(residential_area, [footprint, residential_floors])
 
-    parking_area = model.NewIntVar(
-        0, max(footprint_hi * parking_floors_hi, 0), "parking_area"
-    )
-    model.AddMultiplicationEquality(parking_area, [footprint, parking_floors])
-
     commercial_area = model.NewIntVar(
         0, max(footprint_hi * commercial_floors_hi, 0), "commercial_area"
     )
@@ -3806,18 +4386,15 @@ def solve_program(
     )
     model.AddMultiplicationEquality(industrial_area, [footprint, industrial_floors])
 
-    underground_area = model.NewIntVar(
-        0, max(footprint_hi * underground_levels_hi, 0), "underground_area"
-    )
-    model.AddMultiplicationEquality(underground_area, [footprint, underground_levels])
-
     # The cellar's three plates, on the same footprint as everything else -
     # which is the "flat under the rest of the building" assumption stated as
     # algebra, and the reason *Taux d'implantation* has nothing to say about
     # the basement that it does not already say about the ground floor. A real
     # sous-sol can run out past the plate above it under the yard; this one
-    # does not, and modelling that would need a second footprint the same way
-    # a wider garage would.
+    # does not. The dug *parking* beside it does - its plate is the parcel's,
+    # under the stall constraints below - because article 43 frees a buried
+    # level from the coverage cap and a constant plate costs the model no
+    # product. There is no `underground_area` variable for the same reason.
     basement_residential_area = model.NewIntVar(
         0, max(footprint_hi * res_basement_hi, 0), "basement_residential_area"
     )
@@ -3840,7 +4417,7 @@ def solve_program(
     )
 
     # *Hauteur en mètre*, and the one constraint in this model that is linear
-    # in the decision variables it reads. The four above-grade storey types
+    # in the decision variables it reads. The three above-grade storey types
     # enter at their own heights; `underground_levels` does not enter at all,
     # which is the by-law's own arithmetic rather than a shortcut - height is
     # measured from grade up.
@@ -3848,7 +4425,6 @@ def solve_program(
         0,
         max(
             heights.residential_cm * res_floors_allowed
-            + heights.above_grade_parking_cm * parking_floors_hi
             + heights.commercial_cm * commercial_floors_hi
             + heights.industrial_cm * industrial_floors_hi,
             0,
@@ -3858,7 +4434,6 @@ def solve_program(
     model.Add(
         height
         == heights.residential_cm * residential_floors
-        + heights.above_grade_parking_cm * parking_floors
         + heights.commercial_cm * commercial_floors
         + heights.industrial_cm * industrial_floors
     )
@@ -3874,9 +4449,7 @@ def solve_program(
     # industry are in it - they are storeys, and nothing in the by-law excludes
     # a storey for what is done inside it.
     gross = model.NewIntVar(0, max(footprint_hi * column.floors_max, 0), "gross")
-    model.Add(
-        gross == residential_area + parking_area + commercial_area + industrial_area
-    )
+    model.Add(gross == residential_area + commercial_area + industrial_area)
 
     # And the cellar's usage plates, which are *superficie de plancher* too.
     # Article 38 1° excludes *une aire de stationnement des vehicules [...]
@@ -3884,7 +4457,7 @@ def solve_program(
     # stall and the ramp to it - and it excludes nothing else, so a sous-sol
     # of dwellings or of shops is floor area the index counts exactly as the
     # storey above it is. That is the whole of the difference between
-    # `basement_area` and `underground_area`: both are dug, and only one is
+    # `basement_area` and the dug parking: both are dug, and only one is
     # parked in.
     basement_area = model.NewIntVar(
         0, max(footprint_hi * basement_levels_hi, 0), "basement_area"
@@ -4057,8 +4630,18 @@ def solve_program(
     if column.max_dwellings is not None:
         model.Add(dwellings + retained_dwellings <= column.max_dwellings)
 
-    underground_stalls = model.NewIntVar(0, stalls_hi, "underground_stalls")
-    above_grade_stalls = model.NewIntVar(0, stalls_hi, "above_grade_stalls")
+    # Bounded by the hole before the solver starts: however many stalls the
+    # program could owe, no more fit than `max_underground_levels` of the
+    # parcel's plate hold. A parcel that may not be dug prunes the option.
+    underground_stalls_hi = stalls_hi
+    if underground_stall_area > 0:
+        underground_stalls_hi = min(
+            underground_stalls_hi,
+            underground_plate_hi * underground_levels_hi // underground_stall_area,
+        )
+    underground_stalls = model.NewIntVar(
+        0, max(underground_stalls_hi, 0), "underground_stalls"
+    )
     surface_stalls_hi = (
         stalls_hi
         if parking.max_surface_stalls is None
@@ -4099,14 +4682,13 @@ def solve_program(
     # housing are one stall between them, and two constraints would buy two.
     #
     # This is where the commerce stops being free floor area. Three stalls per
-    # thousand square feet against a stall's own 300 is very nearly a parking
-    # plate for every retail plate, and a parking plate is a storey *En etage*
-    # counts and *Densite* counts - so a retail floor that pays for itself
-    # above grade has to earn its neighbour's keep too, and the solver may
-    # prefer to dig, or to build less of it.
+    # thousand square feet is very nearly a parking plate for every retail
+    # plate, and the only place for it indoors above grade is the ground floor
+    # the dwellings would have used - so a retail floor that pays for itself
+    # has to earn its parking's keep too, and the solver may prefer to dig, or
+    # to build less of it.
     model.Add(
-        STALL_DEMAND_SCALE
-        * (underground_stalls + above_grade_stalls + surface_stalls + garage_stalls)
+        STALL_DEMAND_SCALE * (underground_stalls + surface_stalls + garage_stalls)
         >= stall_ratio * dwellings
         + area_stall_ratio
         * (
@@ -4116,17 +4698,77 @@ def solve_program(
             + basement_industrial_area
         )
     )
-    model.Add(underground_stall_area * underground_stalls <= underground_area)
-    model.Add(above_grade_stall_area * above_grade_stalls <= parking_area)
+    total_stalls_expr = underground_stalls + surface_stalls + garage_stalls
+    non_residential_area_expr = (
+        commercial_area
+        + industrial_area
+        + basement_commercial_area
+        + basement_industrial_area
+    )
+    # The stalls that earn: no more than are built, and no more than the
+    # occupants would rent. The second bound is the whole reason a stall's
+    # rent can be in the objective - a surface stall pays for itself several
+    # times over, and without a ceiling on who rents it the model would pave
+    # every square metre the coverage cap leaves. Rounded down, unlike the
+    # demand above: half a tenant rents no stall.
+    rented_stalls = model.NewIntVar(
+        0, stalls_hi if parking.monthly_revenue_per_stall > 0 else 0, "rented_stalls"
+    )
+    model.Add(rented_stalls <= total_stalls_expr)
+    model.Add(
+        STALL_DEMAND_SCALE * rented_stalls
+        <= market_ratio * dwellings + market_area_ratio * non_residential_area_expr
+    )
+    # The absorption tranches: `absorption_units[(k, unit_type)]` is how many
+    # dwellings of that class stand at coverage tranche `k` - a quarter stall
+    # per dwelling apiece - bounded by the class's dwellings, and between them
+    # consuming no more stalls than the building provides. Priced at the
+    # objective below, where the present-value multipliers are.
+    absorption_units: dict[tuple[int, str], cp_model.IntVar] = {}
+    if (
+        parking.absorption_saving_months > 0
+        and parking.market_stalls_per_dwelling > 0
+        and investment.lease_up_months > 0
+        and priced
+        and stalls_hi > 0
+        and dwellings_hi > 0
+    ):
+        tranche_width = round(
+            parking.market_stalls_per_dwelling
+            / PARKING_ABSORPTION_TRANCHES
+            * STALL_DEMAND_SCALE
+        )
+        for k in range(1, PARKING_ABSORPTION_TRANCHES + 1):
+            for unit_type in priced:
+                var = model.NewIntVar(0, dwellings_hi, f"absorption_{k}_{unit_type}")
+                model.Add(var <= counts[unit_type] + basement_counts[unit_type])
+                absorption_units[(k, unit_type)] = var
+        model.Add(
+            tranche_width * sum(absorption_units.values())
+            <= STALL_DEMAND_SCALE * total_stalls_expr
+        )
+    # The hole: the stalls fit in the levels dug, at a plate that is the
+    # parcel's (`underground_plate_hi`) and not the building's. Linear,
+    # because that plate is a constant: article 43 frees a fully buried level
+    # from the coverage cap, so nothing in the grid ties the parkade to
+    # `footprint`, and nothing here does either. A parkade under the yard of a
+    # small house is one level wide rather than three levels deep, which is
+    # what gets built, and it is what makes the hole the *third* provision
+    # rather than one a tight plate prices out of reach.
+    model.Add(
+        underground_stall_area * underground_stalls
+        <= underground_plate_hi * underground_levels
+    )
     # The yard: the parcel less the plate standing on it. Not a floor plate, so
     # this is the one stall constraint that reads `lot.area_m2` rather than an
     # area variable, and the one provision that costs the building no storey
     # and no *superficie de plancher* - a stall outdoors is not in a building.
     #
-    # It is also what keeps the two structured options honest. They are eight
-    # and ten times the price, so nothing is dug or decked until the coverage
-    # cap has spent the yard, and a low-rise envelope with land to spare simply
-    # parks on it. `_site_coverage_cap` bounds `footprint` at the whole parcel, so
+    # It is also what keeps the two indoor options honest. They are two and a
+    # half and ten times the price, so nothing is bayed or dug until the
+    # coverage cap has spent the yard, and a low-rise envelope with land to
+    # spare simply parks on it. `_site_coverage_cap` bounds `footprint` at the
+    # whole parcel, so
     # the right-hand side cannot go negative even where the grid prints no
     # coverage maximum at all.
     model.Add(surface_stall_area * surface_stalls + footprint <= lot_area_scaled)
@@ -4162,9 +4804,9 @@ def solve_program(
     if yard_area_scaled is not None:
         model.Add(surface_stall_area * surface_stalls <= yard_area_scaled)
     # The garage: bays inside the ground floor, which is one plate of it. More
-    # than a plate's worth is not a garage any more - it is the storey of
-    # stalls `above_grade_stalls` already models, and a building wanting both
-    # can have both.
+    # than a plate's worth is not a garage any more - it is a parking
+    # structure, which this model does not build - so a building owing more
+    # stalls than its ground floor holds digs for the rest.
     model.Add(garage_stall_area * garage_stalls <= footprint)
     # A cellar of dwellings holds dwellings. Nothing in the objective charges
     # for the *plate* - a dwelling's coefficient is on its count, and the
@@ -4176,31 +4818,25 @@ def solve_program(
     # levels get below, for the same reason.
     model.Add(basement_residential_levels <= sum(basement_counts.values()))
 
-    # A parking level exists to hold stalls. Without this the solver would be
-    # free to raise an empty one to satisfy a density *minimum* - floor area
-    # the by-law would count and nobody would ever build.
-    model.Add(parking_floors <= above_grade_stalls)
+    # A dug level exists to hold stalls. Nothing in the objective charges for
+    # a *level*, only for the stalls in it, so without this the level count
+    # would be free above its floor and `underground_levels` would report
+    # whichever depth the search happened to return.
     model.Add(underground_levels <= underground_stalls)
-    # And the hole is no deeper than the stalls need. Without this the level
-    # count is free above its floor - nothing in the objective charges for a
-    # dug *level*, only for the stalls in it - so any depth that holds the
-    # parking is equally optimal and `underground_area_m2` reports whichever
-    # of them the search happened to return. The stalls must not fit in one
-    # level fewer: `underground_area - footprint` is that shallower hole,
-    # written with the product the model already carries rather than a second
-    # one, and the ``+ 1`` makes it strict in the hundredths of a square metre
-    # the areas are held in.
-    #
-    # Enforced only while something is dug, because a program that builds
-    # nothing has a footprint of zero and would otherwise be asked for one
-    # square centimetre of it.
+    # And the hole is no deeper than the stalls need: they must not fit in one
+    # level fewer at the plate the parcel allows. Linear like the fit above,
+    # and the ``+ 1`` makes it strict in the hundredths of a square metre the
+    # areas are held in. Enforced only while something is dug, since zero
+    # levels would otherwise be asked to hold a hundredth of a square metre.
+    # Between them the two bounds pin the level count, and the plate the
+    # stalls took - `underground_plate_m2` - is the area over the levels.
     if underground_levels_hi:
         digs = model.NewBoolVar("digs")
         model.Add(underground_levels >= 1).OnlyEnforceIf(digs)
         model.Add(underground_levels == 0).OnlyEnforceIf(digs.Not())
         model.Add(
             underground_stall_area * underground_stalls
-            >= underground_area - footprint + 1
+            >= underground_plate_hi * (underground_levels - 1) + 1
         ).OnlyEnforceIf(digs)
 
     # Discounted net profit, folded to one coefficient per decision variable.
@@ -4217,7 +4853,6 @@ def solve_program(
     pv_per_monthly_gross = investment.pv_per_monthly_gross
     rent_premium = investment.rent_premium_factor
     underground_value = round(parking.underground_cost_cad * MONEY_SCALE)
-    above_grade_value = round(parking.above_grade_cost_cad * MONEY_SCALE)
     surface_value = round(parking.surface_cost_cad * MONEY_SCALE)
     garage_value = round(parking.garage_cost_cad * MONEY_SCALE)
     net_value = {
@@ -4237,6 +4872,37 @@ def solve_program(
     # free storey - a basement plate costs neither *En etage* nor *Hauteur*, so
     # with the two rates equal the solver would dig on every parcel whose
     # storeys ran out before its density did.
+    # A rented stall is its rent through the same multiplier a dwelling's
+    # rent goes through: the objective is discounted net profit, and a stall
+    # that earns $102 a month is worth what $102 a month is worth.
+    stall_revenue_value = round(
+        parking.monthly_revenue_per_stall * pv_per_monthly_gross * MONEY_SCALE
+    )
+    # The absorption tranches, priced at the marginal gain in present value
+    # between successive coverages: the multiplier at the shorter lease-up
+    # less the multiplier at the one below it, on each class's proforma rent.
+    # Concavity makes the gains decrease, so the solver fills the tranches in
+    # order on its own; a coefficient that rounds to nothing is left out.
+    absorption_deltas: list[float] = []
+    if absorption_units:
+        previous = pv_per_monthly_gross
+        for k in range(1, PARKING_ABSORPTION_TRANCHES + 1):
+            saved = parking.lease_up_months_saved(k / PARKING_ABSORPTION_TRANCHES)
+            at_k = investment.pv_per_monthly_gross_at(
+                investment.lease_up_months - saved
+            )
+            absorption_deltas.append(at_k - previous)
+            previous = at_k
+    absorption_terms: list[tuple[int, cp_model.IntVar]] = []
+    for (k, unit_type), var in absorption_units.items():
+        coefficient = round(
+            absorption_deltas[k - 1]
+            * economics.monthly_revenue(unit_type)
+            * rent_premium
+            * MONEY_SCALE
+        )
+        if coefficient > 0:
+            absorption_terms.append((coefficient, var))
     below_grade_rent = investment.below_grade_rent_factor
     basement_net_value = {
         unit_type: round(
@@ -4291,9 +4957,12 @@ def solve_program(
         + basement_commercial_value * basement_commercial_area
         + basement_industrial_value * basement_industrial_area
         - underground_value * underground_stalls
-        - above_grade_value * above_grade_stalls
         - surface_value * surface_stalls
         - garage_value * garage_stalls
+        # What the stalls earn, on the ones somebody rents.
+        + stall_revenue_value * rented_stalls
+        # And what they save the dwellings in lease-up, by tranche.
+        + sum(coefficient * var for coefficient, var in absorption_terms)
     )
 
     solver = cp_model.CpSolver()
@@ -4301,6 +4970,24 @@ def solve_program(
     status = solver.Solve(model)
     status_name = solver.StatusName(status)
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        if (
+            status == cp_model.INFEASIBLE
+            and waive_parking_if_empty
+            and parking.required
+        ):
+            # Nothing satisfies the model *with* the stalls. Whether the
+            # stalls are why is answered by taking them away and asking
+            # again: a model that builds without them was stopped by the
+            # parking and by nothing else, and one that is still infeasible
+            # or still empty was stopped by a printed minimum the parking
+            # only stood beside. The first comes back as the program it is -
+            # the building with its parking waived - and says so; the second
+            # is the plain INFEASIBLE it always was. INFEASIBLE only: an
+            # UNKNOWN is the time limit, not an answer, and re-solving it
+            # would spend the limit twice to learn nothing.
+            relaxed = _relaxed()
+            if relaxed.solved and not _builds_nothing(relaxed):
+                return _waived(relaxed)
         return _empty_program(
             column, lot, status=status_name, binding=(), unpriced=unpriced
         )
@@ -4324,7 +5011,6 @@ def solve_program(
         )
         for unit_type in sorted(set(above_grade_units) | set(basement_units))
     }
-    chosen_parking_area = solver.Value(parking_area)
     chosen_commercial_area = solver.Value(commercial_area)
     chosen_industrial_area = solver.Value(industrial_area)
     # The non-residential floor the program *adds*: the whole plate less what
@@ -4338,7 +5024,6 @@ def solve_program(
     chosen_height = solver.Value(height)
     chosen_underground_levels = solver.Value(underground_levels)
     chosen_underground_stalls = solver.Value(underground_stalls)
-    chosen_above_grade_stalls = solver.Value(above_grade_stalls)
     chosen_surface_stalls = solver.Value(surface_stalls)
     chosen_garage_stalls = solver.Value(garage_stalls)
     chosen_basement_residential_area = solver.Value(basement_residential_area)
@@ -4346,7 +5031,6 @@ def solve_program(
     chosen_basement_industrial_area = solver.Value(basement_industrial_area)
     chosen_footprint = solver.Value(footprint)
     chosen_residential_floors = solver.Value(residential_floors)
-    chosen_parking_floors = solver.Value(parking_floors)
     chosen_commercial_floors = solver.Value(commercial_floors)
     chosen_industrial_floors = solver.Value(industrial_floors)
     chosen_floors = solver.Value(floors)
@@ -4373,7 +5057,6 @@ def solve_program(
         # not pay for itself at the surveyed retail rent: each came back with
         # one commercial storey, one commercial cellar, and 0 m2 of both.
         chosen_residential_floors = 0
-        chosen_parking_floors = 0
         chosen_commercial_floors = 0
         chosen_industrial_floors = 0
         chosen_floors = 0
@@ -4381,6 +5064,11 @@ def solve_program(
         chosen_basement_commercial_levels = 0
         chosen_basement_industrial_levels = 0
         chosen_underground_levels = 0
+        # The hole is no longer a product with the footprint, so it is
+        # normalised with the rest rather than falling to zero on its own. A
+        # program that builds nothing owes no stall and rents none, so the
+        # solver never pays for one here; this is the boundary stating it.
+        chosen_underground_stalls = 0
     if (
         retained is not None
         and not units
@@ -4402,7 +5090,6 @@ def solve_program(
         chosen_residential_floors = min(chosen_residential_floors, retained.storeys)
         chosen_commercial_floors = min(chosen_commercial_floors, retained.storeys)
         chosen_industrial_floors = min(chosen_industrial_floors, retained.storeys)
-        chosen_parking_floors = 0
         chosen_surface_stalls = 0
         chosen_garage_stalls = 0
         chosen_commercial_area = retained_commercial_scaled
@@ -4425,10 +5112,14 @@ def solve_program(
     # the premium - because that is the rent every dollar below is built from.
     parking_cost = parking.capital_cost(
         underground=chosen_underground_stalls,
-        above_grade=chosen_above_grade_stalls,
         surface=chosen_surface_stalls,
         garage=chosen_garage_stalls,
     )
+    # The hole, as the area the stalls took: the model bounds it by the
+    # parcel's plate times the levels and pins the levels to the fewest that
+    # hold it, so the area dug is the stalls' own and the plate of one level is
+    # that area over the levels.
+    chosen_underground_area = underground_stall_area * chosen_underground_stalls
     construction_cost = sum(
         construction.capital_cost(priced[unit_type]) * quantity
         for unit_type, quantity in above_grade_units.items()
@@ -4443,31 +5134,85 @@ def solve_program(
         industrial_sqft
     ) + construction.below_grade_industrial_capital_cost(basement_industrial_sqft)
     total_capital = construction_cost + commercial_cost + industrial_cost + parking_cost
-    gross_revenue = (
-        sum(
-            economics.monthly_revenue(unit_type) * rent_premium * quantity
-            for unit_type, quantity in above_grade_units.items()
-        )
-        + sum(
-            economics.monthly_revenue(unit_type)
-            * rent_premium
-            * below_grade_rent
-            * quantity
-            for unit_type, quantity in basement_units.items()
-        )
-        + non_residential.commercial_monthly_revenue(commercial_sqft)
-        + non_residential.industrial_monthly_revenue(industrial_sqft)
+    # Kept as three sums rather than one, because the split is reported: a
+    # blended cap rate and a lease-up downstream are both weighted by which
+    # family earns the income, and no downstream area column can recover that
+    # (the basement plates are rented at a discount and are outside
+    # `commercial_area_m2`). Their total is `gross_revenue` as before.
+    residential_revenue = sum(
+        economics.monthly_revenue(unit_type) * rent_premium * quantity
+        for unit_type, quantity in above_grade_units.items()
+    ) + sum(
+        economics.monthly_revenue(unit_type) * rent_premium * below_grade_rent * quantity
+        for unit_type, quantity in basement_units.items()
+    )
+    commercial_revenue = (
+        non_residential.commercial_monthly_revenue(commercial_sqft)
         + non_residential.commercial_monthly_revenue(basement_commercial_sqft)
         * below_grade_rent
+    )
+    industrial_revenue = (
+        non_residential.industrial_monthly_revenue(industrial_sqft)
         + non_residential.industrial_monthly_revenue(basement_industrial_sqft)
         * below_grade_rent
     )
-    present_value = gross_revenue * pv_per_monthly_gross
+    # The parking's own lines. The rent is on the stalls somebody rents and is
+    # inside the gross like any other rent; the absorption gain is a timing
+    # effect on the dwellings' rent and is inside the present value alone -
+    # a stabilised NOI is the same number whichever month it stabilises in.
+    chosen_rented_stalls = solver.Value(rented_stalls)
+    chosen_total_stalls = (
+        chosen_underground_stalls + chosen_surface_stalls + chosen_garage_stalls
+    )
+    if chosen_footprint == 0 or (
+        retained is not None
+        and not units
+        and chosen_commercial_area <= retained_commercial_scaled
+        and chosen_industrial_area <= retained_industrial_scaled
+    ):
+        # Normalised with the building above: a program that builds nothing
+        # rents nothing, whatever the search left in the variable.
+        chosen_rented_stalls = 0
+    parking_revenue = chosen_rented_stalls * parking.monthly_revenue_per_stall
+    absorption_value = sum(
+        absorption_deltas[k - 1]
+        * economics.monthly_revenue(unit_type)
+        * rent_premium
+        * solver.Value(var)
+        for (k, unit_type), var in absorption_units.items()
+    ) if units else 0.0
+    total_dwellings = sum(units.values())
+    parking_coverage = (
+        chosen_total_stalls / total_dwellings if total_dwellings else 0.0
+    )
+    lease_up_saved = (
+        parking.lease_up_months_saved(
+            parking_coverage / parking.market_stalls_per_dwelling
+        )
+        if total_dwellings
+        and parking.market_stalls_per_dwelling > 0
+        and investment.lease_up_months > 0
+        else 0.0
+    )
+    gross_revenue = (
+        residential_revenue + commercial_revenue + industrial_revenue + parking_revenue
+    )
+    present_value = gross_revenue * pv_per_monthly_gross + absorption_value
     annual_stabilised_noi = (
         gross_revenue * MONTHS_PER_YEAR * (1.0 - investment.operating_expense_ratio)
     )
+    # The storeys as reported, by family - the same keys `governing` and
+    # `usage_floors` carry, so a rule written against one can be read off the
+    # other. Built here rather than beside `solver.Value` above because the two
+    # normalisations in between (no plate, and an addition that prices nothing)
+    # are what make the reported counts differ from the solved ones.
+    chosen_usage_floors = {
+        "residential": chosen_residential_floors,
+        "commercial": chosen_commercial_floors,
+        "industrial": chosen_industrial_floors,
+    }
 
-    return DevelopmentProgram(
+    program = DevelopmentProgram(
         units=units,
         floors=chosen_floors,
         height_m=_unscale_height(chosen_height),
@@ -4484,17 +5229,20 @@ def solve_program(
         annual_stabilised_noi_cad=annual_stabilised_noi,
         status=status_name,
         residential_floors=chosen_residential_floors,
-        above_grade_parking_floors=chosen_parking_floors,
         commercial_floors=chosen_commercial_floors,
         industrial_floors=chosen_industrial_floors,
         commercial_area_m2=_unscale(chosen_commercial_area),
         industrial_area_m2=_unscale(chosen_industrial_area),
         underground_levels=chosen_underground_levels,
         underground_stalls=chosen_underground_stalls,
-        above_grade_stalls=chosen_above_grade_stalls,
         surface_stalls=chosen_surface_stalls,
         garage_stalls=chosen_garage_stalls,
-        underground_area_m2=_unscale(solver.Value(underground_area)),
+        underground_area_m2=_unscale(chosen_underground_area),
+        underground_plate_m2=(
+            _unscale(chosen_underground_area) / chosen_underground_levels
+            if chosen_underground_levels
+            else 0.0
+        ),
         basement_residential_levels=chosen_basement_residential_levels,
         basement_commercial_levels=chosen_basement_commercial_levels,
         basement_industrial_levels=chosen_basement_industrial_levels,
@@ -4509,6 +5257,9 @@ def solve_program(
         commercial_cost_cad=commercial_cost,
         industrial_cost_cad=industrial_cost,
         gross_revenue_cad=gross_revenue,
+        residential_gross_revenue_cad=residential_revenue,
+        commercial_gross_revenue_cad=commercial_revenue,
+        industrial_gross_revenue_cad=industrial_revenue,
         retained_floor_area_m2=retained.floor_area_m2 if retained else 0.0,
         retained_dwellings=retained.dwellings if retained else 0,
         retained_monthly_gross_cad=(
@@ -4520,7 +5271,6 @@ def solve_program(
             total_dwellings=sum(units.values()),
             unit_area=unit_area,
             garage_area=garage_stall_area * chosen_garage_stalls,
-            parking_area=chosen_parking_area,
             commercial_area=chosen_commercial_area,
             industrial_area=chosen_industrial_area,
             basement_commercial_area=chosen_basement_commercial_area,
@@ -4546,6 +5296,22 @@ def solve_program(
                 max(commercial_floors_hi, industrial_floors_hi, res_floors_allowed),
             ),
             smallest_unit_area=smallest_unit_area,
+            # Whether the RDC is what the ground-excluded families gave up.
+            # Read off the solution rather than off the caps, like the two
+            # `*_floor_area` names and for the same reason: no printed norm
+            # states it, and the storey is only lost where those families
+            # actually filled everything else.
+            ground_floor_binds=(
+                bool(ground_excluded)
+                and chosen_floors >= 1
+                and sum(
+                    chosen_usage_floors[family]
+                    for family, governing_column in governing.items()
+                    if governing_column is not None
+                    and not governing_column.authorises_ground_floor
+                )
+                == chosen_floors - 1
+            ),
             underground_levels=chosen_underground_levels,
             underground_levels_hi=underground_levels_hi,
             height_floors_cap=height_floors_cap,
@@ -4554,10 +5320,41 @@ def solve_program(
             yard_area=yard_area_scaled,
             surface_stall_area=surface_stall_area,
         ),
+        rented_stalls=chosen_rented_stalls,
+        parking_gross_revenue_cad=parking_revenue,
+        parking_coverage=parking_coverage,
+        lease_up_months_saved=min(lease_up_saved, float(investment.lease_up_months)),
+        absorption_value_cad=absorption_value,
         unpriced_types=unpriced,
         zone=column.zone,
         lot_number=lot.lot_number,
     )
+    if waive_parking_if_empty and parking.required and _builds_nothing(program):
+        # Solved, and the answer was to build nothing. Whether the stalls are
+        # why - a house that cannot pay for the parkade it owes, a plate too
+        # small for its own bays - is the same question as above, asked the
+        # same way: without the obligation, does anything pencil? If it
+        # does, that program is returned on its variance; if the parcel is
+        # still empty, the rents are the reason and this answer stands.
+        relaxed = _relaxed()
+        if relaxed.solved and not _builds_nothing(relaxed):
+            return _waived(relaxed)
+    return program
+
+
+def _builds_nothing(program: DevelopmentProgram) -> bool:
+    """Whether a solved program is the empty answer - `nothing_pencils`.
+
+    No dwelling and no non-residential floor, cellar included, on a rebuild;
+    no dwelling and no floor added on an enhancement. The rule `_binding_caps`
+    names `nothing_pencils` by, read off the reported program so the two
+    cannot disagree.
+    """
+    if program.total_dwellings:
+        return False
+    if program.is_enhancement:
+        return program.added_floor_area_m2 <= 0.0
+    return program.non_residential_area_m2 <= 0.0
 
 
 def _families_by_column(
@@ -4650,7 +5447,6 @@ def _binding_caps(
     total_dwellings: int,
     unit_area: int,
     garage_area: int,
-    parking_area: int,
     commercial_area: int,
     industrial_area: int,
     basement_commercial_area: int,
@@ -4667,6 +5463,7 @@ def _binding_caps(
     res_floors_allowed: int,
     usage_floors_cap: int,
     smallest_unit_area: int,
+    ground_floor_binds: bool = False,
     underground_levels: int,
     underground_levels_hi: int,
     height_floors_cap: int | None,
@@ -4693,12 +5490,12 @@ def _binding_caps(
     stopped it.
 
     The solution values that do belong here are the above-grade storeys that
-    are not dwellings: the parking, the commerce and the industry. Each is
-    floor area the by-law counts and the solver chose to spend on something
-    else, so what is left of the density cap after them is a genuine ceiling on
-    the dwellings rather than an artefact of a tie. `max_underground_levels` is
-    reported on the same footing, with the caveat that it is this module's
-    bound rather than anything the grid prints.
+    are not dwellings - the commerce and the industry - and the garage bays.
+    Each is floor area the by-law counts and the solver chose to spend on
+    something else, so what is left of the density cap after them is a
+    genuine ceiling on the dwellings rather than an artefact of a tie.
+    `max_underground_levels` is reported on the same footing, with the caveat
+    that it is this module's bound rather than anything the grid prints.
 
     `height_max` is reported beside `floors` and from the caps for the same
     reason the rest of them are: the height of a tied solution is as arbitrary
@@ -4762,9 +5559,7 @@ def _binding_caps(
     # question the caller asked would have gone unanswered. `basement_unbuilt`
     # below is that case named instead.
     envelope_cap = footprint_hi * res_floors_allowed
-    non_residential_area = (
-        parking_area + commercial_area + industrial_area + non_residential_below
-    )
+    non_residential_area = commercial_area + industrial_area + non_residential_below
     remaining_density = (
         None if density_cap is None else density_cap - non_residential_area
     )
@@ -4786,8 +5581,6 @@ def _binding_caps(
         # counting it would name the cap while mis-stating what filled it.
         if remaining_density is not None and remaining_density <= envelope_cap:
             binding.append("density_max")
-            if parking_area > 0:
-                binding.append("above_grade_parking")
         if remaining_density is None or envelope_cap <= remaining_density:
             # Which of the two footprint ceilings produced this envelope - the
             # coverage or the margins. See `_footprint_cap_norm`; on a lot with
@@ -4820,6 +5613,16 @@ def _binding_caps(
             binding.append("commercial_floor_area")
         if industrial_area > 0 or basement_industrial_area > 0:
             binding.append("industrial_floor_area")
+
+    if ground_floor_binds:
+        # A storey went to the ground floor because the families that wanted it
+        # may not stand there. Not a printed cap and not a rate either, which
+        # is what makes it worth naming: a reader asking why a *Tous sauf le
+        # RDC* column built five storeys of housing under a six-storey grid is
+        # being told the sixth is at grade and is somebody else's, and that
+        # changing *En etage max* will not hand it back. The row to change is
+        # the *Niveaux* one.
+        binding.append("ground_floor_excluded")
 
     if not permits_residential and (commercial_area > 0 or industrial_area > 0):
         # A column with no dwelling in the question: what stopped the commerce

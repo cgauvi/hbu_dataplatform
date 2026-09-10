@@ -584,3 +584,63 @@ def test_the_frame_that_was_written_is_the_frame_that_is_published(borough, publ
     assert published["calls"] == 1
     assert set(published["datasets"]) == {"lot_investment_opportunities"}
     assert len(published["datasets"]["lot_investment_opportunities"]) == len(BOROUGH)
+
+
+def test_the_zone_join_keeps_the_zone_and_drops_the_layer_slug():
+    """`feature_id` is half the table's key; `source_table` is a join key.
+
+    Both arrive on the frame the same way - borrowed from the HBU row so the
+    heritage columns can be looked up - and only one of them belongs on the
+    output. They used to both be dropped, which was right while a shortlist
+    row was a lot; since a row became a *piece* of a lot, dropping the zone
+    leaves a frame `gold.lot_investment_opportunities` cannot be keyed on, and
+    the run fails after the whole gold chain has been rebuilt with
+    `nothing supplies feature_id`.
+
+    Asserted here rather than only through the asset because the column list
+    (`_CARRIED`) already names `feature_id` - it was the *drop* that removed
+    it, which a check on the list alone cannot see.
+    """
+    inputs = pd.DataFrame(
+        {
+            "lot_uid": [1],
+            "lot_number": ["2 216 001"],
+            "feature_id": ["C01-001"],
+            "source_table": ["Reglement_urbanisme__VSP_REG_ZONE"],
+        }
+    )
+    zones = pd.DataFrame(
+        {
+            "source_table": ["Reglement_urbanisme__VSP_REG_ZONE"],
+            "feature_id": ["C01-001"],
+            "grid_zone": ["C01-001"],
+            "heritage_sector": [None],
+            "piia_sector": [None],
+        }
+    )
+
+    opportunity_assets._join_zones(inputs, pd.DataFrame(), zones)
+
+    assert "feature_id" in inputs.columns
+    assert inputs["feature_id"].tolist() == ["C01-001"]
+    assert "source_table" not in inputs.columns
+
+
+def test_the_zone_join_keeps_the_zone_even_when_the_grids_are_missing():
+    """The other branch, which drops the same keys and had the same bug.
+
+    A partition whose zone columns were parsed before the heritage rows were
+    read has nothing to join, and the shortlist still has to be writable.
+    """
+    inputs = pd.DataFrame(
+        {
+            "lot_uid": [1],
+            "feature_id": ["C01-001"],
+            "source_table": ["Reglement_urbanisme__VSP_REG_ZONE"],
+        }
+    )
+
+    opportunity_assets._join_zones(inputs, pd.DataFrame(), pd.DataFrame())
+
+    assert inputs["feature_id"].tolist() == ["C01-001"]
+    assert "source_table" not in inputs.columns

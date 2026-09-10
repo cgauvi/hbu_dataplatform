@@ -12,6 +12,7 @@ without one, and the verdict picks the largest with holding on a tie.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pandas as pd
 import pytest
@@ -29,8 +30,11 @@ from urban_rag.hbu import (
 from urban_rag.program import (
     BuildingLevel,
     ConstructionCosts,
+    DevelopmentProgram,
     InvestmentAssumptions,
     Lot,
+    NO_PARKING,
+    ParkingRules,
     ProgramError,
     RetainedBuilding,
     UnitEconomics,
@@ -64,6 +68,49 @@ PLEX = RetainedBuilding(
     max_added_storeys=1,
     addition_cost_premium=1.5,
 )
+
+
+# -- the ground floor an enhancement already has ------------------------------
+
+
+def test_an_enhancement_keeps_a_ground_floor_the_grid_would_not_grant_it():
+    """The *Niveaux* placement rule is a rebuild's, not an addition's.
+
+    A rebuild whose ``H`` column is marked *Tous sauf le RDC* must give its
+    ground floor to something else, and where the zone authorises nothing else
+    it may not be built at all. An enhancement is a building that already
+    stands on a ground floor already occupied and already lawful - as of right
+    or as a droit acquis - and the storeys this solve chooses go on **top** of
+    it, above the RDC by construction. Holding the addition to the rule would
+    ask the owner of a plex to put a shop under it before adding a storey.
+    """
+    off_the_rdc = replace(
+        COLUMN, levels=frozenset({BuildingLevel.ALL_EXCEPT_GROUND})
+    )
+    # As a rebuild, the same column is refused outright: nothing may stand at
+    # grade, and a building of storeys has a ground floor.
+    rebuild = solve_program(off_the_rdc, LOT, ECONOMICS, parking=NO_PARKING)
+    assert rebuild.status == "INFEASIBLE"
+    assert rebuild.binding == ("no_usage_permitted_on_ground_floor",)
+
+    # As an enhancement it solves, keeps its two standing storeys of housing,
+    # and owes no commerce for the privilege.
+    enhancement = solve_program(
+        off_the_rdc, LOT, ECONOMICS, parking=NO_PARKING, retained=PLEX
+    )
+    assert enhancement.solved
+    assert enhancement.commercial_floors == 0
+    assert enhancement.industrial_floors == 0
+    assert enhancement.residential_floors >= PLEX.storeys
+    assert "ground_floor_excluded" not in enhancement.binding
+    # And it is the same answer the column gives when the rows never excluded
+    # the RDC at all, which is the point: the addition was never the storey
+    # the grid was talking about.
+    unrestricted = solve_program(
+        COLUMN, LOT, ECONOMICS, parking=NO_PARKING, retained=PLEX
+    )
+    assert enhancement.residential_floors == unrestricted.residential_floors
+    assert enhancement.npv_cad == pytest.approx(unrestricted.npv_cad)
 
 
 # -- the timing ---------------------------------------------------------------
@@ -116,10 +163,10 @@ def test_the_addition_keeps_the_plate_and_the_storeys_and_adds_one():
     assert program.retained_monthly_gross_cad == 3000.0
 
 
-def test_nothing_is_dug_or_decked_under_or_over_a_standing_building():
+def test_nothing_is_dug_under_or_bayed_into_a_standing_building():
     program = solve_program(COLUMN, LOT, ECONOMICS, retained=PLEX)
     assert program.underground_levels == 0
-    assert program.above_grade_parking_floors == 0
+    assert program.underground_stalls == 0
     assert program.garage_stalls == 0
     assert program.basement_levels == 0
     assert program.total_stalls == program.surface_stalls
@@ -377,6 +424,40 @@ def test_solve_enhancements_solves_a_plex_with_room_above_it():
     )
 
 
+# 240 sits on the solver's 0.01 m² grid; 139.3 and 153.3 are the roll's own
+# figures and do not (139.3 x 100 is 13930.000000000002 in a float, and its
+# ceiling is a centimetre of floor nobody built). Both must read as nothing.
+@pytest.mark.parametrize("standing_floor", [240.0, 139.3, 153.3])
+def test_an_enhancement_that_adds_nothing_is_worth_exactly_holding(standing_floor):
+    """No storey and no annex pays at a premium this steep, so the solver's
+    answer is the standing building - and works nobody does disturb no rent.
+    The gain is 0, not minus a quarter of the NOI for nine months."""
+    frame = solve_enhancements(
+        pd.DataFrame([_hbu_row()]),
+        pd.DataFrame([_existing_row(residential_floor_area_m2=standing_floor)]),
+        pd.DataFrame([_envelope_row()]),
+        ECONOMICS,
+        rules=EnhancementRules(
+            construction_months=9, disruption_share=0.25, addition_cost_premium=50.0
+        ),
+    )
+    row = frame.iloc[0]
+    assert row["enhance_solved"]
+    assert "nothing_pencils" in json.loads(row["enhance_binding"])
+    assert row["enhance_added_floor_area_m2"] == 0.0
+    assert row["enhance_added_storeys"] == 0
+    assert row["enhance_capital_cost_cad"] == 0.0
+    assert row["enhance_disruption_cad"] == 0.0
+    assert row["enhance_gain_cad"] == 0.0
+    futures = three_futures(
+        pd.concat(
+            [pd.DataFrame([{"existing_present_value_cad": 165_873.22}]), frame], axis=1
+        )
+    )
+    assert futures.loc[0, "enhance_value_cad"] == futures.loc[0, "hold_value_cad"]
+    assert futures.loc[0, "best_future"] == "hold"
+
+
 @pytest.mark.parametrize(
     "hbu_overrides, existing_overrides, expected",
     [
@@ -455,3 +536,139 @@ def test_the_gap_values_the_hold_without_a_delay(monkeypatch):
         23_400.0 * investment.hold_pv_factor
     )
     assert gap.loc[0, "existing_num_storeys"] == 2
+
+
+# -- the parking waived ---------------------------------------------------------------
+
+#: A plex with a shop under it. The shop's floor owes stalls - the demand is
+#: on the whole building, the standing part included - an enhancement parks
+#: on the yard or not at all, and `NO_YARD` is a lot with no yard to speak of.
+SHOP_PLEX = RetainedBuilding(
+    footprint_m2=200.0,
+    storeys=2,
+    residential_floor_area_m2=200.0,
+    commercial_floor_area_m2=200.0,
+    dwellings=2,
+    max_added_storeys=1,
+)
+MIXED = ZoneColumn(
+    usages=("H", "C.2"),
+    floors_max=6,
+    floors_min=2,
+    levels=frozenset({BuildingLevel.ALL}),
+    site_coverage_max_pct=70.0,
+    density_max=4.5,
+)
+NO_YARD = ParkingRules(max_surface_stalls=0)
+
+
+def test_a_standing_shop_with_no_yard_has_no_enhancement_until_the_parking_is_waived():
+    refused = solve_program(MIXED, LOT, ECONOMICS, retained=SHOP_PLEX, parking=NO_YARD)
+    assert refused.status == "INFEASIBLE"
+    assert refused.binding == ()
+
+    waived = solve_program(
+        MIXED, LOT, ECONOMICS, retained=SHOP_PLEX, parking=NO_YARD,
+        waive_parking_if_empty=True,
+    )
+    assert waived.solved
+    assert waived.is_enhancement
+    assert waived.parking_waived
+    assert waived.total_stalls == 0
+    assert waived.added_floor_area_m2 > 0
+    # Owed on the whole building - the standing shop's floor included, since
+    # that is what the demand constraint read.
+    assert waived.waived_stalls == NO_YARD.stalls_owed(
+        dwellings=waived.total_dwellings,
+        non_residential_area_sqft=(
+            waived.commercial_area_sqft + waived.basement_commercial_area_sqft
+        ),
+    )
+    assert waived.waived_stalls > 0
+
+
+def test_solve_enhancements_carries_the_waiver():
+    existing = _existing_row(
+        residential_floor_area_m2=200.0, commercial_floor_area_m2=200.0
+    )
+    envelope = _envelope_row(
+        usages=json.dumps(["H", "C.2"]),
+        permits_commercial=True,
+        governs_commercial=True,
+    )
+    frame = solve_enhancements(
+        pd.DataFrame([_hbu_row()]),
+        pd.DataFrame([existing]),
+        pd.DataFrame([envelope]),
+        ECONOMICS,
+        assumptions=ProgramAssumptions(parking=NO_YARD),
+    )
+    assert list(frame.columns) == list(ENHANCEMENT_COLUMNS)
+    row = frame.iloc[0]
+    assert row["enhance_solved"]
+    assert row["enhance_parking_waived"]
+    assert row["enhance_waived_stalls"] > 0
+    assert row["enhance_surface_stalls"] == 0
+
+    strict = solve_enhancements(
+        pd.DataFrame([_hbu_row()]),
+        pd.DataFrame([existing]),
+        pd.DataFrame([envelope]),
+        ECONOMICS,
+        assumptions=ProgramAssumptions(parking=NO_YARD, waive_parking_if_empty=False),
+    )
+    assert strict.iloc[0]["enhance_status"] == "INFEASIBLE"
+    assert not strict.iloc[0]["enhance_solved"]
+    assert not strict.iloc[0]["enhance_parking_waived"]
+    assert strict.iloc[0]["enhance_waived_stalls"] == 0
+
+
+# -- the parking rent in the income split -------------------------------------------
+
+
+def test_the_income_shares_spread_the_parking_rent_over_the_families():
+    """The parking rent is inside the gross and belongs to no family, so the
+    shares are taken over the three family rents and still sum to one."""
+    program = DevelopmentProgram(
+        units={}, floors=0, footprint_m2=0.0, gross_floor_area_m2=0.0,
+        unit_area_m2=0.0, net_operating_income=0.0, status="OPTIMAL",
+        gross_revenue_cad=1_100.0,
+        residential_gross_revenue_cad=800.0,
+        commercial_gross_revenue_cad=200.0,
+        parking_gross_revenue_cad=100.0,
+    )
+    shares = hbu._income_shares(program)
+    assert shares == pytest.approx(
+        {"residential": 0.8, "commercial": 0.2, "industrial": 0.0}
+    )
+    assert sum(shares.values()) == pytest.approx(1.0)
+
+
+def test_use_gap_keeps_the_family_noi_lines_summing_with_parking_rent_inside():
+    hbu_frame = pd.DataFrame(
+        [
+            {
+                "lot_uid": 1, "lot_number": "1 000 001", "npv_cad": 100_000.0,
+                "present_value_cad": 900_000.0,
+                "annual_gross_revenue_cad": 99_000.0,
+                "annual_residential_gross_revenue_cad": 90_000.0,
+                "annual_commercial_gross_revenue_cad": 0.0,
+                "annual_industrial_gross_revenue_cad": 0.0,
+                "annual_parking_gross_revenue_cad": 9_000.0,
+                "num_dwellings": 6, "residential_area_m2": 600.0,
+                "commercial_area_m2": 0.0, "industrial_area_m2": 0.0,
+                "unit_area_m2": 500.0, "annual_net_operating_income_cad": 50_000.0,
+                "total_capital_cost_cad": 800_000.0,
+            }
+        ]
+    )
+    gap = hbu.use_gap(
+        hbu_frame, pd.DataFrame([_existing_row()]), operating_expense_ratio=0.35
+    )
+    total = 99_000.0 * 0.65
+    assert gap.loc[0, "hbu_annual_stabilised_noi_cad"] == pytest.approx(total)
+    # All of it on the housing, parking rent included: the shop and the
+    # workshop earn nothing here and get nothing.
+    assert gap.loc[0, "hbu_residential_noi_cad"] == pytest.approx(total)
+    assert gap.loc[0, "hbu_commercial_noi_cad"] == 0.0
+    assert gap.loc[0, "hbu_industrial_noi_cad"] == 0.0

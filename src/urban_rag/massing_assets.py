@@ -27,21 +27,30 @@ looking at.
 the ground has `surface_stalls` standing on the yard, and a surface stall is
 not a building: no floor area, no storey, no height. Folding it into the
 massing rectangle would inflate the footprint `footprint_fit_pct` is checking
-and would have a map extrude a solid where there is asphalt - so it is fitted
-on its own, into the **parcel** less the drawn building rather than into the
+and would have a map extrude a solid where there is asphalt - so it is drawn on
+its own, into the **parcel** less the drawn building rather than into the
 setback envelope (a margin is what a *building* keeps; a car in a side yard is
 standing exactly there), at a depth of at least one stall's length. One asset,
 one parquet with two geometry columns, and two tables published in one
 transaction: `gold.lot_building_massing` keeps the building it always had, and
 `gold.lot_surface_parking` takes the asphalt.
 
+**The asphalt is a band around the building, not a rectangle.** `fit_parking`
+opens the yard by half a stall's depth to settle what may be paved, then grows
+a band out from the drawn massing until it holds the program's own
+`surface_area_m2`. So the polygon is contiguous and it hugs the plate, which is
+what a real lot does - and it takes the shape of the yard it was cut from,
+which no rectangle can: a ring, an L, the wedge behind a corner building.
+
 `surface_parking_fit_pct` is `footprint_fit_pct`'s counterpart and reads the
-same way. `solve_program` is already stopped from parking on ground the parcel
-cannot shape - `Lot.parkable_area_m2` is a real constraint on the solve, not a
-report - but that bound is measured on the bare parcel, because at solve time
-there is no building to subtract. This is where the building exists, so this is
-where the remainder shows up: a yard that looked adequate against the whole lot
-and is a ribbon once the plate is on it.
+same way, but it should now almost always read 100. `Lot.parkable_area_m2` is
+measured by the same function, on the same yard - `parcel less the placeable
+rectangle`, which `lot_development_programs` can compute because
+`placeable_area_m2` fixes the plate before the solve - so the ground the solver
+was allowed to park on is the ground this asset paves. Anything under 100 here
+is now a real disagreement worth chasing rather than the ordinary case: the
+drawn plate shrank where the measured one did not, or the band landed in more
+pieces than `parking_max_bays` allows.
 
 **Every lot keeps a row in the tree; only the drawn ones reach Postgres.**
 That split is `urban_rag.warehouse`'s rule rather than this asset's choice - a
@@ -86,9 +95,7 @@ from urban_rag.massing import (
     MASSING_STATUSES,
     MIN_FOOTPRINT_M2,
     MIN_PARKING_DEPTH_M,
-    MIN_PARKING_WIDTH_M,
     PARKING_COLUMNS,
-    PARKING_DEPTH_STEPS,
     PARKING_MAX_BAYS,
     PARKING_STATUSES,
     SHRINK_STEPS,
@@ -168,28 +175,11 @@ class MassingConfig(Config):
             "01-283. This is the one field here that is not a property of "
             "the search: it is the by-law dimension that makes surface "
             "parking a shape rather than an area, and lowering it lets the "
-            "asset draw parking on ground no car could use."
-        ),
-    )
-    min_parking_width_m: float = Field(
-        default=MIN_PARKING_WIDTH_M,
-        gt=0.0,
-        description=(
-            "The narrow side of one stall, and the floor on the other "
-            "dimension: a rectangle 5.5 m deep and 30 cm wide is not a "
-            "parking space either."
-        ),
-    )
-    parking_depth_steps: int = Field(
-        default=PARKING_DEPTH_STEPS,
-        ge=1,
-        le=32,
-        description=(
-            "Depths tried between min_parking_depth_m and the square, "
-            "shallowest first. The ends of that range are the two layouts "
-            "that get built - one row of stalls down a side yard, and a "
-            "square court on a lot with room - so raising it interpolates "
-            "rather than finding a third kind of parking lot."
+            "asset draw parking on ground no car could use. Half of it is "
+            "the radius the yard is opened by, so the ground kept is what "
+            "holds a disc of that size - 5.5 m clear in every direction, "
+            "whichever way the car is turned. Set it to 2.6 for the looser "
+            "reading, where a stall's narrow side is enough."
         ),
     )
     parking_max_bays: int = Field(
@@ -277,8 +267,6 @@ def lot_building_massing(
         shrink_steps=config.shrink_steps,
         min_footprint_m2=config.min_footprint_m2,
         min_parking_depth_m=config.min_parking_depth_m,
-        min_parking_width_m=config.min_parking_width_m,
-        parking_depth_steps=config.parking_depth_steps,
         parking_max_bays=config.parking_max_bays,
     )
     frame["neighborhood"] = neighborhood
@@ -395,8 +383,8 @@ def lot_building_massing(
             # -- the parking, which is the other polygon and the other check --
             #
             # `num_parked` is what reaches gold.lot_surface_parking; the rest
-            # of the borough parked underground, on a deck, in a ground floor
-            # bay, or owes no stall at all.
+            # of the borough parked underground, in a ground floor bay, or
+            # owes no stall at all.
             "num_parked": len(parking[parking["geometry"].notna()]),
             **{f"num_parking_{name}": count for name, count in by_parking_status.items()},
             # The sanity check applied to the yard. A borough well under 100
@@ -424,8 +412,6 @@ def lot_building_massing(
             "shrink_steps": config.shrink_steps,
             "min_footprint_m2": config.min_footprint_m2,
             "min_parking_depth_m": config.min_parking_depth_m,
-            "min_parking_width_m": config.min_parking_width_m,
-            "parking_depth_steps": config.parking_depth_steps,
             "parking_max_bays": config.parking_max_bays,
             "output_path": MetadataValue.path(str(path)),
             **published_metadata(loaded),
@@ -515,32 +501,50 @@ def _read_lots(
     neighborhood: str,
     scrape_date: str,
 ) -> gpd.GeoDataFrame:
-    """The cadastral parcels, or an empty frame with a warning.
+    """The ground a surface stall may stand on, or an empty frame with a warning.
 
     The parcel rather than the buildable envelope, because that is what a car
     stands on: a setback is a margin a *building* keeps, and a stall in a side
-    or rear yard sits exactly where the margin said no building may go. No
-    downstream table carries the lot boundary, so this reads `rag.lots`.
+    or rear yard sits exactly where the margin said no building may go.
+
+    **Read as pieces where there are pieces.** `silver.lot_zone_pieces` is the
+    ground each zone governs, and a lot two zones cut in two now draws two
+    buildings - so checking both against the whole parcel would let each of
+    them pave ground the other has already built on, and the two rectangles
+    could overlap on the map. `rag.lots` is the fallback, and on a lot one zone
+    covers whole the two are the same boundary.
 
     Missing rather than fatal, and the judgement is `_read_setbacks`': without
-    the cadastre no parking is checked, every row comes back
+    any geometry no parking is checked, every row comes back
     `no_lot_geometry`, and the buildings are still drawn. Falling back to the
     setback envelope would be worse than drawing nothing - it would put the
     parking inside the margins, which is the one place it is least likely to
     be, and it would look entirely plausible on a map.
     """
-    from urban_rag.postgis import fetch_lot_polygons
+    from urban_rag.postgis import fetch_lot_polygons, fetch_zone_piece_polygons
 
     try:
         with postgis.connect() as connection:
-            lots = fetch_lot_polygons(
-                connection, neighborhood=neighborhood, scrape_date=scrape_date
-            )
+            try:
+                lots = fetch_zone_piece_polygons(
+                    connection, neighborhood=neighborhood, scrape_date=scrape_date
+                )
+            except MissingRelation:
+                context.log.warning(
+                    "silver.lot_zone_pieces is not available, so the parking "
+                    "is checked against the whole parcel: on a lot two zones "
+                    "cover, each program is offered ground the other has "
+                    "built on. Apply hbu_infra's sql/025 and materialize "
+                    "lot_zone_pieces for this partition."
+                )
+                lots = fetch_lot_polygons(
+                    connection, neighborhood=neighborhood, scrape_date=scrape_date
+                )
     except (PostgresUnavailable, MissingRelation) as exc:
         context.log.warning(
-            "rag.lots could not be read for %s %s (%s), so no surface parking "
-            "is checked or drawn and every row will be no_lot_geometry - the "
-            "buildings are unaffected",
+            "no parcel geometry could be read for %s %s (%s), so no surface "
+            "parking is checked or drawn and every row will be "
+            "no_lot_geometry - the buildings are unaffected",
             neighborhood,
             scrape_date,
             exc,
@@ -550,8 +554,8 @@ def _read_lots(
         )
     if lots.empty:
         context.log.warning(
-            "rag.lots holds no parcel for %s %s, so no surface parking is "
-            "checked or drawn",
+            "no parcel geometry for %s %s, so no surface parking is checked "
+            "or drawn",
             neighborhood,
             scrape_date,
         )

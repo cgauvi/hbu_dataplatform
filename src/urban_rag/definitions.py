@@ -39,6 +39,7 @@ from urban_rag.rent_assets import (
     montreal_commercial_rents,
 )
 from urban_rag.envelope_assets import lot_zoning_envelopes, zoning_grid_columns
+from urban_rag.zone_piece_assets import lot_zone_pieces
 from urban_rag.estimator_assets import (
     montreal_nonresidential_costs,
     montreal_residential_costs,
@@ -130,6 +131,7 @@ ASSETS = [
     document_chunks,
     document_embeddings,
     zoning_grid_columns,
+    lot_zone_pieces,
     lot_zoning_envelopes,
     lot_buildable_setbacks,
     lot_development_programs,
@@ -372,6 +374,19 @@ vacancy_rates_job = define_asset_job(
 average_rents_job = define_asset_job(
     "average_rents_job",
     selection=AssetSelection.assets(average_rents),
+    partitions_def=scrape_partitions,
+)
+
+# The pieces, ahead of the envelopes that join them and on their own. It is one
+# PostGIS pass over tables already loaded and GiST-indexed - about five seconds
+# on a borough - and its config is about *where a site is*, not about what may
+# be built on one: how much of a parcel a zone has to cover, and how far off a
+# clipped boundary a street edge may sit. Re-cutting a borough after a change
+# to those should not re-parse its grids to do it, which is the same split
+# `lot_buildable_setbacks_job` makes behind `zoning_envelopes_job`.
+lot_zone_pieces_job = define_asset_job(
+    "lot_zone_pieces_job",
+    selection=AssetSelection.assets(lot_zone_pieces),
     partitions_def=scrape_partitions,
 )
 
@@ -939,6 +954,7 @@ defs = Definitions(
         commercial_rent_sources_job,
         commercial_rents_job,
         lot_frontage_job,
+        lot_zone_pieces_job,
         zoning_envelopes_job,
         lot_buildable_setbacks_job,
         lot_development_programs_job,

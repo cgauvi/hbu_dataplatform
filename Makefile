@@ -196,14 +196,17 @@ LAND_FACTOR ?= 1.0
 MARKET_FACTOR ?= $(LAND_FACTOR)
 TOP_N ?= 25
 # The second axis of the same asset - why the site is acquirable: the
-# teardown screen, the heritage switches, the per-square-metre costs each site
+# teardown screen, the heritage switches, the lane screen (ground the roll
+# never listed with under this share of it under a measured building is a
+# ruelle, not an infill; 0 turns it off), the per-square-metre costs each site
 # thesis carries in its denominator, and the shortlist length per site thesis.
 # Every default is explained, with its source, in docs/site-theses.md.
 TEARDOWN_MAX_YEAR ?= 1960
 TEARDOWN_MAX_BUILT_SHARE ?= 0.4
 MIN_STOREY_HEADROOM ?= 2
 EXCLUDE_HERITAGE_SECTORS ?= true
-EXCLUDE_PIIA_SECTORS ?= false
+EXCLUDE_PIIA_SECTORS ?= true
+UNASSESSED_VACANT_MAX_COVERAGE ?= 0.05
 DEMOLITION_COST_M2 ?= 150
 DEMOLITION_COST_NONRES_M2 ?= 250
 SITE_ASSESSMENT_COST ?= 12000
@@ -212,6 +215,38 @@ REMEDIATION_NONRES_M2 ?= 75
 ADDITION_PREMIUM ?= 1.5
 REQUIRE_POSITIVE_NPV ?= true
 SITE_TOP_N ?= 25
+# The returns behind the shortlist (make opportunities): the budget lines the
+# solve leaves out, the absorption, and the two screens a good candidate
+# clears one of. docs/site-theses.md, "Yield on cost and IRR".
+SOFT_COST_PCT ?= 18
+CONTINGENCY_PCT ?= 7
+BUILDERS_RISK_PCT ?= 1
+SELLING_COST_PCT ?= 2.5
+ABSORPTION_PER_MONTH ?= 4
+# The same two for the space a mixed or non-residential program holds, in the
+# unit commerce is leased in. The lease-up is the longest of the three, not
+# the sum: the families fill in parallel.
+COMMERCIAL_ABSORPTION_SQFT ?= 1500
+INDUSTRIAL_ABSORPTION_SQFT ?= 5000
+MARKET_CAP_RATE ?= null
+# What commerce and industry trade over that residential cap, in basis points.
+# The cap a lot is valued and screened at is the two blended by how much of
+# its NOI each family earns - never by floor, since commerce earns about four
+# times what housing does per square foot. 0 values every family at the
+# residential cap, which is what this pipeline did before the spreads existed.
+COMMERCIAL_CAP_SPREAD_BPS ?= 175
+INDUSTRIAL_CAP_SPREAD_BPS ?= 100
+MIN_YOC_SPREAD_BPS ?= 100
+# The IRR bar, as a spread over the cap the lot's own income mix exits at
+# rather than as a level. In this flat-NOI model the cap rate IS the unlevered
+# return on buying the finished building, so the cap is indifference and a
+# hurdle set at it prices development risk at zero. Per lot: 5.5 for an
+# apartment block exiting at 4.5, 7.25 for a retail scheme exiting at 6.25.
+# HURDLE_IRR overrides it with one flat level everywhere; `null` derives it.
+# 12 is the institutional convention and is a *levered* number this model
+# cannot reach - it needs a 12 pct yield on cost, 750 bps over the cap.
+HURDLE_SPREAD_BPS ?= 100
+HURDLE_IRR ?= null
 # The rebuild's timing in the solve (make programs) and the enhancement's in
 # the gap (make hbu): months to build and to fill, the share of the standing
 # income lost during an addition's works, and how many storeys the structure
@@ -315,9 +350,22 @@ vacancy: | $(UV_SYNC_STAMP) ## Materialize vacancy_rates for DATE x NEIGHBORHOOD
 rents: | $(UV_SYNC_STAMP) ## Materialize average_rents for DATE x NEIGHBORHOOD
 	$(DAGSTER) asset materialize --select silver/average_rents --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
 
+# The ground each zone governs, cut out of each lot: one row per (lot, zone),
+# with that piece's own area, the street it faces and its share of what stands
+# on the parcel. Needs silver.lot_zone_pieces (hbu_infra sql/025) applied, and
+# both `building-lots` and `frontage` run first for the same partition - the
+# clip and the buildings come from the first, the street edges from the second.
+# `envelopes` reads it, so this runs ahead of the whole zoning chain. One
+# PostGIS pass, about five seconds on a borough.
+zone-pieces: | $(UV_SYNC_STAMP) ## Materialize lot_zone_pieces for DATE x NEIGHBORHOOD
+	$(DAGSTER) asset materialize --select silver/lot_zone_pieces --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
+
 # The two envelope assets, which lot_profiles now reads: the grids are
 # parsed from the PDFs the corpus already downloaded. Both also upsert into
 # silver.zoning_grid_columns / silver.lot_zoning_envelopes (hbu_infra sql/012).
+# `zone-pieces` has to have run for the same partition - the envelope is a join
+# of the pieces to the parsed grids, and takes its area and its frontage from
+# the piece rather than from the lot.
 envelopes: | $(UV_SYNC_STAMP) ## Materialize the zoning envelopes for DATE x NEIGHBORHOOD
 	$(DAGSTER) asset materialize --select silver/zoning_grid_columns,silver/lot_zoning_envelopes --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
 
@@ -369,7 +417,7 @@ hbu: | $(UV_SYNC_STAMP) ## Materialize lot_highest_best_use and lot_redevelopmen
 # the land at something other than the roll, TOP_N sets the shortlist length.
 opportunities: | $(UV_SYNC_STAMP) ## Rank DATE x NEIGHBORHOOD's under-built lots by thesis, and file each under its site thesis
 	$(DAGSTER) asset materialize --select gold/lot_investment_opportunities --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE) \
-		--config-json '{"ops":{"gold__lot_investment_opportunities":{"config":{"dominant_share":$(DOMINANT_SHARE),"mixed_min_share":$(MIXED_MIN_SHARE),"market_value_factor":$(MARKET_FACTOR),"top_n":$(TOP_N),"teardown_max_year_built":$(TEARDOWN_MAX_YEAR),"teardown_max_built_share":$(TEARDOWN_MAX_BUILT_SHARE),"min_storey_headroom":$(MIN_STOREY_HEADROOM),"exclude_heritage_sectors":$(EXCLUDE_HERITAGE_SECTORS),"exclude_piia_sectors":$(EXCLUDE_PIIA_SECTORS),"demolition_cost_cad_per_m2":$(DEMOLITION_COST_M2),"demolition_cost_cad_per_m2_nonresidential":$(DEMOLITION_COST_NONRES_M2),"site_assessment_cost_cad":$(SITE_ASSESSMENT_COST),"remediation_cost_cad_per_m2_residential":$(REMEDIATION_RES_M2),"remediation_cost_cad_per_m2_nonresidential":$(REMEDIATION_NONRES_M2),"addition_cost_premium":$(ADDITION_PREMIUM),"require_positive_npv":$(REQUIRE_POSITIVE_NPV),"site_top_n":$(SITE_TOP_N)}}}}'
+		--config-json '{"ops":{"gold__lot_investment_opportunities":{"config":{"dominant_share":$(DOMINANT_SHARE),"mixed_min_share":$(MIXED_MIN_SHARE),"market_value_factor":$(MARKET_FACTOR),"top_n":$(TOP_N),"teardown_max_year_built":$(TEARDOWN_MAX_YEAR),"teardown_max_built_share":$(TEARDOWN_MAX_BUILT_SHARE),"min_storey_headroom":$(MIN_STOREY_HEADROOM),"exclude_heritage_sectors":$(EXCLUDE_HERITAGE_SECTORS),"exclude_piia_sectors":$(EXCLUDE_PIIA_SECTORS),"demolition_cost_cad_per_m2":$(DEMOLITION_COST_M2),"demolition_cost_cad_per_m2_nonresidential":$(DEMOLITION_COST_NONRES_M2),"site_assessment_cost_cad":$(SITE_ASSESSMENT_COST),"remediation_cost_cad_per_m2_residential":$(REMEDIATION_RES_M2),"remediation_cost_cad_per_m2_nonresidential":$(REMEDIATION_NONRES_M2),"addition_cost_premium":$(ADDITION_PREMIUM),"unassessed_vacant_max_coverage":$(UNASSESSED_VACANT_MAX_COVERAGE),"require_positive_npv":$(REQUIRE_POSITIVE_NPV),"site_top_n":$(SITE_TOP_N),"soft_cost_pct":$(SOFT_COST_PCT),"contingency_pct":$(CONTINGENCY_PCT),"builders_risk_pct":$(BUILDERS_RISK_PCT),"selling_cost_pct":$(SELLING_COST_PCT),"absorption_units_per_month":$(ABSORPTION_PER_MONTH),"commercial_absorption_sqft_per_month":$(COMMERCIAL_ABSORPTION_SQFT),"industrial_absorption_sqft_per_month":$(INDUSTRIAL_ABSORPTION_SQFT),"market_cap_rate_pct":$(MARKET_CAP_RATE),"commercial_cap_rate_spread_bps":$(COMMERCIAL_CAP_SPREAD_BPS),"industrial_cap_rate_spread_bps":$(INDUSTRIAL_CAP_SPREAD_BPS),"min_yoc_spread_bps":$(MIN_YOC_SPREAD_BPS),"hurdle_irr_spread_bps":$(HURDLE_SPREAD_BPS),"hurdle_irr_pct":$(HURDLE_IRR)}}}}'
 
 # Needs gold.lot_building_massing (hbu_infra sql/022) and gold.lot_surface_parking
 # (sql/024) applied - this one asset writes both, the building and the asphalt

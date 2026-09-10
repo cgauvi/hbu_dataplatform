@@ -219,8 +219,27 @@ def _layers() -> dict[str, LayerSpec]:
                 # the seed dissolves nothing, the run prunes the partition,
                 # and the map's utilisation layer loses its low zooms as well
                 # as its high ones. The cadastral number survives a reload.
+                #
+                # **Summed to one row per lot before the join.** The gap is one
+                # row per (lot, zone) since the pieces, and a parcel two zones
+                # cut in two has two - joined raw, its polygon would arrive
+                # twice and every measure in this cell would count it twice.
+                # Summing first is also the right arithmetic rather than only
+                # the safe one: a split parcel's capacity *is* the sum of what
+                # its pieces may hold, since neither program may be built on
+                # the other's ground. `is_underbuilt` is an `or` for the same
+                # reason - a lot with headroom on one of its two pieces has
+                # headroom.
                 "rag.lots l "
-                "JOIN gold.lot_redevelopment_gap g "
+                "JOIN (SELECT lot_number, neighborhood, scrape_date, "
+                "             sum(existing_floor_area_m2) AS existing_floor_area_m2, "
+                "             sum(hbu_floor_area_m2) AS hbu_floor_area_m2, "
+                "             sum(existing_num_dwellings) AS existing_num_dwellings, "
+                "             sum(hbu_num_dwellings) AS hbu_num_dwellings, "
+                "             sum(dwelling_gap) AS dwelling_gap, "
+                "             bool_or(is_underbuilt) AS is_underbuilt "
+                "        FROM gold.lot_redevelopment_gap "
+                "       GROUP BY lot_number, neighborhood, scrape_date) g "
                 "  ON g.lot_number = l.lot_number "
                 " AND g.neighborhood = l.neighborhood "
                 " AND g.scrape_date = l.scrape_date"

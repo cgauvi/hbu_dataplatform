@@ -52,6 +52,7 @@ from urban_rag.program import (
     M2_PER_SQFT,
     MONTHS_PER_YEAR,
     UNDISCOUNTED_INVESTMENT,
+    ParkingRules,
 )
 from urban_rag.resources import ParquetStore, PostgisResource
 from urban_rag.setback_assets import LOT_SETBACKS_FILE, lot_buildable_setbacks
@@ -75,7 +76,6 @@ ENVELOPE = {
     "column_index": 0,
     "grid_zone": "C01-001",
     "pct_of_lot": 100.0,
-    "overlap_area_m2": 500.0,
     "usages": json.dumps(["H", "C.2"]),
     "usage_habitation": "H",
     "usage_commerce": "C.2",
@@ -90,8 +90,26 @@ ENVELOPE = {
     "solver_error": None,
     "levels": json.dumps(["tous_les_niveaux"]),
     "residential_floors": 6,
+    # The parcel and the ground this zone governs. Equal here, which is the
+    # unsplit case and most of a borough; the tests that split a lot override
+    # `piece_area_m2` and the two shares beside it and leave `lot_area_m2`
+    # alone, which is what the real tables do.
     "lot_area_m2": 500.0,
+    "piece_area_m2": 500.0,
+    "num_lot_zones": 1,
+    "zone_rank": 1,
+    "is_primary_zone": True,
+    # How this piece divides the parcel's assessment. 1.0 is "the whole of
+    # it", which is what one zone covering a lot whole means.
+    "area_share": 1.0,
+    "footprint_share": 1.0,
+    "footprint_share_basis": "footprint",
+    "existing_footprint_m2": 0.0,
     "primary_frontage_m": 20.0,
+    "primary_street_name": "Jarry",
+    "secondary_frontage_m": None,
+    "secondary_street_name": None,
+    "num_frontages": 1,
     "floors_min": 2,
     "floors_max": 6,
     "height_min_m": None,
@@ -337,7 +355,7 @@ def test_a_failed_solve_costs_its_row_and_not_the_frame(economics):
     """A parcel of no area cannot be a `Lot`; the borough is still answered."""
     programs = hbu.solve_envelopes(
         envelopes(
-            envelope(lot_uid=1, lot_area_m2=0.0),
+            envelope(lot_uid=1, lot_area_m2=0.0, piece_area_m2=0.0),
             envelope(lot_uid=2),
         ),
         economics,
@@ -425,7 +443,7 @@ def test_the_floor_stack_travels_as_json_beside_the_counts(economics):
     # reconcile, garage bays included: they ride on the residential run because
     # they are floor area inside it rather than a storey of their own.
     assert sum(entry["stalls"] for entry in stack) == (
-        row["underground_stalls"] + row["above_grade_stalls"] + row["garage_stalls"]
+        row["underground_stalls"] + row["garage_stalls"]
     )
     assert row["total_stalls"] == (
         sum(entry["stalls"] for entry in stack) + row["surface_stalls"]
@@ -552,17 +570,82 @@ def test_retail_at_grade_carries_housing_above(economics):
     assert row["floors"] == row["commercial_floors"] + row["residential_floors"]
 
 
-def test_the_zone_covering_most_of_the_lot_decides(economics):
-    """A boundary sliver is a mapping disagreement, not a choice of rules."""
+def test_both_zones_of_a_split_lot_are_answered(economics):
+    """A zoning boundary crossing a parcel makes two sites of it, not a contest.
+
+    This used to keep only the best-covered zone: the other was a mapping
+    disagreement to be resolved, and 3% of a lot was a sliver whatever it
+    measured. `lot_zone_pieces` resolves the actual slivers upstream - under a
+    per cent *and* under a square metre - so what reaches here is ground under
+    a grid, and both pieces get their own row, their own area and their own
+    program.
+    """
     frame = envelopes(
-        envelope(feature_id="C01-001", pct_of_lot=3.0, floors_max=6),
-        envelope(feature_id="H02-002", pct_of_lot=97.0, floors_max=2),
+        envelope(
+            feature_id="C01-001",
+            pct_of_lot=25.0,
+            piece_area_m2=125.0,
+            floors_max=6,
+            num_lot_zones=2,
+            zone_rank=2,
+            is_primary_zone=False,
+            area_share=0.25,
+            footprint_share=0.25,
+        ),
+        envelope(
+            feature_id="H02-002",
+            pct_of_lot=75.0,
+            piece_area_m2=375.0,
+            floors_max=2,
+            num_lot_zones=2,
+            zone_rank=1,
+            is_primary_zone=True,
+            area_share=0.75,
+            footprint_share=0.75,
+        ),
     )
     chosen = hbu.select_highest_best_use(hbu.solve_envelopes(frame, economics), frame)
-    row = chosen.iloc[0]
-    assert row["feature_id"] == "H02-002"
-    assert row["pct_of_lot"] == 97.0
-    assert row["num_zones"] == 2
+
+    assert len(chosen) == 2
+    by_zone = chosen.set_index("feature_id")
+    assert set(by_zone.index) == {"C01-001", "H02-002"}
+    assert (by_zone["hbu_status"] == "solved").all()
+    # Each was solved over its own ground, and neither over the parcel.
+    assert by_zone.loc["C01-001", "piece_area_m2"] == 125.0
+    assert by_zone.loc["H02-002", "piece_area_m2"] == 375.0
+    assert set(by_zone["lot_area_m2"]) == {500.0}
+    assert set(by_zone["num_zones"]) == {2}
+    # And the row a reader wanting one answer per parcel takes is marked.
+    assert by_zone.loc["H02-002", "is_primary_zone"]
+    assert not by_zone.loc["C01-001", "is_primary_zone"]
+
+
+def test_a_piece_is_solved_over_its_own_area_and_not_the_parcel(economics):
+    """The arithmetic the split is for, isolated to one number.
+
+    Same grid, same parcel, one row governing a quarter of it: the program has
+    to be the quarter's. Under the old rule this zone would either have been
+    dropped or handed all 500 m2.
+    """
+    whole = hbu.solve_envelopes(envelopes(), economics).iloc[0]
+    quarter = hbu.solve_envelopes(
+        envelopes(
+            envelope(
+                pct_of_lot=25.0,
+                piece_area_m2=125.0,
+                num_lot_zones=2,
+                zone_rank=2,
+                is_primary_zone=False,
+            )
+        ),
+        economics,
+    ).iloc[0]
+
+    assert whole["solved"] and quarter["solved"]
+    assert quarter["footprint_m2"] < whole["footprint_m2"]
+    assert quarter["gross_floor_area_m2"] == pytest.approx(
+        whole["gross_floor_area_m2"] / 4.0, rel=0.15
+    )
 
 
 def test_a_lot_with_no_priced_use_keeps_its_row(economics):
@@ -600,42 +683,82 @@ def test_a_column_with_no_usage_at_all_is_not_an_equipment_zone(economics):
     assert chosen.iloc[0]["hbu_status"] == "no_candidate_column"
 
 
-def test_an_equipment_parcel_is_not_answered_by_the_zone_next_door(economics):
-    """Parc Jarry, in miniature: a parcel almost wholly inside an Equipements
-    zone clips a residential one, and used to be reported as a development
-    site on the strength of the sliver."""
+def test_a_parcel_half_park_and_half_housing_says_both(economics):
+    """The equipment gate is per piece, and this is why it has to be.
+
+    Parc Jarry in miniature, except that the residential zone here is real
+    ground rather than the 1.7% clip that used to answer for the whole park.
+    A per-lot gate would have to choose: call the parcel an equipment zone and
+    lose the housing, or answer it and put a proforma on the park. Per piece,
+    each half says what is true of it.
+    """
     frame = envelopes(
         envelope(
             feature_id="E04-019",
-            pct_of_lot=98.3,
+            lot_area_m2=2_000.0,
+            pct_of_lot=75.0,
+            piece_area_m2=1_500.0,
+            num_lot_zones=2,
+            zone_rank=1,
+            is_primary_zone=True,
             usages=json.dumps(["E.1"]),
             permits_residential=False,
             permits_commercial=False,
             governs_residential=False,
             governs_commercial=False,
         ),
-        envelope(feature_id="H02-002", pct_of_lot=1.7, column_index=1),
+        envelope(
+            feature_id="H02-002",
+            lot_area_m2=2_000.0,
+            pct_of_lot=25.0,
+            piece_area_m2=500.0,
+            num_lot_zones=2,
+            zone_rank=2,
+            is_primary_zone=False,
+            column_index=1,
+        ),
+    )
+    chosen = hbu.select_highest_best_use(
+        hbu.solve_envelopes(frame, economics), frame
+    ).set_index("feature_id")
+
+    assert chosen.loc["E04-019", "hbu_status"] == "equipment_zone"
+    assert chosen.loc["E04-019", "num_candidates"] == 0
+    assert pd.isna(chosen.loc["E04-019", "status"])
+    assert chosen.loc["H02-002", "hbu_status"] == "solved"
+    # A building on the housing piece - which kind is the solver's to decide
+    # and not this test's; what matters here is that there is one.
+    assert chosen.loc["H02-002", "gross_floor_area_m2"] > 0
+    # Both know the parcel is split, which is what a reader needs to see that
+    # neither row is the whole of it.
+    assert set(chosen["num_zones"]) == {2}
+
+
+def test_a_sliver_never_reaches_here_at_all(economics):
+    """What used to make an equipment parcel a development site, and where it
+    is stopped now.
+
+    `lot_zone_pieces` writes no piece for a zone under a per cent and a square
+    metre of a lot, so the 1.7% corner of the block next door is not an input
+    to this module. Given only the park's own zone - which is what that table
+    hands over - the parcel stays a park.
+    """
+    frame = envelopes(
+        envelope(
+            feature_id="E04-019",
+            usages=json.dumps(["E.1"]),
+            permits_residential=False,
+            permits_commercial=False,
+            governs_residential=False,
+            governs_commercial=False,
+        )
     )
     programs = hbu.solve_envelopes(frame, economics)
     assert programs.empty
-    row = hbu.select_highest_best_use(programs, frame).iloc[0]
-    assert row["hbu_status"] == "equipment_zone"
-    assert row["num_candidates"] == 0
-    # The other zone is still on the record - it covers part of the parcel and
-    # the table says so - it just does not get to answer for it.
-    assert row["num_zones"] == 2
-
-
-def test_the_governing_zone_still_answers_where_it_has_a_program(economics):
-    """The gate is about which zone speaks, not about excluding slivers: a lot
-    whose dominant zone permits housing is answered by that zone as before."""
-    frame = envelopes(
-        envelope(feature_id="H02-002", pct_of_lot=97.0, floors_max=2),
-        envelope(feature_id="C01-001", pct_of_lot=3.0, column_index=1, floors_max=6),
-    )
-    row = hbu.select_highest_best_use(hbu.solve_envelopes(frame, economics), frame).iloc[0]
-    assert row["hbu_status"] == "solved"
-    assert row["feature_id"] == "H02-002"
+    chosen = hbu.select_highest_best_use(programs, frame)
+    assert len(chosen) == 1
+    assert chosen.iloc[0]["hbu_status"] == "equipment_zone"
+    assert chosen.iloc[0]["num_zones"] == 1
 
 
 def test_a_pure_commerce_zone_is_solved_not_skipped(economics):
@@ -914,9 +1037,119 @@ def test_an_infeasible_governing_column_is_distinguished_from_an_absent_one(
 
 
 def test_a_governing_column_that_raised_says_solver_error(economics):
-    frame = envelopes(envelope(lot_area_m2=0.0))
+    frame = envelopes(envelope(lot_area_m2=0.0, piece_area_m2=0.0))
     chosen = hbu.select_highest_best_use(hbu.solve_envelopes(frame, economics), frame)
     assert chosen.iloc[0]["hbu_status"] == "solver_error"
+
+
+# --------------------------------------------------------------------------
+# the parking waived
+# --------------------------------------------------------------------------
+
+
+def shop_envelope(**overrides) -> dict:
+    """A one-storey retail envelope whose coverage minimum forces a plate.
+
+    Under `NOWHERE_TO_PARK` that plate's stalls have nowhere to go: no yard,
+    no bay, no dig, and one storey leaves no room for a deck. The one shape of
+    envelope the stalls alone can make infeasible - a residential plate can
+    be left empty, a forced commercial one cannot.
+    """
+    return envelope(
+        usages=json.dumps(["C.2"]),
+        usage_habitation=None,
+        permits_residential=False,
+        governs_residential=False,
+        floors_min=1,
+        floors_max=1,
+        density_max=None,
+        site_coverage_min_pct=50.0,
+        **overrides,
+    )
+
+
+NOWHERE_TO_PARK = ParkingRules(
+    max_surface_stalls=0, max_garage_stalls=0, max_underground_levels=0
+)
+
+
+def test_a_piece_the_stalls_alone_stop_is_solved_with_its_parking_waived(economics):
+    frame = envelopes(shop_envelope())
+    programs = hbu.solve_envelopes(
+        frame, economics, assumptions=hbu.ProgramAssumptions(parking=NOWHERE_TO_PARK)
+    )
+    row = programs.iloc[0]
+    assert row["solved"]
+    assert row["parking_waived"]
+    assert row["waived_stalls"] > 0
+    assert row["total_stalls"] == 0
+    assert row["commercial_floors"] == 1
+    chosen = hbu.select_highest_best_use(programs, frame)
+    assert chosen.iloc[0]["hbu_status"] == "solved"
+    assert chosen.iloc[0]["parking_waived"]
+    assert chosen.iloc[0]["waived_stalls"] == row["waived_stalls"]
+
+
+def test_the_waiver_can_be_switched_off(economics):
+    frame = envelopes(shop_envelope())
+    strict = hbu.ProgramAssumptions(
+        parking=NOWHERE_TO_PARK, waive_parking_if_empty=False
+    )
+    programs = hbu.solve_envelopes(frame, economics, assumptions=strict)
+    assert programs.iloc[0]["status"] == "INFEASIBLE"
+    assert not programs.iloc[0]["parking_waived"]
+    assert programs.iloc[0]["waived_stalls"] == 0
+    chosen = hbu.select_highest_best_use(programs, frame)
+    assert chosen.iloc[0]["hbu_status"] == "infeasible"
+
+
+def test_a_program_solved_with_its_parking_is_not_marked(economics):
+    programs = hbu.solve_envelopes(envelopes(), economics)
+    assert not programs.iloc[0]["parking_waived"]
+    assert programs.iloc[0]["waived_stalls"] == 0
+    assert programs.iloc[0]["total_stalls"] > 0
+
+
+def test_the_waiver_travels_through_the_config_and_back():
+    assert hbu_assets.ProgramConfig().assumptions().waive_parking_if_empty
+    strict = hbu_assets.ProgramConfig(waive_parking_if_empty=False).assumptions()
+    assert not strict.waive_parking_if_empty
+    metadata = strict.as_metadata()
+    assert metadata["waive_parking_if_empty"] is False
+    hbu_frame = pd.DataFrame({"program_assumptions": [json.dumps(metadata)]})
+    assert hbu.program_assumptions_of(hbu_frame).waive_parking_if_empty is False
+    # An older payload never heard of the switch and gets the default.
+    older = pd.DataFrame({"program_assumptions": [json.dumps({"max_seconds": 5.0})]})
+    assert hbu.program_assumptions_of(older).waive_parking_if_empty
+
+
+def test_the_parking_rent_travels_through_the_config_and_back():
+    stated = hbu_assets.ProgramConfig(
+        parking_stall_rent_cad_month=0.0,
+        parking_stall_occupancy_pct=50.0,
+        market_stalls_per_dwelling=0.5,
+        parking_absorption_saving_months=0.0,
+    ).assumptions()
+    assert stated.parking.monthly_rent_cad == 0.0
+    assert stated.parking.occupancy_pct == 50.0
+    assert stated.parking.market_stalls_per_dwelling == 0.5
+    assert stated.parking.absorption_saving_months == 0.0
+    metadata = stated.as_metadata()
+    assert metadata["parking_stall_rent_cad_month"] == 0.0
+    assert metadata["market_stalls_per_dwelling"] == 0.5
+    back = hbu.program_assumptions_of(
+        pd.DataFrame({"program_assumptions": [json.dumps(metadata)]})
+    )
+    assert back.parking.monthly_rent_cad == 0.0
+    assert back.parking.occupancy_pct == 50.0
+    assert back.parking.market_stalls_per_dwelling == 0.5
+    assert back.parking.absorption_saving_months == 0.0
+    # And a partition solved before a stall earned anything reads back at the
+    # module's rent, which is what its enhancement is then priced at.
+    older = hbu.program_assumptions_of(
+        pd.DataFrame({"program_assumptions": [json.dumps({"max_seconds": 5.0})]})
+    )
+    assert older.parking.monthly_rent_cad == ParkingRules().monthly_rent_cad
 
 
 def test_every_status_is_declared():
@@ -1095,6 +1328,48 @@ def test_gap_is_per_class_in_both_units(economics):
     assert row["dwelling_gap"] == row["hbu_num_dwellings"] - 3
 
 
+def test_the_proposals_noi_is_split_by_the_family_that_earns_it(economics):
+    """The three parts add back to the whole, netted with the one ratio, so a
+    downstream weighting by use is a weighting of the same income."""
+    row = gap_of(economics).iloc[0]
+    families = ("residential", "commercial", "industrial")
+    parts = [row[f"hbu_{name}_noi_cad"] for name in families]
+    assert min(parts) >= 0.0
+    assert sum(parts) == pytest.approx(row["hbu_annual_stabilised_noi_cad"])
+    # Each family's share of the *space* rent, applied to the whole NOI: the
+    # parking rent is inside the gross and belongs to no family, so it rides
+    # on the floor its tenants live in rather than leaving the three short.
+    space = sum(row[f"annual_{name}_gross_revenue_cad"] for name in families)
+    for name in families:
+        assert row[f"hbu_{name}_noi_cad"] == pytest.approx(
+            row["hbu_annual_stabilised_noi_cad"]
+            * row[f"annual_{name}_gross_revenue_cad"]
+            / space
+        )
+    net = 1.0 - row["hbu_operating_expense_ratio"]
+    assert row["annual_parking_gross_revenue_cad"] > 0.0
+    # Whichever family earns carries more than its own rent netted: the
+    # parking rent rides on it.
+    earning = max(families, key=lambda name: row[f"annual_{name}_gross_revenue_cad"])
+    assert row[f"hbu_{earning}_noi_cad"] > row[f"annual_{earning}_gross_revenue_cad"] * net
+
+
+def test_the_non_residential_plates_carry_their_cellars_for_the_lease_up(economics):
+    """`hbu_commercial_floor_area_m2` is the above-grade plate, because the
+    roll's side of the gap is above-grade floor. What the program would
+    *lease* is that plus the sous-sol, and the proforma measures the lease-up
+    on it - so the pair is carried separately rather than conflated."""
+    row = gap_of(economics).iloc[0]
+    for name in ("commercial", "industrial"):
+        assert row[f"hbu_{name}_floor_area_with_cellar_m2"] == pytest.approx(
+            row[f"{name}_area_m2"] + row[f"basement_{name}_area_m2"]
+        )
+        assert (
+            row[f"hbu_{name}_floor_area_with_cellar_m2"]
+            >= row[f"hbu_{name}_floor_area_m2"]
+        )
+
+
 def test_a_lot_the_roll_never_reached_gets_nulls_and_not_zeros(economics):
     """A lane is not a lot with no floor on it - except for `is_underbuilt`."""
     row = gap_of(
@@ -1142,15 +1417,21 @@ def stub_publish(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def stub_lots(monkeypatch):
-    """The one read `lot_development_programs` makes against `rag.lots`.
+    """The geometry read `lot_development_programs` makes for the yard.
 
-    It measures the shape of each parcel's yard, which bounds the surface
-    stalls. Empty here, which is the documented fallback: no cadastre means
-    `parkable_area_m2` is absent and the stalls are bounded on the yard's
-    *area* alone, exactly as every run did before that bound existed - so the
-    programs these tests assert on are the ones they always were. The bound
-    itself is tested in `test_program.py`, against parcels rather than
-    partitions, and drawn in `test_massing.py`.
+    It measures the shape of the ground each program's surface stalls would
+    stand on, which bounds them. Empty here, which is the documented fallback:
+    no geometry means `parkable_area_m2` is absent and the stalls are bounded
+    on the yard's *area* alone, exactly as every run did before that bound
+    existed - so the programs these tests assert on are the ones they always
+    were. The bound itself is tested in `test_program.py`, against parcels
+    rather than partitions, and drawn in `test_massing.py`.
+
+    **Both reads are stubbed**, because the asset tries the pieces first and
+    falls back to the parcel: `silver.lot_zone_pieces` is the ground a zone
+    actually governs, and on a lot two zones cut in two the parcel would hand
+    each piece the other's back garden. Leaving only the second stubbed would
+    make every test here exercise the fallback path.
 
     Needed at all because `stub_publish` replaces `PostgisResource.connect`
     with something that yields a bare object; without this the read fails on
@@ -1165,7 +1446,23 @@ def stub_lots(monkeypatch):
             crs="EPSG:4326",
         )
 
+    def fetch_zone_piece_polygons(connection, *, neighborhood, scrape_date):
+        return gpd.GeoDataFrame(
+            {
+                "lot_uid": [],
+                "feature_id": [],
+                "lot_number": [],
+                "piece_area_m2": [],
+                "num_lot_zones": [],
+            },
+            geometry=[],
+            crs="EPSG:4326",
+        )
+
     monkeypatch.setattr(postgis, "fetch_lot_polygons", fetch_lot_polygons)
+    monkeypatch.setattr(
+        postgis, "fetch_zone_piece_polygons", fetch_zone_piece_polygons
+    )
 
 
 def write_upstreams(
@@ -1425,7 +1722,14 @@ def test_programs_asset_config_reaches_the_solver(store):
         run_config={
             "ops": {
                 "silver__lot_development_programs": {
-                    "config": {"stalls_per_dwelling": 0.0, "stalls_per_1000_sqft": 0.0}
+                    "config": {
+                        "stalls_per_dwelling": 0.0,
+                        "stalls_per_1000_sqft": 0.0,
+                        # Nothing owed *and* nothing rented: with the market
+                        # ratios left on, a stall that pays is still built.
+                        "market_stalls_per_dwelling": 0.0,
+                        "market_stalls_per_1000_sqft": 0.0,
+                    }
                 }
             }
         },
@@ -1445,6 +1749,31 @@ def test_programs_asset_config_reaches_the_solver(store):
         > priced["monthly_net_operating_income_cad"]
     )
     assert json.loads(free["program_assumptions"])["stalls_per_dwelling"] == 0.0
+    assert json.loads(free["program_assumptions"])["market_stalls_per_dwelling"] == 0.0
+    # The rent alone keeps the stalls: nothing owed, but a stall that pays
+    # is still built, on the yard, for the tenants who would rent it.
+    run(
+        store,
+        lot_development_programs,
+        run_config={
+            "ops": {
+                "silver__lot_development_programs": {
+                    "config": {"stalls_per_dwelling": 0.0, "stalls_per_1000_sqft": 0.0}
+                }
+            }
+        },
+    )
+    rented = pd.read_parquet(
+        join(
+            store.partition_dir(
+                lot_development_programs.key.path[-1], DATE, NEIGHBORHOOD
+            ),
+            LOT_PROGRAMS_FILE,
+        )
+    ).iloc[0]
+    assert rented["total_stalls"] > 0
+    assert rented["rented_stalls"] == rented["total_stalls"]
+    assert rented["annual_parking_gross_revenue_cad"] > 0.0
 
 
 def test_programs_asset_fails_naming_a_missing_upstream(store):
@@ -1685,6 +2014,143 @@ def test_gap_asset_keeps_a_lot_the_roll_never_reached(store):
     metadata = materialization_metadata(result, lot_redevelopment_gap)
     assert metadata["num_with_assessment"].value == 0
     assert metadata["num_without_assessment"].value == 1
+
+
+def split_envelopes():
+    """One parcel, two zones, and the whole building on the larger piece.
+
+    The arrangement `footprint_share` exists for: a 500 m2 lot cut 70/30, with
+    every square metre of what stands on it inside the larger piece. Written
+    once because four tests below are about four consequences of it.
+    """
+    return envelopes(
+        envelope(
+            feature_id="H02-002",
+            pct_of_lot=70.0,
+            piece_area_m2=350.0,
+            num_lot_zones=2,
+            zone_rank=1,
+            is_primary_zone=True,
+            area_share=0.7,
+            footprint_share=1.0,
+        ),
+        envelope(
+            feature_id="C01-001",
+            pct_of_lot=30.0,
+            piece_area_m2=150.0,
+            num_lot_zones=2,
+            zone_rank=2,
+            is_primary_zone=False,
+            column_index=1,
+            area_share=0.3,
+            footprint_share=0.0,
+        ),
+    )
+
+
+def gap_for(economics, frame=None):
+    """`use_gap` over one partition, indexed by zone for readability."""
+    frame = split_envelopes() if frame is None else frame
+    chosen = hbu.select_highest_best_use(
+        hbu.solve_envelopes(frame, economics), frame
+    )
+    computed = hbu.use_gap(
+        chosen, comparables_frame(), operating_expense_ratio=0.35
+    )
+    return computed.set_index("feature_id")
+
+
+def test_the_roll_follows_the_building_and_not_the_ground(economics):
+    """The judgement `footprint_share` encodes, asserted end to end.
+
+    The whole triplex stands on the H piece, so the H piece is charged all
+    300 m2 of floor and all three dwellings, and the C piece is vacant land
+    with nothing to tear down. Pro-rating by area would have given the C
+    strip 90 m2 of a building that is not on it - and reported it as a
+    teardown.
+    """
+    gap = gap_for(economics)
+
+    assert gap.loc["H02-002", "existing_floor_area_m2"] == pytest.approx(300.0)
+    assert gap.loc["C01-001", "existing_floor_area_m2"] == pytest.approx(0.0)
+    assert gap.loc["H02-002", "existing_num_dwellings"] == 3
+    assert gap.loc["C01-001", "existing_num_dwellings"] == 0
+    # And the income with it, on the same share.
+    assert gap.loc["H02-002", "existing_annual_gross_income_cad"] == pytest.approx(
+        50_000.0
+    )
+    assert gap.loc["C01-001", "existing_annual_gross_income_cad"] == pytest.approx(0.0)
+
+
+def test_an_allocated_count_comes_back_whole(economics):
+    """A share of a dwelling is not a dwelling.
+
+    `gold.lot_redevelopment_gap` types `existing_num_dwellings` and
+    `existing_num_assessment_units` `integer`, so an unrounded share reaches
+    Postgres as `invalid input syntax for type integer: "0.98..."` - which is
+    how this rule was learned. Rounded rather than truncated: a piece holding
+    60 per cent of a five-unit plex holds three dwellings, not two.
+    """
+    frame = envelopes(
+        envelope(
+            feature_id="H02-002",
+            piece_area_m2=300.0,
+            num_lot_zones=2,
+            is_primary_zone=True,
+            area_share=0.6,
+            footprint_share=0.6,
+        ),
+        envelope(
+            feature_id="C01-001",
+            piece_area_m2=200.0,
+            num_lot_zones=2,
+            zone_rank=2,
+            is_primary_zone=False,
+            column_index=1,
+            area_share=0.4,
+            footprint_share=0.4,
+        ),
+    )
+    gap = gap_for(economics, frame)
+
+    for zone in ("H02-002", "C01-001"):
+        for column in ("existing_num_dwellings", "existing_num_assessment_units"):
+            value = gap.loc[zone, column]
+            assert value == int(value), f"{zone}.{column} is {value!r}"
+    # 0.6 and 0.4 of three dwellings, each rounded to the nearer whole one.
+    assert gap.loc["H02-002", "existing_num_dwellings"] == 2
+    assert gap.loc["C01-001", "existing_num_dwellings"] == 1
+
+
+def test_the_land_is_divided_by_the_ground_and_not_by_the_building(economics):
+    """`total_assessed_value` follows `area_share`, which is the other rule.
+
+    The building is all on one piece and the *land* is not: an owner selling
+    the vacant third of a parcel is selling a third of the ground, whatever
+    is standing on the rest of it.
+    """
+    gap = gap_for(economics)
+
+    assert gap.loc["H02-002", "existing_total_assessed_value"] == pytest.approx(
+        900_000.0 * 0.7
+    )
+    assert gap.loc["C01-001", "existing_total_assessed_value"] == pytest.approx(
+        900_000.0 * 0.3
+    )
+    # And the two sum back to the parcel, which is what makes a borough total
+    # unchanged by the split.
+    assert gap["existing_total_assessed_value"].sum() == pytest.approx(900_000.0)
+
+
+def test_an_unsplit_lot_is_charged_the_whole_roll(economics):
+    """A share of 1 is what one zone covering a parcel whole means, and every
+    number here has to read exactly as it did before pieces existed."""
+    gap = gap_for(economics, envelopes())
+
+    row = gap.iloc[0]
+    assert row["existing_floor_area_m2"] == pytest.approx(300.0)
+    assert row["existing_num_dwellings"] == 3
+    assert row["existing_total_assessed_value"] == pytest.approx(900_000.0)
 
 
 def test_a_road_parcel_is_never_under_built(store):

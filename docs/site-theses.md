@@ -53,9 +53,9 @@ read as a teardown.
 
 | `site_thesis` | when | what is cleared |
 | --- | --- | --- |
-| `brownfield` | the dominant use standing on the lot is a contamination-risk activity, and the governing zone is not a heritage sector | the building, then the ground: characterisation and remediation |
-| `teardown` | a building old enough to be presumed obsolete, filling little of its envelope, under a grid allowing storeys above it, outside a heritage sector | the building |
-| `infill` | nothing stands on the lot and the solver has a program | nothing |
+| `brownfield` | the dominant use on the lot is a contamination-risk activity, and — where a building stands to be demolished — the governing zone is not a heritage or PIIA sector | the building, then the ground: characterisation and remediation |
+| `teardown` | a building the roll states floor for, old enough to be presumed obsolete, filling little of its envelope, under a grid allowing storeys above it, outside a heritage sector | the building |
+| `infill` | nothing stands on the lot, the solver has a program, and the lot is not a lane the roll never listed | nothing — a vacant lot whose *use* is a risk activity is a `brownfield` first |
 | `improvement` | the building stays and gains a storey on its footprint or an annex on the ground the solver would cover | nothing — the addition is the whole cost |
 | `none` | no condition held | — |
 
@@ -78,9 +78,19 @@ All of these at once, on a lot the gap table calls under-built:
 - `storey_headroom` ≥ `min_storey_headroom` (2) — below two a teardown is a
   like-for-like replacement.
 - not `is_demolition_restricted` — see [Heritage](#heritage-and-the-piia).
+- `existing_floor_area_m2` > 0 — there has to be a building to demolish. The
+  term reads the floor rather than `existing_year_built` because `built_share`
+  fills a missing floor with zero, not null: a lot the roll dates but states no
+  floor for scores 0.0 on the under-built test, passes it, and proposes a
+  demolition whose `demolition_cost_cad` is nothing, there being no floor to
+  charge the rate against. No VSMPE teardown was one of those; the term is what
+  stops the [heritage clause](#heritage-and-the-piia) from creating seven.
 
 Sized on VSMPE 2026-09-01, with the verdict positive (rebuilding beats holding,
-discounted):
+discounted). **These three rows predate both the proforma screens and the PIIA
+screen below**, and are kept because they are what moving the two thresholds
+costs, which has not changed; the partition itself now files 28 teardowns and
+ranks 15:
 
 | screen | lots | median yield on cost | NPV gain | assessed value | mean lot |
 | --- | --- | --- | --- | --- | --- |
@@ -162,6 +172,48 @@ probe — as does vacant land (9xxx). A parking lot is not a risk activity under
 the regime and is not in the brownfield list; the two theses are kept apart
 so the cost side stays honest.
 
+Which is why `infill` is not the fallback for a vacant lot whose use *is* a
+risk activity. Both theses fire on a contaminated yard — nothing stands on it,
+and the regime presumes against it — and precedence names it `brownfield`, so
+the cost line a reader sees matches the $115k the row already carries. The one
+route by which a risk use could land here was the demolition screen; see
+[Heritage](#heritage-and-the-piia) for the clause that closed it.
+
+**A ruelle reads exactly like a vacant lot to this thesis**, and the borough
+has a great many of them: no floor, no dwellings, an envelope and a program.
+It is the one thesis ground the roll never listed can reach — the other three
+need a use code or a stated floor, which is the roll speaking — so on VSMPE
+2026-09-01 it was filing 594 pieces on 482 lots with a median 3.7 m of
+frontage, 289 of them with no frontage at all, as sites ready to build on.
+Lot 2 249 035 is the case: 920 m² the roll never listed, 16.7 m² of a
+neighbour's building clipped onto it, no street.
+
+What tells a lane from a vacant lot is not the roll but the ground: the
+*measured* footprint, `silver.lot_zone_pieces`' clip of the cadastre's
+buildings onto the piece, which the gap carries as `existing_footprint_m2`
+and this table restates as `existing_footprint_coverage`, over the piece's
+area. `is_unassessed_vacant` is two conditions and both are required:
+
+- **nothing on the roll at all** — no assessment unit, no assessed value, no
+  stated floor, no dwelling, no use code. Not the unit count alone: it is
+  footprint-allocated across a split parcel's pieces and rounded, so a bare
+  yard behind an assessed building carries `0` units while its area-allocated
+  value is still on the row — 97 such pieces, every one a real site. And not
+  `has_assessment`, which is true on every row.
+- **under `unassessed_vacant_max_coverage` (0.05) of the ground under a
+  building.** Below the line the pieces are lanes; above it, the 178 off-roll
+  pieces with a garage or a shed over a twentieth of them are something the
+  roll missed, and stay.
+
+A lot both hold on is not an infill and keeps its row at `none`. Either alone
+is a site: an assessed parking lot with nothing on it is this thesis's own
+case. Where the frame carries no measured footprint — a partition older than
+the pieces — the screen does not fire, because absence of the measure is not
+absence of a building; `0` turns it off. The 594 were unranked already (the
+roll never priced them, so there is no acquisition cost and no IRR), so the
+shortlist is unchanged; what changes is the inventory the map's Opportunities
+layer draws and the counts a borough total sums.
+
 ### Improvement: the building stays
 
 The one thesis that needs no old building. Two moves, both inside the envelope
@@ -206,21 +258,61 @@ writes four flags:
 | flag | reads | screens by default |
 | --- | --- | --- |
 | `is_heritage_sector` | `heritage_sector` states a sector | **yes** — out of `teardown` and `brownfield` |
-| `has_piia_review` | `piia_sector` states a sector | no — flagged |
+| `has_piia_review` | `piia_sector` states a sector | **yes** — out of `teardown` and `brownfield` |
 | `demolition_review_required` | the sector, or `existing_year_built` < `demolition_review_year` (1940) | no — flagged |
-| `is_demolition_restricted` | whichever of the three the config screens on | — |
+| `is_demolition_restricted` | whichever of the three the config screens on, **and** `existing_floor_area_m2` > 0 | — |
 
-**Why the heritage sector screens and the PIIA does not.** A *secteur
-d'intérêt patrimonial* is where the borough's demolition by-law
-(RCA04-14007) sends a contributing building to committee with an *étude de la
-valeur patrimoniale* and a reuse programme, and a refusal is the ordinary
-outcome. A PIIA sector is an architectural review of what is *built* — new
+**Why both screen, and what the screen leaves alone.** A *secteur d'intérêt
+patrimonial* is where the borough's demolition by-law (RCA04-14007) sends a
+contributing building to committee with an *étude de la valeur patrimoniale*
+and a reuse programme, and a refusal is the ordinary outcome.
+
+A PIIA sector is a discretionary architectural review of what is *built* — new
 construction, additions visible from the street, rooftop constructions,
-conversions of a non-residential building to four or more dwellings — and it
-does not bar removing what stands. It also covers close to half the borough's
-zones; screening on it would gut the teardown thesis on a design-review rule.
-`EXCLUDE_PIIA_SECTORS=true` turns it into a screen for a mandate that wants
-one.
+conversions of a non-residential building to four or more dwellings. Read
+narrowly it does not bar removing what stands, and until 2026-09-08 it was
+flagged rather than screened for that reason. It now screens, because the
+thing a teardown asks for is exactly the thing the review is written to judge:
+the replacement building, on a street the sector exists to hold together. A
+lot where the rebuild has to survive a discretionary design review before it
+can be priced is not a teardown a shortlist should be offering.
+
+**The screen removes only the theses that demolish.** `teardown` and
+`brownfield` drop; `improvement` does not read
+`is_demolition_restricted` at all, so a PIIA lot that can carry a storey or
+an annex keeps its `improvement` thesis and its rank within it. That is the
+intended landing: the borough's PIIA sectors are full of under-built plexes
+worth adding to, and the enhancement solve already prices exactly that. Lot
+2 214 159 (grid C04-083, PIIA sector 6, 1945, two storeys under six, 13% of
+its envelope) is the shape of it — a teardown at rank 13 before, an
+enhancement candidate after.
+
+**And only where there is something to demolish.** `is_demolition_restricted`
+carries `existing_floor_area_m2` > 0, so a lot the roll states no floor for is
+never screened: there is no demolition there to refer to committee, and what a
+mandate proposes on it is remediation and new construction — which is what
+`infill` proposes on the same sector, unscreened, today. Without that clause
+the screen dropped `brownfield` off exactly those lots and `infill`, which
+does not read the flag either, caught them. Lot **2 249 816** (grid C01-121,
+CUBF 6419 *Autres services de l'automobile*, PIIA sector, no stated floor, no
+stated year) was the case: `is_brownfield_use` true, $12,000 of
+characterisation and $103,261 of remediation charged against it on the cost
+side, and `site_thesis` reading `infill` — the one thesis that means nothing
+stands on it and nothing has to be cleared. It is a `brownfield` from
+2026-09-09, with `is_infill_site` still true beside it, because both are.
+
+Sized on VSMPE 2026-09-01: of the 36 risk-use lots the screen pushed into
+`infill`, all 36 come back to `brownfield`. The 81 it pushed into
+`improvement` stay there — those have a standing building, so the screen still
+bites, and `improvement` is the intended landing for them. `teardown` is
+untouched either way: `built_share` already forces standing floor on it, so
+the clause can never hand out a demolition play on a building the roll
+describes.
+
+The cost is real and worth stating: `piia_sector` is set on 279 of VSMPE's 632
+grids, and 9,449 lots carry `has_piia_review`, so this is the widest screen on
+the page. `EXCLUDE_PIIA_SECTORS=false` restores the flag-only posture for a
+mandate that wants to see the demolition plays anyway.
 
 **The 1940 line.** Bill 69 (2021, c. 10, in force 1 April 2021) obliges every
 municipality to keep a demolition by-law (LAU art. 148.0.2) that applies at
@@ -304,8 +396,8 @@ standing building handed in as a `RetainedBuilding`:
   narrows it — and the usage storeys are a floor under the storey count;
 - at most `max_added_storeys` (1) go on top, the structure's limit rather
   than the grid's, whose own ceiling still applies;
-- nothing is dug under it, no deck is stacked on it and no bay is carved out
-  of its ground floor: the addition parks on the yard or not at all;
+- nothing is dug under it and no bay is carved out of its ground floor: the
+  addition parks on the yard or not at all;
 - the standing floor keeps earning what the roll says it earns; only the new
   floor is priced, at new-build rents and at `addition_cost_premium` (1.5)
   times the rates the rebuild was costed at;
@@ -315,7 +407,12 @@ standing building handed in as a `RetainedBuilding`:
 
 Every `enhance_*` money figure on the gap row is the addition's own, and
 `enhance_gain_cad` — its NPV less the disruption — is what enhancing adds
-over holding. A lot with nothing to grow says why in `enhance_status`:
+over holding. Where the solve adds nothing (`nothing_pencils` in
+`enhance_binding`: no storey and no annex pays at the premium, and the answer
+is normalised to the standing building) there are no works, so no disruption
+is charged either: the gain is 0, `enhance_value_cad` equals `hold_value_cad`,
+and the shortlist states no enhancement return, budget or lease-up for it. A
+lot with nothing to grow says why in `enhance_status`:
 `no_building` (nothing stands, or the roll states no storey count),
 `not_underbuilt`, `no_program`, `no_envelope`, or `INFEASIBLE` where the
 standing plate is more than today's grid would let stand. The solve runs
@@ -381,7 +478,7 @@ before the site's own costs:
 | future | `*_value_cad` | what it is |
 | --- | --- | --- |
 | hold | `hold_value_cad` | the standing NOI discounted over the hold and sold at the cap, starting today |
-| enhance | `enhance_value_cad` | hold, plus the addition's NPV, less the disruption |
+| enhance | `enhance_value_cad` | hold, plus the addition's NPV, less the disruption; equal to hold where nothing pencils |
 | rebuild | `rebuild_value_cad` | the proposal's present value with its income delayed, less its capital |
 
 `best_future` is the largest, `hold` on a tie. The shortlist table repeats
@@ -420,6 +517,194 @@ lot: there is no price to pay. The map's **Buyer** and **Owner** panes show
 the three futures for one lot from these columns and nothing else, and the
 chat's `lot_futures` tool says the same in a sentence each.
 
+## Yield on cost and IRR
+
+A present value is one number and a decision needs two. Every future on the
+shortlist now carries the proforma around it — `urban_rag.proforma` — and
+the two returns a screen is read on:
+
+- **yield on all-in cost**: the future's stabilised NOI over everything a
+  buyer pays to reach it — the price, the site's costs, the hard cost with
+  soft costs, contingency and builder's-risk insurance on it — held against
+  the area's cap rate. A development has to earn a spread over buying the
+  same income already built; `min_yoc_spread_bps` (100) is that spread.
+- **IRR**, unlevered and annual: the price and the site's costs at day one,
+  the budget spent evenly over the build, the income filling linearly over
+  the lease-up, the hold, and the sale at the terminal cap less selling
+  costs. Held against the lot's own blended cap plus `hurdle_irr_spread_bps`
+  (100) — see below for why that is a spread and not a level. Stated twice — the **buyer's**
+  on the whole building after the price, and the **owner's** on the
+  increment over the building they have: no price, the standing income given
+  up during and after the works, the difference in value at the sale.
+
+### A building that is not all dwellings
+
+The solver has filled envelopes with three families — housing, commerce,
+industry — for as long as this pipeline has had them, and a good many of this
+borough's grids ask for it. A column heading `H` marked *Tous sauf le RDC*
+keeps housing off the ground floor; the `C.4` beside it in the same zone is
+marked *Tous les niveaux* and may take that floor. The alternative to shops at
+grade there is an empty storey, and the solve prices both and picks.
+
+Both returns above were shaped for an apartment block, though, and until now
+priced that answer as a building it is not:
+
+- **the lease-up** was dwellings over `absorption_units_per_month`, so a
+  program with *no* dwellings filled in the solve's stated months however much
+  floor it held — fifteen thousand square feet of retail leased as fast as an
+  empty six-plex. It is now the longest of the dwellings over their rate, the
+  commercial floor over `commercial_absorption_sqft_per_month`, and the
+  industrial floor over its own. The longest and not the sum: a rental office
+  and a leasing agent are not waiting on each other. The floor measured is the
+  plate *plus its cellar*, because the solve digs for shops across this borough
+  and a sous-sol of retail is routinely a third of the space again.
+- **the exit** capitalised every dollar at the multifamily terminal cap. Each
+  family now carries its own — the residential cap plus
+  `commercial_cap_rate_spread_bps` (175) or `industrial_cap_rate_spread_bps`
+  (100) — and the cap a lot is valued and screened at is those **blended by
+  income**, per lot. Never by floor: at the solve's own rates a square foot of
+  commerce earns about four times a square foot of housing, so a ground floor
+  of shops under five of flats is a sixth of the building's floor and very
+  nearly half its rent, and a floor weighting would hand it a cap it has no
+  business getting. `hbu_commercial_noi_cad` and its two neighbours on
+  `gold.lot_redevelopment_gap` are that weight.
+
+So `market_cap_rate_pct` is a per-lot column from here on rather than one
+number per partition, `yoc_spread_rebuild_bps` is measured against the lot's
+own blend, and a retail scheme is asked for the yield its own exit implies
+instead of being let through on an apartment's. The standing building is
+capped the same way, on `existing_dominant_income_class` — which is what makes
+an owner's rebuild worth more when what they give up is a warehouse.
+
+Both corrections push a commerce-heavy lot's stated return **down**, and that
+is the point rather than a regression: it was previously leased at housing's
+speed and sold at housing's cap, and neither was a number anyone had chosen.
+The income never moved — the solve has always priced every square foot of
+commerce it builds, and it has always been in the yield's numerator. What
+changed is that "is the shop worth more than the empty floor" is now asked on
+the shop's own terms. `hbu_non_residential_income_share` says at a glance
+whether a lot is a mixed-use answer at all, and `exit_cap_rate_rebuild_pct`
+says what the IRR actually sold the building at.
+
+`is_good_candidate` is the screen: the thesis's own future (the enhancement
+on an improvement, the rebuild on the rest) clears the cap rate by the
+spread *or* clears the hurdle from the buyer's chair, and pays against
+holding. Either bar, since 2026-09-10: the yield is a static ratio and the
+IRR carries the lease-up, so a lot can clear one and miss the other — VSMPE's
+2 784 705 clears its 5.5% hurdle on an 87 bps spread — and a deal that clears
+is reported rather than lost to the screen it missed. `clears_cap_rate` and
+`clears_hurdle` beside it say which.
+`site_thesis_rank` is on the buyer's IRR from here on, the yield the
+tiebreak; the map's **Opportunities** layer draws good candidates with a
+green edge and can be narrowed to them, and every pane and tool says both
+numbers.
+
+### The assumptions, and where they come from
+
+| line | default | basis |
+| --- | --- | --- |
+| soft costs | 18% of hard | architecture and engineering, permits and the borough's fees, legal, marketing, developer overhead; 15–25% on a Montréal wood-frame mid-rise |
+| contingency | 7% of hard | what a lender asks on a costed, unbuilt budget; 5–10% |
+| builder's-risk insurance | 1% of hard | the course-of-construction policy; operating insurance is inside the 35% expense ratio the NOI already carries |
+| selling costs | 2.5% of the sale | brokerage and legal on the exit; 2–3% |
+| absorption | 4 dwellings a month | the lease-up is the longer of the solve's months and the dwellings over this; a 20-unit building takes at least 5 months, a 100-unit one 25 |
+| commercial absorption | 1 500 sq ft a month | a retail or small-office podium on a borough high street; a 15 000 sq ft podium takes 10 months against the 6 a residential solve states |
+| industrial absorption | 5 000 sq ft a month | industrial leases in far larger blocks to far fewer tenants, so it fills faster per foot once it goes |
+| market cap rate | the terminal cap, 4.5% | what stabilised multifamily income has sold at in Montréal, 4–5.5% in recent memory; `MARKET_CAP_RATE` overrides it. **Residential**: the two spreads below put the other families over it |
+| commercial cap spread | 175 bps | commerce at about 6.25 against multifamily's 4.5, where Montréal retail and suburban-class office have sat |
+| industrial cap spread | 100 bps | industrial at 5.5 — tighter than retail, because the sector has been bid tighter than retail for a decade |
+| development spread | 100 bps | the floor a developer prices risk at over buying built income, over the lot's **blended** cap |
+| IRR hurdle spread | 100 bps | over that same blended cap, so the two screens are two views of one bar. Per lot: 5.5% for an apartment block exiting at 4.5, 7.25% for a retail scheme exiting at 6.25 |
+
+The roll's own cap rate for the lots around each one travels as
+`comparable_cap_rate_pct` for the reader: it is NOI over assessed value,
+runs around 3.5% in this borough, and is not what the screen holds the yield
+against. Financing, taxes on the gain and rent growth are still not
+modelled, on both sides, so the IRR and the NPV disagree only by what this
+section adds — and one operating expense ratio still covers all three
+families, which is the solve's own simplification and the one that most
+flatters the dwellings: a triple-net retail lease leaves its landlord a far
+lighter expense load than an apartment does. All twelve lines are
+`make opportunities` variables (`SOFT_COST_PCT`, `CONTINGENCY_PCT`,
+`BUILDERS_RISK_PCT`, `SELLING_COST_PCT`, `ABSORPTION_PER_MONTH`,
+`COMMERCIAL_ABSORPTION_SQFT`, `INDUSTRIAL_ABSORPTION_SQFT`,
+`MARKET_CAP_RATE`, `COMMERCIAL_CAP_SPREAD_BPS`, `INDUSTRIAL_CAP_SPREAD_BPS`,
+`MIN_YOC_SPREAD_BPS`, `HURDLE_SPREAD_BPS`, `HURDLE_IRR`), recorded on every
+row. Setting the two
+spreads to 0 prices every family at the residential cap, which is the stance
+this pipeline took before they existed.
+
+### Why the hurdle is a spread and not a level
+
+`HURDLE_IRR` was 12% flat until 2026-09-10, and it flagged nothing anywhere —
+not because the borough is poor but because 12 is a number from a different
+model. In a **flat-NOI** proforma the cap rate is an identity, not a
+coincidence:
+
+> buy at a 4.5% cap → collect 4.5% forever → sell at 4.5% → **IRR = 4.50%**
+> (4.44% after selling costs)
+
+So the cap is the *indifference* point — what doing nothing but buying the
+finished building pays — and a hurdle set at it prices development risk at
+zero. The bar has to be cap **plus** a premium, and the yield screen already
+states that premium: 100 bps. Held against the same base, the two screens stop
+disagreeing:
+
+| yield on cost | spread vs cap | buyer IRR |
+| --- | --- | --- |
+| 4.5% | 0 bps | 4.23% |
+| **5.5%** | **100 bps** ← the yield test | **5.55%** ← the IRR bar |
+| 6.0% | 150 bps | 6.15% |
+| 12.0% | 750 bps | 12.00% ← what a flat 12 demanded |
+
+A flat 12% needed a **12% yield on cost** — 750 bps over the exit cap, a 2.7×
+value on cost. It is a levered, growth-carrying convention: with rent growth
+added, the same 6% YoC deal scores 7.97% at 2% growth and 8.92% at 3%, and
+reaches 12% only at **6.3% annual NOI growth**. This module has no growth and
+no financing by design, so importing the number was a category error.
+
+Making it a spread also makes it **per lot**, which it has to be now that the
+exit cap is: a pure-commercial scheme exits at 6.25% and must beat 7.25%; an
+apartment block exits at 4.5% and must beat 5.5%. A single number set for the
+apartment block would pass a retail deal returning less than buying the same
+shops already built. `site_hurdle_irr_pct` reports the bar on every row.
+
+And once the two screens share a base, the IRR test starts doing the job the
+yield ratio structurally cannot — pricing the **timeline**. At a fixed 6% YoC:
+12 months' build and a 6-month lease-up scores 6.21%, 24 and 24 scores 5.70%.
+Fifty basis points from timing alone, decisive against a 5.5% bar and
+invisible against a 12% one — and precisely the axis commercial absorption
+moves.
+
+`HURDLE_IRR=12` still restores the flat convention on every lot, and
+`screen_assumptions` records which regime produced a flag.
+
+Expect this to start flagging lots, and expect them to be **marginal by
+construction**: they clear a 100 bps development spread, not a merchant
+builder's return. A green flag here is not a 12% deal.
+
+### The cap is blended to value the parts
+
+The blend is the one cap that reproduces the building valued as the sum of its
+separately-capitalised income streams:
+
+    cap = sum(NOI_f) / sum(NOI_f / cap_f)
+
+the harmonic mean, weighted by income. An NOI-weighted *arithmetic* mean — an
+average of the two cap rates — is always the larger of the two and so always
+values a mixed building under its parts: 14 bps high and 2.65% cheap on a
+50/50 split, 9 to 13 bps on the real Villeray mixed lots. Only the harmonic
+form makes `total NOI / cap` equal `sum(NOI_f / cap_f)`, which is the whole
+property a blended cap is supposed to have.
+
+Worked, on lot 3 456 608 — $37,989 of housing at 4.5% and $21,049 of commerce
+at 6.25%:
+
+    value = 37,989 / 0.045 + 21,049 / 0.0625 = $1,180,989
+    cap   = 59,038 / 1,180,989              = 5.00%
+
+against the 5.12% an average of the two caps would have said.
+
 ## The columns
 
 Added to `gold.lot_investment_opportunities` beside the first axis:
@@ -429,8 +714,8 @@ Added to `gold.lot_investment_opportunities` beside the first axis:
 | `existing_year_built`, `existing_num_storeys`, `existing_dominant_use_code` | what the screen read off the roll |
 | `hbu_floors`, `hbu_footprint_m2`, `grid_zone` | what it read off the solver |
 | `heritage_sector`, `piia_sector` | what it read off the grid |
-| `storey_headroom`, `built_share`, `existing_footprint_m2` | the derived inputs |
-| `is_brownfield_use`, `is_heritage_sector`, `has_piia_review`, `demolition_review_required`, `is_demolition_restricted` | the facts before the theses |
+| `storey_headroom`, `built_share`, `existing_footprint_m2`, `existing_footprint_coverage` | the derived inputs — the last is the *measured* footprint over the piece's ground, where `existing_footprint_m2` is the roll's floor over its storeys |
+| `is_brownfield_use`, `is_unassessed_vacant`, `is_heritage_sector`, `has_piia_review`, `demolition_review_required`, `is_demolition_restricted` | the facts before the theses |
 | `is_brownfield_site`, `is_teardown_site`, `is_infill_site`, `is_improvement_site`, `site_thesis` | the theses |
 | `improvement_added_storeys`, `improvement_floor_m2`, `improvement_cost_cad`, `improvement_noi_cad`, `improvement_yield_pct` | the addition |
 | `demolition_cost_cad`, `site_assessment_cost_cad`, `remediation_cost_cad`, `site_total_project_cost_cad`, `site_yield_on_cost_pct` | the site's own cost and yield |
@@ -439,6 +724,12 @@ Added to `gold.lot_investment_opportunities` beside the first axis:
 | `enhance_*`, `hold_value_cad`, `enhance_value_cad`, `rebuild_value_cad`, `best_future` | the enhancement solve and the three futures, carried from the gap |
 | `owner_*_value_cad`, `owner_gain_*_cad`, `owner_best_future` | the three futures for the owner, site costs on the rebuild |
 | `acquisition_cost_cad`, `buyer_npv_*_cad`, `buyer_yield_*_pct`, `residual_price_*_cad`, `buyer_best_future` | the three futures for a buyer |
+| `rebuild_budget_cad`, `rebuild_soft_cost_cad`, `rebuild_contingency_cad`, `rebuild_builders_risk_cad`, `rebuild_total_development_cost_cad`, `rebuild_lease_up_months`, and the `enhance_*` twins | the budget and the lease-up behind each future |
+| `buyer_yoc_*_pct`, `buyer_irr_*_pct`, `buyer_multiple_*`, `owner_yoc_*_pct`, `owner_irr_*_pct`, `yoc_spread_*_bps`, `market_cap_rate_pct`, `comparable_cap_rate_pct` | the returns, both chairs |
+| `site_irr_pct`, `owner_site_irr_pct`, `site_all_in_yield_on_cost_pct`, `site_yoc_spread_bps`, `site_hurdle_irr_pct`, `clears_cap_rate`, `clears_hurdle`, `is_good_candidate` | the thesis's own returns, the bar each was held against, and the screen |
+| `hbu_residential_noi_cad`, `hbu_commercial_noi_cad`, `hbu_industrial_noi_cad`, and the `enhance_added_*_noi_cad` twins | the future's NOI by the family that earns it, summing to the whole; the weight behind every cap below |
+| `hbu_commercial_floor_area_with_cellar_m2`, `hbu_industrial_floor_area_with_cellar_m2` | the non-residential floor the program would actually lease, cellar included, which the `hbu_*_floor_area_m2` columns exclude; the lease-up is measured on these |
+| `market_cap_rate_enhance_pct`, `exit_cap_rate_rebuild_pct`, `exit_cap_rate_enhance_pct`, `hbu_non_residential_income_share`, `enhance_non_residential_income_share` | the cap each future is screened and sold at once blended to its own mix, and the share that did the blending |
 
 Every lot keeps its row; `site_thesis = 'none'` with the booleans false is a
 lot no condition held on, and a thesis with a null rank is one that held and
@@ -470,6 +761,7 @@ either timing re-solves the borough; a change to a rate or a threshold here
 is `make opportunities` alone. Every variable the
 target reads — `TEARDOWN_MAX_YEAR`, `TEARDOWN_MAX_BUILT_SHARE`,
 `MIN_STOREY_HEADROOM`, `EXCLUDE_HERITAGE_SECTORS`, `EXCLUDE_PIIA_SECTORS`,
+`UNASSESSED_VACANT_MAX_COVERAGE`,
 `DEMOLITION_COST_M2`, `DEMOLITION_COST_NONRES_M2`, `SITE_ASSESSMENT_COST`,
 `REMEDIATION_RES_M2`, `REMEDIATION_NONRES_M2`, `ADDITION_PREMIUM`,
 `REQUIRE_POSITIVE_NPV`, `SITE_TOP_N` — is listed by `make help`.

@@ -29,6 +29,7 @@ reasons the code reads it the way it does.
 | [lot-documents.md](lot-documents.md) | The spatial join from a lot to the map features covering it, and on to their PDFs |
 | [street-frontage.md](street-frontage.md) | The *géobase double*, and how much street each lot actually fronts on |
 | [lot-profiles.md](lot-profiles.md) | `gold.lot_profiles` — every lot in the borough, one row each |
+| [development-program.md](development-program.md) | `urban_rag.program` and `silver.lot_development_programs` — the CP-SAT model behind every answer: its decision variables, the printed norms and the three shape caps that bind them, the four places a stall can go, the discounted-net-profit objective, and the `binding` vocabulary that says why an answer is not bigger |
 | [opportunities.md](opportunities.md) | `gold.lot_investment_opportunities` — the under-built lots worth looking at first, faceted by investment thesis and ranked on yield on cost |
 | [site-theses.md](site-theses.md) | The same table's second axis — why a site is acquirable: teardown, brownfield, infill or improvement, the heritage and PIIA rows read off the grid, and what each thesis costs to clear |
 | [massing.md](massing.md) | `gold.lot_building_massing` — the proposed building drawn as a rectangle inside its own setback envelope, and the fit percentage that says whether the solved footprint has a shape; plus `gold.lot_surface_parking`, the asphalt on the yard it leaves, which is a second polygon because a surface stall is not a building |

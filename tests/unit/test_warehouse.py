@@ -32,6 +32,10 @@ from psycopg._queries import _query2pg_nocache
 from shapely.geometry import box
 
 from urban_rag import warehouse
+from urban_rag.hbu import CANDIDATE_COLUMNS, HBU_COLUMNS
+from urban_rag.hbu_assets import _GAP_OUTPUT_COLUMNS
+from urban_rag.massing import MASSING_COLUMNS, PARKING_COLUMNS
+from urban_rag.opportunity_assets import _CARRIED as OPPORTUNITY_CARRIED
 from urban_rag.layers import Layer, assets_in
 from urban_rag.warehouse import (
     MissingRelation,
@@ -286,6 +290,71 @@ def test_a_key_column_the_frame_cannot_fill_is_named_up_front():
     assert "nothing supplies cote_rue_id" in message
     # What the frame *did* carry, so the rename is visible rather than guessed.
     assert "NOM_VOIE" in message
+
+
+#: The asset-side column lists that decide what actually reaches a table, and
+#: the dataset each writes. `upsert_frame` drops any frame column the target
+#: has no home for, so a list that omits a key column produces a frame the
+#: table cannot take - and the only thing that notices is
+#: `_require_key_columns`, at publish time, against a real database.
+#:
+#: That is one borough-scale solve too late. `gold.lot_redevelopment_gap`
+#: gained `feature_id` in its key when a lot stopped being one development
+#: site, and `_GAP_OUTPUT_COLUMNS` did not: every unit test passed, because
+#: they all stub the publish out, and the run failed after ten minutes of
+#: CP-SAT with `nothing supplies feature_id`. This is that check, offline.
+_ASSET_COLUMN_LISTS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("lot_development_programs", "silver", CANDIDATE_COLUMNS),
+    ("lot_highest_best_use", "gold", HBU_COLUMNS),
+    ("lot_redevelopment_gap", "gold", _GAP_OUTPUT_COLUMNS),
+    ("lot_investment_opportunities", "gold", OPPORTUNITY_CARRIED),
+    ("lot_building_massing", "gold", MASSING_COLUMNS),
+    ("lot_surface_parking", "gold", PARKING_COLUMNS),
+)
+
+
+@pytest.mark.parametrize(
+    "dataset,layer,columns",
+    [(dataset, layer, columns) for dataset, layer, columns in _ASSET_COLUMN_LISTS],
+    ids=[dataset for dataset, _layer, _columns in _ASSET_COLUMN_LISTS],
+)
+def test_an_asset_column_list_covers_its_table_natural_key(dataset, layer, columns):
+    """Whatever an asset writes must at least be keyable.
+
+    The partition columns are the asset's own - it stamps `neighborhood` and
+    `scrape_date` on every row - so what has to be in the list is the *natural*
+    key: `lot_uid` and, since a development site became a piece of a lot rather
+    than a lot, `feature_id` beside it.
+    """
+    table = warehouse.table_for(dataset)
+    assert table.schema == layer
+    missing = [name for name in table.keys if name not in columns]
+    assert not missing, (
+        f"{table.qualified} conflicts on {', '.join(table.keys)}; "
+        f"the asset's column list omits {', '.join(missing)}, so the frame it "
+        f"writes cannot be keyed"
+    )
+
+
+def test_every_per_piece_table_is_keyed_on_the_lot_and_the_zone():
+    """The grain the whole zoning chain shares, asserted in one place.
+
+    A zoning boundary does not have to follow a lot line, so a parcel it
+    crosses is two development sites - and every table downstream of
+    `silver.lot_zone_pieces` carries one row per (lot, zone). A table here that
+    drifted back to `lot_uid` alone would silently keep one of a split
+    parcel's two answers and drop the other on every upsert.
+    """
+    for dataset in (
+        "lot_zone_pieces",
+        "lot_highest_best_use",
+        "lot_redevelopment_gap",
+        "lot_investment_opportunities",
+        "lot_building_massing",
+        "lot_surface_parking",
+    ):
+        table = warehouse.table_for(dataset)
+        assert table.keys[:2] == ("lot_uid", "feature_id"), table.qualified
 
 
 def test_the_partition_is_created_before_anything_is_written():

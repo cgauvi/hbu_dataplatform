@@ -146,8 +146,9 @@ that also held are kept. Each carries its own cost into its own yield —
 demolition, characterisation and remediation, or the premium an addition pays
 over new build — and is ranked within itself as `site_thesis_rank`, with
 `is_top_site_opportunity` marking the first `site_top_n`. A lot whose
-governing zone is a *secteur d'intérêt patrimonial* is kept out of the two
-theses that demolish, and a PIIA review is flagged on the rest.
+governing zone is a *secteur d'intérêt patrimonial* or a *PIIA (secteur)* is
+kept out of the two theses that demolish and falls to `improvement`, where
+the building stays.
 
 That axis reads three inputs this page does not mention — the roll's year and
 storey count, the solver's storeys and footprint, and the grid's *Patrimoine*

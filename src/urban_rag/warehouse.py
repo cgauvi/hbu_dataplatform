@@ -219,6 +219,19 @@ TABLES: dict[str, Table] = {
         keys=("source_table", "feature_id", "column_index"),
         source="sql/012_silver_zoning.sql",
     ),
+    # One row per (lot, zone) - the piece of a parcel one grid governs, as a
+    # site in its own right. Narrower than the envelopes below on purpose: a
+    # piece is a piece of *ground*, and the several columns of one grid all
+    # describe the same ground. It is the grain everything downstream of the
+    # zoning now keys on, and `is_primary_zone` is what a reader wanting one
+    # row per lot takes.
+    "lot_zone_pieces": Table(
+        asset="lot_zone_pieces",
+        name="lot_zone_pieces",
+        keys=("lot_uid", "feature_id"),
+        source="sql/025_silver_lot_zone_pieces.sql",
+        geometry="geom",
+    ),
     "lot_zoning_envelopes": Table(
         asset="lot_zoning_envelopes",
         name="lot_zoning_envelopes",
@@ -340,15 +353,23 @@ TABLES: dict[str, Table] = {
         geometry="geom",
     ),
     # Keyed on `lot_uid` and not on `lot_number`, unlike every other per-lot
-    # table here. These two are downstream of `lot_zoning_envelopes`, whose own
+    # table here. These are downstream of `lot_zoning_envelopes`, whose own
     # grain leads with the cadastre's surrogate key, and a lot the zone layer
     # reaches but the roll never named has a `lot_uid` and a null lot number -
     # which is precisely the under-built parcel `lot_redevelopment_gap` exists
     # to surface, so it cannot be the row the key drops.
+    #
+    # And keyed on the *zone* beside it, which is the grain change
+    # `lot_zone_pieces` above carries into gold: a zoning boundary crossing a
+    # large parcel makes two sites of it, both are solved, and both keep their
+    # row all the way to the shortlist and the map. The five tables below share
+    # this key for that one reason, so a reader joining any two of them joins
+    # on the pair - joining on `lot_uid` alone silently multiplies the split
+    # parcels. See hbu_infra's sql/018 header.
     "lot_highest_best_use": Table(
         asset="lot_highest_best_use",
         name="lot_highest_best_use",
-        keys=("lot_uid",),
+        keys=("lot_uid", "feature_id"),
         source="sql/018_gold_lot_highest_best_use.sql",
     ),
     # The shortlist, keyed the way the gap table it ranks is. No geometry:
@@ -358,14 +379,14 @@ TABLES: dict[str, Table] = {
     "lot_investment_opportunities": Table(
         asset="lot_investment_opportunities",
         name="lot_investment_opportunities",
-        keys=("lot_uid",),
+        keys=("lot_uid", "feature_id"),
         source="sql/021_gold_lot_investment_opportunities.sql",
         attributes="attributes",
     ),
     "lot_redevelopment_gap": Table(
         asset="lot_redevelopment_gap",
         name="lot_redevelopment_gap",
-        keys=("lot_uid",),
+        keys=("lot_uid", "feature_id"),
         source="sql/019_gold_lot_redevelopment_gap.sql",
     ),
     # The same key as the two above, and the one spatial table of the three.
@@ -379,7 +400,7 @@ TABLES: dict[str, Table] = {
     "lot_building_massing": Table(
         asset="lot_building_massing",
         name="lot_building_massing",
-        keys=("lot_uid",),
+        keys=("lot_uid", "feature_id"),
         source="sql/022_gold_lot_building_massing.sql",
         geometry="geom",
     ),
@@ -398,7 +419,7 @@ TABLES: dict[str, Table] = {
     "lot_surface_parking": Table(
         asset="lot_building_massing",
         name="lot_surface_parking",
-        keys=("lot_uid",),
+        keys=("lot_uid", "feature_id"),
         source="sql/024_gold_lot_surface_parking.sql",
         geometry="geom",
     ),

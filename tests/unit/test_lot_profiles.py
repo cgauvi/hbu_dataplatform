@@ -85,7 +85,12 @@ def write_envelopes(store, *, lot_numbers=("1", "2"), pct_of_lot=(92.0, 100.0)):
             "lot_number": list(lot_numbers),
             "neighborhood": [NEIGHBORHOOD] * len(lot_numbers),
             "scrape_date": [DATE] * len(lot_numbers),
+            # The parcel, and the ground this zone governs. Equal here, which
+            # is the unsplit case; the two are separate columns because on a
+            # parcel a zoning boundary crosses they are separate numbers, and
+            # only the second is a property of the envelope.
             "lot_area_m2": [400.0] * len(lot_numbers),
+            "piece_area_m2": [400.0] * len(lot_numbers),
             "primary_frontage_m": [20.0] * len(lot_numbers),
             "feature_id": [f"C01-{i:03d}" for i in range(1, len(lot_numbers) + 1)],
             "pct_of_lot": list(pct_of_lot),
@@ -681,21 +686,46 @@ def test_the_envelopes_reach_the_query_keyed_on_lot_number_most_of_the_lot_first
 def test_an_envelope_entry_drops_the_lot_columns_the_profile_row_already_has(
     store, monkeypatch
 ):
-    """A norm restated once per envelope is the trade; the lot's own area and
-    frontage restated once per envelope is just waste."""
+    """A norm restated once per envelope is the trade; the lot's own area
+    restated once per envelope is just waste."""
     write_partition(store)
     calls = stub_postgis(monkeypatch)
 
     assert run(store).success
 
     _, entry = calls["zoning_envelopes"][0]
-    for column in ("lot_uid", "lot_number", "lot_area_m2", "primary_frontage_m",
+    for column in ("lot_uid", "lot_number", "lot_area_m2",
                    "neighborhood", "scrape_date"):
         assert column not in entry, f"{column} is already a column of the profile"
     # What the envelope is actually for.
     assert entry["feature_id"] == "C01-002"
     assert entry["floors_max"] == 3
     assert entry["governs_residential"] is True
+
+
+def test_an_envelope_entry_keeps_the_frontage_because_it_is_the_piece_own(
+    store, monkeypatch
+):
+    """The one column that moved out of the lot set, and why.
+
+    The frontage on an envelope row is the street the *piece that zone governs*
+    faces, re-ranked inside it - so on a parcel a zoning boundary crosses, two
+    envelopes carry two different streets and the profile's own lot-level pair
+    is one of them and not both. Lifting it out as a lot column would drop from
+    each entry the number its *Largeur du terrain min* was tested against, and
+    leave a reader unable to see why two envelopes on one parcel govern
+    differently.
+    """
+    write_partition(store)
+    calls = stub_postgis(monkeypatch)
+
+    assert run(store).success
+
+    _, entry = calls["zoning_envelopes"][0]
+    assert "primary_frontage_m" in entry
+    # And the ground that envelope governs, for the same reason - beside the
+    # parcel's own area, which stays a column of the profile.
+    assert "piece_area_m2" in entry
 
 
 def test_the_json_string_columns_are_decoded_into_real_json(store, monkeypatch):

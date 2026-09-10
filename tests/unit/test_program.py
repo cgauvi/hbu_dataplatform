@@ -13,26 +13,30 @@ Villeray-Saint-Michel-Parc-Extension zoning by-law (01-283) authorises `H` on
 *Tous sauf le RDC* with *En étage* 2/6, *Taux d'implantation* 50/70 and
 *Densité* 0/4,5.
 
-The parking tests are the fourth group, and they are about one asymmetry: an
-underground stall is bigger (400 sq ft against 300) and dearer ($60 300
-against $48 125) and is still the right answer whenever *Densité* binds,
-because article 38 1° of 01-283 keeps it out of the *superficie de plancher*
-entirely. Each of them makes exactly one of the two options impossible or
-uneconomic and checks the solver picks the other for the stated reason. The
+The parking tests are the fourth group, and they are about three provisions
+that answer to different caps: a stall on the yard, which no cap sees and the
+parcel rations; a bay in the ground floor, which *Densité* and *Taux
+d'implantation* both count and one plate rations; and a dug stall, which
+articles 38 1° and 43 of 01-283 keep out of the *superficie de plancher* and
+the site coverage, and which is rationed by the **parcel** rather than the
+building's plate - a parkade runs out under the yard. The dug stall is the
+biggest (400 sq ft) and the dearest ($60 300) and is still the right answer
+whenever *Densité* binds. Each test makes one provision impossible or
+uneconomic and checks the solver picks the next for the stated reason. The
 tests that are about something else - the rent arithmetic, the vacancy
 factor - pass `NO_PARKING` and `NO_CONSTRUCTION_COST`, so a change to a
 published rate cannot move a number those tests exist to pin.
 
-That asymmetry is between the two *structured* options, and it is only ever
-reached once the yard is spent: a surface stall is $6 105 against $48 125 and
-$60 300, so the solver parks on the ground the footprint leaves and buys
-structure only when the coverage cap has left none. So the tests in that group pass
-`STRUCTURED_ONLY`, which is `max_surface_stalls=0` - the same knob
-`max_underground_levels=0` already was, pointed at the other option - and stay
-about the dig-against-deck question they were written for. The group after
-them is about the yard itself, and about the parcel that made it necessary:
-lot 2 166 060, whose zoning permits one house and which came back with
-nothing at all while a parkade was the only stall the model knew how to buy.
+The hole is only ever reached once the yard and the ground floor are spent: a
+surface stall is $6 105 and a bay $15 450 against $60 300, so the solver parks
+on the ground the footprint leaves, then in the ground floor, and digs only
+when both are full. So the tests about digging pass `STRUCTURED_ONLY`, which
+closes the yard and the bays - the same knob `max_underground_levels=0`
+already was, pointed the other way. The group after them is about the yard
+itself, and about the parcel that made it necessary: lot 2 166 060, whose
+zoning permits one house and which came back with nothing at all while a
+parkade was the only stall the model knew how to buy; and lot 3 791 023,
+whose two-storey four-plex parks in two bays of its ground floor.
 
 The objective is discounted net profit; the tables below are computed under
 `UNDISCOUNTED_INVESTMENT`, which reprices it back to the old monthly NOI
@@ -62,18 +66,19 @@ import math
 import numpy as np
 import pytest
 
+from dataclasses import replace
+
 from urban_rag.program import (
-    ABOVE_GRADE_PARKING_STOREY_HEIGHT_M,
     BASEMENT_LEVELS,
     BASEMENT_LEVELS_ALLOWED,
     BASEMENT_STACK_ORDER,
     BELOW_GRADE_COST_PREMIUM,
     BELOW_GRADE_RENT_DISCOUNT_PCT,
     NO_BASEMENT,
+    GROUND_FLOOR_LEVELS,
     UNRESTRICTED_LEVELS,
+    authorises_ground_floor,
     permitted_basement_levels,
-    ABOVE_GRADE_STALL_AREA_SQFT,
-    ABOVE_GRADE_STALL_COST_CAD,
     AMORTIZATION_MONTHS,
     ASSUMED_BUILDING_AGE_YEARS,
     DEFAULT_INVESTMENT,
@@ -116,6 +121,7 @@ from urban_rag.program import (
     GARAGE_STALL_COST_CAD,
     StoreyHeights,
     UNDERGROUND_LEVEL_HEIGHT_M,
+    UNDERGROUND_LOT_SHARE,
     UNDERGROUND_STALL_AREA_SQFT,
     UNDERGROUND_STALL_COST_CAD,
     UNIT_AREAS_SQFT,
@@ -153,14 +159,24 @@ VACANCY = {
 ECONOMICS = UnitEconomics(average_rent_cad=RENTS, vacancy_rate_pct=VACANCY)
 
 #: The parking program with both cheap provisions taken away, so the only
-#: stalls left are the two that cost a whole storey or a hole. The counterpart
-#: of `ParkingRules(max_underground_levels=0)`, which the group below already
-#: used to take the excavator away, and what every test about the
-#: dig-against-deck trade passes: a stall on the yard is $6 105 and a bay in
-#: the ground floor $15 450 against the deck's $48 125, so on any lot with
-#: either to spare the solver takes it and the trade those tests are about
-#: never comes up.
+#: stalls left are the ones that cost a hole. The counterpart of
+#: `ParkingRules(max_underground_levels=0)`, which takes the excavator away
+#: instead, and what every test about digging passes: a stall on the yard is
+#: $6 105 and a bay in the ground floor $15 450 against $60 300 dug, so on any
+#: lot with either to spare the solver takes it and the hole those tests are
+#: about never gets dug.
 STRUCTURED_ONLY = ParkingRules(max_surface_stalls=0, max_garage_stalls=0)
+
+#: The stall as a pure cost - the program this module priced before a stall
+#: earned anything. The tests about *where the owed stalls go* pass it, so
+#: their answer is the owed stalls and not the ones the market would rent as
+#: well: with the rent on, a surface stall pays for itself and a lot with a
+#: yard builds up to one a dwelling. What a stall earns has its own group
+#: below.
+UNPAID = ParkingRules(monthly_rent_cad=0.0, absorption_saving_months=0.0)
+STRUCTURED_ONLY_UNPAID = replace(
+    STRUCTURED_ONLY, monthly_rent_cad=0.0, absorption_saving_months=0.0
+)
 
 #: The objective the docstring tables at the head of this file were computed
 #: under: the old undiscounted amortisation, no expenses, no premium. The
@@ -171,10 +187,24 @@ UNDISCOUNTED = UNDISCOUNTED_INVESTMENT
 
 
 def column(**overrides) -> ZoneColumn:
-    """Zone C01-001's Habitation column, with fields overridden per test."""
+    """Zone C01-001's Habitation column, with fields overridden per test.
+
+    Its norms, and *not* its `levels`. C01-001 marks the Habitation column
+    *Tous sauf le RDC* and prints a ``C.4`` on *Tous les niveaux* beside it -
+    shops at grade, flats over them - so that column solved **alone** is a
+    building with nothing on its ground floor, which `solve_program` now
+    refuses outright (`no_usage_permitted_on_ground_floor`). It always was one;
+    the model simply used to stack the dwellings onto the RDC and say nothing.
+
+    So the default here is *Tous les niveaux*, which makes this what the
+    seventy-odd tests reaching for it always wanted - an ordinary buildable
+    Habitation column, to hold the norms under test still. The tests that are
+    about the level rows pass their own `levels`, and the ones that are about
+    a zone's two columns build a `ZoneEnvelope`.
+    """
     base = {
         "usages": ("H",),
-        "levels": frozenset({BuildingLevel.ALL_EXCEPT_GROUND}),
+        "levels": frozenset({BuildingLevel.ALL}),
         "floors_max": 6,
         "floors_min": 2,
         "site_coverage_min_pct": 50.0,
@@ -334,6 +364,214 @@ def test_all_except_ground_of_a_single_storey_building_is_nothing():
     assert permitted_floors({BuildingLevel.ALL_EXCEPT_GROUND}, total_floors=1) == 0
 
 
+#: Villeray's own surveyed retail, as `silver.commercial_rents` resolves it.
+#: The module's `COMMERCIAL_REVENUE_PER_SQFT_CAD` is $80 and outbids the
+#: housing for every storey a grid will spare, which is the right default and
+#: the wrong rate for a test about which storeys the *rows* allow.
+SURVEYED_RETAIL = NonResidentialEconomics(commercial_per_sqft_year=26.6007)
+
+
+# -- the level rows as a placement ------------------------------------------
+#
+# The half of the *Niveaux* block a storey count cannot carry. `permitted_floors`
+# above says how many storeys a usage may occupy; these say which of them it may
+# not, and the only level the block ever names that way is the ground floor.
+
+
+@pytest.mark.parametrize(
+    ("levels", "expected"),
+    [
+        ({BuildingLevel.ALL}, True),
+        ({BuildingLevel.GROUND}, True),
+        # Named the RDC alongside another row: still the RDC.
+        ({BuildingLevel.GROUND, BuildingLevel.BELOW_GROUND}, True),
+        # Every other row keeps the usage off it - one by saying so, one by
+        # naming the storey above, one by naming the level below.
+        ({BuildingLevel.ALL_EXCEPT_GROUND}, False),
+        ({BuildingLevel.SECOND}, False),
+        ({BuildingLevel.BELOW_GROUND}, False),
+        ({BuildingLevel.ALL_EXCEPT_GROUND, BuildingLevel.SECOND}, False),
+        # A column the grid left blank is authorised nowhere, the RDC included.
+        (set(), False),
+    ],
+)
+def test_which_rows_put_a_usage_on_the_ground_floor(levels, expected):
+    assert authorises_ground_floor(levels) is expected
+    assert column(levels=frozenset(levels)).authorises_ground_floor is expected
+
+
+def test_the_ground_floor_goes_to_a_usage_authorised_on_it():
+    """The shape zone C04-083 prints, and the reason this rule exists.
+
+    ``H`` on *Tous sauf le RDC* beside a ``C.4`` on *Tous les niveaux*, six
+    storeys. The count alone is satisfied by five storeys of housing standing
+    on levels 1 to 5 - the RDC among them, which the grid excludes - so what
+    makes the answer legal is that the storey the dwellings may not have goes
+    to the commerce.
+    """
+    housing = column(
+        usages=("H",), levels=frozenset({BuildingLevel.ALL_EXCEPT_GROUND})
+    )
+    commerce = column(usages=("C.4",), levels=frozenset({BuildingLevel.ALL}))
+    program = solve_program(
+        ZoneEnvelope(residential=housing, commercial=commerce),
+        Lot(area_m2=400.0, frontage_m=12.0),
+        ECONOMICS,
+        parking=NO_PARKING,
+        # Villeray's own surveyed retail rent rather than the module's $80
+        # default, which outbids the housing for every storey and would make
+        # this a test about the rates instead of about the rows.
+        non_residential=SURVEYED_RETAIL,
+    )
+    assert program.solved
+    assert program.residential_floors == 5
+    assert program.commercial_floors >= 1
+    assert program.floors == program.residential_floors + program.commercial_floors
+    # The dwellings are one storey short of the building, and the storey they
+    # are short of is the one at grade. `floor_stack` is what draws it.
+    assert program.residential_floors == program.floors - 1
+    assert [entry["use"] for entry in floor_stack(program)][:1] == ["commercial"]
+    # Named, because no printed cap says it: a reader who changes *En etage
+    # max* will not get the storey back.
+    assert "ground_floor_excluded" in program.binding
+
+
+def test_a_column_on_every_level_keeps_its_ground_floor():
+    """The rule bites only where a row excludes the RDC, and *Tous les
+    niveaux* excludes nothing - so the same envelope with the housing marked
+    that way builds six storeys of it and reports no such constraint."""
+    program = solve_program(
+        column(usages=("H",), levels=frozenset({BuildingLevel.ALL})),
+        Lot(area_m2=400.0, frontage_m=12.0),
+        ECONOMICS,
+        parking=NO_PARKING,
+    )
+    assert program.solved
+    assert program.residential_floors == 6
+    assert "ground_floor_excluded" not in program.binding
+
+
+def test_a_column_marked_only_the_rdc_gets_one_storey_and_it_is_at_grade():
+    """*Rez-de-chaussee* on its own is one storey - `permitted_floors` says so
+    - and it is the one at grade, so the column stands alone quite happily."""
+    program = solve_program(
+        column(
+            usages=("C.2",),
+            levels=frozenset({BuildingLevel.GROUND}),
+            # *En etage min* 2 over a row that authorises one storey is the
+            # other contradiction this module names, and not the subject here.
+            floors_min=0,
+        ),
+        Lot(area_m2=400.0, frontage_m=12.0),
+        ECONOMICS,
+        parking=NO_PARKING,
+    )
+    assert program.solved
+    assert program.commercial_floors == 1
+    assert program.floors == 1
+    assert [entry["use"] for entry in floor_stack(program)] == ["commercial"]
+    assert "ground_floor_excluded" not in program.binding
+
+
+def test_a_lone_column_that_excludes_the_ground_floor_builds_nothing():
+    """A building of storeys has a ground floor. A zone whose only governing
+    column may not occupy it is not a five-storey building on a six-storey
+    grid, it is a contradiction between two printed rows - and it is named
+    rather than returned as a bare INFEASIBLE."""
+    program = solve_program(
+        column(usages=("H",), levels=frozenset({BuildingLevel.ALL_EXCEPT_GROUND})),
+        Lot(area_m2=400.0, frontage_m=12.0),
+        ECONOMICS,
+        parking=NO_PARKING,
+    )
+    assert not program.solved
+    assert program.status == "INFEASIBLE"
+    assert program.binding == ("no_usage_permitted_on_ground_floor",)
+    assert program.floors == 0
+    assert program.total_dwellings == 0
+
+
+def test_a_cellar_is_not_a_ground_floor_and_may_stand_without_one():
+    """The case the named contradiction above deliberately leaves out.
+
+    *Inferieurs au RDC* authorises a below-grade level and no storeys, so a
+    column marked only that way is not asking for a ground floor it cannot
+    have - it is describing a sous-sol, and where no *En etage min* demands a
+    storey the model is free to build exactly that.
+    """
+    program = solve_program(
+        column(
+            usages=("C.2",),
+            levels=frozenset({BuildingLevel.BELOW_GROUND}),
+            floors_min=0,
+            site_coverage_min_pct=None,
+        ),
+        Lot(area_m2=400.0, frontage_m=12.0),
+        ECONOMICS,
+        parking=NO_PARKING,
+    )
+    assert program.status != "INFEASIBLE"
+    assert "no_usage_permitted_on_ground_floor" not in program.binding
+    assert program.floors == 0
+
+
+def test_the_building_has_one_ground_floor_and_not_one_per_column():
+    """Two columns both kept off the RDC are denied the *same* storey.
+
+    Read per column, each would be allowed every storey but one and the two of
+    them would fill the building between them - housing on levels 2 to 4,
+    commerce on level 1 that may not be there. So the constraint is one
+    inequality over all of them: five storeys of housing-or-commerce under a
+    six-storey grid, and the sixth belongs to the industry the grid does put
+    at grade.
+    """
+    housing = column(
+        usages=("H",), levels=frozenset({BuildingLevel.ALL_EXCEPT_GROUND})
+    )
+    commerce = column(usages=("C.2",), levels=frozenset({BuildingLevel.SECOND}))
+    industry = column(usages=("I.1",), levels=frozenset({BuildingLevel.GROUND}))
+    program = solve_program(
+        ZoneEnvelope(residential=housing, commercial=commerce, industrial=industry),
+        Lot(area_m2=400.0, frontage_m=12.0),
+        ECONOMICS,
+        parking=NO_PARKING,
+    )
+    assert program.solved
+    assert program.industrial_floors == 1
+    assert program.residential_floors + program.commercial_floors == program.floors - 1
+
+
+def test_a_ground_floor_of_garage_bays_is_still_a_residential_storey():
+    """No storey is parking, and that is what made this constraint necessary.
+
+    The bays ride inside the residential run's first level, so a ground floor
+    filled with them is a *residential* storey - one the ``H`` column may not
+    put on the RDC. Parking the dwellings does not buy the grid's permission.
+    """
+    housing = column(
+        usages=("H",), levels=frozenset({BuildingLevel.ALL_EXCEPT_GROUND})
+    )
+    commerce = column(usages=("C.4",), levels=frozenset({BuildingLevel.ALL}))
+    program = solve_program(
+        ZoneEnvelope(residential=housing, commercial=commerce),
+        Lot(area_m2=400.0, frontage_m=12.0),
+        ECONOMICS,
+        parking=ParkingRules(stalls_per_dwelling=1.0),
+        non_residential=SURVEYED_RETAIL,
+    )
+    assert program.solved
+    assert program.garage_stalls > 0
+    assert program.residential_floors == program.floors - 1
+    # Above grade only: the dug level is the first run of the stack, being
+    # read from the bottom, and it is not a storey.
+    above_grade = [
+        entry["use"]
+        for entry in floor_stack(program)
+        if entry["position"] == "above_grade"
+    ]
+    assert above_grade[:1] == ["commercial"]
+
+
 # -- choosing the column ----------------------------------------------------
 
 
@@ -458,7 +696,7 @@ def test_the_best_square_foot_wins_when_the_envelope_is_what_binds():
     # won the test above comes last. Twenty-five 55.74 m2 one-bedrooms fill
     # 1 393.5 of the 1 400.
     program = solve_program(
-        column(density_max=None),
+        column(density_max=None, floors_max=5),
         Lot(area_m2=400.0, frontage_m=12.0),
         ECONOMICS,
         parking=NO_PARKING,
@@ -491,7 +729,7 @@ def test_site_coverage_and_storeys_bound_the_envelope_without_a_density_cap():
     # one-bedrooms with 6.5 m2 to spare.
     lot = Lot(area_m2=400.0, frontage_m=12.0)
     program = solve_program(
-        column(density_max=None), lot, ECONOMICS, parking=NO_PARKING
+        column(density_max=None, floors_max=5), lot, ECONOMICS, parking=NO_PARKING
     )
     assert program.solved
     assert program.residential_floors == 5
@@ -528,7 +766,7 @@ def test_the_margins_bind_when_they_leave_less_than_the_coverage_allows():
     # trade the module docstring's last two columns describe.
     lot = Lot(area_m2=400.0, frontage_m=12.0, buildable_area_m2=240.0)
     program = solve_program(
-        column(density_max=None),
+        column(density_max=None, floors_max=5),
         lot,
         ECONOMICS,
         parking=NO_PARKING,
@@ -558,7 +796,7 @@ def test_a_buildable_area_the_coverage_already_undercuts_changes_nothing():
     binding norm, and must not be reported as one."""
     lot = Lot(area_m2=400.0, frontage_m=12.0, buildable_area_m2=390.0)
     program = solve_program(
-        column(density_max=None), lot, ECONOMICS, parking=NO_PARKING
+        column(density_max=None, floors_max=5), lot, ECONOMICS, parking=NO_PARKING
     )
     assert program.units == {"1_bedroom": 25}
     assert "site_coverage_max" in program.binding
@@ -571,7 +809,7 @@ def test_a_lot_with_no_buildable_area_passed_solves_as_it_always_did():
     has nothing to pass. `None` must leave the answer exactly as it was before
     the setback asset existed."""
     without = solve_program(
-        column(density_max=None),
+        column(density_max=None, floors_max=5),
         Lot(area_m2=400.0, frontage_m=12.0),
         ECONOMICS,
         parking=NO_PARKING,
@@ -639,13 +877,15 @@ def test_fewer_storeys_when_the_level_rows_say_ground_floor_only():
     # A single residential storey, so the plate holds the whole mix at once -
     # pinned from below by the mix and from above by the coverage cap.
     assert 278.7 - 1e-9 <= program.footprint_m2 <= 280.0 + 1e-9
-    # The level rows bound the dwellings, not the building: the five of them
-    # owe three stalls, and with the yard taken away a second storey is where
-    # those go. `STRUCTURED_ONLY` is what makes that the answer - 400 m2 of lot
+    # The level rows bound the dwellings and the building alike: the five of
+    # them owe three stalls, and with the yard and the ground floor taken away
+    # those go under the parcel rather than onto a storey the rows would not
+    # allow. `STRUCTURED_ONLY` is what makes that the answer - 400 m2 of lot
     # under a 280 m2 plate leaves 120 m2 of yard, four surface stalls, and the
-    # solver would otherwise never raise the storey this test is about.
-    assert program.floors == 2
-    assert program.above_grade_parking_floors == 1
+    # solver would otherwise never dig.
+    assert program.floors == 1
+    assert program.underground_stalls == 3
+    assert program.underground_levels == 1
 
 
 def test_a_storey_minimum_the_level_rows_cannot_reach_is_infeasible():
@@ -807,15 +1047,16 @@ def test_a_percentage_outside_zero_to_a_hundred_is_refused():
 def test_the_parking_constants_are_the_ones_the_program_was_specified_with():
     assert STALLS_PER_DWELLING == 0.5
     assert UNDERGROUND_STALL_AREA_SQFT == 400.0
-    assert ABOVE_GRADE_STALL_AREA_SQFT == 300.0
-    # The Altus Group guide's Montreal midpoints, as `urban_rag.estimator`
-    # publishes them: `parkade_ug` [51 925, 68 675] and `parkade_ag`
-    # [38 500, 57 750], both flagged `perStall`.
+    assert GARAGE_STALL_AREA_SQFT == 300.0
+    # The Altus Group guide's Montreal midpoint, as `urban_rag.estimator`
+    # publishes it: `parkade_ug` [51 925, 68 675], flagged `perStall`.
     assert UNDERGROUND_STALL_COST_CAD == pytest.approx((51_925 + 68_675) / 2)
-    assert ABOVE_GRADE_STALL_COST_CAD == pytest.approx((38_500 + 57_750) / 2)
-    # Underground is worse on both counts. Only the by-law makes it worth it.
-    assert UNDERGROUND_STALL_COST_CAD > ABOVE_GRADE_STALL_COST_CAD
-    assert UNDERGROUND_STALL_AREA_SQFT > ABOVE_GRADE_STALL_AREA_SQFT
+    # Underground is worse on both counts than a bay. Only the by-law makes it
+    # worth it - and the by-law also lets it run out to the lot line.
+    assert UNDERGROUND_STALL_COST_CAD > GARAGE_STALL_COST_CAD
+    assert UNDERGROUND_STALL_AREA_SQFT > GARAGE_STALL_AREA_SQFT
+    assert UNDERGROUND_LOT_SHARE == 1.0
+    assert ParkingRules().underground_lot_share == 1.0
 
 
 def test_half_a_stall_a_dwelling_rounds_up():
@@ -824,15 +1065,18 @@ def test_half_a_stall_a_dwelling_rounds_up():
         column(max_dwellings=11, density_max=None),
         Lot(area_m2=2000.0, frontage_m=25.0),
         ECONOMICS,
+        parking=UNPAID,
     )
     assert program.total_dwellings == 11
     assert program.total_stalls == 6
 
 
-def test_a_slack_envelope_parks_above_grade_where_it_is_cheaper():
-    # $48 125 a stall against $60 300, and on a 2 000 m2 lot with no Densité
-    # row there is a whole spare storey to put them on, so the cheaper option
-    # is also the feasible one. Nothing is dug.
+def test_a_slack_envelope_with_no_yard_and_no_bays_digs_one_wide_level():
+    # Twelve dwellings owe six stalls, and with the yard and the ground floor
+    # closed the only place left is under the parcel: 6 x 37.16 m2 is 222.97
+    # m2 of hole, which a 2 000 m2 lot holds in one level. Nothing is stacked
+    # on the building for it - no storey is parking - and the level is dug at
+    # the stalls' own plate, not the building's.
     program = solve_program(
         column(max_dwellings=12, density_max=None),
         Lot(area_m2=2000.0, frontage_m=25.0),
@@ -840,18 +1084,24 @@ def test_a_slack_envelope_parks_above_grade_where_it_is_cheaper():
         parking=STRUCTURED_ONLY,
     )
     assert program.total_dwellings == 12
-    assert program.above_grade_stalls == 6
-    assert program.underground_stalls == 0
-    assert program.underground_levels == 0
-    assert program.above_grade_parking_floors == 1
-    assert program.parking_cost_cad == pytest.approx(6 * ABOVE_GRADE_STALL_COST_CAD)
+    assert program.underground_stalls == 6
+    assert program.underground_levels == 1
+    assert program.surface_stalls == 0
+    assert program.garage_stalls == 0
+    assert program.floors == program.residential_floors
+    stall_m2 = UNDERGROUND_STALL_AREA_SQFT * M2_PER_SQFT
+    assert program.underground_area_m2 == pytest.approx(6 * stall_m2, abs=0.01)
+    assert program.underground_plate_m2 == pytest.approx(6 * stall_m2, abs=0.01)
+    assert program.underground_plate_m2 <= 2000.0
+    assert program.parking_cost_cad == pytest.approx(6 * UNDERGROUND_STALL_COST_CAD)
 
 
-def test_a_tight_density_cap_drives_the_parking_underground():
+def test_a_tight_density_cap_is_unmoved_by_the_parking_underground():
     # ISP 2,0 on 400 m2 is 800 m2 of superficie de plancher, and the mix fills
-    # 798.94 of it. An above-grade stall would have to come out of the 1.06
-    # left; an underground one comes out of area the index cannot see, so all
-    # seven are dug rather than one dwelling being given up for them.
+    # 798.94 of it. A bay would have to come out of the 1.06 left; a dug stall
+    # comes out of area the index cannot see, so all seven are dug and not one
+    # dwelling is given up for them - fourteen stand, as many as with no
+    # parking owed at all.
     program = solve_program(
         column(density_max=2.0),
         Lot(area_m2=400.0, frontage_m=12.0),
@@ -860,17 +1110,18 @@ def test_a_tight_density_cap_drives_the_parking_underground():
     )
     assert program.total_dwellings == 14
     assert program.underground_stalls == 7
-    assert program.above_grade_stalls == 0
-    assert program.above_grade_parking_floors == 0
+    assert program.garage_stalls == 0
     # Seven stalls of 37.16 m2 is 260.13 m2 of excavation, and *how many
-    # levels* that is, is not something the model decides: once the mix is
-    # fixed, any footprint x floors product big enough to hold it is equally
-    # optimal, and the levels follow the footprint. 266.67 x 3 buys one level
-    # deep enough; 200 x 4 needs two. Both are optimal and CP-SAT returns
-    # whichever it reaches first, so what is asserted is the excavation - see
-    # `_binding_caps` on why the caps are read rather than the solution.
-    assert program.underground_levels >= 1
-    assert program.underground_area_m2 >= 7 * UNDERGROUND_STALL_AREA_SQFT * M2_PER_SQFT
+    # levels* that is, the model now does decide: the plate is the parcel's,
+    # 400 m2, so one level holds it, and the level is exactly as wide as the
+    # stalls need. That plate is wider than the building's - a 800 m2 gross on
+    # at most 280 m2 of coverage is a plate of 160 to 280 - which is the whole
+    # point of bounding the hole by the lot rather than by the footprint.
+    stall_m2 = UNDERGROUND_STALL_AREA_SQFT * M2_PER_SQFT
+    assert program.underground_levels == 1
+    assert program.underground_area_m2 == pytest.approx(7 * stall_m2, abs=0.01)
+    assert program.underground_plate_m2 == pytest.approx(7 * stall_m2, abs=0.01)
+    assert program.underground_plate_m2 <= 400.0
     assert program.parking_cost_cad == pytest.approx(7 * UNDERGROUND_STALL_COST_CAD)
 
 
@@ -892,78 +1143,89 @@ def test_underground_parking_is_neither_floor_area_nor_a_storey():
     assert program.floors == program.residential_floors
 
 
-def test_above_grade_parking_is_paid_for_in_dwellings():
-    # The same lot with the excavator taken away. Three storeys of dwellings
-    # and one of stalls inside the same 800 m2: ten dwellings rather than
-    # fourteen, and the report names the parking as what took the other four.
+def test_the_bays_are_paid_for_in_dwellings():
+    # The same lot with the excavator taken away. The stalls go into the
+    # ground floor, and a bay is *superficie de plancher* the density index
+    # counts: every bay is 27.87 m2 of the same 800 m2 no dwelling gets, so
+    # fewer than fourteen stand, and the report names the density cap.
     program = solve_program(
         column(density_max=2.0),
         Lot(area_m2=400.0, frontage_m=12.0),
         ECONOMICS,
-        parking=ParkingRules(
-            max_underground_levels=0, max_surface_stalls=0, max_garage_stalls=0
-        ),
+        parking=ParkingRules(max_underground_levels=0, max_surface_stalls=0),
     )
-    assert program.total_dwellings == 10
-    assert program.above_grade_stalls == 5
+    assert program.solved
+    assert 0 < program.total_dwellings < 14
+    assert program.garage_stalls == program.total_stalls > 0
     assert program.underground_stalls == 0
-    assert program.above_grade_parking_floors == 1
-    assert {"density_max", "above_grade_parking"} <= set(program.binding)
+    # Floor area, and inside the gross: the dwellings and the bays share the
+    # plates, and the two together are what the index was tested against.
+    assert program.garage_area_m2 > 0
+    assert program.unit_area_m2 + program.garage_area_m2 <= program.gross_floor_area_m2 + 1e-6
+    assert program.density_floor_area_m2 <= 800.0 + 1e-9
+    assert "density_max" in program.binding
 
 
 def test_more_stalls_a_dwelling_stack_more_underground_levels():
     # Two stalls a dwelling rather than a half, so the parking is four times
     # the burden and the mix shifts to fewer, larger dwellings to carry fewer
     # stalls: nine of them owing eighteen. At 37.16 m2 each that is 668.9 m2,
-    # and a 200 m2 plate takes four levels to hold it.
+    # and the parcel's 400 m2 takes two levels to hold it - not the four a
+    # 200 m2 plate would have, because the hole is the parcel's, not the
+    # building's.
     program = solve_program(
         column(density_max=2.0),
         Lot(area_m2=400.0, frontage_m=12.0),
         ECONOMICS,
         parking=ParkingRules(
-            stalls_per_dwelling=2.0, max_surface_stalls=0, max_garage_stalls=0
+            stalls_per_dwelling=2.0,
+            max_surface_stalls=0,
+            max_garage_stalls=0,
+            monthly_rent_cad=0.0,
+            absorption_saving_months=0.0,
         ),
         investment=UNDISCOUNTED,
     )
     assert program.total_dwellings == 9
     assert program.underground_stalls == 18
-    # However many levels that plate takes: the footprint is not pinned by the
-    # objective - any plate big enough to hold the mix is equally optimal - so
-    # what is true of the answer is that the hole is exactly deep enough.
+    # The hole is exactly deep enough at the parcel's plate, and its own plate
+    # is the stalls' area over those levels - wider than the building's.
     stall_area_m2 = UNDERGROUND_STALL_AREA_SQFT * M2_PER_SQFT
     assert program.underground_levels == math.ceil(
-        program.underground_stalls * stall_area_m2 / program.footprint_m2 - 1e-9
+        program.underground_stalls * stall_area_m2 / 400.0 - 1e-9
     )
-    assert program.underground_levels <= 4
+    assert program.underground_levels == 2
+    # At `AREA_SCALE`'s hundredth: 18 x 37.16 m2 as the solver holds a stall.
+    assert program.underground_area_m2 == pytest.approx(18 * stall_area_m2, abs=0.05)
+    assert program.underground_plate_m2 == pytest.approx(
+        program.underground_area_m2 / 2, abs=0.01
+    )
+    assert program.underground_plate_m2 <= 400.0
+    assert program.underground_plate_m2 > program.footprint_m2
 
 
 def test_the_footprint_holds_whichever_floor_is_hungriest():
-    # One plate for every storey, so it is at least what a residential floor
-    # needs and at least what a parking floor needs.
+    # One plate for every storey above grade, so it is at least what a
+    # residential floor needs, bays included - and the hole under it is the
+    # one plate that answers to the parcel instead.
     program = solve_program(column(), Lot(area_m2=650.0, frontage_m=18.0), ECONOMICS)
     assert program.solved
     assert program.footprint_m2 >= (
         program.unit_area_m2 / program.residential_floors - 1e-9
     )
-    if program.above_grade_parking_floors:
-        stall_area_m2 = ABOVE_GRADE_STALL_AREA_SQFT * M2_PER_SQFT
-        assert program.footprint_m2 >= (
-            program.above_grade_stalls
-            * stall_area_m2
-            / program.above_grade_parking_floors
-            - 1e-9
-        )
+    assert program.footprint_m2 >= program.garage_area_m2 - 1e-9
     if program.underground_levels:
         stall_area_m2 = UNDERGROUND_STALL_AREA_SQFT * M2_PER_SQFT
-        assert program.footprint_m2 >= (
+        assert program.underground_plate_m2 >= (
             program.underground_stalls * stall_area_m2 / program.underground_levels
             - 1e-9
         )
+        assert program.underground_plate_m2 <= 650.0 + 1e-9
 
 
 def test_no_parking_asks_the_envelope_question_on_its_own():
     program = solve_program(
-        column(density_max=None),
+        column(density_max=None, floors_max=5),
         Lot(area_m2=400.0, frontage_m=12.0),
         ECONOMICS,
         parking=NO_PARKING,
@@ -971,7 +1233,7 @@ def test_no_parking_asks_the_envelope_question_on_its_own():
     assert program.total_stalls == 0
     assert program.parking_cost_cad == 0.0
     assert program.underground_levels == 0
-    assert program.above_grade_parking_floors == 0
+    assert program.underground_plate_m2 == 0.0
     assert program.floors == program.residential_floors == 5
     assert program.units == {"1_bedroom": 25}
 
@@ -981,9 +1243,11 @@ def test_no_parking_asks_the_envelope_question_on_its_own():
     [
         {"stalls_per_dwelling": -0.5},
         {"underground_area_sqft": -1.0},
-        {"above_grade_cost_cad": -1.0},
+        {"underground_cost_cad": -1.0},
         {"amortization_months": 0},
         {"max_underground_levels": -1},
+        {"underground_lot_share": -0.1},
+        {"underground_lot_share": 1.5},
         {"surface_area_sqft": -1.0},
         {"surface_cost_cad": -1.0},
         {"max_surface_stalls": -1},
@@ -1009,34 +1273,33 @@ def test_a_parking_rule_that_cannot_be_priced_is_refused(overrides):
 
 
 def test_the_surface_stall_is_the_guides_third_montreal_midpoint():
-    # Read the same way as the two beside it: `surface_lot`'s mtl
-    # [3 960, 8 250], flagged `perStall`, from the Altus Group guide
-    # `urban_rag.estimator` ingests. Eight to ten times under either parkade,
-    # which is the whole reason a house can afford the stall it owes itself.
+    # Read the same way as the dug one: `surface_lot`'s mtl [3 960, 8 250],
+    # flagged `perStall`, from the Altus Group guide `urban_rag.estimator`
+    # ingests. Ten times under the parkade, which is the whole reason a house
+    # can afford the stall it owes itself.
     assert SURFACE_STALL_COST_CAD == pytest.approx((3_960 + 8_250) / 2)
     assert UNDERGROUND_STALL_COST_CAD / SURFACE_STALL_COST_CAD > 9.0
-    assert ABOVE_GRADE_STALL_COST_CAD / SURFACE_STALL_COST_CAD > 7.0
-    # The same rectangle and the same aisle as an above-grade stall. What
+    # The same rectangle and the same aisle as a bay in the ground floor. What
     # differs is that nothing is built over it.
-    assert SURFACE_STALL_AREA_SQFT == ABOVE_GRADE_STALL_AREA_SQFT
+    assert SURFACE_STALL_AREA_SQFT == GARAGE_STALL_AREA_SQFT
 
 
 def test_a_lot_with_a_yard_parks_on_it_rather_than_paying_for_structure():
-    # The envelope of `test_a_slack_envelope_parks_above_grade_where_it_is_
-    # cheaper`, with the yard put back. 70% of 2 000 m2 leaves 600 m2 of
-    # ground, twenty-one stalls' worth, so the six the twelve dwellings owe
-    # never touch a deck or an excavator - which is that test's answer changed
-    # by exactly the option this group is about.
+    # The envelope of `test_a_slack_envelope_with_no_yard_and_no_bays_digs_
+    # one_wide_level`, with the yard put back. 70% of 2 000 m2 leaves 600 m2
+    # of ground, twenty-one stalls' worth, so the six the twelve dwellings owe
+    # never touch an excavator - which is that test's answer changed by
+    # exactly the option this group is about.
     program = solve_program(
         column(max_dwellings=12, density_max=None),
         Lot(area_m2=2000.0, frontage_m=25.0),
         ECONOMICS,
+        parking=UNPAID,
     )
     assert program.total_dwellings == 12
     assert program.surface_stalls == 6
-    assert program.above_grade_stalls == 0
+    assert program.garage_stalls == 0
     assert program.underground_stalls == 0
-    assert program.above_grade_parking_floors == 0
     assert program.underground_levels == 0
     assert program.parking_cost_cad == pytest.approx(6 * SURFACE_STALL_COST_CAD)
     # Not a storey and not floor area: the building is dwellings all the way up.
@@ -1052,8 +1315,8 @@ def test_the_yard_runs_out_and_the_garage_takes_over():
     # 100 only permits the whole parcel to be covered, and the solver would
     # still choose a smaller plate and park on what is left. A minimum of 100
     # obliges it. With no yard the next-cheapest provision is the ground floor
-    # itself, so the twelve dwellings get bays rather than a deck - $15 450
-    # against $48 125, and no storey spent either way.
+    # itself, so the twelve dwellings get bays rather than a hole - $15 450
+    # against $60 300, and no storey spent either way.
     program = solve_program(
         column(
             max_dwellings=12,
@@ -1063,22 +1326,34 @@ def test_the_yard_runs_out_and_the_garage_takes_over():
         ),
         Lot(area_m2=2000.0, frontage_m=25.0),
         ECONOMICS,
+        parking=UNPAID,
     )
     assert program.total_dwellings == 12
     assert program.footprint_m2 == pytest.approx(2000.0)
     assert program.surface_stalls == 0
     assert program.garage_stalls == 6
-    assert program.above_grade_stalls == 0
     assert program.underground_stalls == 0
     # A garage is not a storey: the building is dwellings all the way up.
-    assert program.above_grade_parking_floors == 0
     assert program.floors == program.residential_floors
     assert program.parking_cost_cad == pytest.approx(6 * GARAGE_STALL_COST_CAD)
+    # But it is floor area, and the plate carries it: the bays are inside the
+    # gross beside the dwellings, and the stack says how much of the ground
+    # floor they are.
+    bay_m2 = GARAGE_STALL_AREA_SQFT * M2_PER_SQFT
+    assert program.garage_area_m2 == pytest.approx(6 * bay_m2, abs=0.01)
+    assert program.unit_area_m2 + program.garage_area_m2 <= (
+        program.gross_floor_area_m2 + 1e-6
+    )
+    housing = [entry for entry in floor_stack(program) if entry["use"] == "residential"]
+    assert len(housing) == 1
+    assert housing[0]["stalls"] == 6
+    assert housing[0]["parking_area_m2"] == pytest.approx(program.garage_area_m2, abs=0.01)
 
 
-def test_and_when_the_ground_floor_is_spoken_for_too_the_deck_takes_over():
+def test_and_when_the_ground_floor_is_spoken_for_too_the_hole_takes_over():
     # The last rung. Same envelope, same parcel, and both cheap provisions
-    # closed: what is left is the storey of stalls the module has always had.
+    # closed: what is left is under the parcel, and it costs the building no
+    # storey, no floor area and no footprint.
     program = solve_program(
         column(
             max_dwellings=12,
@@ -1093,8 +1368,13 @@ def test_and_when_the_ground_floor_is_spoken_for_too_the_deck_takes_over():
     assert program.total_dwellings == 12
     assert program.surface_stalls == 0
     assert program.garage_stalls == 0
-    assert program.above_grade_stalls == 6
-    assert program.above_grade_parking_floors == 1
+    assert program.underground_stalls == 6
+    assert program.underground_levels == 1
+    assert program.floors == program.residential_floors
+    assert program.footprint_m2 == pytest.approx(2000.0)
+    assert program.gross_floor_area_m2 == pytest.approx(
+        program.footprint_m2 * program.floors
+    )
 
 
 def test_the_yard_is_the_parcel_less_the_plate_and_nothing_else():
@@ -1152,11 +1432,10 @@ def test_the_garage_rate_is_derived_from_the_modules_own_build_rate():
         RESIDENTIAL_COST_PER_SQFT_CAD * GARAGE_SHELL_FRACTION * GARAGE_STALL_AREA_SQFT
     )
     # And where it sits is what decides the answers: dearer than asphalt, well
-    # under either structure.
+    # under the parkade.
     assert (
         SURFACE_STALL_COST_CAD
         < GARAGE_STALL_COST_CAD
-        < ABOVE_GRADE_STALL_COST_CAD
         < UNDERGROUND_STALL_COST_CAD
     )
 
@@ -1227,7 +1506,6 @@ def test_the_four_provisions_combine_to_meet_one_demand():
     kinds = [
         program.surface_stalls,
         program.garage_stalls,
-        program.above_grade_stalls,
         program.underground_stalls,
     ]
     assert sum(kinds) == program.total_stalls
@@ -1305,13 +1583,11 @@ def test_a_single_family_envelope_is_not_an_empty_one():
     assert program.height_m == pytest.approx(3.0)
 
     # The stall is on the ground, which on a 741 m2 parcel covered to 35% is
-    # the cheapest of the four and the one a house on a lot this size uses.
+    # the cheapest of the three and the one a house on a lot this size uses.
     assert program.surface_stalls == 1
     assert program.garage_stalls == 0
     assert program.underground_stalls == 0
-    assert program.above_grade_stalls == 0
     assert program.underground_levels == 0
-    assert program.above_grade_parking_floors == 0
     assert program.parking_cost_cad == pytest.approx(SURFACE_STALL_COST_CAD)
 
     # The plate stays inside both ceilings: *Taux d'implantation* on the
@@ -1344,19 +1620,19 @@ def test_the_same_house_puts_the_bay_indoors_when_the_yard_is_taken_away():
     assert program.garage_stalls == 1
     assert program.surface_stalls == 0
     assert program.underground_stalls == 0
-    assert program.above_grade_stalls == 0
     # Not a storey: still the single storey *En étage* allows.
     assert program.floors == 1
-    assert program.above_grade_parking_floors == 0
     # Floor area, though - the plate carries the dwelling and the bay both,
-    # and is bigger than the yard answer's by exactly one bay.
+    # so it is at least the yard answer's plus one bay. At least rather than
+    # exactly: nothing in the objective charges for the plate, so any plate
+    # between that and the coverage cap is equally optimal and which one
+    # CP-SAT returns is a tie - see `_binding_caps` on why the caps are read
+    # rather than the solution.
     # Compared at `AREA_SCALE`'s hundredth: the bay is 27.870912 m2 nominally
     # and 27.87 m2 as the solver reserved it.
     bay_m2 = GARAGE_STALL_AREA_SQFT * M2_PER_SQFT
     assert program.garage_area_m2 == pytest.approx(bay_m2, abs=0.01)
-    assert program.footprint_m2 == pytest.approx(
-        program.unit_area_m2 + program.garage_area_m2
-    )
+    assert program.footprint_m2 >= program.unit_area_m2 + program.garage_area_m2 - 1e-6
     assert program.gross_floor_area_m2 == pytest.approx(program.footprint_m2)
     # And both caps still hold.
     assert program.footprint_m2 <= 741.5225112438202 * 0.35 + 1e-9
@@ -1374,7 +1650,7 @@ def test_the_same_envelope_builds_nothing_with_only_the_structured_options():
     uses were simply missing from it.
     """
     program = solve_program(
-        H03_085, LOT_2166060, ECONOMICS, parking=STRUCTURED_ONLY
+        H03_085, LOT_2166060, ECONOMICS, parking=STRUCTURED_ONLY_UNPAID
     )
     assert program.status == "OPTIMAL"
     assert program.total_dwellings == 0
@@ -1383,6 +1659,120 @@ def test_the_same_envelope_builds_nothing_with_only_the_structured_options():
     # And it says so, rather than leaving a reader to read the zeros as a
     # zoning column that permits nothing.
     assert program.binding == ("nothing_pencils",)
+
+
+#: Zone H03-027 of the same borough, column 3, as `silver.lot_zoning_envelopes`
+#: holds it for the 2026-09-01 partition: ``H.4`` on *Tous les niveaux*, *En
+#: étage* 2/2, *Hauteur en mètre* 0/9, *Taux d'implantation* 35/60, *Nombre de
+#: logements maximal* 4, no *Densité*.
+H03_027 = ZoneColumn(
+    usages=("H.4",),
+    levels=frozenset({BuildingLevel.ALL}),
+    floors_min=2,
+    floors_max=2,
+    height_min_m=0.0,
+    height_max_m=9.0,
+    min_lot_width_m=None,
+    site_coverage_min_pct=35.0,
+    site_coverage_max_pct=60.0,
+    max_dwellings=4,
+    zone="H03-027",
+)
+
+#: Lot 3 791 023, from the same table: 233.07 m2 with 7.62 m on Bordeaux, the
+#: margins (3 m front, 1.5 m side, 3 m rear) leaving 187.30 m2 of which the
+#: largest rectangle is 174.13, and a yard that holds no stall 5.5 m clear -
+#: `parkable_area_m2` is 0.
+LOT_3791023 = Lot(
+    area_m2=233.06880574673414,
+    frontage_m=7.6199613070898105,
+    lot_number="3 791 023",
+    buildable_area_m2=187.30085875207664,
+    placeable_area_m2=174.13244392053713,
+    parkable_area_m2=0.0,
+)
+
+
+def test_a_two_storey_fourplex_parks_in_its_ground_floor_and_says_so():
+    """Lot 3 791 023: two bays in the ground floor of a two-storey four-plex.
+
+    The parcel is 7.6 m wide, so no stall stands on the yard, and H.4 with the
+    printed row caps it at four dwellings on two storeys. Four one-bedrooms
+    need 222.96 m2 and would fit on 111.48 m2 a floor; the two stalls they owe
+    go into the ground floor as bays, and the plate grows to the 60 %
+    coverage cap - 139.84 m2 - to hold them beside the dwellings. Nothing is
+    free about them: they cost $15 450 apiece, they are 55.74 m2 of the
+    *superficie de plancher*, and the plate under them is at *Taux
+    d'implantation*. What they do not do is displace a dwelling, because the
+    dwelling row was already the cap and the envelope had the room.
+
+    The stack says exactly that - one residential run of two levels whose
+    ``parking_area_m2`` is two bays - rather than two storeys of housing with
+    stalls attached and nothing to show where they went.
+    """
+    program = solve_program(H03_027, LOT_3791023, ECONOMICS)
+    assert program.status == "OPTIMAL"
+    assert program.total_dwellings == 4
+    assert program.floors == program.residential_floors == 2
+    assert program.surface_stalls == 0
+    assert program.underground_stalls == 0
+    assert program.garage_stalls == 2
+    bay_m2 = GARAGE_STALL_AREA_SQFT * M2_PER_SQFT
+    assert program.garage_area_m2 == pytest.approx(2 * bay_m2, abs=0.01)
+    assert program.parking_cost_cad == pytest.approx(2 * GARAGE_STALL_COST_CAD)
+    # The bays are floor area and under the plate: both caps see them.
+    assert program.footprint_m2 == pytest.approx(0.60 * LOT_3791023.area_m2, abs=0.01)
+    assert program.unit_area_m2 + program.garage_area_m2 <= (
+        program.gross_floor_area_m2 + 1e-6
+    )
+    assert program.density_floor_area_m2 == pytest.approx(program.gross_floor_area_m2)
+    assert {"site_coverage_max", "surface_parking_shape"} <= set(program.binding)
+    # And the stack shows the garage in the ground floor of the housing run.
+    stack = floor_stack(program)
+    assert len(stack) == 1
+    (housing,) = stack
+    assert housing["use"] == "residential"
+    assert (housing["from_level"], housing["to_level"]) == (1, 2)
+    assert housing["stalls"] == 2
+    assert housing["parking_area_m2"] == pytest.approx(program.garage_area_m2, abs=0.01)
+    assert housing["dwellings"] == 4
+
+
+def test_the_same_fourplex_digs_under_the_parcel_when_the_bays_are_closed():
+    """The next rung on the same parcel, and why the hole is the parcel's.
+
+    With the ground floor kept whole the two stalls go under the lot: 74.32 m2
+    of hole in one level, which is a plate of its own and not the building's
+    - it is bounded by the 233 m2 parcel, and would be even if the footprint
+    were smaller than the stalls need. Dearer by $89 700, so the bays are the
+    answer and this is the alternative the model priced and declined.
+    """
+    dug = solve_program(H03_027, LOT_3791023, ECONOMICS, parking=ParkingRules(max_garage_stalls=0))
+    bays = solve_program(H03_027, LOT_3791023, ECONOMICS)
+    assert dug.status == "OPTIMAL"
+    assert dug.total_dwellings == 4
+    assert dug.garage_stalls == 0
+    assert dug.surface_stalls == 0
+    assert dug.underground_stalls == 2
+    assert dug.underground_levels == 1
+    stall_m2 = UNDERGROUND_STALL_AREA_SQFT * M2_PER_SQFT
+    assert dug.underground_area_m2 == pytest.approx(2 * stall_m2, abs=0.01)
+    assert dug.underground_plate_m2 == pytest.approx(2 * stall_m2, abs=0.01)
+    assert dug.underground_plate_m2 <= LOT_3791023.area_m2
+    # Neither floor area nor footprint nor a storey.
+    assert dug.floors == 2
+    assert dug.gross_floor_area_m2 == pytest.approx(dug.footprint_m2 * 2)
+    assert dug.density_floor_area_m2 == pytest.approx(dug.gross_floor_area_m2)
+    assert dug.parking_cost_cad == pytest.approx(2 * UNDERGROUND_STALL_COST_CAD)
+    assert bays.npv_cad > dug.npv_cad
+    # The stack puts the hole under the housing, at its own plate.
+    stack = floor_stack(dug)
+    assert [entry["use"] for entry in stack] == ["parking", "residential"]
+    assert stack[0]["position"] == "below_grade"
+    assert stack[0]["floor_plate_m2"] == pytest.approx(dug.underground_plate_m2, abs=0.01)
+    assert stack[0]["parking_area_m2"] == pytest.approx(dug.underground_area_m2, abs=0.01)
+    assert stack[1]["stalls"] == 0
+    assert stack[1]["parking_area_m2"] == 0.0
 
 
 def test_an_optimal_solve_that_builds_nothing_says_so():
@@ -1439,21 +1829,21 @@ def test_the_stalls_are_charged_on_the_same_footing_as_the_dwellings():
         column(max_dwellings=1, density_max=None),
         Lot(area_m2=5000.0, frontage_m=40.0),
         ECONOMICS,
-        parking=STRUCTURED_ONLY,
+        parking=STRUCTURED_ONLY_UNPAID,
         investment=UNDISCOUNTED,
     )
-    assert program.above_grade_stalls == 1
+    assert program.underground_stalls == 1
     dwelling = round((1700 * 0.995 - 1200 * 257.5 / 300) * MONEY_SCALE) / MONEY_SCALE
     stall = (
-        round(ABOVE_GRADE_STALL_COST_CAD / AMORTIZATION_MONTHS * MONEY_SCALE)
+        round(UNDERGROUND_STALL_COST_CAD / AMORTIZATION_MONTHS * MONEY_SCALE)
         / MONEY_SCALE
     )
     assert program.net_operating_income == pytest.approx(dwelling - stall)
     # The capital figures are reported unamortised, and separately.
-    assert program.parking_cost_cad == pytest.approx(ABOVE_GRADE_STALL_COST_CAD)
+    assert program.parking_cost_cad == pytest.approx(UNDERGROUND_STALL_COST_CAD)
     assert program.construction_cost_cad == pytest.approx(1200 * 257.5)
     assert program.total_capital_cost_cad == pytest.approx(
-        1200 * 257.5 + ABOVE_GRADE_STALL_COST_CAD
+        1200 * 257.5 + UNDERGROUND_STALL_COST_CAD
     )
 
 
@@ -1805,9 +2195,71 @@ def test_the_commercial_floors_are_priced_and_rented_by_the_square_foot():
         for unit_type, quantity in program.units.items()
     )
     assert program.gross_revenue_cad == pytest.approx(commercial_rent + dwelling_rent)
+    # And the same two numbers are reported apart, cellar included on each, so
+    # a reader downstream can weight the building by what earns it.
+    assert program.commercial_gross_revenue_cad == pytest.approx(commercial_rent)
+    assert program.residential_gross_revenue_cad == pytest.approx(dwelling_rent)
+    assert program.industrial_gross_revenue_cad == 0.0
     assert program.total_capital_cost_cad == pytest.approx(
         program.construction_cost_cad + program.commercial_cost_cad
     )
+
+
+def test_the_income_split_adds_back_to_the_gross_and_is_not_the_floor_split():
+    """A mixed building's rent is not divided the way its floor is - which is
+    the whole reason the split is carried rather than derived downstream.
+
+    The zone is the shape a Montreal high street actually prints: housing on
+    *Tous sauf le RDC*, commerce on the *Rez-de-chaussee* it is kept off. So
+    the answer is shops at grade under flats, and the storey at grade is a
+    sixth of the floor and much more than a sixth of the rent.
+    """
+    housing = column(
+        usages=("H",), levels=frozenset({BuildingLevel.ALL_EXCEPT_GROUND})
+    )
+    commerce = column(
+        usages=("C.2",), levels=frozenset({BuildingLevel.GROUND})
+    )
+    program = solve_program(
+        ZoneEnvelope(residential=housing, commercial=commerce),
+        Lot(area_m2=400.0, frontage_m=12.0),
+        ECONOMICS,
+        parking=NO_PARKING,
+        investment=UNDISCOUNTED,
+    )
+    assert program.commercial_floors == 1
+    assert program.residential_floors > 1
+    parts = (
+        program.residential_gross_revenue_cad,
+        program.commercial_gross_revenue_cad,
+        program.industrial_gross_revenue_cad,
+    )
+    assert min(parts) >= 0.0
+    assert sum(parts) == pytest.approx(program.gross_revenue_cad)
+    assert program.non_residential_gross_revenue_cad == pytest.approx(
+        program.commercial_gross_revenue_cad
+    )
+    assert program.non_residential_income_share == pytest.approx(
+        program.commercial_gross_revenue_cad / program.gross_revenue_cad
+    )
+    # The one storey of commerce earns a larger share of the rent than it
+    # holds of the floor, because a square foot of it is worth several of a
+    # dwelling's. This is the whole reason a downstream weighting cannot be
+    # read off the area columns.
+    by_floor = program.non_residential_area_m2 / program.density_floor_area_m2
+    assert program.non_residential_income_share > by_floor
+
+
+def test_a_program_that_earns_nothing_has_no_income_share():
+    """Zero over zero is not a share; a building the solver declined is not
+    an all-residential one."""
+    program = solve_program(
+        ZoneColumn(usages=("H.1",), floors_max=0),
+        Lot(area_m2=400.0, frontage_m=12.0),
+        ECONOMICS,
+    )
+    assert program.gross_revenue_cad == 0.0
+    assert program.non_residential_income_share == 0.0
 
 
 def test_the_industrial_floors_are_priced_the_same_way():
@@ -1869,17 +2321,22 @@ def test_the_storey_ceiling_is_shared_with_the_dwellings():
 
 
 def test_the_level_rows_bound_the_commerce_as_they_bound_the_dwellings():
-    # "Tous sauf le RDC" on a six-storey column allows five, and the rows are
-    # the column's rather than any one usage's - so the six-storey stack of
-    # the tests above cannot be built by anything the column authorises.
+    # *RDC* and *Immediatement superieur au RDC* on a six-storey column allow
+    # two storeys, and the rows are the column's rather than any one usage's -
+    # so the six-storey stack of the tests above cannot be built by anything
+    # the column authorises, and the two it can build are two between the
+    # usages rather than two apiece.
     program = solve_program(
-        column(usages=("H.2", "C.2")),
+        column(
+            usages=("H.2", "C.2"),
+            levels=frozenset({BuildingLevel.GROUND, BuildingLevel.SECOND}),
+        ),
         Lot(area_m2=400.0, frontage_m=12.0),
         ECONOMICS,
         parking=NO_PARKING,
     )
-    assert program.floors == 5
-    assert program.commercial_floors == 5
+    assert program.floors == 2
+    assert program.commercial_floors == 2
     assert program.residential_floors == 0
 
 
@@ -2056,7 +2513,6 @@ def test_no_parking_owes_nothing_on_a_column_that_authorises_commerce():
         parking=NO_PARKING,
     )
     assert program.total_stalls == 0
-    assert program.above_grade_parking_floors == 0
     assert program.underground_levels == 0
 
 
@@ -2075,15 +2531,16 @@ def test_the_stalls_the_commerce_owes_cost_it_something():
 
 
 def test_the_commerce_digs_rather_than_spend_the_density_cap_on_its_parking():
-    # Three stalls per thousand square feet against a stall's own 300 is very
-    # nearly a parking plate for every retail plate, and an above-grade plate
-    # is floor area *Densite* counts while an underground one is not - article
-    # 38 1°. So the stalls a retail storey owes go under the building.
-    # Three storeys, so the stalls the retail owes stay inside what six
-    # underground levels can hold: 3 x 280 m2 is 9 042 sq ft and 28 stalls
-    # against a capacity of 45. Asked for more commerce than the digging can
-    # serve the answer is a mix of both, which is a different question - this
-    # one is about which the solver reaches for first.
+    # Three stalls per thousand square feet is very nearly a parking plate for
+    # every retail plate, and a bay is floor area *Densite* counts while a dug
+    # stall is not - article 38 1°. A pure commerce column has no residential
+    # ground floor to bay into in any case, so the stalls a retail storey owes
+    # go under the parcel. Three storeys, so the stalls the retail owes stay
+    # inside what six levels of the 400 m2 parcel can hold: 3 x 280 m2 is
+    # 9 042 sq ft and 28 stalls against a capacity of 64. Asked for more
+    # commerce than the digging can serve the answer is a mix of both, which
+    # is a different question - this one is about which the solver reaches
+    # for first.
     program = solve_program(
         mixed("C.2", floors_max=3),
         Lot(area_m2=400.0, frontage_m=12.0),
@@ -2092,8 +2549,8 @@ def test_the_commerce_digs_rather_than_spend_the_density_cap_on_its_parking():
     )
     assert program.commercial_floors == 3
     assert program.underground_stalls > 0
-    assert program.above_grade_stalls == 0
-    assert program.above_grade_parking_floors == 0
+    assert program.garage_stalls == 0
+    assert program.underground_plate_m2 <= 400.0 + 1e-9
 
 
 def test_parking_is_required_by_either_ratio_alone():
@@ -2119,16 +2576,15 @@ def test_the_stall_ratios_are_the_ones_the_docstring_quotes():
 # *En etage* counts storeys and *Hauteur en metre* measures them, so a grid
 # printing both states two ceilings on one stack. The heights are stated
 # assumptions rather than norms - 3 m a dwelling storey, 4 m a commercial or
-# industrial one, 3 m an above-grade deck, nothing at all below grade - which
-# is why every number below is arrived at by multiplying one of them by a
-# storey count the test also asserts.
+# industrial one, nothing at all below grade - which is why every number below
+# is arrived at by multiplying one of them by a storey count the test also
+# asserts.
 
 
 def test_the_storey_heights_are_the_ones_the_module_was_specified_with():
     assert RESIDENTIAL_STOREY_HEIGHT_M == 3.0
     assert COMMERCIAL_STOREY_HEIGHT_M == 4.0
     assert INDUSTRIAL_STOREY_HEIGHT_M == 4.0
-    assert ABOVE_GRADE_PARKING_STOREY_HEIGHT_M == 3.0
     assert UNDERGROUND_LEVEL_HEIGHT_M == 0.0
     assert DEFAULT_STOREY_HEIGHTS.residential_m == RESIDENTIAL_STOREY_HEIGHT_M
     assert DEFAULT_STOREY_HEIGHTS.commercial_m == COMMERCIAL_STOREY_HEIGHT_M
@@ -2138,7 +2594,9 @@ def test_a_column_printing_no_metric_cap_is_unchanged_by_one():
     # The row is optional like every other, and a grid printing "-" for it must
     # give back exactly the answer this module gave before the row existed.
     lot = Lot(area_m2=400.0, frontage_m=12.0)
-    program = solve_program(column(), lot, ECONOMICS, parking=NO_PARKING)
+    program = solve_program(
+        column(floors_max=5), lot, ECONOMICS, parking=NO_PARKING
+    )
     assert program.residential_floors == 5
     assert program.units == {"1_bedroom": 25}
     assert "height_max" not in program.binding
@@ -2168,7 +2626,7 @@ def test_the_slacker_of_the_two_ceilings_is_not_the_one_that_binds():
     # metric cap is not what stopped the building and does not claim to be.
     lot = Lot(area_m2=400.0, frontage_m=12.0)
     program = solve_program(
-        column(height_max_m=18.0), lot, ECONOMICS, parking=NO_PARKING
+        column(height_max_m=18.0, floors_max=5), lot, ECONOMICS, parking=NO_PARKING
     )
     assert program.residential_floors == 5
     assert program.units == {"1_bedroom": 25}
@@ -2221,24 +2679,7 @@ def test_an_underground_level_stands_no_metres():
     )
     assert program.underground_levels >= 1
     assert program.underground_area_m2 > 0.0
-    assert program.above_grade_parking_floors == 0
     assert program.height_m == pytest.approx(3.0 * program.residential_floors)
-
-
-def test_an_above_grade_deck_is_measured_and_a_dug_one_is_not():
-    # The same lot with the excavator taken away: the stalls go on a storey of
-    # their own, and that storey is three metres of the building's height where
-    # the levels dug beside it were none.
-    program = solve_program(
-        column(density_max=2.0),
-        Lot(area_m2=400.0, frontage_m=12.0),
-        ECONOMICS,
-        parking=ParkingRules(
-            max_underground_levels=0, max_surface_stalls=0, max_garage_stalls=0
-        ),
-    )
-    assert program.above_grade_parking_floors == 1
-    assert program.underground_levels == 0
     assert program.height_m == pytest.approx(3.0 * program.floors)
 
 
@@ -2252,7 +2693,6 @@ def test_the_reported_height_is_the_storey_split_priced():
     assert program.height_m == pytest.approx(
         DEFAULT_STOREY_HEIGHTS.height_m(
             residential=program.residential_floors,
-            above_grade_parking=program.above_grade_parking_floors,
             commercial=program.commercial_floors,
             industrial=program.industrial_floors,
         )
@@ -2318,7 +2758,7 @@ def test_a_metric_minimum_no_permitted_stack_reaches_is_infeasible():
 def test_a_metric_minimum_the_envelope_can_reach_is_met():
     # A minimum is a floor, so a building exactly as tall as one meets it.
     program = solve_program(
-        column(height_min_m=15.0),
+        column(height_min_m=15.0, floors_max=5),
         Lot(area_m2=400.0, frontage_m=12.0),
         ECONOMICS,
         parking=NO_PARKING,
@@ -2334,7 +2774,6 @@ def test_a_metric_minimum_the_envelope_can_reach_is_met():
         {"residential_m": 0.0},
         {"commercial_m": -3.0},
         {"industrial_m": 0.0},
-        {"above_grade_parking_m": 0.0},
     ],
 )
 def test_a_storey_of_no_height_is_refused(overrides):
@@ -2859,9 +3298,9 @@ def test_a_program_that_builds_nothing_reports_no_storeys_and_no_levels():
     assert program.commercial_floors == 0
     assert program.industrial_floors == 0
     assert program.residential_floors == 0
-    assert program.above_grade_parking_floors == 0
     assert program.basement_levels == 0
     assert program.underground_levels == 0
+    assert program.underground_stalls == 0
     # And the stack of a building that is not there is empty.
     assert floor_stack(program) == []
 
@@ -3151,34 +3590,38 @@ STACK_KEYS = {
     "storey_height_m",
     "height_m",
     "stalls",
+    "parking_area_m2",
     "dwellings",
     "units",
 }
 
 
 def mixed_program(**overrides) -> DevelopmentProgram:
-    """Two dug levels, retail at grade, a workshop, a deck and five of housing.
+    """Two dug levels, retail at grade, a workshop, five of housing with two
+    bays in its ground floor.
 
-    Written out rather than solved: no envelope produces all four above-grade
+    Written out rather than solved: no envelope produces all three above-grade
     uses at once, and the point of the fixture is to have every branch of the
-    stack present in one answer.
+    stack present in one answer. The hole is 260.13 m2 of stalls over two
+    levels - a 130.06 m2 plate, which is not the building's 200.
     """
     base = {
         "units": {"1_bedroom": 8, "2_bedroom": 4},
-        "floors": 9,
+        "floors": 7,
         "footprint_m2": 200.0,
-        "gross_floor_area_m2": 1800.0,
-        "unit_area_m2": 900.0,
+        "gross_floor_area_m2": 1400.0,
+        "unit_area_m2": 844.26,
         "net_operating_income": 0.0,
         "status": "OPTIMAL",
         "residential_floors": 5,
         "commercial_floors": 1,
         "industrial_floors": 1,
-        "above_grade_parking_floors": 2,
         "underground_levels": 2,
         "underground_stalls": 7,
-        "above_grade_stalls": 5,
-        "underground_area_m2": 400.0,
+        "underground_area_m2": 260.13,
+        "underground_plate_m2": 130.065,
+        "garage_stalls": 2,
+        "garage_area_m2": 55.74,
         "commercial_area_m2": 200.0,
         "industrial_area_m2": 200.0,
     }
@@ -3193,11 +3636,12 @@ def test_a_run_of_identical_storeys_is_one_entry():
             residential_floors=5,
             commercial_floors=0,
             industrial_floors=0,
-            above_grade_parking_floors=0,
             underground_levels=0,
             underground_stalls=0,
-            above_grade_stalls=0,
             underground_area_m2=0.0,
+            underground_plate_m2=0.0,
+            garage_stalls=0,
+            garage_area_m2=0.0,
             commercial_area_m2=0.0,
             industrial_area_m2=0.0,
             gross_floor_area_m2=1000.0,
@@ -3218,15 +3662,13 @@ def test_the_uses_stack_in_the_stated_order():
         "parking",
         "commercial",
         "industrial",
-        "parking",
         "residential",
     ]
     assert [(entry["from_level"], entry["to_level"]) for entry in stack] == [
         (-2, -1),
         (1, 1),
         (2, 2),
-        (3, 4),
-        (5, 9),
+        (3, 7),
     ]
     above = [entry["use"] for entry in stack if entry["position"] == "above_grade"]
     assert above == list(FLOOR_STACK_ORDER)
@@ -3243,6 +3685,11 @@ def test_the_dug_levels_are_numbered_below_grade_and_are_not_floor_area():
     assert dug["storey_height_m"] == UNDERGROUND_LEVEL_HEIGHT_M
     assert dug["height_m"] == 0.0
     assert all(entry["counts_as_floor_area"] for entry in stack[1:])
+    # And it is dug at its own plate - the parcel's, not the building's 200.
+    assert dug["floor_plate_m2"] == pytest.approx(130.07, abs=0.01)
+    assert dug["floor_area_m2"] == pytest.approx(260.13, abs=0.01)
+    assert dug["parking_area_m2"] == pytest.approx(260.13, abs=0.01)
+    assert all(entry["floor_plate_m2"] == pytest.approx(200.0) for entry in stack[1:])
 
 
 def test_the_stalls_are_reported_where_they_were_put():
@@ -3252,9 +3699,18 @@ def test_the_stalls_are_reported_where_they_were_put():
         for entry in stack
         if entry["use"] == "parking"
     }
-    assert parked == {"below_grade": 7, "above_grade": 5}
-    assert sum(entry["stalls"] for entry in stack) == 12
-    assert all(entry["stalls"] == 0 for entry in stack if entry["use"] != "parking")
+    assert parked == {"below_grade": 7}
+    # The bays ride on the housing, in its ground floor, and say how much of
+    # that floor they are; the shop and the workshop park nothing.
+    housing = next(entry for entry in stack if entry["use"] == "residential")
+    assert housing["stalls"] == 2
+    assert housing["parking_area_m2"] == pytest.approx(55.74)
+    assert sum(entry["stalls"] for entry in stack) == 9
+    assert all(
+        entry["stalls"] == 0 and entry["parking_area_m2"] == 0.0
+        for entry in stack
+        if entry["use"] in ("commercial", "industrial")
+    )
 
 
 def test_the_mix_sits_on_the_residential_run_whole():
@@ -3281,7 +3737,6 @@ def test_each_run_is_priced_at_its_own_storey_height():
     expected = {
         ("commercial", "above_grade"): COMMERCIAL_STOREY_HEIGHT_M,
         ("industrial", "above_grade"): INDUSTRIAL_STOREY_HEIGHT_M,
-        ("parking", "above_grade"): ABOVE_GRADE_PARKING_STOREY_HEIGHT_M,
         ("residential", "above_grade"): RESIDENTIAL_STOREY_HEIGHT_M,
         ("parking", "below_grade"): UNDERGROUND_LEVEL_HEIGHT_M,
     }
@@ -3308,10 +3763,10 @@ def test_a_program_with_nothing_built_has_no_stack():
             residential_floors=0,
             commercial_floors=0,
             industrial_floors=0,
-            above_grade_parking_floors=0,
             underground_levels=0,
             gross_floor_area_m2=0.0,
             underground_area_m2=0.0,
+            underground_plate_m2=0.0,
         )
     )
     assert empty == []
@@ -3360,13 +3815,22 @@ def test_the_stack_reconciles_with_the_columns_beside_it():
     # rather than a storey of their own. `total_stalls` is larger by exactly
     # the stalls that are outdoors.
     assert sum(entry["stalls"] for entry in stack) == (
-        solved.underground_stalls
-        + solved.above_grade_stalls
-        + solved.garage_stalls
+        solved.underground_stalls + solved.garage_stalls
     )
     assert solved.total_stalls == (
         sum(entry["stalls"] for entry in stack) + solved.surface_stalls
     )
+    assert sum(entry["parking_area_m2"] for entry in stack) == pytest.approx(
+        solved.underground_area_m2 + solved.garage_area_m2, abs=0.05
+    )
+    # The dug run is at the hole's own plate; every storey is at the building's.
+    for entry in stack:
+        if entry["use"] == "parking":
+            assert entry["floor_plate_m2"] == pytest.approx(
+                solved.underground_plate_m2, abs=0.01
+            )
+        else:
+            assert entry["floor_plate_m2"] == pytest.approx(solved.footprint_m2, abs=0.01)
     assert sum(entry["dwellings"] for entry in stack) == solved.total_dwellings
 
 
@@ -3430,9 +3894,7 @@ def test_a_parcel_that_holds_no_parking_puts_the_stalls_in_structure():
     assert program.solved
     assert program.surface_stalls == 0
     assert program.total_stalls == 2 * program.total_dwellings
-    assert program.total_stalls == (
-        program.underground_stalls + program.above_grade_stalls + program.garage_stalls
-    )
+    assert program.total_stalls == program.underground_stalls + program.garage_stalls
 
 
 def test_the_yard_shape_is_reported_as_the_binding_cap():
@@ -3507,6 +3969,107 @@ def test_a_negative_parkable_area_is_refused(parkable):
 
 
 # --------------------------------------------------------------------------
+# the hole is the parcel's, not the plate's
+# --------------------------------------------------------------------------
+#
+# `underground_area` used to be `footprint x underground_levels` - the parkade
+# confined to the building above it - so a tight plate dug deep or not at all.
+# Article 43 of 01-283 excludes a fully buried level from the site coverage,
+# so the plate of a dug level is now `underground_lot_share` of the parcel and
+# nothing about the building. These are what that changes.
+
+
+def _dig_only_program(lot, **rules):
+    """Five dwellings owing ten stalls on a forced 20 % plate, dig only.
+
+    *Taux d'implantation* 20/20 pins the plate at a fifth of a 500 m2 parcel
+    and five storeys of it hold 500 m2 of dwellings: three two-bedrooms and
+    two three-bedrooms net the most a month once each carries two stalls of
+    $201 a month, and a sixth dwelling would have to be a smaller one that
+    nets less than the mix it displaces. Ten stalls of 37.16 m2 are 371.6 m2
+    of hole, and the yard and the bays are closed, so where the hole goes is
+    the whole question. Undiscounted and unpaid so the answer is about the
+    geometry.
+    """
+    return solve_program(
+        column(
+            floors_max=5,
+            max_dwellings=6,
+            density_max=None,
+            site_coverage_min_pct=20.0,
+            site_coverage_max_pct=20.0,
+        ),
+        lot,
+        ECONOMICS,
+        parking=ParkingRules(
+            stalls_per_dwelling=2.0,
+            max_surface_stalls=0,
+            max_garage_stalls=0,
+            monthly_rent_cad=0.0,
+            absorption_saving_months=0.0,
+            **rules,
+        ),
+        investment=UNDISCOUNTED,
+    )
+
+
+def test_the_hole_is_rationed_by_the_parcel_and_not_by_the_plate():
+    """One wide level under the yard, not four deep ones under the building."""
+    program = _dig_only_program(Lot(area_m2=500.0, frontage_m=20.0))
+    assert program.solved
+    assert program.total_dwellings == 5
+    assert program.units == {"2_bedroom": 3, "3_bedroom_plus": 2}
+    assert program.underground_stalls == 10
+    assert program.footprint_m2 == pytest.approx(100.0)
+    stall_m2 = UNDERGROUND_STALL_AREA_SQFT * M2_PER_SQFT
+    # 371.6 m2 of stalls fit in one level of a 500 m2 parcel; at the 100 m2
+    # plate they would have taken four.
+    assert program.underground_levels == 1
+    assert program.underground_area_m2 == pytest.approx(10 * stall_m2, abs=0.05)
+    assert program.underground_plate_m2 == pytest.approx(program.underground_area_m2)
+    assert program.underground_plate_m2 > program.footprint_m2
+    assert program.underground_plate_m2 <= 500.0
+    # And none of it is floor area, footprint or a storey.
+    assert program.gross_floor_area_m2 == pytest.approx(
+        program.footprint_m2 * program.floors
+    )
+    assert program.density_floor_area_m2 == pytest.approx(program.gross_floor_area_m2)
+
+
+def test_underground_lot_share_narrows_the_hole():
+    """A quarter of the parcel is 125 m2 a level, so the same stalls dig three."""
+    program = _dig_only_program(
+        Lot(area_m2=500.0, frontage_m=20.0), underground_lot_share=0.25
+    )
+    assert program.solved
+    assert program.total_dwellings == 5
+    assert program.underground_stalls == 10
+    assert program.underground_levels == 3
+    assert program.underground_plate_m2 <= 125.0 + 1e-9
+    assert program.underground_plate_m2 == pytest.approx(
+        program.underground_area_m2 / 3, abs=0.01
+    )
+    # Nothing above grade moved for it: the levels are free of every cap.
+    assert program.floors == 5
+    assert program.footprint_m2 == pytest.approx(100.0)
+    # Recorded, like every stated assumption.
+    assert ParkingRules(underground_lot_share=0.25).underground_lot_share == 0.25
+
+
+def test_a_share_of_nothing_forbids_digging():
+    """0 is the counterpart of `max_underground_levels=0`: with the yard and
+    the bays closed too there is nowhere for a stall, and nothing pencils."""
+    program = _dig_only_program(
+        Lot(area_m2=500.0, frontage_m=20.0), underground_lot_share=0.0
+    )
+    assert program.solved
+    assert program.total_dwellings == 0
+    assert program.underground_stalls == 0
+    assert program.underground_levels == 0
+    assert program.binding == ("nothing_pencils",)
+
+
+# --------------------------------------------------------------------------
 # a footprint has a shape too, and it is what the yard is left over from
 # --------------------------------------------------------------------------
 #
@@ -3521,6 +4084,7 @@ def _placement_column(**overrides):
     """Coverage wide open, so the placement cap is the only thing in the way."""
     return column(
         **{
+            "floors_max": 5,
             "max_dwellings": 40,
             "density_max": None,
             "site_coverage_min_pct": None,
@@ -3737,3 +4301,283 @@ def test_a_placement_cap_below_the_coverage_minimum_is_infeasible():
 def test_a_negative_placeable_area_is_refused(placeable):
     with pytest.raises(ProgramError, match="placeable area must not be negative"):
         Lot(area_m2=300.0, frontage_m=12.0, placeable_area_m2=placeable)
+
+
+# -- the parking waived --------------------------------------------------------
+
+#: No yard, no bay, no dig: every provision closed.
+NOWHERE_TO_PARK = ParkingRules(
+    max_surface_stalls=0, max_garage_stalls=0, max_underground_levels=0
+)
+
+
+def shop_column(**overrides) -> ZoneColumn:
+    """A one-storey retail column whose coverage minimum forces a plate.
+
+    The forced plate owes stalls by area, so under `NOWHERE_TO_PARK` the model
+    has floor it must build and stalls it cannot put anywhere. A residential
+    column cannot be made infeasible this way: nothing forces a dwelling onto
+    a plate, so the solver leaves it empty and owes nothing.
+    """
+    return column(
+        usages=("C.2",),
+        levels=frozenset({BuildingLevel.ALL}),
+        floors_min=1,
+        floors_max=1,
+        density_max=None,
+        **overrides,
+    )
+
+
+def test_stalls_with_nowhere_to_go_are_infeasible_unless_waived():
+    lot = Lot(area_m2=400.0, frontage_m=12.0)
+    refused = solve_program(shop_column(), lot, ECONOMICS, parking=NOWHERE_TO_PARK)
+    assert refused.status == "INFEASIBLE"
+    assert refused.binding == ()
+    assert not refused.parking_waived
+
+    waived = solve_program(
+        shop_column(),
+        lot,
+        ECONOMICS,
+        parking=NOWHERE_TO_PARK,
+        waive_parking_if_empty=True,
+    )
+    assert waived.solved
+    assert waived.parking_waived
+    assert waived.total_stalls == 0
+    assert waived.parking_cost_cad == 0.0
+    # The plate the coverage minimum demanded, and the stalls it owes at the
+    # ratios that were waived - counted on the whole floor, cellar included,
+    # because that is what the demand constraint read.
+    assert waived.commercial_area_m2 >= 200.0 - 1e-9
+    owed = NOWHERE_TO_PARK.stalls_owed(
+        dwellings=0,
+        non_residential_area_sqft=(
+            waived.commercial_area_sqft + waived.basement_commercial_area_sqft
+        ),
+    )
+    assert owed > 0
+    assert waived.waived_stalls == owed
+
+
+def test_a_printed_contradiction_is_never_waived():
+    """*Densite min* above what the storeys can reach is not a parking problem,
+    and taking the parking away must not make it look solved."""
+    program = solve_program(
+        column(density_min=50.0, density_max=50.0),
+        Lot(area_m2=400.0, frontage_m=12.0),
+        ECONOMICS,
+        waive_parking_if_empty=True,
+    )
+    assert program.status == "INFEASIBLE"
+    assert not program.parking_waived
+    assert program.waived_stalls == 0
+
+
+def test_a_feasible_program_is_untouched_by_the_waiver():
+    lot = Lot(area_m2=400.0, frontage_m=12.0)
+    plain = solve_program(column(), lot, ECONOMICS)
+    asked = solve_program(column(), lot, ECONOMICS, waive_parking_if_empty=True)
+    assert asked.solved
+    assert not asked.parking_waived
+    assert asked.waived_stalls == 0
+    assert asked.total_stalls > 0
+    assert asked.npv_cad == pytest.approx(plain.npv_cad)
+
+
+def test_stalls_owed_is_the_demand_constraint_read_back():
+    rules = ParkingRules(stalls_per_dwelling=0.5, stalls_per_1000_sqft=3.0)
+    # Rounded up once over both demands: 1.5 + 0 is 2, and 0.5 + 3 is 4
+    # rather than 1 + 3.
+    assert rules.stalls_owed(dwellings=3, non_residential_area_sqft=0.0) == 2
+    assert rules.stalls_owed(dwellings=1, non_residential_area_sqft=1000.0) == 4
+    assert rules.stalls_owed(dwellings=0, non_residential_area_sqft=0.0) == 0
+    # The waived rules owe nothing and keep the price list, the rent and the
+    # market ceiling - so a stall that fits and pays is still built under
+    # them - while `NO_PARKING` keeps nothing and parks nothing.
+    assert not rules.waived.required
+    assert rules.waived.parks
+    assert rules.waived.underground_cost_cad == rules.underground_cost_cad
+    assert rules.waived.max_surface_stalls == rules.max_surface_stalls
+    assert not NO_PARKING.parks
+
+
+# -- what a stall earns --------------------------------------------------------
+
+#: The programs asset's own timing: eighteen months to build and six to fill,
+#: which is what makes the absorption term non-zero - it is a saving on the
+#: lease-up, and the module defaults have none to save.
+LEASED_UP = InvestmentAssumptions(construction_months=18, lease_up_months=6)
+
+
+def test_a_rented_stall_is_worth_its_rent():
+    """The lot of `test_a_lot_with_a_yard_parks_on_it_rather_than_paying_for_
+    structure`, with the stall earning: the owed six are a floor, and the
+    yard takes six more because a surface stall pays for itself and the
+    twelve dwellings would rent one apiece."""
+    lot = Lot(area_m2=2000.0, frontage_m=25.0)
+    unpaid = solve_program(
+        column(max_dwellings=12, density_max=None), lot, ECONOMICS, parking=UNPAID
+    )
+    paid = solve_program(column(max_dwellings=12, density_max=None), lot, ECONOMICS)
+    assert unpaid.total_stalls == 6
+    assert unpaid.rented_stalls == 0
+    assert unpaid.parking_gross_revenue_cad == 0.0
+    # One a dwelling is the market ceiling, and it is reached on the yard.
+    assert paid.total_dwellings == 12
+    assert paid.total_stalls == 12
+    assert paid.surface_stalls == 12
+    assert paid.rented_stalls == 12
+    assert paid.parking_gross_revenue_cad == pytest.approx(12 * 120.0 * 0.85)
+    # Inside the gross, beside the three family lines rather than in them.
+    assert paid.gross_revenue_cad == pytest.approx(
+        paid.residential_gross_revenue_cad
+        + paid.commercial_gross_revenue_cad
+        + paid.industrial_gross_revenue_cad
+        + paid.parking_gross_revenue_cad
+    )
+    assert paid.residential_gross_revenue_cad == pytest.approx(
+        unpaid.residential_gross_revenue_cad
+    )
+    assert paid.npv_cad > unpaid.npv_cad
+    assert paid.parking_cost_cad == pytest.approx(12 * SURFACE_STALL_COST_CAD)
+
+
+def test_the_market_ceiling_keeps_the_yard_from_being_paved():
+    # Rents too low to build a dwelling: no tenant, and therefore no stall,
+    # however cheap the yard - a parking lot is not a program.
+    program = solve_program(
+        column(),
+        Lot(area_m2=650.0, frontage_m=18.0),
+        UnitEconomics(average_rent_cad={"1_bedroom": 50.0}, vacancy_rate_pct={}),
+    )
+    assert program.binding == ("nothing_pencils",)
+    assert program.total_stalls == 0
+    assert program.rented_stalls == 0
+    # And `NO_PARKING` still means none at all, rent or no rent.
+    none = solve_program(
+        column(max_dwellings=12, density_max=None),
+        Lot(area_m2=2000.0, frontage_m=25.0),
+        ECONOMICS,
+        parking=NO_PARKING,
+    )
+    assert none.total_stalls == 0
+    assert none.rented_stalls == 0
+
+
+def test_the_rent_enters_the_noi_on_the_same_footing_as_the_cost():
+    """`test_the_stalls_are_charged_on_the_same_footing_as_the_dwellings`, its
+    one dug stall now rented: the same amortised cost off, the rent on."""
+    program = solve_program(
+        column(max_dwellings=1, density_max=None),
+        Lot(area_m2=5000.0, frontage_m=40.0),
+        ECONOMICS,
+        parking=STRUCTURED_ONLY,
+        investment=UNDISCOUNTED,
+    )
+    assert program.underground_stalls == 1
+    assert program.rented_stalls == 1
+    dwelling = round((1700 * 0.995 - 1200 * 257.5 / 300) * MONEY_SCALE) / MONEY_SCALE
+    stall = (
+        round(UNDERGROUND_STALL_COST_CAD / AMORTIZATION_MONTHS * MONEY_SCALE)
+        / MONEY_SCALE
+    )
+    assert program.net_operating_income == pytest.approx(dwelling - stall + 120.0 * 0.85)
+    assert program.parking_gross_revenue_cad == pytest.approx(120.0 * 0.85)
+
+
+def test_parking_leases_the_dwellings_faster_with_diminishing_returns():
+    rules = ParkingRules()
+    assert rules.lease_up_months_saved(0.0) == 0.0
+    assert rules.lease_up_months_saved(0.25) == pytest.approx(0.875)
+    assert rules.lease_up_months_saved(0.5) == pytest.approx(1.5)
+    assert rules.lease_up_months_saved(1.0) == pytest.approx(2.0)
+    # Saturated at the market ratio: a second stall a dwelling leases nothing
+    # faster.
+    assert rules.lease_up_months_saved(2.0) == pytest.approx(2.0)
+    # And concave: each quarter stall saves less than the one before it.
+    steps = [
+        rules.lease_up_months_saved(k / 4) - rules.lease_up_months_saved((k - 1) / 4)
+        for k in range(1, 5)
+    ]
+    assert steps == sorted(steps, reverse=True)
+    assert steps[-1] > 0.0
+
+
+def test_the_absorption_saving_is_priced_into_the_present_value():
+    lot = Lot(area_m2=2000.0, frontage_m=25.0)
+    col = column(max_dwellings=12, density_max=None)
+    still = solve_program(
+        col, lot, ECONOMICS, investment=LEASED_UP,
+        parking=ParkingRules(absorption_saving_months=0.0),
+    )
+    faster = solve_program(col, lot, ECONOMICS, investment=LEASED_UP)
+    assert still.absorption_value_cad == 0.0
+    assert still.lease_up_months_saved == 0.0
+    assert faster.absorption_value_cad > 0.0
+    assert 0.0 < faster.lease_up_months_saved <= 2.0
+    assert faster.parking_coverage == pytest.approx(
+        faster.total_stalls / faster.total_dwellings
+    )
+    # Inside the present value, and in no income: a stabilised NOI is the
+    # same number whichever month it stabilises in.
+    assert faster.present_value_cad == pytest.approx(
+        faster.gross_revenue_cad * LEASED_UP.pv_per_monthly_gross
+        + faster.absorption_value_cad
+    )
+    assert faster.annual_stabilised_noi_cad == pytest.approx(
+        faster.gross_revenue_cad * 12 * (1.0 - LEASED_UP.operating_expense_ratio)
+    )
+    # The twelve dwellings rent a stall apiece, so every one stands at full
+    # coverage and the value is the whole difference between the multiplier
+    # at the shorter lease-up and the stated one, on the dwellings' rent.
+    assert faster.parking_coverage >= 1.0
+    gain = LEASED_UP.pv_per_monthly_gross_at(6 - 2.0) - LEASED_UP.pv_per_monthly_gross
+    assert faster.absorption_value_cad == pytest.approx(
+        gain * faster.residential_gross_revenue_cad
+    )
+    assert faster.npv_cad >= still.npv_cad - 1e-6
+
+
+def test_the_absorption_term_is_off_without_a_lease_up():
+    program = solve_program(
+        column(max_dwellings=12, density_max=None),
+        Lot(area_m2=2000.0, frontage_m=25.0),
+        ECONOMICS,
+    )
+    assert program.total_stalls > 0
+    assert program.absorption_value_cad == 0.0
+    assert program.lease_up_months_saved == 0.0
+
+
+def test_an_empty_program_is_re_solved_without_its_parking():
+    """`test_the_same_envelope_builds_nothing_with_only_the_structured_options`
+    asked again: the house that cannot pay for the parkade it owes is a house
+    on a parking variance, and the waiver says so. A parcel nothing pencils
+    on for its rents stays empty - the parking was not the reason."""
+    empty = solve_program(
+        H03_085, LOT_2166060, ECONOMICS, parking=STRUCTURED_ONLY_UNPAID
+    )
+    assert empty.binding == ("nothing_pencils",)
+    assert not empty.parking_waived
+
+    waived = solve_program(
+        H03_085, LOT_2166060, ECONOMICS, parking=STRUCTURED_ONLY_UNPAID,
+        waive_parking_if_empty=True,
+    )
+    assert waived.solved
+    assert waived.total_dwellings == 1
+    assert waived.parking_waived
+    assert waived.total_stalls == 0
+    assert waived.waived_stalls == 1
+    assert waived.npv_cad > 0.0
+
+    poor = solve_program(
+        column(),
+        Lot(area_m2=650.0, frontage_m=18.0),
+        UnitEconomics(average_rent_cad={"1_bedroom": 50.0}, vacancy_rate_pct={}),
+        waive_parking_if_empty=True,
+    )
+    assert poor.binding == ("nothing_pencils",)
+    assert not poor.parking_waived

@@ -222,7 +222,6 @@ def hbu_row(lot_uid=1, **overrides):
         "residential_floors": 4,
         "commercial_floors": 1,
         "industrial_floors": 0,
-        "above_grade_parking_floors": 0,
         "underground_levels": 1,
         "num_dwellings": 11,
         **overrides,
@@ -570,30 +569,40 @@ def test_a_ribbon_holds_no_parking_whatever_its_area():
 
 
 def test_the_depth_boundary_is_one_stall():
-    """A stall is 5.5 m long, and a parcel shorter than that in every
-    direction takes no car however wide it is."""
+    """5.5 m clear is the dimension, and the boundary case is inclusive.
+
+    A yard exactly one stall across erodes to a zero-width line at the bare
+    radius, so the opening is inset by `_FIT_EPSILON_M` - the by-law asks for
+    5.5 m of ground, not for more than 5.5 m of it.
+    """
     assert massing.parking_capacity_m2(PARCELS["one stall deep"]) > 0.0
-    assert massing.parking_capacity_m2(PARCELS["just too shallow"]) > 0.0
-    # Long enough for a stall in neither direction.
+    assert massing.parking_capacity_m2(PARCELS["just too shallow"]) == 0.0
     assert massing.parking_capacity_m2(box(0, 0, 5.2, 5.2)) == 0.0
-    # And wide enough for one in neither.
     assert massing.parking_capacity_m2(box(0, 0, 2.4, 90.0)) == 0.0
 
 
-def test_a_narrow_strip_parks_in_single_file():
-    """Four metres is a driveway, and the model must not call it unparkable.
+def test_a_narrow_strip_is_not_parkable():
+    """The strict reading, and the expensive half of it.
 
-    A car needs a stall length one way and a stall width the other. Testing the
-    parcel's short side against the *depth* rejected every strip under 5.5 m
-    wide, which is a large and confident error about an ordinary Montreal side
-    yard.
+    This test used to assert the opposite: that a 4 m strip is a driveway, that
+    a car parks down it in single file, and that rejecting it would sell a
+    borough of side yards parkades they do not need. That was the anisotropic
+    rule - a stall's length one way and its width the other - and it went with
+    the rectangle search, which could orient a bay along the strip.
+
+    What replaced it is a morphological opening, which has no orientation to
+    give: ground is parkable where 5.5 m is clear *in every direction*, so a
+    strip narrower than that parks nothing at any length. That is a deliberate
+    choice of the strict reading over the loose one and it is not free - it is
+    the narrow-lot tail of the borough, and those programs now dig, deck or bay
+    their stalls. `parkable_ground` states the trade and `MIN_PARKING_DEPTH_M`
+    is the one place to reverse it: set it to 2.6 and the driveway comes back.
     """
-    capacity = massing.parking_capacity_m2(PARCELS["driveway"])
-    assert capacity == pytest.approx(PARCELS["driveway"].area, rel=1e-9)
-    parked = massing.fit_parking(PARCELS["driveway"], 3 * STALL_M2)
-    assert parked.status == "fitted"
-    assert parked.geometry is not None
-    assert PARCELS["driveway"].contains(parked.geometry.buffer(-1e-6))
+    assert massing.parking_capacity_m2(PARCELS["driveway"]) == 0.0
+    assert massing.fit_parking(PARCELS["driveway"], 3 * STALL_M2).status == "no_fit"
+
+    loose = massing.parkable_ground(PARCELS["driveway"], min_depth_m=2.6)
+    assert loose.area == pytest.approx(PARCELS["driveway"].area, rel=1e-6)
 
 
 def test_a_rectangular_parcel_is_its_own_capacity():
@@ -610,19 +619,143 @@ def test_a_rectangular_parcel_is_its_own_capacity():
         )
 
 
-def test_capacity_measures_one_rectangle_and_says_so():
-    """The strict half of the bound, pinned down rather than left implicit.
+def test_capacity_counts_every_lobe_now():
+    """The approximation the rectangle search made, and no longer makes.
 
-    A dumbbell holds a 196 m2 lobe and a 224 m2 one; `fit_parking` would use
-    both and this measures the larger. That is the documented approximation,
-    and a test is what keeps it from being quietly repaired into something
-    slower.
+    A dumbbell holds a 196 m2 lobe and a 224 m2 one. The old bound measured a
+    single rectangle and reported the parcel at its better lobe - documented,
+    but wrong by 47 pct on a shape a builder would pave both halves of. The
+    opening keeps both, because it is not looking for a rectangle at all.
     """
     parcel = PARCELS["dumbbell"]
     capacity = massing.parking_capacity_m2(parcel)
-    assert capacity == pytest.approx(224.0, rel=0.02)
-    assert capacity < parcel.area
     assert parcel.area == pytest.approx(196.0 + 224.0)
+    assert capacity == pytest.approx(parcel.area, rel=1e-6)
+
+
+# ---- the yard is a band, not a rectangle ---------------------------------
+#
+# The shape a real Montreal yard has is a band wrapping the building, and the
+# three-rectangle search read one at a little over half its area. These pin
+# down what replaced it: an opening for what may be paved, and a distance band
+# for which part of it is.
+
+
+def test_a_ring_yard_is_parkable_all_the_way_round():
+    """The failure the rewrite exists for, in one assertion.
+
+    A plate in the middle of a parcel leaves a ring. No rectangle covers a
+    ring, so the old search read this yard at a fraction of itself; the opening
+    keeps the whole of it, because it is not looking for a rectangle.
+    """
+    lot, plate = box(0, 0, 60, 60), box(20, 20, 40, 40)
+    yard = massing.yard_of(lot, plate)
+    assert yard.area == pytest.approx(3200.0)
+    assert massing.parking_capacity_m2(yard) == pytest.approx(3200.0, rel=1e-6)
+
+
+def test_the_paving_is_one_piece_and_hugs_the_building():
+    """Contiguous and near the plate - the two properties that make it a plan."""
+    lot, plate = box(0, 0, 60, 60), box(20, 20, 40, 40)
+    yard = massing.yard_of(lot, plate)
+    parked = massing.fit_parking(yard, 1000.0, building=plate)
+
+    assert parked.status == "fitted"
+    assert parked.area_m2 == pytest.approx(1000.0, abs=1.0)
+    assert parked.num_bays == 1
+    # Every bit of it is within the band's own depth of the building, which is
+    # what "hugs" means and what a Hilbert prefix would not give.
+    assert plate.buffer(parked.depth_m + 1e-6).contains(parked.geometry)
+    # And it is inside the yard, so nothing was paved under the building or
+    # over the lot line.
+    assert yard.buffer(1e-6).contains(parked.geometry)
+
+
+def test_the_band_grows_with_the_program():
+    """More stalls reach further out, and never further than they need to."""
+    lot, plate = box(0, 0, 60, 60), box(20, 20, 40, 40)
+    yard = massing.yard_of(lot, plate)
+    depths = [
+        massing.fit_parking(yard, area, building=plate).depth_m
+        for area in (400.0, 1200.0, 2400.0)
+    ]
+    assert depths == sorted(depths)
+    assert depths[0] < depths[-1]
+
+
+def test_the_area_is_met_exactly_when_the_ground_is_there():
+    """The 1-1 property: the polygon drawn is the area the solver charged for.
+
+    A rectangle search could only land on the areas its ratio ladder allowed;
+    a bisected band lands on the number itself, which is what makes
+    `surface_parking_fit_pct` a check rather than a running discount.
+    """
+    lot, plate = box(0, 0, 60, 60), box(20, 20, 40, 40)
+    yard = massing.yard_of(lot, plate)
+    for area in (27.87, 100.0, 733.0, 1500.0, 2999.0):
+        parked = massing.fit_parking(yard, area, building=plate)
+        assert parked.status == "fitted"
+        assert parked.area_m2 == pytest.approx(area, abs=1.0)
+
+
+def test_a_yard_too_small_is_paved_whole_and_reported_short():
+    """`shrunk` is the honest answer, and it is what the fit pct reports."""
+    # An 8 m ring: wide enough to park in, nowhere near 5 000 m2 of it.
+    lot, plate = box(0, 0, 40, 40), box(8, 8, 32, 32)
+    yard = massing.yard_of(lot, plate)
+    parked = massing.fit_parking(yard, 5_000.0, building=plate)
+    assert parked.status == "shrunk"
+    assert parked.area_m2 < 5_000.0
+    assert parked.area_m2 <= yard.area + 1e-6
+
+
+def test_the_second_lobe_is_reached_only_after_the_first_is_full():
+    """Order matters, and the near ground goes first.
+
+    A plate against one end of a dumbbell parcel: a small program parks beside
+    it in one piece, and only a program too big for that lobe crosses to the
+    other.
+    """
+    parcel = MultiPolygon([box(0, 0, 20, 20), box(0, 40, 20, 60)])
+    plate = box(2, 2, 12, 12)
+    yard = massing.yard_of(parcel, plate)
+
+    near = massing.fit_parking(yard, 150.0, building=plate)
+    assert near.num_bays == 1
+    assert near.geometry.bounds[3] <= 25.0  # never left the first lobe
+
+    far = massing.fit_parking(yard, 500.0, building=plate)
+    assert far.num_bays == 2
+    assert far.geometry.bounds[3] > 40.0
+
+
+def test_more_pieces_than_max_bays_are_dropped_not_counted():
+    """A program parked across five scraps is not the one the solver priced."""
+    parcel = MultiPolygon(
+        [box(0, 0, 20, 20)] + [box(30 * i, 40, 30 * i + 12, 52) for i in range(4)]
+    )
+    plate = box(2, 2, 12, 12)
+    yard = massing.yard_of(parcel, plate)
+    parked = massing.fit_parking(yard, yard.area, building=plate, max_bays=2)
+    assert parked.num_bays <= 2
+    assert parked.status == "shrunk"
+
+
+def test_without_a_building_the_band_grows_from_the_middle():
+    """The documented fallback - a blob, not a plan, and still one piece."""
+    parked = massing.fit_parking(box(0, 0, 60, 60), 900.0)
+    assert parked.status == "fitted"
+    assert parked.area_m2 == pytest.approx(900.0, abs=1.0)
+    assert parked.num_bays == 1
+
+
+def test_a_band_has_no_width_or_angle():
+    """Null rather than 0.0, because a band has no such dimension - see `Parking`."""
+    lot, plate = box(0, 0, 60, 60), box(20, 20, 40, 40)
+    parked = massing.fit_parking(massing.yard_of(lot, plate), 900.0, building=plate)
+    assert parked.width_m is None
+    assert parked.rotation_deg is None
+    assert parked.depth_m > 0.0
 
 
 def test_no_parcel_no_capacity():
@@ -818,19 +951,20 @@ def test_a_yard_that_can_take_it_all_is_fitted():
     assert parked.depth_m >= massing.MIN_PARKING_DEPTH_M
 
 
-def test_every_drawn_bay_is_at_least_one_stall_deep():
-    """The by-law dimension, checked on the shape rather than trusted."""
+def test_every_drawn_piece_holds_a_stall_at_any_angle():
+    """The by-law dimension, checked on the shape rather than trusted.
+
+    Checked as the opening itself defines it - a disc of half a stall's depth
+    fits somewhere inside every piece drawn - rather than against the sides of
+    a bounding rectangle, which is what the measurement used to be and is not
+    a statement about a band.
+    """
+    radius = massing.MIN_PARKING_DEPTH_M / 2.0 - 1e-6
     for stalls in (1, 3, 8, 25):
         parked = massing.fit_parking(box(0, 0, 18, 40), stalls * STALL_M2)
         assert parked.geometry is not None
-        for bay in getattr(parked.geometry, "geoms", [parked.geometry]):
-            sides = massing._rectangle_sides(bay.minimum_rotated_rectangle)
-            # The *long* side carries the depth requirement and the short one
-            # the width: a single stall is 27.87 m2 at 5.5 m deep, which is
-            # 5.07 m wide, so demanding 5.5 m of both would be demanding a
-            # shape the by-law does not.
-            assert max(sides) >= massing.MIN_PARKING_DEPTH_M - 1e-6
-            assert min(sides) >= massing.MIN_PARKING_WIDTH_M - 1e-6
+        for piece in getattr(parked.geometry, "geoms", [parked.geometry]):
+            assert piece.buffer(-radius).area > 0.0
 
 
 @pytest.mark.parametrize(
@@ -854,14 +988,24 @@ def test_nothing_parked_says_why(yard, target, expected):
 # ---- the two polygons, through the asset ----------------------------------
 
 
-def parcel_row(geometry, lot_uid=1):
-    """One row of `rag.lots`, as `fetch_lot_polygons` hands it back."""
+def parcel_row(geometry, lot_uid=1, feature_id="C01-001"):
+    """One piece, as `fetch_zone_piece_polygons` hands it back.
+
+    The ground a zone governs rather than the whole parcel - which is what the
+    asset now measures a yard inside, since a lot two zones cut in two draws
+    two buildings and each may only pave its own half. `feature_id` defaults to
+    the zone `hbu_row` uses, so a test that says nothing about zoning gets one
+    piece covering its lot, which is the unsplit case and what these tests were
+    written against.
+    """
     return {
         "lot_uid": lot_uid,
+        "feature_id": feature_id,
         "lot_number": f"2 216 {lot_uid:03d}",
         "neighborhood": NEIGHBORHOOD,
         "scrape_date": DATE,
-        "lot_area_m2": geometry.area,
+        "piece_area_m2": geometry.area,
+        "num_lot_zones": 1,
         "geometry": geometry,
     }
 
@@ -884,27 +1028,40 @@ _PARCELS_FOR_RUN: list = []
 
 @pytest.fixture(autouse=True)
 def stub_lots(monkeypatch):
-    """Patch out the one read this asset makes against `rag.lots`.
+    """Patch out the geometry read this asset makes for the yard.
 
     `stub_publish` already replaces `PostgisResource.connect` with something
-    that yields a bare object, so the parcel read has to be stubbed too rather
-    than left to fail on it. Empty by default, which is the honest default: a
-    test that says nothing about parcels gets `no_lot_geometry` and no parking,
+    that yields a bare object, so the read has to be stubbed too rather than
+    left to fail on it. Empty by default, which is the honest default: a test
+    that says nothing about the ground gets `no_lot_geometry` and no parking,
     and the building half of the asset is unaffected - which is exactly the
     behaviour a partition with no cadastre loaded should have.
+
+    **Both reads are stubbed.** The asset asks `silver.lot_zone_pieces` first
+    - the ground each zone governs, which is what a surface stall may stand on
+    - and falls back to `rag.lots` only where that table is not there. Leaving
+    the second stubbed alone would make every test here exercise the fallback.
     """
     _PARCELS_FOR_RUN.clear()
 
-    def fetch_lot_polygons(connection, *, neighborhood, scrape_date):
+    empty = gpd.GeoDataFrame(
+        {"lot_uid": [], "feature_id": [], "lot_number": [], "piece_area_m2": []},
+        geometry=[],
+        crs="EPSG:4326",
+    )
+
+    def fetch_zone_piece_polygons(connection, *, neighborhood, scrape_date):
         if not _PARCELS_FOR_RUN:
-            return gpd.GeoDataFrame(
-                {"lot_uid": [], "lot_number": [], "lot_area_m2": []},
-                geometry=[],
-                crs="EPSG:4326",
-            )
+            return empty
         return parcels_gdf(_PARCELS_FOR_RUN)
 
+    def fetch_lot_polygons(connection, *, neighborhood, scrape_date):
+        return empty
+
     monkeypatch.setattr(postgis, "fetch_lot_polygons", fetch_lot_polygons)
+    monkeypatch.setattr(
+        postgis, "fetch_zone_piece_polygons", fetch_zone_piece_polygons
+    )
     return _PARCELS_FOR_RUN
 
 

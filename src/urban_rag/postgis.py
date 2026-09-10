@@ -430,11 +430,65 @@ def load_features(
     return inserted
 
 
+#: How much of a building has to land inside a lot, in square metres, before
+#: that footprint counts as standing on it.
+#:
+#: BDOI digitises a terrace, a shopping strip or a pair of semi-detacheds as
+#: one contiguous outline drawn straight through the party walls, so a
+#: footprint routinely crosses lot lines the building itself does not. Clipping
+#: is what makes that reportable - each lot gets the part inside it - but the
+#: clip also produces a second kind of row: the few square metres of the
+#: neighbour's house that fall on this side of a lot line the two surveys draw
+#: differently. Those are not a building on this parcel, and counting them is
+#: how lot 3 791 059 came to report three buildings when one stands on it.
+#:
+#: Five square metres, and the pair below is what makes that safe. Over VSMPE
+#: 2026-09-01 this rule drops 2 253 of 31 815 intersections - 7.1 per cent of
+#: the rows and 0.09 per cent of the clipped area, which is the whole argument
+#: in one ratio: what it removes is numerous and occupies almost nothing.
+#:
+#: `MIN_BUILDING_PCT_OF_BUILDING` is the other half and the two are applied as
+#: an *or*, not an and - see it for why the zone cutoffs' *and* would be
+#: catastrophic here. hbu_rag_map's `queries.MIN_BUILDING_OVERLAP_M2` is the
+#: same five square metres in the repo that cannot import this one.
+MIN_BUILDING_OVERLAP_M2 = 5.0
+
+#: How much of a building has to land inside a lot, as a percentage of the
+#: building, before that footprint counts as standing on it.
+#:
+#: The other half of the cutoff, and the half that keeps a real shed. A row
+#: under `MIN_BUILDING_OVERLAP_M2` is only dropped if it *also* falls under
+#: this, because a slice can be small in one measure and be the whole building
+#: in the other: a 4 m2 garage sitting entirely on its lot is under the
+#: absolute cutoff and is 100 per cent of its footprint. Over VSMPE 2 235 rows
+#: sit under five square metres and are kept by this, 896 of them structures
+#: standing at least half on the lot they are reported against - which is what
+#: an absolute cutoff on its own would have deleted.
+#:
+#: **The or is the point, and it is the opposite of `MIN_ZONE_OVERLAP_M2` and
+#: `MIN_ZONE_PCT_OF_LOT`, which are an and.** A zone is large and a lot is
+#: small, so a genuine zone covers most of the lot and a small share of it is
+#: an artefact. A building is the other way round: the contiguous outline above
+#: means a townhouse standing wholly on its own parcel is a small *percentage*
+#: of the block-long footprint it was digitised into. Over VSMPE the median
+#: intersection between 3 and 10 per cent of its building is about 100 m2 - a
+#: whole house - so a 5 per cent floor applied the way the zone floor is would
+#: delete 9 224 rows, most of them the buildings this table exists to report.
+#: Ten per cent, applied as an escape hatch rather than as a requirement, keeps
+#: every one of them.
+#:
+#: hbu_rag_map's `queries.MIN_BUILDING_PCT_OF_BUILDING` is the same ten per
+#: cent one repo over.
+MIN_BUILDING_PCT_OF_BUILDING = 10.0
+
+
 def compute_intersections(
     connection: "Connection",
     *,
     neighborhood: str,
     scrape_date: str,
+    min_overlap_m2: float = MIN_BUILDING_OVERLAP_M2,
+    min_pct_of_building: float = MIN_BUILDING_PCT_OF_BUILDING,
 ) -> dict[str, object]:
     """(Re)compute `silver.building_lot_intersections` for one partition.
 
@@ -450,6 +504,15 @@ def compute_intersections(
     again on each load, so in practice a re-run of a partition prunes all of
     it and inserts all of it - which is what this table has always done, now
     said once in one place instead of here.
+
+    **Not every intersection is a building on the lot.** Two screens stand
+    between "these polygons overlap" and a row here, and they catch different
+    things. A party wall drawn on the lot line clips to a *line*, which the
+    dimension test drops. The neighbour's wall drawn a hand's breadth over it
+    clips to a thin polygon, which has area and passes that test - and is
+    still the house next door. `min_overlap_m2` / `min_pct_of_building` are
+    what drop the second kind; the constants they default to carry the
+    argument for the values and for the `or` between them.
     """
     cursor = connection.cursor()
     result = warehouse.upsert_select(
@@ -494,8 +557,24 @@ def compute_intersections(
           -- which is not a "building on this lot" - only a 2D clip is.
           AND NOT ST_IsEmpty(clipped.geom)
           AND ST_Dimension(clipped.geom) = 2
+          -- And a 2D clip is not enough either: two surveys disagreeing along
+          -- a lot line give the neighbour's house a few square metres on this
+          -- side of it, which has area and is still not a building here. Kept
+          -- only if the slice is large enough to be one, *or* is enough of its
+          -- footprint to be one - see the two constants for why that is an or.
+          AND (
+                ST_Area(geography(clipped.geom)) >= %(min_overlap_m2)s
+             OR (ST_Area(geography(b.geom)) > 0
+                 AND 100.0 * ST_Area(geography(clipped.geom))
+                           / ST_Area(geography(b.geom)) >= %(min_pct_of_building)s)
+          )
         """,
-        {"neighborhood": neighborhood, "scrape_date": scrape_date},
+        {
+            "neighborhood": neighborhood,
+            "scrape_date": scrape_date,
+            "min_overlap_m2": min_overlap_m2,
+            "min_pct_of_building": min_pct_of_building,
+        },
         neighborhood=neighborhood,
         scrape_date=scrape_date,
     )
@@ -1574,6 +1653,10 @@ _BUILDABLE_RELATIONS: tuple[tuple[str, str], ...] = (
     ("rag.lots", "sql/002_spatial.sql"),
     ("silver.lot_frontage", "sql/008_silver_lot_frontage.sql"),
     ("silver.lot_zoning_envelopes", "sql/012_silver_zoning.sql"),
+    # The ground each zone actually governs. Without it the margins would come
+    # off the whole parcel for every zone that touches it, and two columns of
+    # two different grids would each be handed the same lot.
+    ("silver.lot_zone_pieces", "sql/025_silver_lot_zone_pieces.sql"),
 )
 
 #: The per-lot temp table the boundary sort lands in, named to the same
@@ -1759,12 +1842,25 @@ def _setback_lots_already_published(
     travels on every row precisely so a run at a new one can tell its own work
     from the previous setting's, and redo the borough rather than leave two
     settings mixed in one table.
+
+    **And on `piece_area_m2` being there**, which is the same guard against a
+    different change. A row written before the carve was clipped to
+    `silver.lot_zone_pieces` was computed over the whole parcel, and on a lot
+    two zones cut in two that is the wrong ground under both of its grids - but
+    it was computed at the same tolerance, so the clause above cannot tell.
+    Left to it, a re-run of a partition that had already been carved the old
+    way skipped every lot in it and reported `0 row(s)` over a table still
+    holding the previous answer, which is exactly the silent half-answer this
+    function exists to prevent. The column is NOT NULL for every row this
+    version writes, so its absence is a precise marker for "computed by the
+    version before".
     """
     cursor.execute(
         """
         SELECT DISTINCT lot_uid FROM silver.lot_buildable_setbacks
         WHERE neighborhood = %s AND scrape_date = %s::date
           AND edge_tolerance_m = %s
+          AND piece_area_m2 IS NOT NULL
         """,
         [neighborhood, scrape_date, tolerance],
     )
@@ -1846,12 +1942,27 @@ def compute_lot_buildable_setbacks(
     `compute_lot_frontage` takes towards the same lots.
 
     `footprint_cap_m2` is the lesser of the buildable envelope and *Taux
-    d'implantation au sol max* x lot area, and `footprint_cap_binding` says
+    d'implantation au sol max* x piece area, and `footprint_cap_binding` says
     which of the two produced it. They are independent caps - one says where on
-    the lot, the other how much of it - and a building satisfies both.
+    the ground, the other how much of it - and a building satisfies both.
 
-    Assumes `compute_lot_frontage` and `lot_zoning_envelopes` have both landed
-    this partition. Both are dependencies on the assets rather than something
+    **The margins come off the lot; the answer is clipped to the zone.** A
+    setback is measured from a *lot line*, so the subtraction is against the
+    parcel's own boundary exactly as it always was - a zone boundary crossing
+    the middle of a parcel is not a lot line and takes nothing off. What the
+    zone decides is where its rules apply at all, and that is an intersection
+    with `silver.lot_zone_pieces` at the end. So a lot two grids cut in two
+    gets two buildable envelopes that do not overlap, each carved by its own
+    column's four margins, and the coverage cap is charged against the piece
+    rather than the parcel. Before this, both columns were handed the whole lot
+    and the borough's buildable area was double-counted on every split parcel.
+
+    A column whose zone governs no piece of a lot gets no row: that is the
+    sliver cutoff arriving from `lot_zone_pieces`, and a buildable envelope for
+    a zone covering a square centimetre is one nobody may build in.
+
+    Assumes `compute_lot_frontage`, `compute_lot_zone_pieces` and
+    `lot_zoning_envelopes` have all landed this partition. Both are dependencies on the assets rather than something
     the SQL can check: a borough whose envelopes were never computed yields no
     rows and looks exactly like a borough whose grids all failed to parse,
     which is why the caller gets `num_envelopes` back to tell them apart.
@@ -2001,6 +2112,7 @@ def compute_lot_buildable_setbacks(
             (
                 "scrape_date", "neighborhood", "lot_uid", "feature_id",
                 "column_index", "lot_number", "source_table", "lot_area_m2",
+                "piece_area_m2", "num_lot_zones",
                 "front_edge_m", "secondary_front_edge_m", "side_edge_m",
                 "rear_edge_m",
                 "implantation_mode", "side_setback_rule", "side_margin_min_m",
@@ -2067,6 +2179,20 @@ def compute_lot_buildable_setbacks(
                        END AS side_setback_m
                   FROM norms n
             ),
+            -- The ground each zone governs, which is what the carve below is
+            -- finally clipped to. Projected here rather than in the temp table
+            -- because a piece is joined once per (lot, zone, column) and the
+            -- transform is cheaper than carrying a second indexed copy.
+            pieces AS (
+                SELECT lot_uid, feature_id,
+                       piece_area_m2,
+                       num_lot_zones,
+                       ST_Transform(geom, %(srid)s) AS geom
+                  FROM silver.lot_zone_pieces
+                 WHERE neighborhood = %(neighborhood)s
+                   AND scrape_date = %(scrape_date)s::date
+                   AND lot_uid = ANY(%(lot_uids)s)
+            ),
             carved AS (
                 -- One ST_Difference against the union of the four buffers, rather
                 -- than four nested differences: the cuts overlap at every corner
@@ -2078,34 +2204,57 @@ def compute_lot_buildable_setbacks(
                 -- a column stating no rear margin both cut nothing, without either
                 -- needing a branch of its own. The COALESCEs are only to keep a
                 -- NULL out of the array.
+                --
+                -- **The margins come off the lot and the result is clipped to
+                -- the zone.** That composition is the whole of what the piece
+                -- grain changes here, and the order matters: a margin is a
+                -- setback from a *lot line*, so it is subtracted from the
+                -- parcel's own boundary as it always was, and a zone boundary
+                -- running through the middle of a parcel is not a lot line and
+                -- takes nothing off. What the zone does decide is where its
+                -- rules apply at all, and that is the intersection - so the
+                -- eight-storey grid on lot 1 740 794 gets the 24 596 m2 it
+                -- governs to build on rather than the whole 27 044.
                 SELECT a.*,
                        b.lot_number AS cadastre_lot_number,
                        b.lot_area_m2,
+                       p.piece_area_m2,
+                       p.num_lot_zones,
                        b.front_edge_m, b.secondary_front_edge_m,
                        b.side_edge_m, b.rear_edge_m,
                        ST_CollectionExtract(
-                           ST_Difference(
-                               b.lot_geom,
-                               ST_UnaryUnion(ST_Collect(ARRAY[
-                                   ST_Buffer(b.front_geom, a.front_setback_m),
-                                   ST_Buffer(
-                                       COALESCE(b.secondary_geom, blank.geom),
-                                       a.secondary_front_setback_m
-                                   ),
-                                   ST_Buffer(
-                                       COALESCE(b.rear_geom, blank.geom),
-                                       a.rear_setback_m
-                                   ),
-                                   ST_Buffer(
-                                       COALESCE(b.side_geom, blank.geom),
-                                       a.side_setback_m
-                                   )
-                               ]))
+                           ST_Intersection(
+                               ST_Difference(
+                                   b.lot_geom,
+                                   ST_UnaryUnion(ST_Collect(ARRAY[
+                                       ST_Buffer(b.front_geom, a.front_setback_m),
+                                       ST_Buffer(
+                                           COALESCE(b.secondary_geom, blank.geom),
+                                           a.secondary_front_setback_m
+                                       ),
+                                       ST_Buffer(
+                                           COALESCE(b.rear_geom, blank.geom),
+                                           a.rear_setback_m
+                                       ),
+                                       ST_Buffer(
+                                           COALESCE(b.side_geom, blank.geom),
+                                           a.side_setback_m
+                                       )
+                                   ]))
+                               ),
+                               p.geom
                            ),
                            3
                        ) AS buildable_geom
                   FROM applied a
                   JOIN {setback_edges} b ON b.lot_uid = a.lot_uid
+                  -- An inner join, so a column whose zone governs no ground on
+                  -- this lot gets no row. That is the sliver cutoff reaching
+                  -- here: `lot_zone_pieces` wrote no piece for it, and a
+                  -- buildable envelope for a zone that covers a square
+                  -- centimetre would be an envelope nobody may build in.
+                  JOIN pieces p
+                    ON p.lot_uid = a.lot_uid AND p.feature_id = a.feature_id
                   CROSS JOIN (
                       SELECT ST_SetSRID('LINESTRING EMPTY'::geometry, %(srid)s) AS geom
                   ) blank
@@ -2113,9 +2262,22 @@ def compute_lot_buildable_setbacks(
             measured AS (
                 SELECT c.*,
                        ST_Area(c.buildable_geom) AS buildable_area_m2,
+                       -- *Taux d'implantation au sol* applies to the ground the
+                       -- column governs, so the piece's area and not the
+                       -- parcel's: a grid permitting four fifths coverage of a
+                       -- tenth of a lot permits two twenty-fifths of the lot,
+                       -- and charging it against the whole would hand the
+                       -- smaller zone a footprint the larger one's ground has
+                       -- to hold.
+                       --
+                       -- Spelled out in words rather than with a per-cent
+                       -- sign, which psycopg reads as the start of a
+                       -- placeholder wherever it appears in this statement -
+                       -- the same reason the `norms` CTE above matches with
+                       -- `strpos` rather than LIKE.
                        CASE WHEN c.site_coverage_max_pct IS NOT NULL
-                                 AND c.lot_area_m2 IS NOT NULL
-                            THEN c.lot_area_m2 * c.site_coverage_max_pct / 100.0
+                                 AND c.piece_area_m2 IS NOT NULL
+                            THEN c.piece_area_m2 * c.site_coverage_max_pct / 100.0
                        END AS coverage_cap_m2
                   FROM carved c
             )
@@ -2131,6 +2293,8 @@ def compute_lot_buildable_setbacks(
                 COALESCE(m.lot_number, m.cadastre_lot_number),
                 m.source_table,
                 m.lot_area_m2,
+                m.piece_area_m2,
+                m.num_lot_zones,
                 m.front_edge_m,
                 m.secondary_front_edge_m,
                 m.side_edge_m,
@@ -2143,8 +2307,12 @@ def compute_lot_buildable_setbacks(
                 m.side_setback_m,
                 m.rear_setback_m,
                 m.buildable_area_m2,
-                CASE WHEN m.lot_area_m2 > 0
-                     THEN 100.0 * m.buildable_area_m2 / m.lot_area_m2
+                -- Of the piece, which is what the column is a percentage *of*
+                -- now that the carve is clipped to one. On an unsplit lot the
+                -- two denominators are the same number and the column reads
+                -- exactly as it always did.
+                CASE WHEN m.piece_area_m2 > 0
+                     THEN 100.0 * m.buildable_area_m2 / m.piece_area_m2
                 END,
                 m.coverage_cap_m2,
                 -- LEAST ignores a NULL argument, which is exactly wrong here: a
@@ -2314,7 +2482,7 @@ DEFAULT_MAX_BUILT_AREA_M2 = 30.0
 #: `MIN_ZONE_PCT_OF_LOT` is the other half, and the two are applied together
 #: because neither catches what the other does.
 #:
-#: Read by `EnvelopeConfig.min_overlap_m2` and by `compute_lot_profiles`.
+#: Read by `ZonePieceConfig.min_overlap_m2` and by `compute_lot_profiles`.
 #: hbu_infra's `rag.search_at_lot_number` and hbu_rag_map's
 #: `queries.MIN_ZONE_OVERLAP_M2` are the same square metre in the two repos
 #: that cannot import this one.
@@ -2356,6 +2524,510 @@ MIN_ZONE_OVERLAP_M2 = 1.0
 #: `queries.MIN_ZONE_PCT_OF_LOT` are the same one per cent in the two repos
 #: that cannot import this one.
 MIN_ZONE_PCT_OF_LOT = 1.0
+
+#: The absolute floor beside `MIN_ZONE_PCT_OF_LOT`, and the one clause that is
+#: an **or** rather than an **and**: a clip this large is a site whatever share
+#: of its parcel it is.
+#:
+#: The two cutoffs above are a matched pair against one artefact - a survey
+#: disagreement is small absolutely *and* small proportionally - and applying
+#: them together is right for the ordinary lot. On a very large one the
+#: percentage turns around and starts discarding real ground: one per cent of
+#: Parc Jarry is 15 900 m2, an entire city block, and a zone governing it would
+#: be dropped as a sliver. So a clip that is large in its own right is kept
+#: even where it is a small share of what it is a piece of.
+#:
+#: 500 m2, because the question the number answers is "could a building stand
+#: here" and the median parcel in Villeray-Saint-Michel-Parc-Extension is
+#: 429 m2. Over that borough the clause is nearly inert - it recovers 3 pieces
+#: totalling 0.2 ha, none of them over 1 000 m2 - which is the point: it is
+#: insurance against a borough with bigger parcels, priced at almost nothing in
+#: one without them.
+MIN_ZONE_PIECE_AREA_M2 = 500.0
+
+#: How far off a piece's boundary a `silver.lot_frontage` linestring may sit and
+#: still count as that piece's street edge, in metres.
+#:
+#: Larger than `DEFAULT_SETBACK_EDGE_TOLERANCE_M`, and the difference is which
+#: two geometries are being matched. There, the frontage is subtracted from the
+#: *lot* boundary it was cut from, so the two are the same line and 5 cm only
+#: has to absorb a round trip through EPSG:4326. Here it is matched against the
+#: boundary of a **clip** - `ST_Intersection(lot, zone)`, reprojected - and the
+#: intersection's vertices are computed rather than copied.
+#:
+#: A quarter of a metre is what that costs, measured: over VSMPE the pieces'
+#: frontages sum to 375 369.7 m against the lots' own 375 348.4 m, an excess of
+#: 0.006 per cent. That excess is the tolerance letting two pieces meeting at a
+#: street corner both claim the few centimetres between them, and it is the
+#: right direction to be wrong in - a metre of street counted twice is a metre;
+#: a piece credited with no frontage at all loses every column its grid prints
+#: a *Largeur du terrain min* for.
+DEFAULT_ZONE_PIECE_EDGE_TOLERANCE_M = 0.25
+
+#: How much street a clipped edge has to carry to be a frontage rather than the
+#: tolerance above showing through, in metres.
+#:
+#: Half a metre. The edges this removes are the corner artefacts named under
+#: `DEFAULT_ZONE_PIECE_EDGE_TOLERANCE_M` - 122 of VSMPE's 25 941 clipped pairs -
+#: and removing them matters beyond tidiness because these edges are *ranked*:
+#: a 4 cm smear of the cross street ranks second on a piece that genuinely
+#: fronts one street, and `secondary_front_margin_min_m` would then be
+#: subtracted from a boundary no street runs along.
+MIN_ZONE_PIECE_FRONTAGE_M = 0.5
+
+#: Where a piece is clipped, measured and carved. `FRONTAGE_METRIC_SRID` for
+#: the reason every metric operation in this module uses it.
+ZONE_PIECE_METRIC_SRID = FRONTAGE_METRIC_SRID
+
+#: The relations `compute_lot_zone_pieces` reads, and the hbu_infra file that
+#: creates each. `silver.lot_zone_pieces` is deliberately not among them - it
+#: is the target, and `warehouse.upsert_select` checks that one.
+_ZONE_PIECE_RELATIONS: tuple[tuple[str, str], ...] = (
+    ("silver.lot_features", "sql/005_silver_lot_features.sql"),
+    ("silver.lot_frontage", "sql/008_silver_lot_frontage.sql"),
+    (
+        "silver.building_lot_intersections",
+        "sql/004_silver_building_lots.sql",
+    ),
+)
+
+
+def compute_lot_zone_pieces(
+    connection: "Connection",
+    *,
+    neighborhood: str,
+    scrape_date: str,
+    zone_sources: Sequence[str],
+    min_pct_of_lot: float = MIN_ZONE_PCT_OF_LOT,
+    min_overlap_m2: float = MIN_ZONE_OVERLAP_M2,
+    min_piece_area_m2: float = MIN_ZONE_PIECE_AREA_M2,
+    edge_tolerance_m: float = DEFAULT_ZONE_PIECE_EDGE_TOLERANCE_M,
+) -> dict[str, object]:
+    """(Re)compute `silver.lot_zone_pieces` for one (neighborhood, scrape_date).
+
+    The piece of a lot that one zone governs, as a site in its own right: its
+    own area, its own street, and its own share of what already stands on the
+    parcel. One row per (lot, zone).
+
+    **A zoning boundary does not have to follow a lot line.** On a large parcel
+    it usually does not, and the platform used to answer as though it did.
+    `lot_zoning_envelopes` has always written a row per (lot, zone, column),
+    but every row carried the whole lot's area and the whole lot's frontage,
+    and `hbu.governing_zone` - now `hbu.primary_zone`, and a label rather than
+    a filter - then kept the best-covered zone and dropped the
+    rest. Lot 1 740 794 is the case to picture: 27 044 m2, of which 24 596 sit
+    in H04-072 (H.7, eight storeys) and 2 440 in C04-083 (C.4 and H, six). The
+    eight storeys were priced over the whole parcel including the 2 440 m2
+    H04-072 does not govern, and the C.4 was not priced at all.
+
+    **The frontage is the piece's, and that is most of what this changes.**
+    `lot_frontage` measures the street a *lot* faces; a piece faces only the
+    part of that edge on its own boundary, and which street that is can differ
+    from the lot's answer. On 1 740 794 the lot's rank-1 frontage is 19.8 m of
+    Jarry and it belongs entirely to the commercial piece - the residential
+    remainder behind it has 15.2 m of D'Hérelle and no Jarry. So each edge is
+    intersected with the piece and the survivors are re-ranked *within* it, and
+    `primary_*` / `secondary_*` are the piece's own rank 1 and 2, which is the
+    pair the solver reads as *Largeur du terrain* and *Avant secondaire*.
+
+    A piece with no street of its own is an answer rather than a gap - an
+    interior remnant, held to the columns printing no width minimum - and it is
+    not a *new* gap: every piece of a lot `lot_frontage` could not measure was
+    already reading 0 m. Among the pieces of lots that do have a frontage row,
+    38 of the 158 above 500 m2 come out landlocked.
+
+    **Two allocators, because the roll is per lot and the answer is per
+    piece.** `lot_assessment_comparables` describes the parcel - one floor
+    area, one dwelling count, one NOI, one value - and `use_gap` subtracts that
+    from a program that is now per piece. `footprint_share` is what divides
+    everything the *building* is or earns, and it is measured rather than
+    assumed: `building_lot_intersections`' lot-clipped footprints are clipped
+    again to the piece. `area_share` divides what belongs to the *ground*.
+
+    Pro-rating the building by area would have been simpler and is wrong in the
+    ordinary case - a corner commercial strip is a tenth of the parcel and
+    carries the whole of the retail block standing on it. Where a lot carries
+    no measured footprint at all, `footprint_share` falls back to `area_share`
+    and `footprint_share_basis` says so, so a null never reaches a gap.
+
+    **Both shares are normalised over the pieces this function keeps**, not
+    over the whole parcel, so a lot's shares sum to exactly 1. The difference
+    is the ground the cutoffs dropped: over VSMPE the kept pieces hold
+    4 007 133 m2 of the 4 039 882 m2 of footprint on lot area, and the 0.8 per
+    cent missing sits on clips no zone was found to govern. Charging that
+    remainder to nobody would leave every share on a split lot summing to less
+    than one and quietly understate every redevelopment gap on it.
+
+    ``zone_sources`` is `rag.documents.DOCUMENT_SOURCES` - the feature layers
+    that *are* zoning. Passed in rather than imported so this module stays free
+    of the corpus, the posture every other function here takes towards its
+    caller's vocabulary.
+
+    Assumes `building_lot_intersections` and `compute_lot_frontage` have landed
+    this partition. A lot with no frontage row still gets its pieces, with 0 m
+    on each: unlike the setbacks, there is nothing here that a missing front
+    edge makes undefined.
+    """
+    tolerance = float(edge_tolerance_m)
+    if tolerance < 0:
+        raise ValueError(
+            f"edge_tolerance_m must not be negative, got {edge_tolerance_m!r}"
+        )
+    sources = [str(name) for name in zone_sources]
+    if not sources:
+        raise ValueError("zone_sources is empty; there is no zoning layer to clip")
+
+    cursor = connection.cursor()
+    _require_relations(cursor, _ZONE_PIECE_RELATIONS)
+    srid = int(ZONE_PIECE_METRIC_SRID)
+
+    parameters: dict[str, Any] = {
+        "neighborhood": neighborhood,
+        "scrape_date": scrape_date,
+        "sources": sources,
+        "min_pct_of_lot": float(min_pct_of_lot),
+        "min_overlap_m2": float(min_overlap_m2),
+        "min_piece_area_m2": float(min_piece_area_m2),
+        "tolerance_m": tolerance,
+        "min_frontage_m": float(MIN_ZONE_PIECE_FRONTAGE_M),
+    }
+
+    # Dropped rather than declared ON COMMIT DROP, for the reason
+    # `_frontage_sides` is: this runs inside the caller's transaction, and
+    # session scope is what makes a second call on one connection work whether
+    # or not that connection is in autocommit.
+    for table in _ZONE_PIECE_TEMP_TABLES:
+        cursor.execute(f"DROP TABLE IF EXISTS {table}")
+
+    # The pieces themselves, projected once and indexed. The cutoffs are
+    # applied *here* rather than downstream because everything below is per
+    # piece: ranking, frontage and footprint over the slivers would be work
+    # spent on ground nothing may be built on, and the shares would then be
+    # normalised over a denominator that includes it.
+    cursor.execute(
+        f"""
+        CREATE TEMP TABLE _zone_pieces AS
+        SELECT lf.lot_uid,
+               lf.lot_number,
+               lf.source_table,
+               lf.feature_id,
+               lf.lot_area_m2,
+               lf.overlap_area_m2 AS piece_area_m2,
+               lf.pct_of_lot,
+               -- The polygons of the clip and nothing else. `lot_features.geom`
+               -- is typed `geometry(Geometry, 4326)` because one column holds
+               -- every layer's shapes, and the intersection of two polygons is
+               -- not always a polygon: where a lot and a zone share part of a
+               -- boundary it comes back as a GeometryCollection holding the
+               -- areal overlap *and* the line they touch along.
+               --
+               -- Extracted here rather than on the way out, because everything
+               -- below measures against this column and the line is not
+               -- harmless to all of it. The areas would be right either way -
+               -- a line has none - but the frontage clip buffers this geometry
+               -- by a quarter of a metre and would then claim street along a
+               -- shared *lot* boundary that no street runs on.
+               ST_CollectionExtract(ST_Transform(lf.geom, {srid}), 3) AS geom,
+               row_number() OVER (
+                   PARTITION BY lf.lot_uid
+                   -- feature_id breaks the tie so a lot cut exactly in half
+                   -- ranks the same zone first on every run, rather than
+                   -- whichever the scan happened to reach first.
+                   ORDER BY lf.overlap_area_m2 DESC, lf.feature_id
+               )::integer AS zone_rank,
+               count(*) OVER (PARTITION BY lf.lot_uid)::integer AS num_lot_zones
+          FROM silver.lot_features lf
+         WHERE lf.neighborhood = %(neighborhood)s
+           AND lf.scrape_date = %(scrape_date)s::date
+           AND lf.source_table = ANY(%(sources)s)
+           -- A zone that clipped to a line or a point covers no ground, and
+           -- `lot_features` keeps those rows on purpose for the non-areal
+           -- layers. See its docstring.
+           AND ST_Dimension(lf.geom) = 2
+           AND (
+                (lf.pct_of_lot >= %(min_pct_of_lot)s
+                 AND lf.overlap_area_m2 >= %(min_overlap_m2)s)
+                -- The one **or**: see MIN_ZONE_PIECE_AREA_M2.
+                OR lf.overlap_area_m2 >= %(min_piece_area_m2)s
+           )
+        """,
+        parameters,
+    )
+    cursor.execute("CREATE INDEX ON _zone_pieces (lot_uid)")
+    cursor.execute("CREATE INDEX ON _zone_pieces USING gist (geom)")
+    # Without stats the planner costs the two spatial joins below against a
+    # default row estimate - the same reason `compute_lot_frontage` analyzes
+    # `_frontage_sides`.
+    cursor.execute("ANALYZE _zone_pieces")
+
+    cursor.execute(
+        f"""
+        CREATE TEMP TABLE _zone_piece_edges AS
+        SELECT lot_uid, cote_rue_id, street_name, buffer_m, frontage_m,
+               ST_Transform(geom, {srid}) AS geom
+          FROM silver.lot_frontage
+         WHERE neighborhood = %(neighborhood)s
+           AND scrape_date = %(scrape_date)s::date
+           AND geom IS NOT NULL
+        """,
+        parameters,
+    )
+    cursor.execute("CREATE INDEX ON _zone_piece_edges (lot_uid)")
+    cursor.execute("ANALYZE _zone_piece_edges")
+
+    # Each lot's street edges, cut to each of its pieces and re-ranked inside
+    # it. Joined on `lot_uid` and *then* filtered spatially rather than by a
+    # bare ST_Intersects over the borough: a frontage can only belong to a
+    # piece of its own lot, so the cheap equality is what bounds the work and
+    # the geometry only has to settle which piece.
+    cursor.execute(
+        """
+        CREATE TEMP TABLE _zone_piece_frontage AS
+        WITH clipped AS (
+            SELECT p.lot_uid, p.feature_id, e.cote_rue_id, e.street_name,
+                   e.buffer_m,
+                   ST_Length(
+                       ST_Intersection(e.geom, ST_Buffer(p.geom, %(tolerance_m)s))
+                   ) AS frontage_m
+              FROM _zone_pieces p
+              JOIN _zone_piece_edges e ON e.lot_uid = p.lot_uid
+             WHERE ST_Intersects(e.geom, ST_Buffer(p.geom, %(tolerance_m)s))
+        )
+        SELECT lot_uid, feature_id, cote_rue_id, street_name, buffer_m,
+               frontage_m,
+               row_number() OVER (
+                   PARTITION BY lot_uid, feature_id
+                   ORDER BY frontage_m DESC, cote_rue_id
+               )::integer AS frontage_rank
+          FROM clipped
+         WHERE frontage_m >= %(min_frontage_m)s
+        """,
+        parameters,
+    )
+    cursor.execute("CREATE INDEX ON _zone_piece_frontage (lot_uid, feature_id)")
+    cursor.execute("ANALYZE _zone_piece_frontage")
+
+    # What already stands on each piece. `building_lot_intersections.geom` is
+    # already the building clipped to *its* lot, so this second clip is against
+    # a footprint that is only ever inside the parcel - which is why the sum
+    # over a lot's pieces can be compared with the sum over its buildings.
+    cursor.execute(
+        f"""
+        CREATE TEMP TABLE _zone_piece_buildings AS
+        WITH footprints AS (
+            SELECT lot_uid, building_uid, ST_Transform(geom, {srid}) AS geom
+              FROM silver.building_lot_intersections
+             WHERE neighborhood = %(neighborhood)s
+               AND scrape_date = %(scrape_date)s::date
+               AND geom IS NOT NULL
+        )
+        SELECT p.lot_uid, p.feature_id,
+               count(*)::integer AS num_buildings,
+               sum(ST_Area(ST_Intersection(p.geom, f.geom))) AS footprint_m2
+          FROM _zone_pieces p
+          JOIN footprints f ON f.lot_uid = p.lot_uid
+         WHERE ST_Intersects(p.geom, f.geom)
+         GROUP BY p.lot_uid, p.feature_id
+        """,
+        parameters,
+    )
+    cursor.execute("CREATE INDEX ON _zone_piece_buildings (lot_uid, feature_id)")
+    cursor.execute("ANALYZE _zone_piece_buildings")
+
+    result = warehouse.upsert_select(
+        cursor,
+        "lot_zone_pieces",
+        _ZONE_PIECE_COLUMNS,
+        _ZONE_PIECE_SELECT.format(srid=srid),
+        parameters,
+        neighborhood=neighborhood,
+        scrape_date=scrape_date,
+    )
+
+    cursor.execute(
+        """
+        SELECT count(*),
+               count(DISTINCT lot_uid),
+               count(*) FILTER (WHERE num_lot_zones > 1),
+               count(DISTINCT lot_uid) FILTER (WHERE num_lot_zones > 1),
+               count(*) FILTER (WHERE COALESCE(primary_frontage_m, 0) <= 0),
+               count(*) FILTER (WHERE footprint_share_basis = 'area'),
+               count(*) FILTER (WHERE existing_footprint_m2 <= 0),
+               count(*) FILTER (WHERE NOT is_primary_zone
+                                  AND piece_area_m2 >= %(min_piece_area_m2)s),
+               coalesce(sum(piece_area_m2) FILTER (WHERE NOT is_primary_zone), 0.0)
+          FROM silver.lot_zone_pieces
+         WHERE neighborhood = %(neighborhood)s
+           AND scrape_date = %(scrape_date)s::date
+        """,
+        parameters,
+    )
+    (
+        num_pieces,
+        num_lots,
+        pieces_on_split_lots,
+        num_split_lots,
+        pieces_without_frontage,
+        pieces_by_area_share,
+        vacant_pieces,
+        large_secondary_pieces,
+        secondary_area_m2,
+    ) = cursor.fetchone()
+
+    for table in _ZONE_PIECE_TEMP_TABLES:
+        cursor.execute(f"DROP TABLE IF EXISTS {table}")
+
+    return {
+        **result,
+        "num_pieces": int(num_pieces),
+        "num_lots": int(num_lots),
+        "num_split_lots": int(num_split_lots),
+        "num_pieces_on_split_lots": int(pieces_on_split_lots),
+        # The two counts that say whether the piece grain is doing anything on
+        # this borough: how many *secondary* pieces are large enough to be
+        # sites, and how much land they hold. On VSMPE that is 121 ha which
+        # used to be priced under the primary zone's grid.
+        "num_large_secondary_pieces": int(large_secondary_pieces),
+        "secondary_piece_area_ha": round(float(secondary_area_m2) / 10_000.0, 1),
+        # A piece with no street of its own is held to the columns printing no
+        # width minimum - see the docstring - so how many there are belongs in
+        # the run's metadata rather than in a surprising solve downstream.
+        "num_pieces_without_frontage": int(pieces_without_frontage),
+        "num_vacant_pieces": int(vacant_pieces),
+        # High here means the buildings layer did not land, which would make
+        # every redevelopment gap on a split lot an area pro-rata.
+        "num_pieces_by_area_share": int(pieces_by_area_share),
+        "min_pct_of_lot": float(min_pct_of_lot),
+        "min_overlap_m2": float(min_overlap_m2),
+        "min_piece_area_m2": float(min_piece_area_m2),
+        "edge_tolerance_m": tolerance,
+    }
+
+
+#: The temp tables `compute_lot_zone_pieces` builds, in creation order. Named
+#: once so the drop before and the drop after cannot fall out of step.
+_ZONE_PIECE_TEMP_TABLES: tuple[str, ...] = (
+    "_zone_piece_buildings",
+    "_zone_piece_frontage",
+    "_zone_piece_edges",
+    "_zone_pieces",
+)
+
+#: `silver.lot_zone_pieces`, in the order sql/025 declares it.
+_ZONE_PIECE_COLUMNS: tuple[str, ...] = (
+    "scrape_date", "neighborhood", "lot_uid", "feature_id",
+    "lot_number", "source_table",
+    "lot_area_m2", "piece_area_m2", "pct_of_lot",
+    "num_lot_zones", "zone_rank", "is_primary_zone",
+    "primary_frontage_m", "primary_street_name", "primary_cote_rue_id",
+    "secondary_frontage_m", "secondary_street_name", "secondary_cote_rue_id",
+    "num_frontages", "lot_frontage_m", "frontage_buffer_m",
+    "existing_footprint_m2", "lot_footprint_m2", "num_buildings",
+    "area_share", "footprint_share", "footprint_share_basis",
+    "min_pct_of_lot", "min_overlap_m2", "min_piece_area_m2",
+    "edge_tolerance_m", "geom",
+)
+
+#: The statement behind those columns. A module constant rather than an inline
+#: string because it is long, and because the two normalisation denominators in
+#: it are the whole of the allocation argument - see the docstring - and belong
+#: somewhere a reader can find them without reading the function around them.
+_ZONE_PIECE_SELECT = """
+WITH ranked AS (
+    SELECT f.lot_uid, f.feature_id,
+           max(f.frontage_m) FILTER (WHERE f.frontage_rank = 1)
+               AS primary_frontage_m,
+           max(f.street_name) FILTER (WHERE f.frontage_rank = 1)
+               AS primary_street_name,
+           max(f.cote_rue_id) FILTER (WHERE f.frontage_rank = 1)
+               AS primary_cote_rue_id,
+           max(f.frontage_m) FILTER (WHERE f.frontage_rank = 2)
+               AS secondary_frontage_m,
+           max(f.street_name) FILTER (WHERE f.frontage_rank = 2)
+               AS secondary_street_name,
+           max(f.cote_rue_id) FILTER (WHERE f.frontage_rank = 2)
+               AS secondary_cote_rue_id,
+           -- Every street the piece touches, including the ranks past 2 that
+           -- get no columns: a piece facing three streets should be visible as
+           -- one rather than silently the same as a corner.
+           count(*)::integer AS num_frontages,
+           max(f.buffer_m) AS frontage_buffer_m
+      FROM _zone_piece_frontage f
+     GROUP BY f.lot_uid, f.feature_id
+),
+lot_frontage_total AS (
+    SELECT lot_uid, sum(frontage_m) AS lot_frontage_m
+      FROM _zone_piece_edges
+     GROUP BY lot_uid
+),
+-- The two denominators. Both are sums over the pieces *kept* rather than over
+-- the parcel, so a lot's shares sum to exactly 1 and the ground the cutoffs
+-- dropped is charged to the pieces that remain rather than to nobody.
+totals AS (
+    SELECT p.lot_uid,
+           sum(p.piece_area_m2) AS lot_kept_area_m2,
+           coalesce(sum(b.footprint_m2), 0.0) AS lot_footprint_m2
+      FROM _zone_pieces p
+      LEFT JOIN _zone_piece_buildings b
+             ON b.lot_uid = p.lot_uid AND b.feature_id = p.feature_id
+     GROUP BY p.lot_uid
+)
+SELECT
+    %(scrape_date)s::date,
+    %(neighborhood)s,
+    p.lot_uid,
+    p.feature_id,
+    p.lot_number,
+    p.source_table,
+    p.lot_area_m2,
+    p.piece_area_m2,
+    p.pct_of_lot,
+    p.num_lot_zones,
+    p.zone_rank,
+    (p.zone_rank = 1),
+    r.primary_frontage_m,
+    r.primary_street_name,
+    r.primary_cote_rue_id,
+    r.secondary_frontage_m,
+    r.secondary_street_name,
+    r.secondary_cote_rue_id,
+    coalesce(r.num_frontages, 0),
+    lf.lot_frontage_m,
+    r.frontage_buffer_m,
+    coalesce(b.footprint_m2, 0.0),
+    t.lot_footprint_m2,
+    coalesce(b.num_buildings, 0),
+    CASE WHEN t.lot_kept_area_m2 > 0
+         THEN p.piece_area_m2 / t.lot_kept_area_m2
+         ELSE 0.0
+    END,
+    -- The allocator, and its one documented fallback: a lot carrying no
+    -- measured footprint divides its roll by the ground instead, so a null
+    -- never reaches a redevelopment gap.
+    CASE WHEN t.lot_footprint_m2 > 0
+         THEN coalesce(b.footprint_m2, 0.0) / t.lot_footprint_m2
+         WHEN t.lot_kept_area_m2 > 0
+         THEN p.piece_area_m2 / t.lot_kept_area_m2
+         ELSE 0.0
+    END,
+    CASE WHEN t.lot_footprint_m2 > 0 THEN 'footprint' ELSE 'area' END,
+    %(min_pct_of_lot)s::double precision,
+    %(min_overlap_m2)s::double precision,
+    %(min_piece_area_m2)s::double precision,
+    %(tolerance_m)s::double precision,
+    -- ST_Multi because the column is typed MultiPolygon: a zone can cut a lot
+    -- into two disjoint parts - a strip along a street and a corner behind it
+    -- - and a zone that does not still has to arrive as a multi. The
+    -- collection was already extracted into `_zone_pieces`; see there.
+    ST_Multi(ST_Transform(p.geom, 4326))
+  FROM _zone_pieces p
+  JOIN totals t ON t.lot_uid = p.lot_uid
+  LEFT JOIN ranked r ON r.lot_uid = p.lot_uid AND r.feature_id = p.feature_id
+  LEFT JOIN lot_frontage_total lf ON lf.lot_uid = p.lot_uid
+  LEFT JOIN _zone_piece_buildings b
+         ON b.lot_uid = p.lot_uid AND b.feature_id = p.feature_id
+"""
+
 
 #: The relations `compute_lot_profiles` reads, and the hbu_infra file that
 #: creates each. Checked up front so a partition fails naming what to apply
@@ -3971,6 +4643,8 @@ _LOT_BUILDABLE_COLUMNS = (
     "column_index",
     "source_table",
     "lot_area_m2",
+    "piece_area_m2",
+    "num_lot_zones",
     "front_edge_m",
     "secondary_front_edge_m",
     "side_edge_m",
@@ -4159,6 +4833,68 @@ def fetch_lot_frontage(
     )
 
 
+#: `silver.lot_zone_pieces`, plus its geometry. The whole table: every column
+#: of it is read by something - `lot_zoning_envelopes` takes the area and the
+#: frontage, `use_gap` takes the two shares, the map takes the polygon - and a
+#: narrower list would be one more place to add a column to.
+_LOT_ZONE_PIECE_COLUMNS = (
+    "lot_uid",
+    "feature_id",
+    "lot_number",
+    "source_table",
+    "neighborhood",
+    "scrape_date",
+    "lot_area_m2",
+    "piece_area_m2",
+    "pct_of_lot",
+    "num_lot_zones",
+    "zone_rank",
+    "is_primary_zone",
+    "primary_frontage_m",
+    "primary_street_name",
+    "primary_cote_rue_id",
+    "secondary_frontage_m",
+    "secondary_street_name",
+    "secondary_cote_rue_id",
+    "num_frontages",
+    "lot_frontage_m",
+    "frontage_buffer_m",
+    "existing_footprint_m2",
+    "lot_footprint_m2",
+    "num_buildings",
+    "area_share",
+    "footprint_share",
+    "footprint_share_basis",
+    "min_pct_of_lot",
+    "min_overlap_m2",
+    "min_piece_area_m2",
+    "edge_tolerance_m",
+    "geom",
+)
+
+
+def fetch_lot_zone_pieces(
+    connection: "Connection", *, neighborhood: str, scrape_date: str
+) -> gpd.GeoDataFrame:
+    """This partition's `silver.lot_zone_pieces` rows, largest piece first.
+
+    Ordered by area within each lot rather than by the cadastre's numbering, so
+    the parquet read from the top of a lot's rows is that lot's primary zone -
+    the same choice `fetch_lot_buildable_setbacks` makes, and the order
+    `is_primary_zone` marks.
+    """
+    return _fetch_partition(
+        connection,
+        _LOT_ZONE_PIECE_COLUMNS,
+        """
+        FROM silver.lot_zone_pieces
+        WHERE neighborhood = %s AND scrape_date = %s::date
+        ORDER BY lot_uid, zone_rank, feature_id
+        """,
+        [neighborhood, scrape_date],
+    )
+
+
 def fetch_lot_buildable_setbacks(
     connection: "Connection", *, neighborhood: str, scrape_date: str
 ) -> gpd.GeoDataFrame:
@@ -4222,6 +4958,48 @@ def fetch_lot_polygons(
         FROM rag.lots
         WHERE neighborhood = %s AND scrape_date = %s::date
         ORDER BY lot_uid
+        """,
+        [neighborhood, scrape_date],
+    )
+
+
+#: `silver.lot_zone_pieces`, narrowed to a shape and its key. The piece twin of
+#: `_LOT_GEOMETRY_COLUMNS`, and narrow for the same reason: this is read to fit
+#: rectangles onto and to open yards inside, so the frontages, the shares and
+#: the cutoffs are weight those callers do not use.
+_ZONE_PIECE_GEOMETRY_COLUMNS = (
+    "lot_uid",
+    "feature_id",
+    "lot_number",
+    "neighborhood",
+    "piece_area_m2",
+    "num_lot_zones",
+)
+
+
+def fetch_zone_piece_polygons(
+    connection: "Connection", *, neighborhood: str, scrape_date: str
+) -> gpd.GeoDataFrame:
+    """This partition's zone pieces, as shapes to fit things onto.
+
+    The piece twin of `fetch_lot_polygons`, and the reason there are two: a
+    surface stall stands on the *ground the zone governs*, not on the parcel.
+    Those are the same thing on a lot one zone covers whole and they are not on
+    a lot a zoning boundary crosses - and on that lot, measuring a yard against
+    the whole parcel gives each of its two pieces the other's back garden to
+    park in, twice over.
+
+    A caller that cannot read this falls back to `fetch_lot_polygons`, which is
+    exactly the behaviour before the pieces existed and is the generous reading
+    rather than a wrong one on an unsplit lot.
+    """
+    return _fetch_partition(
+        connection,
+        _ZONE_PIECE_GEOMETRY_COLUMNS,
+        """
+        FROM silver.lot_zone_pieces
+        WHERE neighborhood = %s AND scrape_date = %s::date
+        ORDER BY lot_uid, feature_id
         """,
         [neighborhood, scrape_date],
     )

@@ -1,10 +1,17 @@
 # Massing — the proposed building, drawn on the ground
 
-`gold.lot_building_massing` is one rectangle per lot, fitted inside that lot's
-setback envelope, in EPSG:4326 and ready to put on a map. It exists because
-`urban_rag.program` answers in numbers and numbers are what nobody can
-sanity-check: *a 287 m² footprint under five storeys* is not something you can
-look at and call wrong.
+`gold.lot_building_massing` is one rectangle per **(lot, zone)**, fitted inside
+that piece's setback envelope, in EPSG:4326 and ready to put on a map. It
+exists because `urban_rag.program` answers in numbers and numbers are what
+nobody can sanity-check: *a 287 m² footprint under five storeys* is not
+something you can look at and call wrong.
+
+Per piece rather than per lot because a zoning boundary does not have to follow
+a lot line: a parcel two zones cut in two gets two buildings, each drawn inside
+the margins of its own grid and on the ground that grid governs, and the two do
+not overlap. The surface parking below follows the same ground — it is fitted
+into the piece rather than the parcel, so neither program is offered a yard the
+other has already built on.
 
 Written by the `lot_building_massing` asset over `urban_rag.massing`; the table
 is hbu_infra's [sql/022](../../hbu_infra/sql/022_gold_lot_building_massing.sql).
@@ -134,7 +141,7 @@ under-state a yard and can never claim ground that is not there.
 about it: the largest parking-shaped rectangle a parcel holds, measured off
 `rag.lots` by `massing.parking_capacity_m2` and handed to `solve_program`
 beside the area bound. A parcel measuring 0 parks nothing on the ground and its
-program must dig, deck, bay it into the ground floor, or be smaller —
+program must dig, bay it into the ground floor, or be smaller —
 `binding` says `surface_parking_shape` on exactly those rows, because no
 printed norm will.
 

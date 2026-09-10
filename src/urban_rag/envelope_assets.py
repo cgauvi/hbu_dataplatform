@@ -17,13 +17,23 @@ page, and joining on the printed one would drop the second zone of a shared
 grid.
 
 **`lot_zoning_envelopes`** is the denormalised table itself: one row per
-``(lot, grid column)``, carrying the lot's area, its primary and secondary
-frontage, and every norm that column states. It is a join of three things this
-platform already computes and nothing more - `building_lot_intersections`'s
-lot x feature side says which zone covers which parcel, `lot_frontage` says
-how much street each parcel faces, and the grid columns above say what may be
-built. A row of it is one call to `solve_program`, with `governs_residential`
-marking the row `select_residential_column` would pick.
+``(lot, zone, grid column)``, carrying the *piece* of the lot that zone
+governs, its own primary and secondary frontage, and every norm that column
+states. It is a join of two things this platform already computes and nothing
+more - `lot_zone_pieces` says what ground each zone governs and what faces the
+street, and the grid columns above say what may be built on it. A row of it is
+one call to `solve_program`, with `governs_residential` marking the row
+`select_residential_column` would pick.
+
+**The parcel a row describes is the piece, not the lot.** This is the change
+`lot_zone_pieces` exists for and it reaches every column here.
+`piece_area_m2` is the ground *this zone* covers and it is what the solver
+sizes a building on; `lot_area_m2` is the whole parcel, carried so a reader
+knows what the piece is a piece of. `primary_frontage_m` is the street the
+piece faces rather than the street its lot faces - on lot 1 740 794 those are
+two different streets, and the commercial strip on Jarry used to be solved as
+though the housing behind it shared its frontage. See
+`urban_rag.zone_piece_assets`.
 
 **Why denormalised.** The alternative is three tables and a join at read time,
 and the reader is a solver that runs per lot: every column it needs on one row
@@ -36,6 +46,16 @@ and `governs_residential` are the grid's own reading of itself, `solver_ready`
 says only that the four caps a CP-SAT model needs are present, and every value
 is the one printed on the page with ``-`` carried through as null rather than
 as zero. What the envelope is worth is `solve_program`'s to say.
+
+**Nor does it decide which zones exist.** It used to: this asset carried the
+two sliver cutoffs and applied them to `building_lot_intersections`' lot x
+feature side on its way past. They moved to `zone_piece_assets.ZonePieceConfig`
+along with the join itself, because they decide which *sites* there are, and
+that is now a table rather than a filter inside a join - one every downstream
+asset reads, so the zone the map shows, the zone the corpus answers from and
+the zone the solver priced still cannot disagree. The values are on every row
+here (`min_pct_of_lot`, `min_overlap_m2`, `min_piece_area_m2`), carried through
+from the piece, so nothing about reading this table back has changed.
 """
 
 import json
@@ -43,23 +63,15 @@ import json
 import pandas as pd
 from dagster import (
     AssetExecutionContext,
-    Config,
     Failure,
     MaterializeResult,
     MetadataValue,
     asset,
 )
-from pydantic import Field
 
-from urban_rag.building_lots_assets import (
-    LOT_FEATURES_FILE,
-    building_lot_intersections,
-)
 from urban_rag.frames import write_frame
-from urban_rag.frontage_assets import LOT_FRONTAGE_FILE, lot_frontage
 from urban_rag.layers import key_prefix
 from urban_rag.partitions import scrape_partitions
-from urban_rag.postgis import MIN_ZONE_OVERLAP_M2, MIN_ZONE_PCT_OF_LOT
 from urban_rag.program import (
     ProgramError,
     ZoneColumn,
@@ -74,6 +86,7 @@ from urban_rag.rag_assets import DOCUMENTS_FILE, linked_documents
 from urban_rag.resources import ParquetStore, PdfCache, PostgisResource
 from urban_rag.storage import clear_parquet, filesystem, join, storage_options
 from urban_rag.warehouse import MissingRelation, publish, published_metadata
+from urban_rag.zone_piece_assets import LOT_ZONE_PIECES_FILE, lot_zone_pieces
 from urban_rag.zoning_grid import (
     ZONE_FIELDS,
     GridColumn,
@@ -91,12 +104,46 @@ ZONE_COLUMNS_FILE = "zone_columns.parquet"
 #: `silver/lot_zoning_envelopes/<YYYY-MM-DD>/<neighborhood>/`.
 LOT_ENVELOPES_FILE = "lot_zoning_envelopes.parquet"
 
-#: The frontage a lot "has": `lot_frontage` ranks a lot's street edges longest
-#: first, so rank 1 is the street it fronts on and rank 2 is the other side of
-#: a corner lot. `program.Lot.frontage_m` is the first of these, and the second
-#: is carried because a corner parcel is a different site from an interior one
-#: at the same area - which is the judgement the row exists to support.
-FRONTAGE_RANKS = {1: "primary", 2: "secondary"}
+#: What each row carries about the ground it describes, taken straight from
+#: `lot_zone_pieces` and not recomputed here.
+#:
+#: The frontage pair is the piece's own, which is the part worth naming twice:
+#: `lot_frontage` ranks a *lot's* street edges longest first, and
+#: `lot_zone_pieces` cuts those edges to each piece and ranks them again inside
+#: it. So `primary_frontage_m` is the street this zone's ground fronts on, and
+#: on a split parcel that is not always the street the lot fronts on -
+#: `program.Lot.frontage_m` is the first of these, and the second is carried
+#: because a corner piece is a different site from an interior one at the same
+#: area.
+#:
+#: `piece_area_m2` is the area the solver sizes a building on and `lot_area_m2`
+#: is the parcel it belongs to; the two are equal on the great majority of rows
+#: and are emphatically not the same column. The shares are what `use_gap`
+#: divides the roll by, carried here so the gap needs no second join.
+PIECE_FIELDS: tuple[str, ...] = (
+    "lot_area_m2",
+    "piece_area_m2",
+    "pct_of_lot",
+    "num_lot_zones",
+    "zone_rank",
+    "is_primary_zone",
+    "primary_frontage_m",
+    "primary_street_name",
+    "primary_cote_rue_id",
+    "secondary_frontage_m",
+    "secondary_street_name",
+    "secondary_cote_rue_id",
+    "num_frontages",
+    "lot_frontage_m",
+    "frontage_buffer_m",
+    "existing_footprint_m2",
+    "area_share",
+    "footprint_share",
+    "footprint_share_basis",
+    "min_pct_of_lot",
+    "min_overlap_m2",
+    "min_piece_area_m2",
+)
 
 #: The norms carried straight through from a parsed grid column, in the order
 #: they are printed. Named once so the two assets cannot disagree about the
@@ -129,88 +176,6 @@ NORM_FIELDS = (
 #: lots allow housing" reads `permits_residential`; one asking "what else is
 #: allowed beside it" reads these.
 USAGE_CATEGORIES = ("habitation", "commerce", "industrie", "equipements")
-
-
-class EnvelopeConfig(Config):
-    """How much of a lot a zone has to cover to be one of its envelopes.
-
-    Zone polygons and cadastral polygons are drawn by two publishers and agree
-    only approximately, so a parcel on a zone boundary picks up a sliver of the
-    neighbouring zone - a fraction of a percent of its area, and not a set of
-    rules anybody would build under. Two cutoffs, and they measure the sliver
-    differently, which is why they are two. A zone has to clear both.
-
-    **`min_overlap_m2` measures the sliver absolutely.** A clip of under a
-    square metre is the two publishers' lines missing each other by
-    centimetres along a lot line; it is not a small amount of governing, it is
-    a survey disagreement wearing a zone's number. Parc Jarry is the case to
-    picture - 1.59 km2 carrying 31 envelope rows over 14 zones, its own E04-019
-    covering 98.3% of it and one of the other thirteen covering 0.000022%, a
-    few square centimetres of a residential zone at the corner of the park.
-    A percentage would never catch that one: 0.000022% of a park is still
-    0.000022% of a duplex lot as far as a ratio is concerned, but the ratio
-    reads the same for a corner nobody could stand in and for a strip somebody
-    could build a wall along.
-
-    **`min_pct_of_lot` measures it proportionally**, and that is what catches
-    the sliver a square metre cannot. Lot 6 291 714 is 438 m2 with 437.23 of
-    them in H03-126 and 1.19 in C03-130 - 0.27% of the parcel, and 19% more
-    than the absolute cutoff. Under `min_overlap_m2` alone that lot went out
-    carrying two zones, and the commercial grid governing a quarter of a per
-    cent of it was priced and solved beside the residential one governing the
-    rest.
-
-    **One per cent is a judgement, and this is where it is made.** How much of
-    a parcel a zone should govern before it counts as governing it is an
-    argument about the borough rather than about the data, and it used to
-    default to 0 so that a table written once could be read back at any
-    threshold. That argument was settled against the borough instead: at 1%,
-    Villeray-Saint-Michel-Parc-Extension loses 930 of 28 850 lot x zone pairs
-    and 668 of its 2 529 supposedly split lots, and every pair it loses is a
-    boundary artefact. `pct_of_lot` is still on every row of
-    `silver.lot_features`, so the reading back is still possible one table
-    upstream - it is the *envelope* that should not be written for a zone
-    nobody could build under.
-
-    A parcel losing every zone this way goes out as unzoned - 110 of them in
-    the borough, park and right-of-way remnants whose only zoning was a corner
-    clipped off the block beside them, which is a truer answer than a
-    neighbour's grid. `num_lots_unzoned` reports it either way.
-
-    `silver.lot_features` keeps every row on purpose - see
-    005_silver_lot_features.sql - so nothing is lost upstream by cutting here.
-    The values are `postgis.MIN_ZONE_OVERLAP_M2` and
-    `postgis.MIN_ZONE_PCT_OF_LOT`, which `compute_lot_profiles` reads too, and
-    hbu_infra's `rag.search_at_lot_number` and hbu_rag_map's
-    `queries.MIN_ZONE_OVERLAP_M2` / `queries.MIN_ZONE_PCT_OF_LOT` are the same
-    two numbers in the repos that cannot import them - so the zone the map
-    shows, the zone the corpus answers from and the zone the solver priced
-    cannot disagree.
-    """
-
-    min_pct_of_lot: float = Field(
-        default=MIN_ZONE_PCT_OF_LOT,
-        ge=0.0,
-        le=100.0,
-        description=(
-            "A zone gives a lot an envelope row when it covers at least this "
-            "percentage of it. Guards against the sliver a cadastral boundary "
-            "and a zoning boundary produce where they disagree, in the "
-            "measure `min_overlap_m2` cannot see - a square metre of a zone on "
-            "a 438 m2 lot is 0.27% of it. 0 keeps every overlap the join "
-            "found."
-        ),
-    )
-    min_overlap_m2: float = Field(
-        default=MIN_ZONE_OVERLAP_M2,
-        ge=0.0,
-        description=(
-            "A zone gives a lot an envelope row when it covers at least this "
-            "many square metres of it. Guards against the sliver a cadastral "
-            "boundary and a zoning boundary produce where they disagree; 0 "
-            "keeps every overlap the join found."
-        ),
-    )
 
 
 @asset(
@@ -362,44 +327,40 @@ def zoning_grid_columns(
 @asset(
     key_prefix=key_prefix("lot_zoning_envelopes"),
     partitions_def=scrape_partitions,
-    deps=[building_lot_intersections, lot_frontage, zoning_grid_columns],
+    deps=[lot_zone_pieces, zoning_grid_columns],
     group_name=GROUP,
     kinds={"postgres", "parquet"},
     description=(
-        "Every lot's zoning envelope, denormalised to the grain "
-        "urban_rag.program reads: one row per (lot, grid column), carrying the "
-        "lot's area, its primary and secondary street frontage, and every norm "
-        "the column states - storeys and the levels the usage may occupy, "
-        "minimum lot width, site coverage, density, dwelling ceiling, heights "
-        "and margins. Joins building_lot_intersections' lot x feature side to "
-        "zoning_grid_columns on the zone number, and lot_frontage on the lot. "
-        "A zone clipping under min_overlap_m2 (1 m2) or min_pct_of_lot (1%) "
-        "of a lot is dropped rather than given a row: that is the cadastre "
-        "and the zoning layer disagreeing by centimetres, not a zone anybody "
-        "could build under. "
-        "governs_residential marks the column select_residential_column picks "
-        "for that lot's width. Writes silver/lot_zoning_envelopes/"
-        f"<YYYY-MM-DD>/<neighborhood>/{LOT_ENVELOPES_FILE} and upserts "
-        "silver.lot_zoning_envelopes on (scrape_date, neighborhood, lot_uid, "
-        "feature_id, column_index)."
+        "Every zoning envelope in one borough, denormalised to the grain "
+        "urban_rag.program reads: one row per (lot, zone, grid column), "
+        "carrying the piece of the lot *that zone governs* - its own area and "
+        "its own primary and secondary street frontage, from lot_zone_pieces "
+        "- and every norm the column states: storeys and the levels the usage "
+        "may occupy, minimum lot width, site coverage, density, dwelling "
+        "ceiling, heights and margins. Joins lot_zone_pieces to "
+        "zoning_grid_columns on the zone number, and nothing else. "
+        "piece_area_m2 is what the solver sizes a building on and lot_area_m2 "
+        "is the parcel it belongs to; on a split lot they differ and the "
+        "frontage can be a different street on each piece. Which pieces exist "
+        "is lot_zone_pieces' decision and its three cutoffs travel on every "
+        "row here. governs_residential marks the column "
+        "select_residential_column picks for that piece's width. Writes "
+        f"silver/lot_zoning_envelopes/<YYYY-MM-DD>/<neighborhood>/"
+        f"{LOT_ENVELOPES_FILE} and upserts silver.lot_zoning_envelopes on "
+        "(scrape_date, neighborhood, lot_uid, feature_id, column_index)."
     ),
 )
 def lot_zoning_envelopes(
     context: AssetExecutionContext,
-    config: EnvelopeConfig,
     store: ParquetStore,
     postgis: PostgisResource,
 ) -> MaterializeResult:
     neighborhood, scrape_date = _partition(context)
-    lot_features = _read(
+    pieces = _read(
         store.partition_dir(
-            building_lot_intersections.key.path[-1], scrape_date, neighborhood
+            lot_zone_pieces.key.path[-1], scrape_date, neighborhood
         ),
-        LOT_FEATURES_FILE,
-    )
-    frontage = _read(
-        store.partition_dir(lot_frontage.key.path[-1], scrape_date, neighborhood),
-        LOT_FRONTAGE_FILE,
+        LOT_ZONE_PIECES_FILE,
     )
     columns = _read(
         store.partition_dir(
@@ -408,51 +369,22 @@ def lot_zoning_envelopes(
         ZONE_COLUMNS_FILE,
     )
 
-    num_lots = int(lot_features["lot_uid"].nunique())
-    zoning = lot_features[lot_features["source_table"].isin(DOCUMENT_SOURCES)]
-    covered = zoning[
-        (zoning["pct_of_lot"] >= config.min_pct_of_lot)
-        & (zoning["overlap_area_m2"] >= config.min_overlap_m2)
-    ]
-    if covered.empty:
+    if pieces.empty:
         raise Failure(
-            f"{neighborhood} {scrape_date}: no lot is covered by a "
-            f"{'/'.join(DOCUMENT_SOURCES)} feature at or above "
-            f"{config.min_pct_of_lot}% of its area and "
-            f"{config.min_overlap_m2} m2, so no envelope can be built. Check "
-            "that building_lot_intersections loaded the zoning layer for this "
-            "partition."
+            f"{neighborhood} {scrape_date}: lot_zone_pieces holds no piece, so "
+            "no envelope can be built. Materialize it for this partition "
+            "first."
         )
-    # Counted here rather than inferred from the row drop downstream: a sliver
-    # removed is a zone that would have been priced, solved and reported as a
-    # development site, so how many of them there were belongs in the run's
-    # metadata rather than in the difference between two other numbers.
-    num_slivers = len(zoning) - len(covered)
-    if num_slivers:
-        context.log.info(
-            "%s %s: dropped %d lot x zone pair(s) covering under %g m2 or "
-            "under %g%% of their lot - the cadastre and the zoning layer "
-            "disagreeing, not a zone that governs anything",
-            neighborhood,
-            scrape_date,
-            num_slivers,
-            config.min_overlap_m2,
-            config.min_pct_of_lot,
-        )
-    if "lot_number" not in covered.columns:
-        # Added to `postgis._LOT_FEATURE_COLUMNS` after some partitions were
-        # already written. The lot number is a label, not a key this asset
-        # joins on, so an older file costs the label rather than the run.
-        context.log.warning(
-            "%s: carries no lot_number - re-materialize "
-            "building_lot_intersections for this partition to get it.",
-            LOT_FEATURES_FILE,
-        )
-        covered = covered.assign(lot_number=None)
+    # The geometry stays in `silver.lot_zone_pieces` and on the map. This table
+    # is read by a solver scanning a borough, and a polygon on every row of it
+    # is weight nothing here reads - the same reason `lot_buildable_setbacks`
+    # publishes its envelope and the programs do not carry it.
+    pieces = pieces.drop(columns=["geom"], errors="ignore")
+    num_lots = int(pieces["lot_uid"].nunique())
 
-    # An inner join on purpose: a lot whose zone published no readable grid
-    # has no envelope to state, and a row of nulls would be one to solve.
-    envelopes = covered.merge(
+    # An inner join on purpose: a zone that published no readable grid has no
+    # envelope to state, and a row of nulls would be one to solve.
+    envelopes = pieces.merge(
         columns,
         on=["source_table", "feature_id"],
         how="inner",
@@ -460,13 +392,16 @@ def lot_zoning_envelopes(
     )
     if envelopes.empty:
         raise Failure(
-            f"{neighborhood} {scrape_date}: the {len(covered)} lot x zone "
-            f"pair(s) and the {len(columns)} grid column(s) share no zone "
+            f"{neighborhood} {scrape_date}: the {len(pieces)} lot x zone "
+            f"piece(s) and the {len(columns)} grid column(s) share no zone "
             "number. The map's feature id and the grid's are the same column "
             "(NUMERO_COMPLET) and should match."
         )
 
-    envelopes = envelopes.merge(_frontage_by_lot(frontage), on="lot_uid", how="left")
+    # The piece's frontage, not its lot's - which is the whole reason
+    # `lot_zone_pieces` re-ranks the street edges inside each piece. A
+    # commercial strip and the housing behind it are held to two different
+    # *Largeur du terrain min* tests because they face two different streets.
     envelopes["meets_min_lot_width"] = envelopes["min_lot_width_m"].isna() | (
         envelopes["min_lot_width_m"] <= envelopes["primary_frontage_m"].fillna(0.0)
     )
@@ -512,14 +447,18 @@ def lot_zoning_envelopes(
 
     solvable = frame[frame["governs_residential"] & frame["solver_ready"]]
     with_frontage = int(frame["primary_frontage_m"].notna().sum())
+    split = frame[frame["num_lot_zones"] > 1]
     context.log.info(
-        "%s %s: %d of %d lot(s) covered by a zone -> %d envelope row(s), "
+        "%s %s: %d of %d lot(s) covered by a zone -> %d envelope row(s) over "
+        "%d piece(s), %d of them on lots split between two or more zones; "
         "%d solvable on %d lot(s), %d row(s) with a measured frontage -> %s",
         neighborhood,
         scrape_date,
         int(frame["lot_uid"].nunique()),
         num_lots,
         len(frame),
+        int(frame.groupby(["lot_uid", "feature_id"], sort=False).ngroups),
+        len(split),
         len(solvable),
         int(solvable["lot_uid"].nunique()),
         with_frontage,
@@ -536,6 +475,15 @@ def lot_zoning_envelopes(
             # zone whose PDF failed to parse - both show up here first.
             "num_lots_unzoned": num_lots - int(frame["lot_uid"].nunique()),
             "num_envelopes": len(frame),
+            # The piece count, beside the row count that has always been here.
+            # A row is a *column* of a grid and several describe one piece of
+            # ground; the piece is what gets solved, so it is the number to
+            # read against `lot_development_programs`.
+            "num_pieces": int(
+                frame.groupby(["lot_uid", "feature_id"], sort=False).ngroups
+            ),
+            "num_envelopes_on_split_lots": len(split),
+            "num_split_lots": int(split["lot_uid"].nunique()),
             "num_residential_envelopes": int(frame["permits_residential"].sum()),
             "num_commercial_envelopes": int(frame["permits_commercial"].sum()),
             "num_industrial_envelopes": int(frame["permits_industrial"].sum()),
@@ -549,13 +497,20 @@ def lot_zoning_envelopes(
             # terrain*; `meets_min_lot_width` reads a missing frontage as 0, so
             # a column with a width minimum is excluded rather than assumed.
             "num_rows_without_frontage": len(frame) - with_frontage,
-            "num_corner_lots": int((frame["num_frontages"] > 1).sum()),
+            "num_corner_pieces": int((frame["num_frontages"] > 1).sum()),
+            # The piece, then the parcel. The two medians differ by exactly the
+            # ground the split lots hand to their secondary zones, which is the
+            # quantity this whole grain exists to stop mispricing.
+            "median_piece_area_m2": round(
+                float(frame["piece_area_m2"].median()), 1
+            ),
             "median_lot_area_m2": round(float(frame["lot_area_m2"].median()), 1),
-            # What the row count means depends entirely on these, so they
-            # travel with it rather than only in the run's config.
-            "min_pct_of_lot": config.min_pct_of_lot,
-            "min_overlap_m2": config.min_overlap_m2,
-            "num_sliver_pairs_dropped": num_slivers,
+            # What the row count means depends entirely on these. Read off the
+            # rows rather than off this asset's config, because the cutoffs are
+            # `lot_zone_pieces`' now - see the module docstring.
+            "min_pct_of_lot": _threshold(frame, "min_pct_of_lot"),
+            "min_overlap_m2": _threshold(frame, "min_overlap_m2"),
+            "min_piece_area_m2": _threshold(frame, "min_piece_area_m2"),
             "num_duplicate_rows_dropped": num_duplicates,
             "output_path": MetadataValue.path(str(path)),
             **published_metadata(loaded),
@@ -563,7 +518,21 @@ def lot_zoning_envelopes(
     )
 
 
-#: The table, in reading order: the lot, then what it faces, then the zone,
+def _threshold(frame: pd.DataFrame, column: str) -> float:
+    """One of `lot_zone_pieces`' cutoffs, read back off the rows it wrote.
+
+    The same value on every row by construction, so the first is the answer -
+    but taken as a max rather than as `iloc[0]`, so a partition that somehow
+    mixed two settings reports the looser one rather than whichever row the
+    join happened to place first. Absent on a parquet written before the
+    pieces existed, which is a `nan` rather than a failed materialization.
+    """
+    if column not in frame.columns:
+        return float("nan")
+    return float(pd.to_numeric(frame[column], errors="coerce").max())
+
+
+#: The table, in reading order: the piece, then what it faces, then the zone,
 #: then what the zone allows. Declared rather than inherited from the merge so
 #: the column order is a decision and the surrogate keys of the join do not
 #: leak into it.
@@ -572,7 +541,15 @@ _OUTPUT_COLUMNS = (
     "lot_number",
     "neighborhood",
     "scrape_date",
+    # The parcel, then the piece of it this row is about. Both, always: a
+    # reader holding one row has to be able to tell a whole lot from a tenth
+    # of one, and `piece_area_m2` alone cannot say which it is.
     "lot_area_m2",
+    "piece_area_m2",
+    "num_lot_zones",
+    "zone_rank",
+    "is_primary_zone",
+    # The piece's own street, re-ranked inside it - not the lot's.
     "primary_frontage_m",
     "primary_street_name",
     "primary_cote_rue_id",
@@ -580,11 +557,21 @@ _OUTPUT_COLUMNS = (
     "secondary_street_name",
     "secondary_cote_rue_id",
     "num_frontages",
+    "lot_frontage_m",
     "frontage_buffer_m",
+    # What already stands on this piece, and the two shares that divide the
+    # roll between a lot's pieces. `use_gap` is the reader; see
+    # `postgis.compute_lot_zone_pieces` for why there are two.
+    "existing_footprint_m2",
+    "area_share",
+    "footprint_share",
+    "footprint_share_basis",
     "feature_id",
     "source_table",
     "pct_of_lot",
-    "overlap_area_m2",
+    "min_pct_of_lot",
+    "min_overlap_m2",
+    "min_piece_area_m2",
     "doc_id",
     "url",
     "grid_zone",
@@ -664,40 +651,8 @@ def _column_row(column: GridColumn) -> dict:
     }
 
 
-def _frontage_by_lot(frontage: pd.DataFrame) -> pd.DataFrame:
-    """One row per lot: its primary and secondary street edge.
-
-    `lot_frontage` holds one row per (lot, street side) and ranks them longest
-    first, which is the shape a corner lot needs and the wrong shape for a
-    table whose grain is the lot. Ranks beyond the second are dropped from the
-    columns but still counted in `num_frontages`, so a lot facing three streets
-    is visible as one without carrying a third pair of columns every other row
-    would leave empty.
-    """
-    per_lot = frontage.groupby("lot_uid", sort=False).agg(
-        num_frontages=("frontage_m", "size"),
-        frontage_buffer_m=("buffer_m", "max"),
-    )
-    wide = per_lot
-    for rank, prefix in FRONTAGE_RANKS.items():
-        ranked = (
-            frontage[frontage["frontage_rank"] == rank]
-            .drop_duplicates("lot_uid")
-            .set_index("lot_uid")[["frontage_m", "street_name", "cote_rue_id"]]
-            .rename(
-                columns={
-                    "frontage_m": f"{prefix}_frontage_m",
-                    "street_name": f"{prefix}_street_name",
-                    "cote_rue_id": f"{prefix}_cote_rue_id",
-                }
-            )
-        )
-        wide = wide.join(ranked, how="left")
-    return wide.reset_index()
-
-
 def _governing(envelopes: pd.DataFrame) -> dict[str, pd.Series]:
-    """Which row of each (lot, zone) governs the lot, per usage family.
+    """Which row of each (lot, zone) governs that piece, per usage family.
 
     `select_governing_column` is the rule, and it is called rather than
     reimplemented: a grid authorises a family in more than one column and
@@ -705,14 +660,18 @@ def _governing(envelopes: pd.DataFrame) -> dict[str, pd.Series]:
     a parcel is the widest minimum it still satisfies - and, among the columns
     a zone prints at that same width, the one permitting the most dwellings.
     Decided once per family, because a zone's Habitation rule and its Commerce
-    rule are two rules and a lot is governed by each. The choice is made within
-    one zone at a time, because two zones covering the same lot are two
-    separate readings of it and `pct_of_lot` is what says which is the real
-    one.
+    rule are two rules and a piece of ground is governed by each. The choice is
+    made within one (lot, zone) at a time, and that grouping now means
+    something stronger than it used to: two zones covering one lot are two
+    *sites*, each with its own area and its own street, so each picks its own
+    governing column against its own frontage. It used to mean the opposite -
+    the two were competing readings of one site, and `pct_of_lot` decided which
+    to keep - and the piece with the narrower street was answered under the
+    other piece's width. See `urban_rag.zone_piece_assets`.
 
-    False on every row of a lot with no measured frontage and a width minimum -
-    the missing frontage reads as 0, which excludes the column rather than
-    assuming it qualifies.
+    False on every row of a piece with no measured frontage and a width
+    minimum - the missing frontage reads as 0, which excludes the column rather
+    than assuming it qualifies.
     """
     families: dict[str, object] = {
         "residential": lambda column: column.permits_residential,

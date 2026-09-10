@@ -73,7 +73,12 @@ uv run dagster asset materialize --select "bronze/linked_documents,silver/docume
 # and publish those vectors to the Postgres/pgvector store
 uv run dagster asset materialize --select gold/document_index --partition "2026-09-01|VSMPE" -m urban_rag.definitions
 
-# the zoning grids read as tables, and the envelope per (lot, grid column)
+# the ground each zone governs, cut out of each lot: one row per (lot, zone),
+# with that piece's own area and the street it faces. Everything below reads
+# it, because a zoning boundary crossing a large parcel makes two sites of it
+uv run dagster asset materialize --select silver/lot_zone_pieces --partition "2026-09-01|VSMPE" -m urban_rag.definitions
+
+# the zoning grids read as tables, and the envelope per (lot, zone, grid column)
 uv run dagster asset materialize --select "silver/zoning_grid_columns,silver/lot_zoning_envelopes" --partition "2026-09-01|VSMPE" -m urban_rag.definitions
 
 # finally the gold row per lot, which reads the three silver parquet

@@ -57,6 +57,10 @@ SCHEMAS = ("rag", "silver", "gold", "warehouse")
 SCHEMA_FILES = (
     "002_spatial.sql",
     "003_warehouse.sql",
+    # The lot x feature clips `compute_lot_zone_pieces` cuts its pieces out of,
+    # and the building x lot clips it measures each piece's footprint against.
+    "004_silver_building_lots.sql",
+    "005_silver_lot_features.sql",
     "007_silver_streets.sql",
     "008_silver_lot_frontage.sql",
     # What `compute_lot_buildable_setbacks` reads the margins from, and the
@@ -64,7 +68,18 @@ SCHEMA_FILES = (
     # the order here is only the order the files are numbered in.
     "012_silver_zoning.sql",
     "015_silver_lot_buildable_setbacks.sql",
+    # The ground each zone governs. Last because its own migration block
+    # re-keys the gold tables, and those are not applied here at all - the
+    # block is written to skip a table that is not there, which this ordering
+    # is what exercises.
+    "025_silver_lot_zone_pieces.sql",
 )
+
+#: The feature layer a zoning clip is filed under, and the one
+#: `rag.documents.DOCUMENT_SOURCES` names. `silver.lot_features` holds every
+#: layer in one table, so this is what separates a zone from a heritage sector
+#: or a parking district.
+ZONE_SOURCE_TABLE = "Reglement_urbanisme__VSP_REG_ZONE"
 
 #: The slice of VSMPE these tests measure: every lot within 120 m of lot
 #: 3 790 556, and every street side those lots could reach. Carved from the
@@ -195,3 +210,114 @@ def load_slice(connection, fixture_dir: pathlib.Path, scrape_date: str):
         )
 
     return {"num_lots": len(lots), "num_streets": len(sides)}
+
+
+def ensure_partition(connection, table: str, neighborhood: str = NEIGHBORHOOD) -> None:
+    """A LIST partition for one borough, on a table that has none.
+
+    Every table here is `PARTITION BY LIST (neighborhood)` and a partitioned
+    table rejects an insert with no partition to take it. The real pipeline
+    creates these through `urban_rag.warehouse.ensure_partition`; these tests
+    write straight into the tables, so they have to make their own.
+    """
+    connection.cursor().execute(
+        f"CREATE TABLE IF NOT EXISTS "
+        f"{table.replace('.', '_')}_{neighborhood.lower()} "
+        f"PARTITION OF {table} FOR VALUES IN ('{neighborhood}')"
+    )
+
+
+def load_zone_clips(connection, scrape_date: str, clips) -> None:
+    """Zone clips into `silver.lot_features`, as the spatial join writes them.
+
+    ``clips`` is an iterable of ``(lot_number, feature_id, geometry)`` in
+    EPSG:4326, where the geometry is the piece of that lot the zone covers -
+    which is exactly what `postgis.compute_lot_features` computes with
+    ``ST_Intersection(lot, feature)``. Written directly rather than through
+    that function because these tests want to *state* the split: a fixture that
+    computed it from a synthetic zone polygon would be testing PostGIS's
+    intersection rather than what `compute_lot_zone_pieces` does with one.
+
+    The areas are measured here rather than passed in, so a clip and its
+    `overlap_area_m2` cannot disagree - and `pct_of_lot` is taken against the
+    parcel in `rag.lots`, which is what the cutoffs are applied to.
+    """
+    ensure_partition(connection, "silver.lot_features")
+    cursor = connection.cursor()
+    with connection.transaction():
+        cursor.execute(
+            "DELETE FROM silver.lot_features "
+            "WHERE neighborhood = %s AND scrape_date = %s::date",
+            [NEIGHBORHOOD, scrape_date],
+        )
+        cursor.executemany(
+            """
+            INSERT INTO silver.lot_features
+                (scrape_date, neighborhood, lot_uid, source_table, feature_id,
+                 lot_number, feature_uid, lot_area_m2, overlap_area_m2,
+                 pct_of_lot, geom)
+            SELECT %(scrape_date)s::date, %(neighborhood)s, l.lot_uid,
+                   %(source_table)s, %(feature_id)s, l.lot_number,
+                   NULL,
+                   ST_Area(geography(l.geom)),
+                   ST_Area(geography(clip.geom)),
+                   CASE WHEN ST_Area(geography(l.geom)) > 0
+                        THEN 100.0 * ST_Area(geography(clip.geom))
+                                   / ST_Area(geography(l.geom))
+                        ELSE 0.0
+                   END,
+                   clip.geom
+              FROM rag.lots l
+              CROSS JOIN LATERAL (
+                  SELECT ST_GeomFromWKB(decode(%(wkb)s, 'hex'), 4326) AS geom
+              ) clip
+             WHERE l.neighborhood = %(neighborhood)s
+               AND l.scrape_date = %(scrape_date)s::date
+               AND l.lot_number = %(lot_number)s
+            """,
+            [
+                {
+                    "scrape_date": scrape_date,
+                    "neighborhood": NEIGHBORHOOD,
+                    "source_table": ZONE_SOURCE_TABLE,
+                    "feature_id": feature_id,
+                    "lot_number": lot_number,
+                    "wkb": geometry.wkb_hex,
+                }
+                for lot_number, feature_id, geometry in clips
+            ],
+        )
+
+
+def whole_lot_clips(connection, scrape_date: str, feature_id: str) -> None:
+    """One clip per lot in the slice, covering the whole parcel.
+
+    The unsplit case, and the one every test written before the piece grain
+    assumes: a piece that *is* its lot, so `piece_area_m2` equals `lot_area_m2`
+    and every measure downstream reads exactly as it did when the lot was the
+    unit of work.
+    """
+    ensure_partition(connection, "silver.lot_features")
+    cursor = connection.cursor()
+    with connection.transaction():
+        cursor.execute(
+            "DELETE FROM silver.lot_features "
+            "WHERE neighborhood = %s AND scrape_date = %s::date",
+            [NEIGHBORHOOD, scrape_date],
+        )
+        cursor.execute(
+            """
+            INSERT INTO silver.lot_features
+                (scrape_date, neighborhood, lot_uid, source_table, feature_id,
+                 lot_number, lot_area_m2, overlap_area_m2, pct_of_lot, geom)
+            SELECT %s::date, %s, l.lot_uid, %s, %s, l.lot_number,
+                   ST_Area(geography(l.geom)), ST_Area(geography(l.geom)),
+                   100.0, l.geom
+              FROM rag.lots l
+             WHERE l.neighborhood = %s AND l.scrape_date = %s::date
+            """,
+            [
+                scrape_date, NEIGHBORHOOD, ZONE_SOURCE_TABLE, feature_id,
+                NEIGHBORHOOD, scrape_date,
+            ],
+        )

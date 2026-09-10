@@ -61,6 +61,7 @@ so a database that is down costs a re-run of the load rather than of the solve.
 """
 
 import json
+from collections.abc import Mapping
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -157,12 +158,28 @@ _ENVELOPE_KEYS = ("lot_uid", "feature_id", "column_index")
 #: a table whose whole job is the comparison rather than the envelope. So this
 #: is identity, `hbu_status`, and every column `use_gap` *adds* - nothing it
 #: only carries through.
+#:
+#: **Identity is the pair now.** `feature_id` is half the key of both tables
+#: since `lot_zone_pieces`, so it is carried here for the same reason `lot_uid`
+#: always was: without it a row cannot be written at all, and a reader cannot
+#: join back to the programme it is the gap for. The piece's own area and the
+#: two flags beside it are carried for the reader rather than the key - a gap
+#: of 2 440 m² against a 27 044 m² parcel is not a small gap, and only
+#: `piece_area_m2` says which of the two the row is about.
 _GAP_OUTPUT_COLUMNS = (
     "lot_uid",
+    "feature_id",
     "lot_number",
     "neighborhood",
     "scrape_date",
     "lot_area_m2",
+    "piece_area_m2",
+    "num_lot_zones",
+    "is_primary_zone",
+    "area_share",
+    "footprint_share",
+    "footprint_share_basis",
+    "existing_footprint_m2",
     "primary_frontage_m",
     "hbu_status",
     "has_assessment",
@@ -179,6 +196,11 @@ _GAP_OUTPUT_COLUMNS = (
     "hbu_industrial_floor_area_m2",
     "industrial_floor_area_gap_m2",
     "industrial_floor_area_gap_sqft",
+    # The two non-residential plates with the cellar under them. Not part of
+    # any gap - the roll's side is above-grade floor - and carried because
+    # what the proposal takes to *lease* is the whole of it. See `use_gap`.
+    "hbu_commercial_floor_area_with_cellar_m2",
+    "hbu_industrial_floor_area_with_cellar_m2",
     "existing_floor_area_m2",
     "hbu_floor_area_m2",
     "floor_area_gap_m2",
@@ -203,6 +225,16 @@ _GAP_OUTPUT_COLUMNS = (
     "existing_maintenance_penalty_cad",
     "existing_annual_stabilised_noi_cad",
     "hbu_annual_stabilised_noi_cad",
+    # The proposal's NOI split by the family that earns it, summing to the
+    # line above. Carried here and not left to a join because it is not the
+    # floor split three rows up: at the solver's rates a square foot of
+    # commerce earns about four times a square foot of housing, so a ground
+    # floor of shops under five of flats is a sixth of the floor and nearly
+    # half the income. Everything that weights a lot by use - the blended cap
+    # rate and the lease-up in `urban_rag.proforma`, above all - wants this.
+    "hbu_residential_noi_cad",
+    "hbu_commercial_noi_cad",
+    "hbu_industrial_noi_cad",
     "annual_stabilised_noi_gap_cad",
     "hbu_annual_noi_after_construction_cad",
     "hbu_total_capital_cost_cad",
@@ -260,6 +292,69 @@ class ProgramConfig(Config):
             "Stalls each thousand square feet of commercial or industrial "
             "floor owes. The single heaviest lever on whether a mixed-use "
             "column fills with commerce or with housing."
+        ),
+    )
+    parking_stall_rent_cad_month: float = Field(
+        default=ParkingRules().monthly_rent_cad,
+        ge=0.0,
+        description=(
+            "What a rented stall earns a month. Enters the objective through "
+            "the same present-value multiplier a dwelling's rent does, on the "
+            "stalls the occupants would rent, so a stall is worth its rent "
+            "over the hold less its capital: a surface stall now pays for "
+            "itself and a dug one still does not. 0 returns a stall to a pure "
+            "cost."
+        ),
+    )
+    parking_stall_occupancy_pct: float = Field(
+        default=ParkingRules().occupancy_pct,
+        ge=0.0,
+        le=100.0,
+        description="Share of the stalls a building offers that are rented.",
+    )
+    market_stalls_per_dwelling: float = Field(
+        default=ParkingRules().market_stalls_per_dwelling,
+        ge=0.0,
+        description=(
+            "The most stalls a dwelling's occupants would rent - the ceiling "
+            "on the stalls that earn, and the coverage at which parking stops "
+            "leasing the building faster. Without it a stall on the yard pays "
+            "for itself and the solver would pave the parcel for tenants who "
+            "do not exist. The stalls owed by stalls_per_dwelling are still "
+            "the floor; this is how far above it the model may go where more "
+            "pays."
+        ),
+    )
+    market_stalls_per_1000_sqft: float = Field(
+        default=ParkingRules().market_stalls_per_1000_sqft,
+        ge=0.0,
+        description=(
+            "The same ceiling per thousand square feet of commercial or "
+            "industrial floor."
+        ),
+    )
+    parking_absorption_saving_months: float = Field(
+        default=ParkingRules().absorption_saving_months,
+        ge=0.0,
+        description=(
+            "Months of lease-up a dwelling with a full stall saves over one "
+            "with none, concave in the coverage below it (the first quarter "
+            "stall saves 44 percent of it, the last 6). Worth about 0.4 "
+            "percent of a dwelling's present value per two months at a 5 "
+            "percent discount rate - a real term and a small one. 0 switches "
+            "it off; it is off by construction when lease_up_months is 0."
+        ),
+    )
+    waive_parking_if_empty: bool = Field(
+        default=ProgramAssumptions().waive_parking_if_empty,
+        description=(
+            "Solve again without the parking obligation where a candidate "
+            "holds nothing with it - infeasible, or solved and empty - and "
+            "mark the row parking_waived with the shortfall in waived_stalls. "
+            "Whatever fits and pays is still built. Off, such a candidate "
+            "keeps its INFEASIBLE status or its empty program. Never applied "
+            "where a printed minimum or the rents are the cause: a model that "
+            "is still empty without its parking stays as it was."
         ),
     )
     residential_cost_per_sqft_cad: float = Field(
@@ -457,13 +552,11 @@ class ProgramConfig(Config):
     ) -> ProgramAssumptions:
         """This run's config as the object `urban_rag.hbu` is handed.
 
-        The storey heights collapse four fields to three on purpose: commerce
+        The storey heights collapse three fields to two on purpose: commerce
         and industry are given one height because the difference between a
         retail plenum and a warehouse clear height is not something anything
-        upstream distinguishes, and an above-grade parking deck takes the
-        residential figure because a garage carries no plenum at all. Both are
-        `urban_rag.program`'s own defaults, stated here rather than silently
-        inherited.
+        upstream distinguishes. That is `urban_rag.program`'s own default,
+        stated here rather than silently inherited.
 
         ``surveyed_rents`` is the borough's `commercial_rents` partition as a
         ``{rent_class: rent_psf_cad}`` map. Retail stands in for the solver's
@@ -487,6 +580,11 @@ class ProgramConfig(Config):
                 stalls_per_dwelling=self.stalls_per_dwelling,
                 stalls_per_1000_sqft=self.stalls_per_1000_sqft,
                 amortization_months=self.amortization_months,
+                monthly_rent_cad=self.parking_stall_rent_cad_month,
+                occupancy_pct=self.parking_stall_occupancy_pct,
+                market_stalls_per_dwelling=self.market_stalls_per_dwelling,
+                market_stalls_per_1000_sqft=self.market_stalls_per_1000_sqft,
+                absorption_saving_months=self.parking_absorption_saving_months,
             ),
             construction=ConstructionCosts(
                 residential_cost_per_sqft=self.residential_cost_per_sqft_cad,
@@ -505,7 +603,6 @@ class ProgramConfig(Config):
                 residential_m=self.residential_storey_height_m,
                 commercial_m=self.commercial_storey_height_m,
                 industrial_m=self.commercial_storey_height_m,
-                above_grade_parking_m=self.residential_storey_height_m,
             ),
             investment=InvestmentAssumptions(
                 discount_rate_pct=self.discount_rate_pct,
@@ -519,6 +616,7 @@ class ProgramConfig(Config):
             ),
             basement_levels_allowed=self.basement_levels_allowed,
             max_seconds=self.max_seconds,
+            waive_parking_if_empty=self.waive_parking_if_empty,
         )
 
 
@@ -540,14 +638,15 @@ class ProgramConfig(Config):
         "commerce or industry and that the grid parser could turn into a "
         "solver input, each the answer to one urban_rag.program CP-SAT run. "
         "Carries the mix of dwellings by CMHC bedroom class, the storeys "
-        "split into residential, commercial, industrial and above-grade "
-        "parking, the underground levels, the footprint and gross floor "
-        "area, the sous-sol of usage beside it - basement_area_m2, which "
-        "neither storey cap sees and which the density index counts, so "
-        "density_floor_area_m2 rather than gross_floor_area_m2 is what "
+        "split into residential, commercial and industrial, the underground "
+        "levels and the plate they are dug at (underground_plate_m2, bounded "
+        "by the parcel rather than the footprint), the footprint and gross "
+        "floor area, the sous-sol of usage beside it - basement_area_m2, "
+        "which neither storey cap sees and which the density index counts, "
+        "so density_floor_area_m2 rather than gross_floor_area_m2 is what "
         "Densite was tested against - the stalls by where they were put - "
-        "dug, decked, bayed into the "
-        "ground floor, or standing on the yard the footprint leaves - "
+        "dug under the parcel, bayed into the ground floor, or standing on "
+        "the yard the footprint leaves - "
         "surface_area_m2 for the ground those last ones take (floor area of "
         "no kind, and not part of the footprint either), parkable_area_m2 for "
         "the largest parking-shaped rectangle the parcel actually holds, "
@@ -594,9 +693,11 @@ def lot_development_programs(
             f"{neighborhood} {scrape_date}; there is nothing to solve."
         )
     envelopes = _with_buildable_area(context, store, envelopes, neighborhood, scrape_date)
-    envelopes = _with_placeable_area(context, store, envelopes, neighborhood, scrape_date)
+    envelopes, plates = _with_placeable_area(
+        context, store, envelopes, neighborhood, scrape_date
+    )
     envelopes = _with_parkable_area(
-        context, postgis, envelopes, neighborhood, scrape_date
+        context, postgis, envelopes, neighborhood, scrape_date, plates=plates
     )
 
     economics, suppressed = unit_economics(
@@ -704,6 +805,19 @@ def lot_development_programs(
             "num_infeasible": int(
                 (~frame["solved"] & (frame["status"] != "ERROR")).sum()
             ),
+            # Solved only once the stalls were taken off the model: with the
+            # parking these were infeasible, and without a printed minimum
+            # behind it. Each one is a program standing on a parking variance
+            # of `waived_stalls`, and would have been counted above before
+            # `waive_parking_if_infeasible` existed.
+            "num_parking_waived": int(
+                solved["parking_waived"].fillna(False).astype(bool).sum()
+            ),
+            # What the parking earns over the borough.
+            "total_rented_stalls": int(solved["rented_stalls"].sum()),
+            "annual_parking_revenue_millions": round(
+                float(solved["annual_parking_gross_revenue_cad"].sum()) / 1e6, 3
+            ),
             # A model that could not be built at all, which solver_ready
             # promised would not happen - so anything above zero is a stale
             # parquet rather than a fact about the parcels.
@@ -794,35 +908,44 @@ def lot_development_programs(
     group_name=GOLD_GROUP,
     kinds={"parquet", "postgres"},
     description=(
-        "The highest and best use of every lot in one borough, one row each: "
-        "the most profitable of the zoning envelopes that govern the parcel, "
-        "with the envelope named beside it. Within a zone each usage family's "
+        "The highest and best use of every piece of ground in one borough: "
+        "one row per (lot, zone), because a zoning boundary crossing a large "
+        "parcel makes two sites of it and both are solved - over their own "
+        "area, against their own street, under their own margins. "
+        "is_primary_zone marks the largest piece, which is the row a reader "
+        "wanting one answer per lot takes; lot_number groups the pieces back "
+        "into a parcel and num_lot_zones says how many there are. "
+        "Within a zone each usage family's "
         "governing column is the grid's own pick on Largeur du terrain min - "
         "select_governing_column's, carried through lot_zoning_envelopes as "
-        "governs_residential / governs_commercial / governs_industrial - "
-        "across zones the one covering most of the lot wins, and among the "
-        "governing columns the developer's choice is made on discounted net "
-        "profit (npv_cad): which use to build is the one real choice, and it "
-        "is priced the way a land developer prices it. hbu_dominant_use says "
+        "governs_residential / governs_commercial / governs_industrial - and "
+        "among the governing columns the developer's choice is made on "
+        "discounted net profit (npv_cad): which use to build is the one real "
+        "choice, and it is priced the way a land developer prices it. "
+        "hbu_dominant_use says "
         "in one word what kind of building won, and floor_stack what stands "
         "on each storey - one entry per run of identical levels, bottom "
         "upwards, with the indoor stalls and the dwelling mix on the runs "
         "holding them, the surface ones being on no storey at all. Carries "
         "the dwellings by "
         "bedroom class, the storey split, the footprint and floor area, the "
-        "stalls, what it costs to build, the npv and present value, and the "
-        "monthly and annual net operating income, plus num_candidates and "
-        "num_zones so a real choice is distinguishable from none. Two kinds "
-        "of parcel keep their row and get no program: one that is the road - "
-        "either the roll files it under a CUBF road code (4510-4599) or a "
+        "stalls, what it costs to build, the npv and present value, the "
+        "monthly and annual net operating income, and the footprint_share "
+        "that divides the lot's assessment between its pieces downstream, "
+        "plus num_candidates so a real choice of column is distinguishable "
+        "from none. Two kinds of ground keep their row and get no program: a "
+        "parcel that is the road - either the roll files it under a CUBF road "
+        "code (4510-4599) or a "
         "geobase double street side runs down the inside of it, which is how "
         "Montreal's own street lots are found, since the roll never records "
-        "them - and one whose governing zone authorises only Equipements "
-        "collectifs (a park, a school, a cemetery). Every lot "
-        "the envelopes reach keeps a row: hbu_status is one of "
+        "them - and a piece whose zone authorises only Equipements "
+        "collectifs (a park, a school, a cemetery), which is now decided per "
+        "piece so a parcel half park and half housing reports both. Every "
+        "piece the envelopes reach keeps a row: hbu_status is one of "
         f"{', '.join(HBU_STATUSES)}. Written to gold/lot_highest_best_use/"
         f"<YYYY-MM-DD>/<neighborhood>/{LOT_HBU_FILE} and upserted into "
-        "gold.lot_highest_best_use on (scrape_date, neighborhood, lot_uid)."
+        "gold.lot_highest_best_use on (scrape_date, neighborhood, lot_uid, "
+        "feature_id)."
     ),
 )
 def lot_highest_best_use(
@@ -883,26 +1006,57 @@ def lot_highest_best_use(
         status: int((frame["hbu_status"] == status).sum()) for status in HBU_STATUSES
     }
     answered = frame[frame["hbu_status"] == "solved"]
+    split = frame[frame["num_zones"] > 1]
     context.log.info(
-        "%s %s: %d lot(s) with an envelope -> %s; %d dwelling(s), %.1f ha of "
-        "floor, %d lot(s) with a real choice of zone -> %s",
+        "%s %s: %d piece(s) over %d lot(s) with an envelope -> %s; "
+        "%d dwelling(s), %.1f ha of floor; %d piece(s) on %d lot(s) the "
+        "zoning cuts in more than one -> %s",
         neighborhood,
         scrape_date,
         len(frame),
+        int(frame["lot_uid"].nunique()),
         ", ".join(f"{name}={count}" for name, count in by_status.items()),
         int(answered["num_dwellings"].sum()),
         float(answered["gross_floor_area_m2"].sum()) / 10_000.0,
-        int((frame["num_zones"] > 1).sum()),
+        len(split),
+        int(split["lot_uid"].nunique()),
         path,
     )
 
     return MaterializeResult(
         metadata={
             "dagster/row_count": len(frame),
-            "num_lots": len(frame),
+            # The row count is pieces now, so the lot count is stated beside it
+            # rather than left to be read off the rows. A reader comparing this
+            # partition with one written before the grain changed wants both.
+            "num_pieces": len(frame),
+            "num_lots": int(frame["lot_uid"].nunique()),
+            "num_split_lots": int(split["lot_uid"].nunique()),
+            "num_pieces_on_split_lots": len(split),
+            # What the split actually put in play: the ground on secondary
+            # pieces, which the primary zone's grid used to answer for.
+            "secondary_piece_area_ha": round(
+                float(
+                    pd.to_numeric(
+                        frame.loc[
+                            ~frame["is_primary_zone"].fillna(True).astype(bool),
+                            "piece_area_m2",
+                        ],
+                        errors="coerce",
+                    ).sum()
+                )
+                / 10_000.0,
+                1,
+            ),
             "num_answered": by_status["solved"],
             "num_unanswered": len(frame) - by_status["solved"],
             **{f"num_{name}": count for name, count in by_status.items()},
+            # Among the answered, the pieces whose chosen program only exists
+            # because its stalls were waived - see lot_development_programs'
+            # count of the same name.
+            "num_parking_waived": int(
+                answered["parking_waived"].fillna(False).astype(bool).sum()
+            ) if "parking_waived" in answered.columns else 0,
             "num_candidates": int(frame["num_candidates"].sum()),
             # What the road gate actually took away rather than what it merely
             # labelled: parcels the roll calls a street that the solver had
@@ -931,12 +1085,12 @@ def lot_highest_best_use(
                 len(cadastral_road_lots(road_lots))
                 - len(cadastral_road_lots(road_lots, assessments))
             ),
-            # A lot two zones reach is a lot on a zoning boundary, where the
-            # answer depends on which line is believed. pct_of_lot decides it
-            # and travels on every row, so a pick made off a 2 percent sliver
-            # is visible rather than inferred.
-            "num_lots_on_a_zone_boundary": int((frame["num_zones"] > 1).sum()),
-            "num_lots_with_two_columns": int(
+            # A lot two zones reach is a lot the zoning cuts in two, and it now
+            # has two answers rather than one taken on which line is believed.
+            # Counted in lots rather than in rows, so it reads as "how many
+            # parcels here are really two sites".
+            "num_lots_on_a_zone_boundary": int(split["lot_uid"].nunique()),
+            "num_pieces_with_two_columns": int(
                 (frame["num_governing_candidates"] > 1).sum()
             ),
             "total_dwellings": int(answered["num_dwellings"].sum()),
@@ -1212,6 +1366,12 @@ def lot_redevelopment_gap(
             # solved with their building retained, how many of those additions
             # pay after the disruption, and which future wins where.
             "num_enhancements_solved": int(frame["enhance_solved"].sum()),
+            # Of those, the additions that only solve with their stalls waived:
+            # a standing shop's floor owes stalls too, and a lot with no yard
+            # had no enhancement at all before the waiver.
+            "num_enhancements_parking_waived": int(
+                frame["enhance_parking_waived"].fillna(False).astype(bool).sum()
+            ),
             "num_enhancements_paying": int(
                 (frame["enhance_gain_cad"].fillna(0.0) > 0).sum()
             ),
@@ -1434,7 +1594,7 @@ def _with_placeable_area(
     """
     import geopandas as gpd
 
-    from urban_rag.massing import placeable_area_m2, to_metric
+    from urban_rag.massing import fit_rectangle, to_metric
 
     partition_dir = store.partition_dir(
         lot_buildable_setbacks.key.path[-1], scrape_date, neighborhood
@@ -1448,7 +1608,7 @@ def _with_placeable_area(
             path,
             lot_buildable_setbacks.key.path[-1],
         )
-        return envelopes
+        return envelopes, {}
 
     try:
         setbacks = gpd.read_parquet(path, storage_options=storage_options(path))
@@ -1467,7 +1627,7 @@ def _with_placeable_area(
             exc,
             lot_buildable_setbacks.key.path[-1],
         )
-        return envelopes
+        return envelopes, {}
 
     missing = [name for name in _ENVELOPE_KEYS if name not in setbacks.columns]
     if missing:
@@ -1479,23 +1639,31 @@ def _with_placeable_area(
     # In metres once, for the whole borough: a rectangle fitted in square
     # degrees is not a rectangle, and is not the one the massing will draw.
     projected = to_metric(setbacks)
-    cache: dict[bytes, float] = {}
+    cache: dict[bytes, object] = {}
     measured: dict[tuple, float] = {}
+    plates: dict[tuple, object] = {}
     for row in projected.itertuples(index=False):
         geometry = row.geometry
         if geometry is None or geometry.is_empty:
             continue
         key = geometry.wkb
-        area = cache.get(key)
-        if area is None:
-            area = placeable_area_m2(geometry)
-            cache[key] = area
-        measured[(row.lot_uid, row.feature_id, row.column_index)] = area
+        fitted = cache.get(key)
+        if fitted is None:
+            fitted = fit_rectangle(geometry, geometry.area)
+            cache[key] = fitted
+        envelope_key = (row.lot_uid, row.feature_id, row.column_index)
+        measured[envelope_key] = float(fitted.placed_footprint_m2)
+        if fitted.geometry is not None and not fitted.geometry.is_empty:
+            plates[envelope_key] = fitted.geometry
 
     keys = pd.MultiIndex.from_frame(envelopes[list(_ENVELOPE_KEYS)])
     placeable = pd.Series(
         [measured.get(key) for key in keys], index=envelopes.index, dtype="float64"
     )
+    # The rectangles themselves, for `_with_parkable_area` below. Handed over
+    # rather than recomputed there because the fit is this asset's expensive
+    # step, and because the yard has to be the complement of *this* plate: two
+    # searches agreeing to the metre would still be two searches.
     unbuildable = int((placeable == 0).sum())
     context.log.info(
         "%s %s: envelope shape measured on %d of %d row(s) from %d distinct "
@@ -1507,7 +1675,7 @@ def _with_placeable_area(
         len(cache),
         unbuildable,
     )
-    return envelopes.assign(placeable_area_m2=placeable)
+    return envelopes.assign(placeable_area_m2=placeable), plates
 
 
 def _notna_count(frame: pd.DataFrame, column: str) -> int:
@@ -1535,22 +1703,47 @@ def _with_parkable_area(
     envelopes: pd.DataFrame,
     neighborhood: str,
     scrape_date: str,
+    plates: Mapping[tuple, object] | None = None,
 ) -> pd.DataFrame:
-    """The envelopes, plus the shape of the yard each parcel could park on.
+    """The envelopes, plus the ground each one's yard could actually park on.
 
     `solve_program` bounds surface stalls at ``stall area x stalls + footprint
     <= lot area``, which is an area against an area and is satisfied on a
     parcel four metres wide - where no car can stand at any price.
-    `massing.parking_capacity_m2` is the same question asked of the parcel's
-    *shape*: the largest rectangle at least one stall deep that fits inside the
-    boundary. Merged on here so `Lot.parkable_area_m2` reaches the solver, and
-    at the **lot** grain rather than the (lot, zone, column) one the setbacks
-    use - a parcel has one boundary however many columns govern it, so it is
-    measured once per lot and broadcast.
+    `massing.parking_capacity_m2` is the same question asked of the yard's
+    *shape*: it opens the polygon by half a stall's depth and measures what
+    survives, so a ribbon of margin comes back at nothing and a band wrapping a
+    building comes back at its own area, whatever shape that band is.
 
-    Read from `rag.lots` rather than from a parquet because that is where a
-    parcel keyed on `lot_uid` lives: `bronze/neighborhood_lots` is the Infolot
-    scrape, which predates the uid and cannot be joined to an envelope.
+    **The yard, not the parcel** - and that is what `plates` buys. Until
+    `placeable_area_m2` fixed the building's rectangle before the solve, there
+    was no building to subtract at solve time and this had to measure the bare
+    parcel, which overstated every yard by whatever the plate would go on to
+    cover. `_with_placeable_area` now fits that rectangle first and hands it
+    over, so the ground measured here is the ground the answer will actually
+    have: ``parcel - plate``, opened. That is the same region
+    `lot_building_massing` will pave, measured by the same function, which is
+    what makes `surface_parking_fit_pct` a check that can pass rather than the
+    51.7 pct it reported when the bound and the drawing were two searches.
+
+    Two grains meet here. The ground is read at the **(lot, zone)** grain -
+    `silver.lot_zone_pieces`, the ground each zone governs - and the plate at
+    the **(lot, zone, column)** grain, because the margins that shape it are
+    printed in a column. The yard is therefore per envelope row, and a lot
+    straddling two zones has two of them that do not overlap.
+
+    **The parcel is the piece, and on a split lot the difference is a double
+    count.** This used to read `rag.lots` and open the yard inside the whole
+    boundary, which was right while one zone answered for a parcel. With both
+    zones answered, each piece would be handed the other's back garden to park
+    in - so lot 1 740 794 would report the same 27 044 m2 of yard twice, once
+    under each grid. `fetch_zone_piece_polygons` is what makes the ground each
+    row's own; `rag.lots` is the fallback for a partition without the pieces
+    and is exactly the behaviour that shipped before them.
+
+    Read from Postgres rather than from a parquet because that is where a shape
+    keyed on `lot_uid` lives: `bronze/neighborhood_lots` is the Infolot scrape,
+    which predates the uid and cannot be joined to an envelope.
 
     Optional the way `_with_buildable_area` is optional, and for a stronger
     reason. Failing the partition when the cadastre is unreachable would cost
@@ -1558,22 +1751,43 @@ def _with_parkable_area(
     exactly the behaviour every run had before this existed - surface stalls
     bounded on area alone - and says so in the log. What it costs is named
     there too, because "the yard was never measured" and "the yard measured
-    zero" are different answers and only one of them is in the data.
+    zero" are different answers and only one of them is in the data. An absent
+    plate is the milder version of the same thing: the parcel stands in for
+    the yard, which is the generous reading and the one that shipped before.
     """
-    from urban_rag.massing import parking_capacity_m2, to_metric
-    from urban_rag.postgis import fetch_lot_polygons
+    from urban_rag.massing import parking_capacity_m2, to_metric, yard_of
+    from urban_rag.postgis import fetch_lot_polygons, fetch_zone_piece_polygons
 
+    by_piece = True
     try:
         with postgis.connect() as connection:
-            lots = fetch_lot_polygons(
-                connection, neighborhood=neighborhood, scrape_date=scrape_date
-            )
+            try:
+                lots = fetch_zone_piece_polygons(
+                    connection, neighborhood=neighborhood, scrape_date=scrape_date
+                )
+            except MissingRelation:
+                # The pieces have not been created for this database yet. The
+                # parcel is the generous reading and the one that shipped
+                # before them, so it is a warning and not a failure - but it
+                # double-counts the yard of a split lot, which is worth saying
+                # out loud rather than leaving in the numbers.
+                context.log.warning(
+                    "silver.lot_zone_pieces is not available, so the yard is "
+                    "measured on the whole parcel: a lot two zones cover will "
+                    "report the same ground as parkable under each of them. "
+                    "Apply hbu_infra's sql/025 and materialize lot_zone_pieces "
+                    "for this partition."
+                )
+                by_piece = False
+                lots = fetch_lot_polygons(
+                    connection, neighborhood=neighborhood, scrape_date=scrape_date
+                )
     except (PostgresUnavailable, MissingRelation) as exc:
         context.log.warning(
-            "rag.lots could not be read for %s %s (%s), so every surface "
-            "stall is bounded on the yard's *area* alone - a four-metre "
-            "parcel will still be allowed to park on it. Load the cadastre "
-            "for this partition to bound it on the yard's shape as well.",
+            "no parcel geometry could be read for %s %s (%s), so every "
+            "surface stall is bounded on the yard's *area* alone - a "
+            "four-metre parcel will still be allowed to park on it. Load the "
+            "cadastre for this partition to bound it on the yard's shape too.",
             neighborhood,
             scrape_date,
             exc,
@@ -1582,30 +1796,62 @@ def _with_parkable_area(
 
     if lots.empty:
         context.log.warning(
-            "rag.lots holds no parcel for %s %s, so no yard shape was "
-            "measured and every surface stall is bounded on area alone",
+            "no parcel geometry for %s %s, so no yard shape was measured and "
+            "every surface stall is bounded on area alone",
             neighborhood,
             scrape_date,
         )
         return envelopes
 
-    # In metres once, for the whole borough: the fit is a rectangle against a
-    # boundary and a rectangle in square degrees is not a rectangle.
+    # In metres once, for the whole borough: the opening is a buffer against a
+    # boundary, and a buffer in square degrees is not a buffer.
     projected = to_metric(lots)
-    capacity = {
-        row.lot_uid: parking_capacity_m2(row.geometry)
+    # Keyed on the piece where there is one, on the lot where there is not, and
+    # looked up below by trying the pair first. Two dicts would be two lookups
+    # to keep in step; one dict with two key shapes is one.
+    parcels = {
+        ((row.lot_uid, row.feature_id) if by_piece else row.lot_uid): row.geometry
         for row in projected.itertuples(index=False)
         if row.geometry is not None and not row.geometry.is_empty
     }
-    measured = envelopes["lot_uid"].map(capacity)
+    plates = plates or {}
+
+    # Cached on (parcel, plate) rather than on the lot, because the yard is the
+    # pair: one parcel under two columns with different margins has two plates
+    # and two yards, and two columns printing the same margins share one.
+    cache: dict[tuple[int, bytes | None], float] = {}
+    values: list[float | None] = []
+    without_plate = 0
+    for row in envelopes[list(_ENVELOPE_KEYS)].itertuples(index=False):
+        parcel = parcels.get(
+            (row.lot_uid, row.feature_id) if by_piece else row.lot_uid
+        )
+        if parcel is None:
+            values.append(None)
+            continue
+        plate = plates.get((row.lot_uid, row.feature_id, row.column_index))
+        if plate is None:
+            without_plate += 1
+        key = (id(parcel), None if plate is None else plate.wkb)
+        area = cache.get(key)
+        if area is None:
+            area = parking_capacity_m2(yard_of(parcel, plate))
+            cache[key] = area
+        values.append(area)
+
+    measured = pd.Series(values, index=envelopes.index, dtype="float64")
     unparkable = int((measured == 0).sum())
     context.log.info(
-        "%s %s: yard shape measured on %d of %d envelope row(s); %d row(s) "
-        "sit on a parcel that holds no surface stall at all",
+        "%s %s: yard shape measured on %d of %d envelope row(s) from %d "
+        "distinct yard(s); %d row(s) had no plate to subtract and were "
+        "measured on the bare parcel; %d row(s) sit on a yard that holds no "
+        "surface stall at all",
         neighborhood,
         scrape_date,
         int(measured.notna().sum()),
         len(envelopes),
+        len(cache),
+        without_plate,
         unparkable,
     )
     return envelopes.assign(parkable_area_m2=measured)

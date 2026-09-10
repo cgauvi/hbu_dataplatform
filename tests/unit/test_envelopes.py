@@ -1,8 +1,10 @@
 """Offline tests for `zoning_grid_columns` and `lot_zoning_envelopes`.
 
-Neither asset touches a database - the joins they read were computed in
-PostGIS by `building_lot_intersections` and `lot_frontage`, and what is left
-here is a parse and two merges, which is exactly what these cover.
+Neither asset touches a database - the clip and the frontage they read were
+computed in PostGIS by `lot_zone_pieces`, and what is left here is a parse and
+one merge, which is exactly what these cover. The piece grain itself - the
+clip, the re-ranked frontage and the two cutoffs - is covered against real
+geometry in `tests/integration/test_lot_zone_pieces.py`.
 
 The one seam stubbed out is the download. `PdfCache` hands back a fetcher that
 reads bytes off disk or off the city's web server; the fixture below
@@ -25,13 +27,9 @@ import pandas as pd
 import pytest
 from asset_helpers import materialization_metadata, stub_publish as stub_publish_into
 from dagster import Failure, MultiPartitionKey, materialize
-from shapely.geometry import LineString, Polygon
+from shapely.geometry import Polygon
 from test_zoning_grid import grid_pdf
 
-from urban_rag.building_lots_assets import (
-    LOT_FEATURES_FILE,
-    building_lot_intersections,
-)
 from urban_rag.envelope_assets import (
     LOT_ENVELOPES_FILE,
     ZONE_COLUMNS_FILE,
@@ -40,10 +38,10 @@ from urban_rag.envelope_assets import (
 )
 from urban_rag import envelope_assets
 from urban_rag.frames import write_frame
-from urban_rag.frontage_assets import LOT_FRONTAGE_FILE, lot_frontage
 from urban_rag.rag_assets import DOCUMENTS_FILE, linked_documents
 from urban_rag.resources import ParquetStore, PdfCache, PostgisResource
 from urban_rag.storage import join
+from urban_rag.zone_piece_assets import LOT_ZONE_PIECES_FILE, lot_zone_pieces
 
 DATE = "2026-08-01"
 NEIGHBORHOOD = "VSMPE"
@@ -104,78 +102,99 @@ def write_documents(store, *, urls=(GRID_URL,), feature_ids=(["C01-001"],)):
     )
 
 
-def write_lot_features(
+def write_pieces(
     store,
     *,
     lot_uids=(1,),
     zones=("C01-001",),
     pct=(100.0,),
     lot_area_m2=400.0,
+    frontages=(30.0,),
+    streets=("Jarry",),
+    secondary_frontages=(None,),
+    secondary_streets=(None,),
+    footprint_shares=None,
 ):
-    """The lot x feature side of `building_lot_intersections`.
+    """One partition of `lot_zone_pieces`, at the columns this asset reads.
 
-    ``lot_area_m2`` is what turns a percentage into square metres, and it is a
-    parameter because the two artefact cutoffs are only telling apart on lots
-    of different sizes: 0.2% is 0.8 m2 of a 400 m2 parcel and 4 m2 of a
-    2 000 m2 one, so which cutoff a row falls to depends on the denominator.
+    The single input `lot_zoning_envelopes` has since the pieces became a table
+    of their own: the ground each zone governs, the street *that ground* faces,
+    and the shares that divide the lot's assessment between its pieces. What
+    used to be assembled here from `building_lot_intersections` and
+    `lot_frontage` is assembled in PostGIS now - see
+    `tests/integration/test_lot_zone_pieces.py`, which is where the clip, the
+    re-ranked frontage and the two cutoffs are covered against real geometry.
+
+    ``pct`` is what turns `lot_area_m2` into each piece's own area, so a split
+    lot is written by passing one entry per zone.
     """
+    count = len(lot_uids)
+    areas = [lot_area_m2 * value / 100.0 for value in pct]
+    # Rank within the lot, largest piece first - `lot_zone_pieces` writes this
+    # and `_piece_index` reads it back rather than re-deriving it.
+    order: dict[int, list[int]] = {}
+    for index, uid in enumerate(lot_uids):
+        order.setdefault(uid, []).append(index)
+    ranks = [0] * count
+    for indexes in order.values():
+        for rank, index in enumerate(
+            sorted(indexes, key=lambda i: (-areas[i], zones[i])), start=1
+        ):
+            ranks[index] = rank
+    shares = (
+        list(footprint_shares)
+        if footprint_shares is not None
+        else [value / sum(pct[i] for i in order[uid]) for value, uid in zip(pct, lot_uids)]
+    )
     frame = gpd.GeoDataFrame(
         {
-            "lot_feature_uid": list(range(1, len(lot_uids) + 1)),
             "lot_uid": list(lot_uids),
-            "lot_number": [f"2 216 {uid:03d}" for uid in lot_uids],
-            "feature_uid": list(range(1, len(lot_uids) + 1)),
-            "source_table": [ZONE_TABLE] * len(lot_uids),
             "feature_id": list(zones),
-            "neighborhood": [NEIGHBORHOOD] * len(lot_uids),
-            "scrape_date": [DATE] * len(lot_uids),
-            "lot_area_m2": [lot_area_m2] * len(lot_uids),
-            "overlap_area_m2": [lot_area_m2 * p / 100.0 for p in pct],
-            "pct_of_lot": list(pct),
-        },
-        geometry=[Polygon([(0, 0), (0, 0.001), (0.001, 0.001), (0.001, 0)])]
-        * len(lot_uids),
-        crs="EPSG:4326",
-    )
-    write_frame(
-        frame,
-        join(
-            store.partition_dir(
-                building_lot_intersections.key.path[-1], DATE, NEIGHBORHOOD
-            ),
-            LOT_FEATURES_FILE,
-        ),
-    )
-
-
-def write_frontage(store, *, lot_uids=(1,), lengths=(30.0,), ranks=(1,)):
-    """`lot_frontage`, one row per (lot, street side), longest first."""
-    frame = gpd.GeoDataFrame(
-        {
-            "lot_frontage_uid": list(range(1, len(lot_uids) + 1)),
-            "lot_uid": list(lot_uids),
             "lot_number": [f"2 216 {uid:03d}" for uid in lot_uids],
-            "street_uid": list(range(1, len(lot_uids) + 1)),
-            "cote_rue_id": [f"c{index}" for index in range(len(lot_uids))],
-            "street_name": ["Jarry", "Papineau", "De Castelnau"][: len(lot_uids)]
-            if len(lot_uids) <= 3
-            else ["Jarry"] * len(lot_uids),
-            "neighborhood": [NEIGHBORHOOD] * len(lot_uids),
-            "scrape_date": [DATE] * len(lot_uids),
-            "buffer_m": [3.0] * len(lot_uids),
-            "frontage_m": list(lengths),
-            "lot_perimeter_m": [80.0] * len(lot_uids),
-            "pct_of_perimeter": [length / 80.0 * 100 for length in lengths],
-            "frontage_rank": list(ranks),
+            "source_table": [ZONE_TABLE] * count,
+            "neighborhood": [NEIGHBORHOOD] * count,
+            "scrape_date": [DATE] * count,
+            "lot_area_m2": [lot_area_m2] * count,
+            "piece_area_m2": areas,
+            "pct_of_lot": list(pct),
+            "num_lot_zones": [len(order[uid]) for uid in lot_uids],
+            "zone_rank": ranks,
+            "is_primary_zone": [rank == 1 for rank in ranks],
+            "primary_frontage_m": list(frontages),
+            "primary_street_name": list(streets),
+            "primary_cote_rue_id": [f"c{index}" for index in range(count)],
+            "secondary_frontage_m": list(secondary_frontages),
+            "secondary_street_name": list(secondary_streets),
+            "secondary_cote_rue_id": [None] * count,
+            "num_frontages": [
+                1 + (1 if value is not None else 0) for value in secondary_frontages
+            ],
+            "lot_frontage_m": [
+                sum(frontages[i] or 0.0 for i in order[uid]) for uid in lot_uids
+            ],
+            "frontage_buffer_m": [0.0] * count,
+            "existing_footprint_m2": [0.0] * count,
+            "lot_footprint_m2": [0.0] * count,
+            "num_buildings": [0] * count,
+            "area_share": [
+                value / sum(pct[i] for i in order[uid])
+                for value, uid in zip(pct, lot_uids)
+            ],
+            "footprint_share": shares,
+            "footprint_share_basis": ["area"] * count,
+            "min_pct_of_lot": [1.0] * count,
+            "min_overlap_m2": [1.0] * count,
+            "min_piece_area_m2": [500.0] * count,
+            "edge_tolerance_m": [0.25] * count,
         },
-        geometry=[LineString([(0, 0), (0.0001, 0)])] * len(lot_uids),
+        geometry=[Polygon([(0, 0), (0, 0.001), (0.001, 0.001), (0.001, 0)])] * count,
         crs="EPSG:4326",
     )
     write_frame(
         frame,
         join(
-            store.partition_dir(lot_frontage.key.path[-1], DATE, NEIGHBORHOOD),
-            LOT_FRONTAGE_FILE,
+            store.partition_dir(lot_zone_pieces.key.path[-1], DATE, NEIGHBORHOOD),
+            LOT_ZONE_PIECES_FILE,
         ),
     )
 
@@ -343,9 +362,10 @@ def materialize_both(store, cache, stub_pdfs, *, feature_ids=None, **envelope_kw
     return run_envelopes(store, **envelope_kwargs)
 
 
-def test_one_row_per_lot_and_grid_column(store, cache, stub_pdfs):
-    write_lot_features(store)
-    write_frontage(store)
+
+
+def test_one_row_per_piece_and_grid_column(store, cache, stub_pdfs):
+    write_pieces(store)
     result = materialize_both(store, cache, stub_pdfs)
     assert result.success
 
@@ -353,12 +373,85 @@ def test_one_row_per_lot_and_grid_column(store, cache, stub_pdfs):
     assert len(frame) == 2
     assert set(frame["lot_uid"]) == {1}
     assert frame["lot_area_m2"].unique().tolist() == [400.0]
+    # One zone covering the parcel whole: the piece *is* the lot, which is the
+    # case on the great majority of a borough's rows.
+    assert frame["piece_area_m2"].unique().tolist() == [400.0]
+    assert frame["num_lot_zones"].unique().tolist() == [1]
+    assert frame["is_primary_zone"].all()
     assert frame["lot_number"].unique().tolist() == ["2 216 001"]
 
 
+def write_split_lot(store):
+    """Lot 1 740 794's shape, at the columns this asset joins.
+
+    27 044 m2 split 90.94 / 9.02 between two zones, the smaller one holding
+    the street the parcel mostly fronts on. Named once because four tests
+    below are about four different consequences of the same parcel.
+    """
+    write_pieces(
+        store,
+        lot_uids=(1, 1),
+        zones=("C01-001", "C01-009"),
+        pct=(90.94, 9.02),
+        lot_area_m2=27_044.0,
+        frontages=(15.2, 19.8),
+        streets=("Herelle", "Jarry"),
+        secondary_frontages=(None, None),
+        secondary_streets=(None, None),
+    )
+
+
+def test_a_split_lot_keeps_both_zones_with_their_own_ground(
+    store, cache, stub_pdfs
+):
+    """Both zones are envelopes, each sized to the ground its own grid governs.
+
+    The piece areas sum to the parcel and neither of them *is* the parcel.
+    Before `lot_zone_pieces` the best-covered zone was kept and handed all
+    27 044 m2 of it, and the other was dropped before anything was solved.
+    """
+    write_split_lot(store)
+
+    materialize_both(store, cache, stub_pdfs, feature_ids=["C01-001", "C01-009"])
+    frame = read_envelopes(store)
+
+    assert sorted(frame["feature_id"].unique()) == ["C01-001", "C01-009"]
+    by_zone = frame.drop_duplicates("feature_id").set_index("feature_id")
+    assert by_zone.loc["C01-001", "piece_area_m2"] == pytest.approx(24_593.8, abs=1.0)
+    assert by_zone.loc["C01-009", "piece_area_m2"] == pytest.approx(2_439.4, abs=1.0)
+    # The parcel is on every row and is not the ground any of them governs.
+    assert frame["lot_area_m2"].unique().tolist() == [27_044.0]
+    assert frame["num_lot_zones"].unique().tolist() == [2]
+    # The larger piece is the one a reader wanting a single row would take.
+    assert by_zone.loc["C01-001", "is_primary_zone"]
+    assert not by_zone.loc["C01-009", "is_primary_zone"]
+
+
+def test_each_piece_faces_its_own_street(store, cache, stub_pdfs):
+    """The half of the split that is not about area.
+
+    A commercial strip on a boulevard with housing behind it is the ordinary
+    form of a Montreal arterial, and the two pieces face different streets.
+    Every envelope row used to carry the *lot's* rank-1 frontage, so the
+    housing behind was tested for width against a boulevard it does not touch.
+    """
+    write_split_lot(store)
+
+    materialize_both(store, cache, stub_pdfs, feature_ids=["C01-001", "C01-009"])
+    frame = read_envelopes(store).drop_duplicates("feature_id").set_index("feature_id")
+
+    assert frame.loc["C01-001", "primary_street_name"] == "Herelle"
+    assert frame.loc["C01-001", "primary_frontage_m"] == 15.2
+    assert frame.loc["C01-009", "primary_street_name"] == "Jarry"
+    assert frame.loc["C01-009", "primary_frontage_m"] == 19.8
+
+
 def test_carries_the_primary_and_secondary_frontage(store, cache, stub_pdfs):
-    write_lot_features(store)
-    write_frontage(store, lot_uids=(1, 1), lengths=(30.0, 12.0), ranks=(1, 2))
+    write_pieces(
+        store,
+        secondary_frontages=(12.0,),
+        secondary_streets=("Papineau",),
+    )
 
     materialize_both(store, cache, stub_pdfs)
     frame = read_envelopes(store)
@@ -370,9 +463,8 @@ def test_carries_the_primary_and_secondary_frontage(store, cache, stub_pdfs):
     assert frame["num_frontages"].unique().tolist() == [2]
 
 
-def test_an_interior_lot_has_no_frontage_and_says_so(store, cache, stub_pdfs):
-    write_lot_features(store)
-    write_frontage(store, lot_uids=(2,), lengths=(30.0,))  # a different lot
+def test_an_interior_piece_has_no_frontage_and_says_so(store, cache, stub_pdfs):
+    write_pieces(store, frontages=(None,), streets=(None,))
 
     materialize_both(store, cache, stub_pdfs)
     frame = read_envelopes(store)
@@ -386,8 +478,7 @@ def test_an_interior_lot_has_no_frontage_and_says_so(store, cache, stub_pdfs):
 def test_governs_residential_marks_the_column_the_solver_would_pick(
     store, cache, stub_pdfs
 ):
-    write_lot_features(store)
-    write_frontage(store)
+    write_pieces(store)
     materialize_both(store, cache, stub_pdfs)
 
     frame = read_envelopes(store)
@@ -398,13 +489,12 @@ def test_governs_residential_marks_the_column_the_solver_would_pick(
     assert not frame[~frame["permits_residential"]]["governs_residential"].any()
 
 
-def test_a_lot_too_narrow_for_every_residential_column_governs_none(
+def test_a_piece_too_narrow_for_every_residential_column_governs_none(
     store, cache, stub_pdfs
 ):
-    """*Largeur du terrain min* is a real answer about the parcel."""
+    """*Largeur du terrain min* is a real answer about the ground."""
     stub_pdfs[GRID_URL] = grid_pdf(lot_width=("-", "18"))
-    write_lot_features(store)
-    write_frontage(store, lengths=(9.0,))
+    write_pieces(store, frontages=(9.0,))
 
     materialize_both(store, cache, stub_pdfs)
     frame = read_envelopes(store)
@@ -414,120 +504,25 @@ def test_a_lot_too_narrow_for_every_residential_column_governs_none(
     assert not frame["governs_residential"].any()
 
 
-def test_a_sliver_of_a_neighbouring_zone_can_be_configured_away(
+def test_the_width_test_is_taken_against_the_piece_not_the_lot(
     store, cache, stub_pdfs
 ):
-    # Two *distinct* zones, which is what a lot on a boundary actually meets:
-    # the same number twice is one zone, and the assets now say so.
-    write_lot_features(
-        store, lot_uids=(1, 1), zones=("C01-001", "C01-009"), pct=(97.0, 3.0)
-    )
-    write_frontage(store)
+    """Two pieces of one parcel, one wide enough for the grid and one not.
+
+    The whole reason the frontage is re-ranked inside each piece: under the
+    lot's own rank-1 edge both rows would have read 19.8 m and both would have
+    qualified for an 18 m minimum, including the piece that faces 15.2 m.
+    """
+    stub_pdfs[GRID_URL] = grid_pdf(lot_width=("-", "18"))
+    write_split_lot(store)
 
     materialize_both(store, cache, stub_pdfs, feature_ids=["C01-001", "C01-009"])
-    assert len(read_envelopes(store)) == 4
-
-    run_envelopes(
-        store,
-        run_config={
-            "ops": {
-                "silver__lot_zoning_envelopes": {"config": {"min_pct_of_lot": 5.0}}
-            }
-        },
-    )
     frame = read_envelopes(store)
-    assert len(frame) == 2
-    assert frame["pct_of_lot"].unique().tolist() == [97.0]
+    residential = frame[frame["permits_residential"]].set_index("feature_id")
 
-
-def test_a_square_metre_of_a_neighbouring_zone_is_not_an_envelope(
-    store, cache, stub_pdfs
-):
-    """The absolute cutoff, doing what the proportional one cannot.
-
-    A 40 m2 remnant, 1.5% of which - 0.6 m2 - is the block next door's zone.
-    The percentage clears `min_pct_of_lot` comfortably and the clip is still
-    the cadastre and the zoning layer missing each other along a lot line, so
-    it is `min_overlap_m2` that has to catch it. That is why both cutoffs
-    exist and why a row has to clear both.
-    """
-    write_lot_features(
-        store,
-        lot_uids=(1, 1),
-        zones=("C01-001", "C01-009"),
-        pct=(98.5, 1.5),
-        lot_area_m2=40.0,
-    )
-    write_frontage(store)
-
-    result = materialize_both(
-        store, cache, stub_pdfs, feature_ids=["C01-001", "C01-009"]
-    )
-    frame = read_envelopes(store)
-    assert frame["feature_id"].unique().tolist() == ["C01-001"]
-    assert len(frame) == 2
-
-    metadata = materialization_metadata(result, lot_zoning_envelopes)
-    # One lot x zone pair, which the grid then turns into the two columns the
-    # kept zone contributes.
-    assert metadata["min_overlap_m2"].value == 1.0
-    assert metadata["num_sliver_pairs_dropped"].value == 1
-
-
-def test_a_zone_over_a_square_metre_but_under_one_per_cent_is_not_an_envelope(
-    store, cache, stub_pdfs
-):
-    """The proportional cutoff, doing what the absolute one cannot.
-
-    Lot 6 291 714 of Villeray-Saint-Michel-Parc-Extension to the square metre:
-    438 m2, of which the two publishers put 437.23 in H03-126 and 1.19 in
-    C03-130. That 1.19 m2 is 19% more than `min_overlap_m2` and 0.27% of the
-    parcel, so before `min_pct_of_lot` had a default the lot went out carrying
-    two zones - and a commercial grid governing a quarter of a per cent of it
-    was priced and solved beside the residential one governing the rest.
-    """
-    write_lot_features(
-        store,
-        lot_uids=(1, 1),
-        zones=("C01-001", "C01-009"),
-        pct=(99.727457, 0.272543),
-        lot_area_m2=438.42,
-    )
-    write_frontage(store)
-
-    result = materialize_both(
-        store, cache, stub_pdfs, feature_ids=["C01-001", "C01-009"]
-    )
-    frame = read_envelopes(store)
-    assert frame["feature_id"].unique().tolist() == ["C01-001"]
-    assert len(frame) == 2
-
-    metadata = materialization_metadata(result, lot_zoning_envelopes)
-    assert metadata["min_pct_of_lot"].value == 1.0
-    assert metadata["num_sliver_pairs_dropped"].value == 1
-
-
-def test_the_artefact_cutoffs_can_be_turned_off(store, cache, stub_pdfs):
-    """Both of them, and both are needed: 0.8 m2 is also 0.2% of the lot."""
-    write_lot_features(
-        store, lot_uids=(1, 1), zones=("C01-001", "C01-009"), pct=(99.8, 0.2)
-    )
-    write_frontage(store)
-
-    materialize_both(
-        store,
-        cache,
-        stub_pdfs,
-        feature_ids=["C01-001", "C01-009"],
-        run_config={
-            "ops": {
-                "silver__lot_zoning_envelopes": {
-                    "config": {"min_overlap_m2": 0.0, "min_pct_of_lot": 0.0}
-                }
-            }
-        },
-    )
-    assert len(read_envelopes(store)) == 4
+    assert not residential.loc["C01-001", "meets_min_lot_width"]
+    assert residential.loc["C01-009", "meets_min_lot_width"]
+    assert set(frame.loc[frame["governs_residential"], "feature_id"]) == {"C01-009"}
 
 
 def test_a_zone_a_grid_cites_twice_is_one_zone(store, cache, stub_pdfs):
@@ -539,8 +534,7 @@ def test_a_zone_a_grid_cites_twice_is_one_zone(store, cache, stub_pdfs):
     parquet - which is the file `hbu_candidates` reads, and a second CP-SAT
     model on the same envelope.
     """
-    write_lot_features(store)
-    write_frontage(store)
+    write_pieces(store)
 
     materialize_both(store, cache, stub_pdfs, feature_ids=["C01-001", "C01-001"])
 
@@ -556,71 +550,109 @@ def test_a_zone_a_grid_cites_twice_is_one_zone(store, cache, stub_pdfs):
 
 
 def test_a_zone_no_grid_was_parsed_for_fails_the_partition(store, cache, stub_pdfs):
-    write_lot_features(store, zones=("C01-999",))
-    write_frontage(store)
+    write_pieces(store, zones=("C01-999",))
     with pytest.raises(Failure, match="share no zone number"):
         materialize_both(store, cache, stub_pdfs)
 
 
 def test_metadata_counts_what_is_solvable(store, cache, stub_pdfs):
-    write_lot_features(store)
-    write_frontage(store)
+    write_pieces(store)
     result = materialize_both(store, cache, stub_pdfs)
 
     metadata = materialization_metadata(result, lot_zoning_envelopes)
     assert metadata["num_envelopes"].value == 2
+    # Two columns of one grid describe one piece of ground.
+    assert metadata["num_pieces"].value == 1
     assert metadata["num_lots_zoned"].value == 1
+    assert metadata["num_split_lots"].value == 0
     assert metadata["num_residential_envelopes"].value == 1
     assert metadata["num_governing_envelopes"].value == 1
     assert metadata["num_solvable_envelopes"].value == 1
     assert metadata["num_lots_solvable"].value == 1
+    # Read off the rows the pieces wrote rather than off this asset's config,
+    # which no longer carries them.
     assert metadata["min_pct_of_lot"].value == 1.0
     assert metadata["min_overlap_m2"].value == 1.0
-    assert metadata["num_sliver_pairs_dropped"].value == 0
+    assert metadata["min_piece_area_m2"].value == 500.0
     assert metadata["num_duplicate_rows_dropped"].value == 0
 
 
+def test_metadata_counts_the_split_lots(store, cache, stub_pdfs):
+    write_split_lot(store)
+    result = materialize_both(
+        store, cache, stub_pdfs, feature_ids=["C01-001", "C01-009"]
+    )
+
+    metadata = materialization_metadata(result, lot_zoning_envelopes)
+    assert metadata["num_pieces"].value == 2
+    assert metadata["num_split_lots"].value == 1
+    assert metadata["num_envelopes_on_split_lots"].value == 4
+    # The piece median is under the parcel median, which is the arithmetic of
+    # the whole change in one pair of numbers.
+    assert (
+        metadata["median_piece_area_m2"].value < metadata["median_lot_area_m2"].value
+    )
+
+
 def test_a_row_is_one_call_to_solve_program(store, cache, stub_pdfs):
-    """The point of the table: a governing row is the solver's whole input."""
+    """The point of the table: a zone's governing rows are the solver's whole
+    input.
+
+    The zone's rows, and not one of them. C01-001 prints its ``C.4`` on *Tous
+    les niveaux* and its ``H`` on *Tous sauf le RDC* - shops at grade, flats
+    over them - so the Habitation row alone is a building with nothing on its
+    ground floor, which `solve_program` now refuses by name. This rebuilds the
+    `ZoneEnvelope` the way `hbu._program_row` does, which is the call the
+    asset actually feeds.
+    """
     from urban_rag.program import (
         BuildingLevel,
         Lot,
         UnitEconomics,
+        NonResidentialEconomics,
         ZoneColumn,
+        ZoneEnvelope,
         solve_program,
     )
 
-    write_lot_features(store)
-    write_frontage(store)
+    write_pieces(store)
     materialize_both(store, cache, stub_pdfs)
 
-    row = read_envelopes(store).query("governs_residential").iloc[0]
-    program = solve_program(
-        ZoneColumn(
-            usages=tuple(json.loads(row["usages"])),
-            floors_max=int(row["floors_max"]),
+    rows = read_envelopes(store)
+    row = rows.query("governs_residential").iloc[0]
+
+    def column_of(source):
+        return ZoneColumn(
+            usages=tuple(json.loads(source["usages"])),
+            floors_max=int(source["floors_max"]),
             levels=frozenset(
-                BuildingLevel(level) for level in json.loads(row["levels"])
+                BuildingLevel(level) for level in json.loads(source["levels"])
             ),
-            floors_min=int(row["floors_min"]),
-            density_max=float(row["density_max"]),
-            site_coverage_max_pct=float(row["site_coverage_max_pct"]),
-            zone=row["feature_id"],
+            floors_min=int(source["floors_min"]),
+            density_max=float(source["density_max"]),
+            site_coverage_max_pct=float(source["site_coverage_max_pct"]),
+            zone=source["feature_id"],
+        )
+
+    program = solve_program(
+        ZoneEnvelope.of(
+            [column_of(other) for _, other in rows.iterrows()],
+            frontage_m=float(row["primary_frontage_m"]),
         ),
+        # The piece, which is the ground the zone governs - `hbu.lot_of` reads
+        # exactly this column.
         Lot(
-            area_m2=float(row["lot_area_m2"]),
+            area_m2=float(row["piece_area_m2"]),
             frontage_m=float(row["primary_frontage_m"]),
             lot_number=row["lot_number"],
         ),
         UnitEconomics(average_rent_cad={"2_bedroom": 1_500.0}),
+        # The borough's own surveyed retail rather than the module's $80
+        # default, which outbids the housing for all six storeys and would
+        # leave this asserting on a building with no dwellings in it.
+        non_residential=NonResidentialEconomics(commercial_per_sqft_year=26.6007),
     )
     assert program.solved
     assert program.total_dwellings > 0
     assert program.zone == "C01-001"
     assert program.lot_number == "2 216 001"
-    # Six storeys authorised, the ground floor not among them - the number the
-    # grid never prints, carried on the row as `residential_floors`. It bounds
-    # the *dwellings*: `program.floors` is the whole building, and the sixth
-    # storey the level rows deny them is where the stalls end up.
-    assert program.residential_floors <= int(row["residential_floors"]) == 5
-    assert program.floors <= int(row["floors_max"]) == 6

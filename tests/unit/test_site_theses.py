@@ -7,8 +7,9 @@ asset is then materialized over hand-written gap, HBU, comparables and zone
 partitions, the way `test_opportunities.py` materializes it over the gap alone.
 
 The fixture borough is one lot per case: a gas station, an obsolete plex under
-a six-storey grid, the same plex in a heritage sector, a parking lot, a plex
-that can take a storey, one the solver never reached, and one built out.
+a six-storey grid, the same plex in a heritage sector, the same plex in a PIIA
+sector, a parking lot, a plex that can take a storey, one the solver never
+reached, and one built out.
 """
 
 from __future__ import annotations
@@ -243,18 +244,177 @@ def test_a_dash_in_the_heritage_row_is_no_sector():
     assert not flags.loc[0, "is_heritage_sector"]
 
 
-def test_a_piia_sector_is_flagged_and_not_screened_by_default():
+def test_a_piia_sector_keeps_a_lot_out_of_the_theses_that_demolish():
+    """What a PIIA reviews is the replacement building - which is what a
+    teardown proposes - so it screens the same two theses the heritage
+    sector does."""
     assigned = assign_site_thesis(frame({"piia_sector": "2"}))
     assert assigned.loc[0, "has_piia_review"]
+    assert assigned.loc[0, "is_demolition_restricted"]
+    assert not assigned.loc[0, "is_teardown_site"]
+    # The building may still gain a storey, so the lot lands on improvement
+    # rather than dropping off the shortlist - lot 2 214 159's case.
+    assert assigned.loc[0, "site_thesis"] == IMPROVEMENT
+
+
+def test_a_piia_sector_keeps_a_brownfield_out_too():
+    assigned = assign_site_thesis(
+        frame({"piia_sector": "2", "existing_dominant_use_code": "6411"})
+    )
+    assert assigned.loc[0, "is_brownfield_use"]
+    assert not assigned.loc[0, "is_brownfield_site"]
+
+
+def test_a_risk_use_with_nothing_standing_stays_a_brownfield_under_a_piia():
+    """Lot 2 249 816's case: a garage yard the roll states no floor for.
+
+    The screen is on demolition and there is nothing here to demolish, so it
+    does not bite; without that, `brownfield` dropped and `infill` - which
+    does not read the flag - caught the lot and named a contaminated yard the
+    one thesis that means nothing stands on it.
+    """
+    assigned = assign_site_thesis(
+        frame(
+            {
+                "piia_sector": "2",
+                "existing_dominant_use_code": "6419",
+                "existing_floor_area_m2": None,
+                "existing_num_dwellings": 0,
+                "existing_year_built": None,
+                "existing_num_storeys": None,
+            }
+        )
+    )
+    assert assigned.loc[0, "has_piia_review"]
     assert not assigned.loc[0, "is_demolition_restricted"]
-    assert assigned.loc[0, "site_thesis"] == TEARDOWN
+    assert assigned.loc[0, "is_brownfield_use"]
+    assert assigned.loc[0, "is_brownfield_site"]
+    # Nothing stands on it either - both fire, and precedence names it.
+    assert assigned.loc[0, "is_infill_site"]
+    assert assigned.loc[0, "site_thesis"] == BROWNFIELD
+
+
+def test_a_piia_lot_with_a_building_is_still_screened():
+    """The gate is the standing floor, not the sector: put a building back on
+    the same lot and the screen bites again."""
+    assigned = assign_site_thesis(
+        frame({"piia_sector": "2", "existing_dominant_use_code": "6419"})
+    )
+    assert assigned.loc[0, "is_demolition_restricted"]
+    assert not assigned.loc[0, "is_brownfield_site"]
+
+
+def test_a_lot_the_roll_dates_but_states_no_floor_for_is_not_a_teardown():
+    """A demolition with no floor to demolish.
+
+    `built_share` fills a missing floor with zero rather than null, so such a
+    lot passes the under-built test at 0.0 and would be filed as a teardown on
+    a year of construction alone - one whose `demolition_cost_cad` is nothing,
+    because there is no floor to charge the rate against.
+    """
+    assigned = assign_site_thesis(
+        frame({"existing_floor_area_m2": None, "existing_num_dwellings": 0})
+    )
+    # The share that made it look under-built, and the cost that gives it away.
+    assert assigned.loc[0, "built_share"] == 0.0
+    assert not assigned.loc[0, "is_teardown_site"]
+    # It is a lot with nothing on it, and that thesis reads it correctly.
+    assert assigned.loc[0, "site_thesis"] == INFILL
+
+
+# -- ground the roll never reached -------------------------------------------
+
+
+def _lane(**overrides) -> dict:
+    """Lot 2 249 035 as the gap carries it: a 920 m2 piece the roll never
+    listed, with 16.7 m2 of a neighbour's building clipped onto it and a
+    program the solver was happy to put there."""
+    row = {
+        "lot_number": "2 249 035",
+        "lot_area_m2": 932.37,
+        "piece_area_m2": 920.51,
+        "existing_footprint_m2": 16.71,
+        "existing_floor_area_m2": None,
+        "existing_num_dwellings": None,
+        "existing_num_assessment_units": 0,
+        "existing_total_assessed_value": None,
+        "existing_year_built": None,
+        "existing_num_storeys": None,
+        "existing_dominant_use_code": None,
+        "existing_dominant_income_class": None,
+        "hbu_floor_area_m2": 222.96,
+    }
+    row.update(overrides)
+    return row
+
+
+def test_a_lane_the_roll_never_listed_is_not_an_infill():
+    assigned = assign_site_thesis(frame(_lane()))
+    assert assigned.loc[0, "existing_footprint_coverage"] == pytest.approx(
+        16.71 / 920.51, abs=1e-4
+    )
+    assert assigned.loc[0, "is_unassessed_vacant"]
+    assert not assigned.loc[0, "is_infill_site"]
+    assert assigned.loc[0, "site_thesis"] == NO_SITE_THESIS
+
+
+def test_an_off_roll_lot_with_a_building_over_a_twentieth_of_it_is_kept():
+    """Either condition alone is a site; only the two together are a lane."""
+    assigned = assign_site_thesis(frame(_lane(existing_footprint_m2=60.0)))
+    assert not assigned.loc[0, "is_unassessed_vacant"]
+    assert assigned.loc[0, "site_thesis"] == INFILL
+
+
+@pytest.mark.parametrize(
+    "signal",
+    [
+        {"existing_num_assessment_units": 1},
+        {"existing_total_assessed_value": 250_000.0},
+        {"existing_dominant_use_code": "4621"},
+    ],
+    ids=["a unit", "a value", "a use code"],
+)
+def test_any_sign_of_the_roll_keeps_bare_ground_an_infill(signal):
+    """An assessed parking lot with nothing on it is the infill thesis's own
+    case. The value counts on its own because the unit count is
+    footprint-allocated across a split parcel's pieces and rounds to zero on
+    a bare yard behind an assessed building."""
+    assigned = assign_site_thesis(frame(_lane(**signal)))
+    assert not assigned.loc[0, "is_unassessed_vacant"]
+    assert assigned.loc[0, "site_thesis"] == INFILL
+
+
+def test_a_frame_with_no_measured_footprint_screens_nothing():
+    """Absence of the measure is not absence of a building."""
+    row = _lane()
+    del row["existing_footprint_m2"]
+    assigned = assign_site_thesis(frame(row))
+    assert pd.isna(assigned.loc[0, "existing_footprint_coverage"])
+    assert not assigned.loc[0, "is_unassessed_vacant"]
+    assert assigned.loc[0, "site_thesis"] == INFILL
+
+
+def test_the_coverage_is_over_the_parcel_where_there_is_no_piece():
+    assigned = assign_site_thesis(frame(_lane(piece_area_m2=None)))
+    assert assigned.loc[0, "existing_footprint_coverage"] == pytest.approx(
+        16.71 / 932.37, abs=1e-4
+    )
+    assert assigned.loc[0, "is_unassessed_vacant"]
+
+
+def test_the_lane_screen_is_a_threshold():
+    rules = SiteRules(unassessed_vacant_max_coverage=0.0)
+    assigned = assign_site_thesis(frame(_lane()), rules)
+    assert not assigned.loc[0, "is_unassessed_vacant"]
+    assert assigned.loc[0, "site_thesis"] == INFILL
 
 
 def test_the_piia_screen_is_a_switch():
-    rules = SiteRules(exclude_piia_sectors=True)
+    rules = SiteRules(exclude_piia_sectors=False)
     assigned = assign_site_thesis(frame({"piia_sector": "2"}), rules)
-    assert assigned.loc[0, "is_demolition_restricted"]
-    assert not assigned.loc[0, "is_teardown_site"]
+    assert assigned.loc[0, "has_piia_review"]
+    assert not assigned.loc[0, "is_demolition_restricted"]
+    assert assigned.loc[0, "site_thesis"] == TEARDOWN
 
 
 def test_a_pre_1940_building_needs_a_demolition_review_and_is_flagged():
@@ -468,6 +628,8 @@ def test_rules_that_make_no_sense_are_refused():
         SiteRules(addition_cost_premium=0.0)
     with pytest.raises(ValueError):
         SiteRules(brownfield_use_prefixes=())
+    with pytest.raises(ValueError):
+        SiteRules(unassessed_vacant_max_coverage=1.5)
 
 
 # -- the asset --------------------------------------------------------------
@@ -490,6 +652,8 @@ def _gap_rows() -> pd.DataFrame:
         {"lot_number": "1 000 003"},  # in a heritage zone -> improvement
         {"lot_number": "1 000 004", "existing_year_built": 1985},  # improvement
         {"lot_number": "1 000 005", "is_underbuilt": False, "existing_year_built": 1985},
+        {"lot_number": "1 000 006"},  # in a PIIA zone -> improvement
+        _lane(lot_number="1 000 007"),  # a ruelle -> none
     )
     gap = rows.drop(
         columns=[
@@ -532,8 +696,14 @@ def borough(store):
             "lot_number": gap["lot_number"],
             "floors": 6,
             "footprint_m2": 180.0,
-            "grid_zone": ["H01-001", "C01-002", "H01-003", "H01-001", "H01-001"],
-            "feature_id": ["H01-001", "C01-002", "H01-003", "H01-001", "H01-001"],
+            "grid_zone": [
+                "H01-001", "C01-002", "H01-003", "H01-001", "H01-001", "H01-006",
+                "H01-001",
+            ],
+            "feature_id": [
+                "H01-001", "C01-002", "H01-003", "H01-001", "H01-001", "H01-006",
+                "H01-001",
+            ],
             "source_table": "ZONAGE",
         }
     )
@@ -547,7 +717,7 @@ def borough(store):
     comparables = pd.DataFrame(
         {
             "lot_number": gap["lot_number"],
-            "year_built": [1950, 1962, 1950, 1985, 1985],
+            "year_built": [1950, 1962, 1950, 1985, 1985, 1950, None],
             "num_storeys": 2,
         }
     )
@@ -563,10 +733,10 @@ def borough(store):
     zones = pd.DataFrame(
         {
             "source_table": "ZONAGE",
-            "feature_id": ["H01-001", "H01-001", "C01-002", "H01-003"],
-            "column_index": [0, 1, 0, 0],
-            "heritage_sector": [None, None, None, "Oui"],
-            "piia_sector": [None, None, "2", None],
+            "feature_id": ["H01-001", "H01-001", "C01-002", "H01-003", "H01-006"],
+            "column_index": [0, 1, 0, 0, 0],
+            "heritage_sector": [None, None, None, "Oui", None],
+            "piia_sector": [None, None, None, None, "2"],
         }
     )
     write_frame(
@@ -601,33 +771,50 @@ def test_the_asset_joins_the_three_inputs_and_files_every_lot(borough):
 
     assert frame_out.loc["1 000 001", "site_thesis"] == TEARDOWN
     assert frame_out.loc["1 000 002", "site_thesis"] == BROWNFIELD
-    assert frame_out.loc["1 000 002", "has_piia_review"]
     assert frame_out.loc["1 000 003", "is_heritage_sector"]
     assert frame_out.loc["1 000 003", "site_thesis"] == IMPROVEMENT
     assert frame_out.loc["1 000 004", "site_thesis"] == IMPROVEMENT
     assert frame_out.loc["1 000 005", "site_thesis"] == NO_SITE_THESIS
+    # The PIIA lot is the teardown screen's other half: same 1950 plex under
+    # the same envelope as 1 000 001, filed under improvement instead.
+    assert frame_out.loc["1 000 006", "has_piia_review"]
+    assert frame_out.loc["1 000 006", "is_demolition_restricted"]
+    assert frame_out.loc["1 000 006", "site_thesis"] == IMPROVEMENT
+    # The ruelle: the roll never listed it and 1.8% of it is under a
+    # building, so it is not the one thesis it could have reached.
+    assert frame_out.loc["1 000 007", "is_unassessed_vacant"]
+    assert frame_out.loc["1 000 007", "existing_footprint_coverage"] == pytest.approx(
+        16.71 / 920.51, abs=1e-4
+    )
+    assert not frame_out.loc["1 000 007", "is_infill_site"]
+    assert frame_out.loc["1 000 007", "site_thesis"] == NO_SITE_THESIS
 
     # What the screen read travels with the row.
     assert frame_out.loc["1 000 001", "existing_year_built"] == 1950
     assert frame_out.loc["1 000 001", "hbu_floors"] == 6
     assert frame_out.loc["1 000 001", "grid_zone"] == "H01-001"
     assert frame_out.loc["1 000 003", "heritage_sector"] == "Oui"
-    # The join keys to the zone do not.
-    assert "feature_id" not in frame_out.columns
+    # Of the two zone join keys, `feature_id` stays - it is half the table's
+    # key since a shortlist row became a piece of a lot - and `source_table`,
+    # which is a join key and nothing else, does not.
+    assert "feature_id" in frame_out.columns
+    assert "source_table" not in frame_out.columns
 
     assumptions = json.loads(frame_out.iloc[0]["screen_assumptions"])
     assert assumptions["demolition_cost_cad_per_m2"] == 150.0
     assert assumptions["demolition_cost_cad_per_m2_nonresidential"] == 250.0
     assert assumptions["addition_cost_premium"] == 1.5
+    assert assumptions["unassessed_vacant_max_coverage"] == 0.05
     assert assumptions["heritage_source"] == "zoning_grid_columns"
     assert assumptions["site_top_n"] == 25
 
     metadata = materialization_metadata(result, lot_investment_opportunities)
     assert metadata["num_teardown_sites"].value == 1
     assert metadata["num_brownfield_sites"].value == 1
-    assert metadata["num_improvement_sites"].value == 2
+    assert metadata["num_improvement_sites"].value == 3
     assert metadata["num_heritage_sector_lots"].value == 1
     assert metadata["num_piia_review_lots"].value == 1
+    assert metadata["num_unassessed_vacant_lots"].value == 1
     # Every lot's zone had a grid row, and a grid printing '-' against the
     # heritage row is an answer rather than an unknown.
     assert metadata["num_lots_heritage_unknown"].value == 0
@@ -644,6 +831,7 @@ def test_the_asset_carries_the_config_into_the_rules(borough):
                     "config": {
                         "exclude_heritage_sectors": False,
                         "demolition_cost_cad_per_m2": 200.0,
+                        "unassessed_vacant_max_coverage": 0.0,
                         "site_top_n": 1,
                     }
                 }
@@ -661,6 +849,10 @@ def test_the_asset_carries_the_config_into_the_rules(borough):
     ).set_index("lot_number")
     # The heritage lot is a teardown once the switch is off.
     assert frame_out.loc["1 000 003", "site_thesis"] == TEARDOWN
+    # And the ruelle is an infill once the lane screen is, unranked because
+    # the roll never priced it.
+    assert frame_out.loc["1 000 007", "site_thesis"] == INFILL
+    assert pd.isna(frame_out.loc["1 000 007", "site_thesis_rank"])
     assert frame_out.loc["1 000 001", "demolition_cost_cad"] == pytest.approx(
         240.0 * 200.0
     )

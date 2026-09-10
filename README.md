@@ -68,7 +68,7 @@ tree: [docs/architecture.md](docs/architecture.md).
 | Layer | |
 | --- | --- |
 | **bronze** | `spectrum_table_catalog` `neighborhood_features` `reference_neighborhoods` `neighborhood_lots` `neighborhood_buildings` `cmhc_vacancy_survey` `cmhc_rent_survey` `street_network` `montreal_residential_costs` `montreal_nonresidential_costs` `property_assessment_roll` `uniformized_property_wealth` `montreal_commercial_rents` `commercial_rent_index` `linked_documents` |
-| **silver** | `vacancy_rates` `average_rents` `building_lot_intersections` `assessment_units` `lot_assessed_values` `lot_assessment_comparables` `commercial_rents` `neighborhood_streets` `lot_frontage` `zoning_grid_columns` `lot_zoning_envelopes` `lot_buildable_setbacks` `lot_development_programs` `document_chunks` `document_embeddings` |
+| **silver** | `vacancy_rates` `average_rents` `building_lot_intersections` `assessment_units` `lot_assessed_values` `lot_assessment_comparables` `commercial_rents` `neighborhood_streets` `lot_frontage` `zoning_grid_columns` `lot_zone_pieces` `lot_zoning_envelopes` `lot_buildable_setbacks` `lot_development_programs` `document_chunks` `document_embeddings` |
 | **gold** | `lot_profiles` `lot_highest_best_use` `lot_redevelopment_gap` `lot_investment_opportunities` `lot_building_massing` `document_index` |
 
 They read seven publishers: Spectrum and the open-data portal (Ville de
@@ -78,9 +78,13 @@ page per source under [docs/](docs/README.md#the-data).
 
 `lot_development_programs` is where the highest-and-best-use question
 actually gets solved — one `urban_rag.program.solve_program` CP-SAT run per
-candidate envelope, maximising monthly net operating income over the mix of
-dwellings, commerce, industry and parking. `lot_highest_best_use` picks the
-governing envelope's program for each lot, and `lot_redevelopment_gap` puts it
+candidate envelope, maximising discounted net profit (`npv_cad`) over the mix
+of dwellings, commerce, industry and parking. The model itself — its caps, the
+four places a stall can go, and the `binding` vocabulary that says why an
+answer is not bigger — is
+[docs/development-program.md](docs/development-program.md).
+`lot_highest_best_use` picks the governing envelope's program for each lot,
+and `lot_redevelopment_gap` puts it
 beside what `lot_assessment_comparables` says already stands there — the floor
 area gap by residential/commercial/industrial class, in m² and sqft, and the
 two incomes reconciled onto one stated definition of NOI. `make programs` and
@@ -126,10 +130,13 @@ outstanding is `db.py init` against the target database — twice for
 has run.
 
 Each fails up front naming the file to apply, rather than letting psycopg raise.
-Run them by hand with `make frontage`, `make setbacks`, `make lot-profiles`,
-`make programs`, `make hbu` and `make massing`; the envelope pair they all sit
-behind has no schedule either (`make envelopes`). Details, and the order the
-seven want scheduling in, are in [docs/assets.md](docs/assets.md).
+Run them by hand with `make frontage`, `make zone-pieces`, `make setbacks`,
+`make lot-profiles`, `make programs`, `make hbu` and `make massing`; the
+envelope pair they all sit behind has no schedule either (`make envelopes`).
+`zone-pieces` is the first of the zoning chain rather than an addition to it —
+the envelopes join the ground each zone governs rather than the raw overlaps,
+so nothing below it is correct until it has run for the partition. Details, and
+the order they want scheduling in, are in [docs/assets.md](docs/assets.md).
 
 ## Retrieval
 

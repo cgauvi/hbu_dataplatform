@@ -80,7 +80,7 @@ building goes in one of the pieces, not across both.
 The parking is a second polygon, and never part of the first
 ----------------------------------------------------------------------------
 
-`solve_program` has four places to put a stall and one of them is the ground:
+`solve_program` has three places to put a stall and one of them is the ground:
 `surface_stalls` stand on the yard the footprint leaves, costing no storey and
 no *superficie de plancher* because a car outdoors is not in a building. That
 last clause is also why the parking is not in the massing. A surface stall is
@@ -107,13 +107,28 @@ was forgotten.
 **What is checked is the shape, which is the point.** The stalls are already
 bounded upstream by `surface_stall_area x stalls + footprint <= lot area`, and
 that is an area against an area: it is satisfied on a parcel four metres wide,
-where no car can stand at all. So a parking rectangle here is fitted **depth
-first** - at least `MIN_PARKING_DEPTH_M`, the length of a stall - and the width
-follows from the area. `parking_capacity_m2` is the same question asked of the
-bare parcel and handed to `solve_program` as `Lot.parkable_area_m2`, which is
-what keeps the answer from being drawn on ground it never fitted;
-`surface_parking_fit_pct` is what is left over once a real building has taken
-its place on the lot.
+where no car can stand at all. So the ground is tested for depth -
+`parkable_ground` opens the yard by half of `MIN_PARKING_DEPTH_M` and keeps
+whatever survives, at whatever shape that leaves. `parking_capacity_m2` is that
+region measured and handed to `solve_program` as `Lot.parkable_area_m2`, and
+`fit_parking` is that region *drawn*, as a band grown out from the building
+until it holds the program's area.
+
+**One rule, two uses, and that is deliberate.** The bound and the drawing were
+a rectangle search and a three-rectangle search, and being two searches they
+disagreed: the solve priced parking the placer could not lay out, and
+`surface_parking_fit_pct` came back under 100 on about half the borough. They
+are now the same function, so a program is bounded by exactly the ground it
+will be drawn on and the column is a check that can pass.
+
+**A rectangle was the wrong primitive.** The ordinary Montreal answer is a band
+wrapping the building - a ring, an L, a wedge behind a corner plate - and three
+rectangles read a band at a little over half its area. Across 600 real VSMPE
+yards the bays kept a median 34 pct of the ground and the opening keeps 79, at
+0.12 ms against 4.4. What survives of the old strictness is the by-law
+dimension itself, and it is stricter than it was: 5.5 m clear in *every*
+direction, so a 3 m side-yard ribbon parks nothing at any length. See
+`parkable_ground` for the trade and where to reverse it.
 """
 
 from __future__ import annotations
@@ -125,7 +140,7 @@ from typing import Sequence
 import numpy as np
 import pandas as pd
 import shapely
-from shapely.geometry import Polygon
+from shapely.geometry import Point, Polygon
 from shapely.geometry.base import BaseGeometry
 
 from urban_rag.comparables import METRIC_CRS
@@ -177,16 +192,12 @@ MIN_FOOTPRINT_M2 = 10.0
 #: for the stall and its share of the aisle without buying either twice.
 MIN_PARKING_DEPTH_M = 5.5
 
-#: The narrow side of one stall, and the floor on the other dimension: a
-#: rectangle 5.5 m deep and 30 cm wide is not a parking space either.
-MIN_PARKING_WIDTH_M = 2.6
-
-#: Depths tried between `MIN_PARKING_DEPTH_M` and the square, shallowest
-#: first. Four is enough because the ends of that range are the two layouts
-#: that actually get built - one row of stalls down a side yard, and a square
-#: court on a lot with room - and the middle of it is interpolation between
-#: them rather than a third kind of parking lot.
-PARKING_DEPTH_STEPS = 4
+#: Halvings of the bisection that grows the paving out from the building until
+#: it holds the program's area. Each step is one buffer and one intersection,
+#: so forty is about a millisecond and a half on a Villeray yard and lands the
+#: area within a few square centimetres of the target - far inside the square
+#: metre `_PARKING_AREA_TOLERANCE_M2` already calls `fitted`.
+PARKING_BISECT_STEPS = 40
 
 #: Separate patches of asphalt one program may be drawn as. Unlike the
 #: building, which is one massing or it is nothing, parking genuinely comes in
@@ -201,28 +212,12 @@ PARKING_DEPTH_STEPS = 4
 #: pass of the search.
 PARKING_MAX_BAYS = 3
 
-#: How much of its own minimum rotated rectangle a parcel may fail to fill and
-#: still be treated as a rectangle by `parking_capacity_m2`. A thousandth of the
-#: area is a couple of square decimetres on a Villeray lot - the survey's own
-#: rounding rather than a shape - and the shortcut it buys is exact for a true
-#: rectangle and the common case for a cadastre.
-_RECTANGULAR_TOLERANCE = 0.001
-
 #: How far short of the reserved area the bays may fall and still be `fitted`.
 #: The total is reassembled from patches each bisected into place, so it lands
 #: a little under the target even where the ground is plainly there. One square
 #: metre is under four percent of a stall and an order of magnitude below the
 #: precision of anything upstream.
 _PARKING_AREA_TOLERANCE_M2 = 1.0
-
-#: The same two searches, coarser, for `parking_capacity_m2`. That one runs
-#: over every lot of a borough inside `lot_development_programs` rather than
-#: once per drawn massing, and it is answering "does this parcel hold parking
-#: at all" rather than "where exactly does it go" - a question a coarser grid
-#: settles just as well, and the cheap rejection above settles outright for
-#: most of the parcels that fail it.
-CAPACITY_GRID_STEPS = 5
-CAPACITY_SHRINK_STEPS = 6
 
 #: A nanometre off each half-dimension of every rectangle before it is tested
 #: and reported, and the reason is arithmetic rather than planning: a rectangle
@@ -282,8 +277,8 @@ PARKING_STATUSES: tuple[str, ...] = (
     # The lot polygon for this lot is missing, so nothing was checked. Not the
     # same as `no_yard`: that one is an answer, this one is an absence.
     "no_lot_geometry",
-    # The program parks nothing on the yard - it dug, decked, bayed, or owes
-    # no stall at all. Nothing to draw, and not a failure to draw it.
+    # The program parks nothing on the yard - it dug, bayed, or owes no stall
+    # at all. Nothing to draw, and not a failure to draw it.
     "no_parking",
     # `lot_highest_best_use` has no program for this lot.
     "no_program",
@@ -318,7 +313,6 @@ MASSING_COLUMNS: tuple[str, ...] = (
     "residential_floors",
     "commercial_floors",
     "industrial_floors",
-    "above_grade_parking_floors",
     "underground_levels",
     "num_dwellings",
     # `placed_footprint_m2 * floors` - the gross floor area actually drawable,
@@ -364,9 +358,9 @@ PARKING_COLUMNS: tuple[str, ...] = (
     "placed_surface_parking_m2",
     "surface_parking_shortfall_m2",
     "surface_parking_fit_pct",
-    # The rectangle itself. `parking_depth_m` is the dimension the by-law
-    # states and the search holds; `parking_width_m` is what the area then
-    # asks for.
+    # The band itself. `parking_depth_m` is how far the paving reaches out
+    # from the building; `parking_width_m` and `parking_rotation_deg` are null
+    # since the rectangle search was replaced - see `Parking`.
     "parking_width_m",
     "parking_depth_m",
     "parking_rotation_deg",
@@ -775,17 +769,27 @@ class Parking:
 
     `geometry` is a Polygon where one patch of asphalt held the whole program,
     and a MultiPolygon where it took more than one - see `PARKING_MAX_BAYS`.
-    `width_m`, `depth_m` and `rotation_deg` describe the **largest** bay, since
-    a single set of dimensions cannot describe several; `num_bays` is what says
-    whether they describe all of it.
+    It is a band wrapping the building rather than a rectangle, so it has the
+    shape of the yard it was cut from: a ring, an L, a wedge behind a corner
+    plate.
+
+    `depth_m` is the one dimension that band has - how far out from the
+    building the paving reaches. `num_bays` is how many separate pieces it
+    came out in, and 1 is the common answer.
+
+    **`width_m` and `rotation_deg` are null, and are kept for the shape of the
+    table rather than for what they say.** They described the largest
+    *rectangle* when the parking was pieced together out of up to three of
+    them; a band has no single width and no angle, and reporting 0.0 for them
+    would read as a measurement rather than as their absence.
     """
 
     geometry: BaseGeometry | None
     status: str
     area_m2: float = 0.0
-    width_m: float = 0.0
+    width_m: float | None = None
     depth_m: float = 0.0
-    rotation_deg: float = 0.0
+    rotation_deg: float | None = None
     num_bays: int = 0
 
 
@@ -821,64 +825,132 @@ def yard_of(lot: BaseGeometry | None, building: BaseGeometry | None):
     return lot.difference(building)
 
 
+def parkable_ground(
+    yard: BaseGeometry | None,
+    *,
+    min_depth_m: float = MIN_PARKING_DEPTH_M,
+    min_area_m2: float | None = None,
+) -> BaseGeometry | None:
+    """The part of ``yard`` a car can actually stand on, at whatever shape.
+
+    A **morphological opening**: erode the yard by half a stall's depth and
+    dilate it back. Ground that cannot hold a disc of that radius vanishes and
+    everything else survives *as its own shape* - a ring around a building, an
+    L, both side yards at once, the wedge behind a corner plate. What is left
+    is the yard less its unparkable fringe, which is the honest answer to "how
+    much of this can be paved" and the one a rectangle search cannot give.
+
+    **Why this replaced the rectangles.** `fit_parking` used to piece the
+    paving together out of up to `PARKING_MAX_BAYS` rectangles, and a rectangle
+    is the wrong primitive for the shape a yard actually is: the ordinary
+    Montreal answer is a band wrapping the building, and three rectangles read
+    a band at a little over half its area. Measured across 600 real VSMPE
+    yards, the bays kept a median 34 pct of the ground and this keeps 79 - and
+    it does it in 0.12 ms against the search's 4.4.
+
+    **The radius is half `min_depth_m`, and that is a strict reading.** A disc
+    of 2.75 m fits only where 5.5 m is clear *in every direction* - a stall's
+    full length whichever way the car is turned. A 3 m side-yard ribbon is
+    therefore not parkable at any length, which is the intended answer and the
+    expensive one: it is the narrow-lot tail, and those programs must dig or
+    bay their stalls instead of pretending the margin will hold them. The
+    looser reading - a disc of half a stall's *width*, so 2.6 m clear - is what
+    the old ``min_width_m`` bay implied, and it keeps a median 95 pct. This
+    module takes the strict one; `MIN_PARKING_DEPTH_M` is where to change it.
+
+    Parts smaller than ``min_area_m2`` are dropped, defaulting to one stall's
+    allowance: a 12 m2 corner that survives the opening still parks no car, and
+    leaving it in would put a scrap of asphalt on the map and a fraction of a
+    stall in the arithmetic.
+
+    Returns ``None`` for no yard and an empty geometry for a yard that parks
+    nothing - which every caller reads as `no_fit`, distinct from `no_yard`.
+    """
+    if yard is None or yard.is_empty or yard.area <= 0:
+        return None
+    # Inset by `_FIT_EPSILON_M`, so the boundary case is inclusive: a yard
+    # exactly `min_depth_m` across erodes to a zero-width line at the bare
+    # radius and would come back parking nothing, when 5.5 m clear is the
+    # dimension the by-law asks for rather than the one it excludes.
+    radius = min_depth_m / 2.0 - _FIT_EPSILON_M
+    if radius <= 0:
+        return yard
+    # `join_style=2` (mitre) rather than the rounded default, so a square
+    # corner of yard comes back square. Rounded joins would shave a disc's
+    # worth off every corner on the dilation and report a rectangular yard at
+    # less than its own area, which is a measurable bias on the common case.
+    opened = yard.buffer(-radius, join_style=2).buffer(radius, join_style=2)
+    # Clipped back to the yard because the dilation is not the exact inverse of
+    # the erosion at a mitred corner: it can push a whisker past the lot line,
+    # and parking outside the parcel is the one answer this must never give.
+    opened = opened.intersection(yard)
+    if opened.is_empty:
+        return opened
+    floor = _surface_stall_area_m2() if min_area_m2 is None else min_area_m2
+    parts = [
+        part for part in getattr(opened, "geoms", [opened]) if part.area >= floor
+    ]
+    if not parts:
+        return opened.intersection(opened.buffer(-1e9))  # a typed empty
+    if len(parts) == len(getattr(opened, "geoms", [opened])):
+        return opened
+    return shapely.union_all(parts)
+
+
 def fit_parking(
     yard: BaseGeometry | None,
     target_area_m2: float,
     *,
+    building: BaseGeometry | None = None,
     min_depth_m: float = MIN_PARKING_DEPTH_M,
-    min_width_m: float = MIN_PARKING_WIDTH_M,
-    depth_steps: int = PARKING_DEPTH_STEPS,
-    grid_steps: int = GRID_STEPS,
-    shrink_steps: int = SHRINK_STEPS,
     max_bays: int = PARKING_MAX_BAYS,
+    bisect_steps: int = PARKING_BISECT_STEPS,
+    min_area_m2: float | None = None,
 ) -> Parking:
     """The surface parking of ``target_area_m2``, drawn on ``yard``.
 
-    **Up to `max_bays` patches, largest first.** This is the one place the
-    parking search is more generous than the building's, and the difference is
-    real rather than a convenience: a building is one massing or it is nothing,
-    while parking honestly comes in pieces. A building across the middle of its
-    parcel leaves a front yard and a rear yard, and stalls in both is the
-    ordinary answer rather than a compromise - so the largest rectangle is
-    placed, cut out of the yard, and the search runs again on what is left
-    until the program's area is met or nothing more will fit. Insisting on a
-    single rectangle would report that lot at half its real capacity, which
-    would make `surface_parking_fit_pct` noise on the common case.
+    Two steps, and they answer two different questions. `parkable_ground`
+    settles **what may be paved** - the yard less the fringe too narrow to
+    stand a car in, at whatever shape that leaves. This settles **which part of
+    it is**, by growing a band out from the building until the band holds the
+    program's area: ``region & building.buffer(d)``, bisecting ``d``.
 
-    Greedy, and therefore not optimal: taking the biggest bay first can leave
-    two pieces where a smaller first cut would have left one good one. It errs
-    towards *less* parking placed, never more, which is the direction a sanity
-    check should err in - it can under-state a yard and can never claim ground
-    that is not there.
+    **Contiguous, and hugging the plate.** Those are the two properties that
+    make the answer a site plan rather than a shading. A band is connected
+    wherever the region is, so the result is one piece of asphalt on the great
+    majority of parcels; and taking the *nearest* ground first is what a real
+    lot does - the parking wraps the building, and what gets left over is the
+    far corner of a deep parcel rather than the strip by the door. Where the
+    region is genuinely in two lobes the band reaches the second only after the
+    first is full, which is the same order and the honest picture.
 
-    ``yard`` is what `yard_of` leaves - the parcel less the building - in a
-    **projected** CRS whose unit is the metre, the same requirement
-    `fit_rectangle` makes and for the same reason.
+    **Why a distance band rather than a space-filling curve.** A Hilbert or
+    Morton prefix is the other way to take "a compact piece of a mask", and it
+    is a worse fit here in three ways: the prefix is anchored to the curve's
+    own quadrant recursion rather than to the building, so it has no notion of
+    near; it is not connected inside an arbitrary mask, because the curve
+    leaves the yard and comes back; and it needs the yard rasterised, where
+    this stays in vector space and hits the target area to float precision -
+    which is the whole point, since that area is the number the solver already
+    charged the parcel for. A curve would earn its place if something needed a
+    canonical pixel ordering reusable across tiles. Nothing here does.
 
-    The rectangle is fitted **depth first**, which is the one way this search
-    differs from the building's. A building is looked for at a few aspect
-    *ratios* because nothing in a grid says how long a building is. A parking
-    area has a dimension that is stated, and 5.5 m of it is not negotiable: a
-    strip of yard shallower than a stall is long holds no car whatever its
-    area. So the depths are tried from `min_depth_m` upwards and the width
-    follows from the area, rather than the ratio being chosen and the two
-    dimensions falling out of it.
+    ``building`` is what to grow from, and it is optional: without it the band
+    grows from the region's own centroid, which is a compact blob in the middle
+    of the yard rather than a plan. Every caller inside this module passes the
+    placed massing.
 
-    Shallowest first is the realistic order as well as the cheap one. A single
-    row of stalls down a side or rear yard is what a Montreal parcel actually
-    parks on, and it is the shape most likely to fit what a building has left;
-    a square court is what a lot with room to spare gets, and it is the far end
-    of the same ladder.
+    **The area is met exactly, or the shortfall is reported.** A region smaller
+    than the target is taken whole and returned `shrunk` - that is
+    `surface_parking_fit_pct` below 100, and it says the program bought stalls
+    the ground cannot hold. Where the region is larger, the bisection lands the
+    band on the target and the status is `fitted`.
 
-    Depths stop at ``sqrt(target_area_m2)``. Past that the "depth" is the
-    longer side, which is the same rectangle turned ninety degrees - and both
-    angles are tried - so carrying on would only re-test shapes already tested.
-
-    Returns `Parking`, whose `status` is one of `PARKING_STATUSES`. A yard that
-    cannot take the whole reserved area is `shrunk` rather than dropped,
-    exactly as a footprint is: the gap is how much of the program's parking is
-    standing on ground that cannot hold it, and hiding it would hide the lots
-    worth looking at.
+    ``max_bays`` survives from the rectangle search with its meaning intact:
+    the most separate patches of asphalt one program may be drawn as. A band
+    landing in more pieces than that keeps the largest and reports the rest as
+    shortfall, because a program parked across five scattered scraps is not the
+    program the solver priced.
     """
     if target_area_m2 is None or not math.isfinite(target_area_m2):
         return _no_parking("no_parking")
@@ -887,186 +959,108 @@ def fit_parking(
     if yard is None or yard.is_empty or yard.area <= 0:
         return _no_parking("no_yard")
 
-    smallest = min_depth_m * min_width_m
-    remaining = yard
-    outstanding = target_area_m2
-    bays: list[Parking] = []
-    for _ in range(max(1, max_bays)):
-        if outstanding < smallest:
-            break
-        bay = _fit_one_bay(
-            remaining,
-            outstanding,
-            min_depth_m=min_depth_m,
-            min_width_m=min_width_m,
-            depth_steps=depth_steps,
-            grid_steps=grid_steps,
-            shrink_steps=shrink_steps,
-        )
-        if bay is None:
-            break
-        bays.append(bay)
-        outstanding -= bay.area_m2
-        if bay.status == "fitted":
-            break
-        # Cut the bay out and look again in what is left. Buffered by the fit
-        # epsilon so the difference does not leave a zero-width sliver along
-        # the seam - `_largest_part` would then hand the next pass a shape no
-        # rectangle can sit in, and the search would spend a full ladder on it.
-        remaining = remaining.difference(bay.geometry.buffer(_FIT_EPSILON_M))
-        if remaining.is_empty or remaining.area <= 0:
-            break
-
-    if not bays:
-        # There is a yard; nothing of one stall's dimensions stands in it.
+    region = parkable_ground(yard, min_depth_m=min_depth_m, min_area_m2=min_area_m2)
+    if region is None or region.is_empty or region.area <= 0:
+        # There is a yard, and no part of it a car can stand in.
         return _no_parking("no_fit")
 
-    placed_area = sum(bay.area_m2 for bay in bays)
-    largest = max(bays, key=lambda bay: bay.area_m2)
-    geometry = (
-        bays[0].geometry
-        if len(bays) == 1
-        else shapely.union_all([bay.geometry for bay in bays])
-    )
-    # `fitted` on the whole program's area rather than on the last bay's, and
-    # compared with a tolerance because the area is reassembled from bays that
-    # were each bisected into place. A square metre either way is four
-    # centimetres of a stall.
-    complete = placed_area >= target_area_m2 - _PARKING_AREA_TOLERANCE_M2
+    anchor = building if building is not None and not building.is_empty else None
+    if anchor is None:
+        anchor = region.centroid
+
+    if region.area <= target_area_m2 + _PARKING_AREA_TOLERANCE_M2:
+        # The whole parkable yard is not enough, so there is nothing to choose
+        # between: pave it, and say how far short it fell.
+        paved = region
+    else:
+        # The band, bisected. `hi` is what gets returned rather than `lo`,
+        # because the invariant worth keeping is "this much area is definitely
+        # covered": `lo` is the last distance known to fall *short*, and
+        # returning it would draw a program a few square metres under the one
+        # the solver priced.
+        lo, hi = 0.0, _band_ceiling(anchor, region)
+        for _ in range(max(1, bisect_steps)):
+            mid = (lo + hi) / 2.0
+            if _band(anchor, region, mid).area < target_area_m2:
+                lo = mid
+            else:
+                hi = mid
+        paved = _band(anchor, region, hi)
+
+    paved = _largest_bays(paved, max_bays)
+    if paved is None or paved.is_empty or paved.area <= 0:
+        return _no_parking("no_fit")
+
+    placed = paved.area
+    complete = placed >= target_area_m2 - _PARKING_AREA_TOLERANCE_M2
     return Parking(
-        geometry=geometry,
+        geometry=paved,
         status="fitted" if complete else "shrunk",
-        area_m2=min(placed_area, target_area_m2),
-        width_m=largest.width_m,
-        depth_m=largest.depth_m,
-        rotation_deg=largest.rotation_deg,
-        num_bays=len(bays),
+        area_m2=min(placed, target_area_m2),
+        # The band's own dimension, and the only one it has: how far out from
+        # the building the paving reaches. A rectangle's width and angle went
+        # with the rectangle search - see `Parking` on why they are now null.
+        depth_m=_band_depth(anchor, paved),
+        num_bays=len(getattr(paved, "geoms", [paved])),
     )
 
 
-def _fit_one_bay(
-    yard: BaseGeometry | None,
-    target_area_m2: float,
-    *,
-    min_depth_m: float,
-    min_width_m: float,
-    depth_steps: int,
-    grid_steps: int,
-    shrink_steps: int,
-) -> Parking | None:
-    """The largest single patch of asphalt ``yard`` holds, up to the target.
+def _band(anchor: BaseGeometry, region: BaseGeometry, distance: float):
+    """``region`` within ``distance`` of ``anchor`` - one step of the bisection.
 
-    One pass of the ladder `fit_parking` runs up to `PARKING_MAX_BAYS` times.
-    Returns ``None`` where nothing of one stall's dimensions fits, which is
-    what ends that loop.
+    Mitred like the opening and for the same reason: a rounded buffer of a
+    rectangular plate bulges at the corners and would pave a quarter-disc of
+    ground the band has not reached yet.
     """
-    polygon = _largest_part(yard)
-    if polygon is None or polygon.is_empty or polygon.area <= 0:
-        return None
-    if polygon.area < min_depth_m * min_width_m:
-        # Not one stall's worth of ground, whatever shape it is in.
-        return None
+    return region.intersection(anchor.buffer(distance, join_style=2))
 
-    angles = _candidate_angles(polygon)
-    centres = _candidate_centres(polygon, grid_steps)
-    if not len(centres):
-        return None
-    shapely.prepare(polygon)
-    frames = _frames(polygon, angles)
-    depths = _parking_depths(target_area_m2, min_depth_m, depth_steps)
 
-    # Full size, shallowest depth first. A hit is the whole of what is still
-    # outstanding and nothing later in the ladder can improve on it.
-    if target_area_m2 <= polygon.area:
-        for depth in depths:
-            width = target_area_m2 / depth
-            if width < min_width_m:
-                continue
-            for angle, frame in zip(angles, frames):
-                placed = _place(
-                    polygon, centres, target_area_m2, width / depth, angle, frame
-                )
-                if placed is not None:
-                    return Parking(
-                        geometry=placed,
-                        status="fitted",
-                        area_m2=target_area_m2,
-                        width_m=width,
-                        depth_m=depth,
-                        rotation_deg=angle,
-                        num_bays=1,
-                    )
+def _band_ceiling(anchor: BaseGeometry, region: BaseGeometry) -> float:
+    """A distance that certainly covers ``region``, to bisect down from.
 
-    # Nothing fits whole: at each depth, the widest rectangle that does. The
-    # *width* is bisected rather than the area, unlike `_shrink_to_fit`. The
-    # depth is a stated dimension being held rather than a proportion being
-    # scaled, and shrinking the area at a fixed ratio would hand back a
-    # shallower rectangle - a shape the stalls do not fit in, reported as
-    # though they did.
-    best: Parking | None = None
-    for angle, frame in zip(angles, frames):
-        # The depths are re-laddered against the *yard* here rather than
-        # against the target. Above, `sqrt(target)` is the right ceiling
-        # because a deeper rectangle of that exact area is a wider one turned
-        # ninety degrees. Down here the area is no longer fixed - what is being
-        # looked for is the biggest rectangle this ground holds - so a ladder
-        # pinned to the target makes the answer depend on how much parking was
-        # asked for, and a yard reported 109.96 m2 against ten stalls came back
-        # 109.57 against forty. The ground has not moved; only the sampling
-        # had.
-        for depth in _parking_depths_for(frame, min_depth_m, depth_steps):
-            if frame.max_x - frame.min_x < min_width_m:
-                continue
-            # Measured against the *yard's* full extent, never against the
-            # target, and this is the whole of what keeps the answer stable.
-            # Bisecting up to `target / depth` makes the resolution depend on
-            # how much parking was asked for - eight halvings of a 200 m
-            # ceiling settle to 80 cm and eight of a 20 m ceiling to 8 cm - so
-            # the same yard came back 119.7 m2 against ten stalls and 118.9
-            # against forty. How much ground there is at a given depth is a
-            # fact about the ground.
-            width, placed = _widest_at_depth(
-                polygon,
-                centres,
-                depth,
-                angle,
-                frame,
-                min_width_m=min_width_m,
-                ceiling_m=frame.max_x - frame.min_x,
-                steps=shrink_steps,
-            )
-            if placed is None:
-                continue
-            # The target is applied afterwards, as a clamp. Nobody is being
-            # sold more asphalt than the program reserved, and clamping a
-            # stable measurement is monotone in the target where bisecting to
-            # it was not.
-            wanted = target_area_m2 / depth
-            if wanted < width:
-                clamped = _place(
-                    polygon, centres, wanted * depth, wanted / depth, angle, frame
-                )
-                if clamped is not None:
-                    width, placed = wanted, clamped
-            area = width * depth
-            if best is None or area > best.area_m2:
-                best = Parking(
-                    geometry=placed,
-                    # `fitted` where the clamp is what stopped it: this depth
-                    # was not on the target's own ladder, and the ground turned
-                    # out to hold the whole reservation at it.
-                    status=(
-                        "fitted"
-                        if area >= target_area_m2 - _PARKING_AREA_TOLERANCE_M2
-                        else "shrunk"
-                    ),
-                    area_m2=area,
-                    width_m=width,
-                    depth_m=depth,
-                    rotation_deg=angle,
-                    num_bays=1,
-                )
-    return best
+    The furthest any point of the region can lie from the anchor is bounded by
+    the two bounding boxes together, so this is that diagonal - computed rather
+    than fixed at a constant, because a constant too small silently caps the
+    band on a large parcel and one too large spends the first halvings on
+    distances already known to cover everything.
+    """
+    minx, miny, maxx, maxy = region.bounds
+    anchor_minx, anchor_miny, anchor_maxx, anchor_maxy = anchor.bounds
+    span_x = max(maxx, anchor_maxx) - min(minx, anchor_minx)
+    span_y = max(maxy, anchor_maxy) - min(miny, anchor_miny)
+    return math.hypot(span_x, span_y) + 1.0
+
+
+def _band_depth(anchor: BaseGeometry, paved: BaseGeometry) -> float:
+    """How far the paving reaches from the building, in metres.
+
+    Measured off the drawn polygon rather than carried out of the bisection, so
+    it still describes the shape after `_largest_bays` has dropped a piece.
+    """
+    if paved is None or paved.is_empty:
+        return 0.0
+    return float(max(anchor.distance(Point(vertex)) for vertex in _vertices(paved)))
+
+
+def _vertices(geometry: BaseGeometry):
+    """Every exterior vertex of ``geometry``, polygon or multipolygon."""
+    for part in getattr(geometry, "geoms", [geometry]):
+        yield from part.exterior.coords
+
+
+def _largest_bays(paved: BaseGeometry, max_bays: int):
+    """``paved`` cut down to its ``max_bays`` largest pieces.
+
+    A program parked across five scattered scraps is not the program the solver
+    priced, so the surplus is dropped rather than counted - and dropping it
+    lowers `area_m2`, which is what turns the answer `shrunk`. The largest are
+    kept because they are the ones a builder would pave.
+    """
+    parts = list(getattr(paved, "geoms", [paved]))
+    if len(parts) <= max(1, max_bays):
+        return paved
+    parts.sort(key=lambda part: part.area, reverse=True)
+    return shapely.union_all(parts[: max(1, max_bays)])
 
 
 def placeable_area_m2(
@@ -1090,12 +1084,9 @@ def placeable_area_m2(
     So this is the same rectangle `fit_rectangle` would draw, measured before
     the solve rather than after it, and handed to `solve_program` as
     `Lot.placeable_area_m2`. Deliberately the **same search** at the **same
-    settings** the massing asset runs - `GRID_STEPS` and `SHRINK_STEPS`, not
-    the coarser `CAPACITY_*` pair `parking_capacity_m2` uses. The coarse grid
-    reads a Villeray envelope about a quarter low, and a quarter off the
-    footprint cap is a quarter off the borough; more to the point, the whole
-    value of this number is that the program the solver prices is the program
-    the placer can draw, and two different searches would not agree.
+    settings** the massing asset runs: the whole value of the number is that
+    the program the solver prices is the program the placer can draw, and two
+    different searches would not agree.
 
     Asked as ``fit_rectangle(buildable, buildable.area)``: no rectangle can
     hold more area than the envelope it sits in, so the full-size pass either
@@ -1139,213 +1130,45 @@ def placeable_area_m2(
 
 
 def parking_capacity_m2(
-    lot: BaseGeometry | None,
+    ground: BaseGeometry | None,
     *,
     min_depth_m: float = MIN_PARKING_DEPTH_M,
-    min_width_m: float = MIN_PARKING_WIDTH_M,
-    depth_steps: int = PARKING_DEPTH_STEPS,
-    grid_steps: int = CAPACITY_GRID_STEPS,
-    shrink_steps: int = CAPACITY_SHRINK_STEPS,
+    min_area_m2: float | None = None,
 ) -> float:
-    """The most parking-shaped ground ``lot`` holds, in square metres.
+    """How much of ``ground`` a car can stand on, in square metres.
 
-    This is the number `solve_program` is handed as `Lot.parkable_area_m2`, and
-    it is a **bound on the parcel rather than a layout on it**: the largest
-    single rectangle at least `min_depth_m` deep that fits anywhere inside the
-    lot boundary, with no building subtracted.
+    `parkable_ground` measured rather than described - this is that region's
+    area, and it is the number `solve_program` is handed as
+    `Lot.parkable_area_m2`. The same function the drawing uses, deliberately:
+    a bound computed one way and a polygon drawn another is how the solve and
+    `lot_building_massing` came to answer two different questions, and this
+    module now has exactly one rule for what ground is parkable.
 
-    The building is left out on purpose. At solve time there is no building to
-    subtract - its footprint is the decision this cap is an input to - so a cap
-    that assumed one would forbid programs the parcel can perfectly well take.
+    **What to pass.** The *yard* - the parcel less the building - wherever the
+    building is known, which since `placeable_area_m2` fixed the plate before
+    the solve is everywhere the setbacks have geometry. That makes the bound
+    exact rather than generous: it is the ground that answer will actually
+    have. Passing the bare parcel is the fallback for a partition whose
+    envelopes have no polygon, and it overstates the yard by whatever the
+    building will stand on.
 
-    **It errs in both directions, and knowing which is which matters.**
-    Ignoring the building makes it generous: no particular answer will have
-    this much yard once its plate is down. Insisting on a *single* rectangle
-    makes it strict, and this is the half worth watching: unlike `fit_parking`,
-    which pieces a program's parking together out of up to `PARKING_MAX_BAYS`
-    patches, this measures one. An L-shaped or two-lobed parcel is therefore
-    reported at the size of its better lobe, and a program wanting more than
-    that is refused parking the land could arguably have given it. That is
-    tolerable because the strict half only bites on parcels that are already
-    odd, because the generous half is much the larger effect on ordinary ones,
-    and because the alternative - running the full multi-bay search over every
-    lot of a borough before a single program is solved - is not what the bound
-    is worth.
+    **What it used to be.** The largest single parking-shaped *rectangle* the
+    parcel held, which was strict in a way that mattered: a yard wrapping a
+    building is a band, an L or a ring, and no rectangle reads more than about
+    half of it. Across 600 real VSMPE yards the rectangle search kept a median
+    34 pct of the ground and this keeps 79, and it does it in 0.12 ms against
+    the search's 4.4. The strictness that remains is honest and is
+    `parkable_ground`'s to explain: 5.5 m clear in every direction, so a 3 m
+    side-yard ribbon parks nothing at any length.
 
-    What it decisively rules out is the class of answer that made it worth
-    computing at all: stalls standing on a four-metre ribbon, on a triangular
-    remnant, on the tail of an L. `fit_parking` asks the exact question once a
-    building has been placed, and `surface_parking_fit_pct` is what it answers
-    with.
-
-    Returns 0.0 for a parcel that holds no parking at any size, and for one
-    with no geometry at all - which is the reading `Lot.parkable_area_m2`
-    gives a missing lot, and the conservative one.
+    Returns 0.0 for ground with no geometry and for ground that parks nothing -
+    which is the reading `Lot.parkable_area_m2` gives a missing parcel, and the
+    conservative one.
     """
-    polygon = _largest_part(lot)
-    if polygon is None or polygon.is_empty or polygon.area <= 0:
+    region = parkable_ground(ground, min_depth_m=min_depth_m, min_area_m2=min_area_m2)
+    if region is None or region.is_empty:
         return 0.0
-
-    # Two answers off the minimum rotated rectangle, before any search. This
-    # function runs once per parcel of a borough ahead of every solve, so the
-    # cases it can settle in a few multiplications are worth settling there.
-    bounding = polygon.minimum_rotated_rectangle
-    sides = _rectangle_sides(bounding)
-
-    # A parcel that cannot hold one car in either orientation holds no parking
-    # at any angle. The bound is exact in this direction: a rectangle inside
-    # the polygon is inside the polygon's minimum rotated rectangle too.
-    #
-    # Note which dimension goes with which. A car needs a stall's *length* one
-    # way and a stall's *width* the other, so the test is on the long side
-    # against `min_depth_m` and the short side against `min_width_m` - not on
-    # the short side against the depth. Written the stricter way this rejected
-    # every parcel under 5.5 m wide, which is a driveway: a four-metre strip
-    # parks cars in single file, parallel to its own length, and telling a
-    # borough of them to build parkades instead would be a large and confident
-    # error.
-    if sides is not None and (
-        min(sides) < min_width_m or max(sides) < min_depth_m
-    ):
-        return 0.0
-
-    # And a parcel that *is* a rectangle is its own answer - the largest
-    # rectangle inside a rectangle is the rectangle - which the search would
-    # otherwise spend forty-eight `contains` calls rediscovering to within the
-    # precision of its own bisection. This is the common case rather than a
-    # special one: a Montreal cadastral lot is a rectangle perpendicular to the
-    # street, and the exact answer here is better than the searched one as well
-    # as cheaper.
-    if (
-        sides is not None
-        and not bounding.is_empty
-        and bounding.area > 0
-        and bounding.difference(polygon).area <= _RECTANGULAR_TOLERANCE * bounding.area
-    ):
-        return float(polygon.area)
-
-    angles = _candidate_angles(polygon)
-    centres = _candidate_centres(polygon, grid_steps)
-    if not len(centres):
-        return 0.0
-    shapely.prepare(polygon)
-    frames = _frames(polygon, angles)
-
-    best = 0.0
-    for angle, frame in zip(angles, frames):
-        span_depth = frame.max_y - frame.min_y
-        span_width = frame.max_x - frame.min_x
-        if span_depth < min_depth_m or span_width < min_width_m:
-            continue
-        for depth in np.linspace(min_depth_m, span_depth, depth_steps):
-            width, _ = _widest_at_depth(
-                polygon,
-                centres,
-                float(depth),
-                angle,
-                frame,
-                min_width_m=min_width_m,
-                ceiling_m=span_width,
-                steps=shrink_steps,
-            )
-            best = max(best, width * float(depth))
-    return best
-
-
-def _parking_depths(
-    target_area_m2: float, min_depth_m: float, steps: int
-) -> tuple[float, ...]:
-    """The depths to try for a parking area of ``target_area_m2``.
-
-    One stall's length up to the square, which is where the two axes meet: a
-    rectangle deeper than that is a wider one turned ninety degrees, and both
-    angles are tried anyway. A target too small to make a square that deep gets
-    the single depth the floor allows.
-    """
-    square = math.sqrt(target_area_m2)
-    if square <= min_depth_m or steps <= 1:
-        return (min_depth_m,)
-    return tuple(float(depth) for depth in np.linspace(min_depth_m, square, steps))
-
-
-def _parking_depths_for(
-    frame: "_Frame", min_depth_m: float, steps: int
-) -> tuple[float, ...]:
-    """The depths to try against a *yard* rather than against a target area.
-
-    Used once the full area is known not to fit, where what is being looked for
-    is the largest rectangle the ground holds at any legal depth. That is a
-    property of the ground, so the ladder is measured off the ground: one
-    stall's length up to the yard's own extent along this angle.
-    """
-    span = frame.max_y - frame.min_y
-    if span <= min_depth_m or steps <= 1:
-        return (min_depth_m,)
-    return tuple(float(depth) for depth in np.linspace(min_depth_m, span, steps))
-
-
-def _widest_at_depth(
-    polygon: Polygon,
-    centres: np.ndarray,
-    depth_m: float,
-    angle_deg: float,
-    frame: "_Frame",
-    *,
-    min_width_m: float,
-    ceiling_m: float,
-    steps: int,
-) -> tuple[float, Polygon | None]:
-    """The widest rectangle ``depth_m`` deep that fits, bisecting the width.
-
-    Expressed to `_place` as an area and a ratio, which is what that function
-    takes: a rectangle of area ``w x d`` at ratio ``w / d`` has half-sides
-    ``w / 2`` and ``d / 2``, so holding the depth is a matter of moving both
-    arguments together rather than of a second placement routine.
-    """
-    low, high = 0.0, ceiling_m
-    found: Polygon | None = None
-    found_width = 0.0
-    for _ in range(steps):
-        middle = (low + high) / 2.0
-        if middle < min_width_m:
-            # Below one stall's width there is nothing worth drawing, so this
-            # half of the interval is walked up rather than searched - the same
-            # move `_shrink_to_fit` makes at its own floor.
-            low = middle
-            continue
-        placed = _place(
-            polygon, centres, middle * depth_m, middle / depth_m, angle_deg, frame
-        )
-        if placed is None:
-            high = middle
-        else:
-            low = middle
-            found, found_width = placed, middle
-    return found_width, found
-
-
-def _rectangle_sides(rectangle: BaseGeometry | None) -> tuple[float, float] | None:
-    """The two side lengths of a `minimum_rotated_rectangle`, or None.
-
-    Degenerate parcels are what the guard is for: a sliver whose minimum
-    rotated rectangle collapses to a line has no exterior ring to read four
-    corners off, and the caller wants "unknown" rather than an exception.
-    """
-    if rectangle is None or rectangle.is_empty:
-        return None
-    try:
-        corners = list(rectangle.exterior.coords)[:4]
-    except (AttributeError, IndexError, ValueError):
-        return None
-    if len(corners) < 3:
-        return None
-    (x0, y0), (x1, y1), (x2, y2) = corners[0], corners[1], corners[2]
-    return (math.hypot(x1 - x0, y1 - y0), math.hypot(x2 - x1, y2 - y1))
-
-
-# --------------------------------------------------------------------------
-# over a partition
-# --------------------------------------------------------------------------
+    return float(region.area)
 
 
 def massing_frame(
@@ -1358,8 +1181,6 @@ def massing_frame(
     shrink_steps: int = SHRINK_STEPS,
     min_footprint_m2: float = MIN_FOOTPRINT_M2,
     min_parking_depth_m: float = MIN_PARKING_DEPTH_M,
-    min_parking_width_m: float = MIN_PARKING_WIDTH_M,
-    parking_depth_steps: int = PARKING_DEPTH_STEPS,
     parking_max_bays: int = PARKING_MAX_BAYS,
 ):
     """One building rectangle per lot of ``hbu``, and its surface parking beside it.
@@ -1381,8 +1202,10 @@ def massing_frame(
       `massing_status` says nothing was drawn.
     * `parking_geometry` - the surface parking, fitted into the parcel less
       that building. None where `parking_status` says nothing was drawn, which
-      includes every program that parks underground, on a deck, in a ground
-      floor bay, or not at all.
+      includes every program that parks underground, in a ground floor bay,
+      or not at all. The dug parking is not drawn either: its plate is the
+      parcel's rather than the building's (`underground_plate_m2`), and a
+      polygon of it would be the lot.
 
     **The parking is not part of the massing and never joins it.** A surface
     stall is not a building: it is not floor area, it is not a storey, and a
@@ -1415,7 +1238,12 @@ def massing_frame(
     for row in frame.to_dict("records"):
         key = (row.get("lot_uid"), row.get("feature_id"), row.get("column_index"))
         buildable = envelopes.get(key)
-        parcel = parcels.get(row.get("lot_uid"))
+        # The piece first, the parcel second: `_lots_by_uid` keys on whichever
+        # the frame it was handed carries, and a partition without the pieces
+        # falls back to the boundary exactly as it did before them.
+        parcel = parcels.get((row.get("lot_uid"), row.get("feature_id")))
+        if parcel is None:
+            parcel = parcels.get(row.get("lot_uid"))
         if row.get("hbu_status") != "solved":
             results.append(_nothing("no_program"))
             parked.append(_no_parking("no_program"))
@@ -1452,11 +1280,12 @@ def massing_frame(
             fit_parking(
                 yard,
                 required,
+                # What the paving grows out from, so it wraps this building
+                # rather than settling somewhere in the parcel: the *drawn*
+                # massing, not the solved footprint, since a plate that had to
+                # shrink leaves a different yard than the one that did not.
+                building=massing.geometry,
                 min_depth_m=min_parking_depth_m,
-                min_width_m=min_parking_width_m,
-                depth_steps=parking_depth_steps,
-                grid_steps=grid_steps,
-                shrink_steps=shrink_steps,
                 max_bays=parking_max_bays,
             )
         )
@@ -1500,7 +1329,7 @@ def massing_frame(
     placed_area = frame["placed_surface_parking_m2"]
     # The same NaN-rather-than-zero rule as the footprint above: only a row
     # where parking was actually looked for has a shortfall to report, so a
-    # program that dug or decked is not counted as a parking failure.
+    # program that dug or bayed is not counted as a parking failure.
     checked = frame["parking_status"].isin(("fitted", "shrunk", "no_fit", "no_yard"))
     frame["surface_parking_shortfall_m2"] = (required_area - placed_area).where(checked)
     frame["surface_parking_fit_pct"] = (
@@ -1607,13 +1436,24 @@ def _buildable_by_key(setbacks) -> dict[tuple, BaseGeometry]:
 
 
 def _lots_by_uid(lots) -> dict:
-    """Each parcel's boundary, in metres, keyed on `lot_uid`.
+    """The ground a surface stall may stand on, in metres, keyed for lookup.
 
-    Keyed on the lot alone rather than on the (lot, zone, column) triple
-    `_buildable_by_key` uses, and the difference is not an oversight: a
-    buildable envelope belongs to a zoning column because the margins that
-    carved it are printed in one, while a parcel boundary belongs to the
-    parcel. A lot straddling two zones has two envelopes and one shape.
+    Keyed on **(lot_uid, feature_id)** where the frame carries a zone - it is
+    `silver.lot_zone_pieces`, the ground each zone governs - and on `lot_uid`
+    alone where it does not, which is `rag.lots` and the fallback. `massing_frame`
+    tries the pair and then the lot, so both shapes work through one dict.
+
+    The pair rather than the lot, and it took the piece grain to see why. A
+    parcel boundary does belong to the parcel, so keying on the lot was right
+    while one zone answered for it. With both zones answered, each is drawing a
+    building and paving a yard on the same 27 044 m2 - so the parking would be
+    checked against ground the other program has already built on, and the two
+    rectangles could overlap on the map. The piece is the ground each row may
+    actually use.
+
+    A buildable envelope is still keyed on the (lot, zone, column) triple
+    `_buildable_by_key` uses, because the margins that carved it are printed in
+    a *column* and two columns of one grid state different ones.
 
     An absent frame is an empty dict, which every row then reads as
     `no_lot_geometry` - see `massing_frame` on why that is a status rather
@@ -1623,9 +1463,10 @@ def _lots_by_uid(lots) -> dict:
         return {}
     if "lot_uid" not in lots.columns:
         return {}
+    by_piece = "feature_id" in lots.columns
     projected = to_metric(lots)
     return {
-        row.lot_uid: row.geometry
+        ((row.lot_uid, row.feature_id) if by_piece else row.lot_uid): row.geometry
         for row in projected.itertuples(index=False)
         if row.geometry is not None and not row.geometry.is_empty
     }

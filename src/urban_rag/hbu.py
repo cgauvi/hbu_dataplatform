@@ -50,9 +50,9 @@ fallback every caller had before that asset existed, and the asset's
 Choosing
 ----------------------------------------------------------------------------
 
-`select_highest_best_use` collapses the candidates onto one row per lot, and
-the shape of the choice matters: what may be chosen is the *use*, never the
-rules.
+`select_highest_best_use` collapses the candidates onto one row per **(lot,
+zone)** - one row per *piece* of ground - and the shape of the choice matters:
+what may be chosen is the *use*, never the rules, and never the site.
 
 A lot can carry several envelope rows for three reasons, and only one of them
 is anybody's choice. Within one zone and one usage family, a grid authorises
@@ -62,10 +62,31 @@ terrain min*: the column a parcel of this width is written for is
 `governs_residential` - and `governs_commercial`, `governs_industrial` for
 the families beside it - and taking a higher-earning column of the *same*
 family instead would be reporting a program under rules the parcel may not
-build to. Across zones, a lot on a boundary picks up a sliver of its
-neighbour's zoning because two publishers drew two lines - that is not two
-sets of rules the owner may choose between, it is one set and a mapping
-disagreement, and `pct_of_lot` is what says which is the real one.
+build to.
+
+**Across zones there is no choice either, and it took a wrong answer to see
+why.** A lot covered by two zones used to be treated as one site with two
+competing readings, and `pct_of_lot` picked the winner: the best-covered zone
+answered for the whole parcel and the others were dropped before anything was
+solved. That is right for the case it was written for - a parcel on a boundary
+picking up a sliver of its neighbour's zoning because two publishers drew two
+lines - and wrong for the case it could not see. A zoning boundary does not
+have to follow a lot line, and on a large parcel it usually does not: lot
+1 740 794 is 27 044 m2 with 24 596 in H04-072 (H.7, eight storeys) and 2 440 in
+C04-083 (C.4 and H, six), and the old rule priced eight storeys over all of it
+including the ground H04-072 does not reach, while never pricing the C.4 at
+all. Over Villeray-Saint-Michel-Parc-Extension that is 121 ha under the wrong
+grid.
+
+So the zones are not a menu and they are not a contest - they are **two
+sites**, and both are solved. `lot_zone_pieces` is what makes that expressible:
+each piece carries its own area, its own street and its own share of what
+stands, so a piece is a `Lot` in `program`'s sense and the split parcel is two
+calls to `solve_program` rather than one. The slivers do not come back with it;
+they never reach this module, because that table applies the same two cutoffs
+before writing a piece at all. `is_primary_zone` marks the largest piece, which
+is the row a reader wanting one answer per parcel takes and the answer this
+module used to give.
 
 Across *families*, there is no choice to make, because there is nothing to
 choose between. A zone whose grid writes an ``H.2`` column and a ``C.4``
@@ -88,14 +109,16 @@ by a median of $136 000.
 
 The maximisation over the *mix* is inside `solve_program`, over the dwellings
 and the floor one envelope can hold - now including the split between the
-families. What is left to maximise here is only which *zone*, on a lot two of
-them overlap, and `pct_of_lot` settles that before profit is consulted at all.
+families. Nothing is maximised here at all any more: every piece keeps its own
+answer, and the only ranking left is the one a reader does when they sort a
+shortlist.
 
-A lot with candidates but no governing one keeps its row and says so in
-`hbu_status`: `no_governing_column` is almost always a parcel with no measured
+A piece with candidates but no governing column keeps its row and says so in
+`hbu_status`: `no_governing_column` is almost always ground with no measured
 frontage under a grid that states a width minimum, which reads as 0 m and
-qualifies for nothing. That is a gap in `lot_frontage` rather than in the grid,
-and it is worth being able to count.
+qualifies for nothing. On a split lot that is now a real answer rather than a
+gap - an interior piece behind a street-facing one genuinely fronts nothing -
+and it is worth being able to count either way.
 
 ----------------------------------------------------------------------------
 What is not a development site
@@ -131,7 +154,7 @@ redevelopment gap, and ranked them among the borough's investment
 opportunities. The union of the two predicates is what closes that; the sets
 overlap little and neither is a superset of the other.
 
-**A parcel whose zone authorises only Équipements collectifs.** A park, a
+**A piece whose zone authorises only Équipements collectifs.** A park, a
 school, a hospital, a cemetery. `program` has never priced the ``E`` family -
 a school is not something a proforma rents by the square foot - so those
 columns were never candidates, and what made these parcels development sites
@@ -139,12 +162,19 @@ anyway was the *other* zone: a lot on a zone boundary picks up a sliver of its
 neighbour's, and `_chosen` resolved between zones only among the rows that had
 produced a program, so a zone that produced none dropped silently out of the
 contest and a 1.7% sliver of the block next door answered for the whole parcel.
-`governing_zone` closes that by deciding which zone speaks for a lot *before*
-the candidates are read, on the same coverage rule `_chosen` always used. On
-the 2026 Villeray-Saint-Michel-Parc-Extension partition it removes 343 such
-answers, 206 of them on Équipements parcels, Parc Jarry among them, and takes
-the borough's candidate rows from 75,007 to 64,493 - which is that many CP-SAT
-models not run on parcels nobody may build on.
+
+Two things close that, and it is worth keeping them apart because only one of
+them survives the move to pieces. The sliver itself is gone upstream:
+`lot_zone_pieces` writes no piece for a zone under a per cent and a square
+metre of a lot, so the 1.7% corner of Parc Jarry never reaches a solver. What
+is left is the gate here, and it is now applied **per piece** rather than per
+lot - `equipment_zone_pieces` - which is the only reading that works once both
+zones are answered: a parcel half park and half housing has one piece nobody
+may build on and one piece somebody may, and calling the whole lot an
+equipment parcel would lose the second. On the 2026
+Villeray-Saint-Michel-Parc-Extension partition the two together remove 343
+answers that were a neighbour's grid, 206 of them on Équipements parcels, Parc
+Jarry among them.
 
 The road gate and the equipment gate are independent of each other, and of the
 two road predicates the roll is much the narrower: it reaches 21,862 of the
@@ -343,7 +373,10 @@ HBU_STATUSES: tuple[str, ...] = (
     # min*: a missing frontage reads as 0 m and qualifies for nothing.
     "no_governing_column",
     # A governing column was solved and none has a feasible program - a
-    # minimum the parcel cannot meet, or stalls it has nowhere to put.
+    # minimum the parcel cannot meet. Stalls it has nowhere to put no longer
+    # land here on their own: a piece the parking alone stopped is solved
+    # again without it, reported `solved`, and marked `parking_waived` on its
+    # program row with the stalls it owes in `waived_stalls`.
     "infeasible",
     # A governing column could not be turned into a model at all;
     # `solve_error` carries what it said.
@@ -377,6 +410,9 @@ PROGRAM_COLUMNS: tuple[str, ...] = (
     "annual_net_operating_income_cad",
     "monthly_gross_revenue_cad",
     "annual_gross_revenue_cad",
+    "annual_residential_gross_revenue_cad",
+    "annual_commercial_gross_revenue_cad",
+    "annual_industrial_gross_revenue_cad",
     "num_dwellings",
     "units",
     "floors",
@@ -393,12 +429,12 @@ PROGRAM_COLUMNS: tuple[str, ...] = (
     "basement_commercial_area_m2",
     "basement_industrial_area_m2",
     "underground_area_m2",
+    "underground_plate_m2",
     "garage_area_m2",
     "surface_area_m2",
     "residential_floors",
     "commercial_floors",
     "industrial_floors",
-    "above_grade_parking_floors",
     "basement_levels",
     "basement_residential_levels",
     "basement_commercial_levels",
@@ -406,10 +442,25 @@ PROGRAM_COLUMNS: tuple[str, ...] = (
     "basement_dwellings",
     "underground_levels",
     "underground_stalls",
-    "above_grade_stalls",
     "surface_stalls",
     "garage_stalls",
     "total_stalls",
+    # Whether the stalls above are zero because the program was solved with
+    # its parking waived - the model was infeasible with the stalls and solved
+    # without them - and how many it owes at the stated ratios if so. See
+    # `program.solve_program` on `waive_parking_if_infeasible`.
+    "parking_waived",
+    "waived_stalls",
+    # What the parking earns and what it buys: the stalls somebody rents and
+    # their rent a year (inside `annual_gross_revenue_cad`), the stalls per
+    # dwelling provided, the lease-up months that coverage saves and what the
+    # saving is worth in present value (inside `present_value_cad`). See
+    # `program.solve_program` on what a stall is worth.
+    "rented_stalls",
+    "annual_parking_gross_revenue_cad",
+    "parking_coverage",
+    "lease_up_months_saved",
+    "absorption_value_cad",
     "floor_stack",
     "construction_cost_cad",
     "commercial_cost_cad",
@@ -431,6 +482,9 @@ _PROGRAM_FLOATS: tuple[str, ...] = (
     "annual_net_operating_income_cad",
     "monthly_gross_revenue_cad",
     "annual_gross_revenue_cad",
+    "annual_residential_gross_revenue_cad",
+    "annual_commercial_gross_revenue_cad",
+    "annual_industrial_gross_revenue_cad",
     "height_m",
     "footprint_m2",
     "gross_floor_area_m2",
@@ -444,6 +498,7 @@ _PROGRAM_FLOATS: tuple[str, ...] = (
     "basement_commercial_area_m2",
     "basement_industrial_area_m2",
     "underground_area_m2",
+    "underground_plate_m2",
     "garage_area_m2",
     "surface_area_m2",
     "construction_cost_cad",
@@ -451,6 +506,10 @@ _PROGRAM_FLOATS: tuple[str, ...] = (
     "industrial_cost_cad",
     "parking_cost_cad",
     "total_capital_cost_cad",
+    "annual_parking_gross_revenue_cad",
+    "parking_coverage",
+    "lease_up_months_saved",
+    "absorption_value_cad",
 )
 
 #: The counts of a program, same purpose as `_PROGRAM_FLOATS`.
@@ -460,7 +519,6 @@ _PROGRAM_COUNTS: tuple[str, ...] = (
     "residential_floors",
     "commercial_floors",
     "industrial_floors",
-    "above_grade_parking_floors",
     "basement_levels",
     "basement_residential_levels",
     "basement_commercial_levels",
@@ -468,10 +526,11 @@ _PROGRAM_COUNTS: tuple[str, ...] = (
     "basement_dwellings",
     "underground_levels",
     "underground_stalls",
-    "above_grade_stalls",
     "surface_stalls",
     "garage_stalls",
     "total_stalls",
+    "waived_stalls",
+    "rented_stalls",
 )
 
 #: What a candidate row carries about the parcel and the column *before* the
@@ -494,22 +553,30 @@ CANDIDATE_COLUMNS: tuple[str, ...] = (
     "governs_residential",
     "governs_commercial",
     "governs_industrial",
+    # The parcel, and the ground this zone governs. Both, because a reader
+    # holding one program row has to be able to tell "this is a 27 044 m2 lot"
+    # from "this is the 2 440 m2 of it C04-083 covers" - and it is the second
+    # that was solved.
     "lot_area_m2",
+    "piece_area_m2",
+    "num_lot_zones",
+    "is_primary_zone",
     "primary_frontage_m",
+    "primary_street_name",
     "buildable_area_m2",
     "parkable_area_m2",
     "placeable_area_m2",
 )
 
-#: The columns a chosen program brings across from its candidate row. The lot's
-#: own facts are not among them: those come from `_lot_index`, which has a row
-#: for every lot including the ones no candidate was chosen for.
+#: The columns a chosen program brings across from its candidate row. The
+#: piece's own facts are not among them: those come from `_piece_index`, which
+#: has a row for every piece including the ones no candidate was chosen for -
+#: and `feature_id` and `pct_of_lot` are the piece's, so they moved there when
+#: the grain did.
 _CHOSEN_COLUMNS: tuple[str, ...] = (
-    "feature_id",
     "source_table",
     "column_index",
     "grid_zone",
-    "pct_of_lot",
     "usages",
     "permits_residential",
     "permits_commercial",
@@ -522,15 +589,39 @@ _CHOSEN_COLUMNS: tuple[str, ...] = (
     *PROGRAM_COLUMNS,
 )
 
-#: What a `lot_highest_best_use` row says about the parcel before the envelope
+#: What a `lot_highest_best_use` row says about the ground before the envelope
 #: chosen for it and the program that fills it.
-_HBU_LOT_COLUMNS: tuple[str, ...] = (
+#:
+#: The key leads and it is a *pair*: one row per (lot, zone), because a zoning
+#: boundary crossing a large parcel makes two sites of it. Everything after
+#: `scrape_date` down to `footprint_share_basis` is the piece as
+#: `lot_zone_pieces` measured it, carried onto the answer so a reader holding
+#: one row knows what ground was solved, how much of its parcel that is, which
+#: street it faces, and what share of the standing building sits on it - the
+#: last being what `use_gap` divides the roll by.
+_HBU_PIECE_COLUMNS: tuple[str, ...] = (
     "lot_uid",
+    "feature_id",
     "lot_number",
     "neighborhood",
     "scrape_date",
+    # The parcel and the piece of it, always both: a reader has to be able to
+    # tell a whole lot from a tenth of one.
     "lot_area_m2",
+    "piece_area_m2",
+    "pct_of_lot",
+    "num_lot_zones",
+    "zone_rank",
+    "is_primary_zone",
     "primary_frontage_m",
+    "primary_street_name",
+    "secondary_frontage_m",
+    "secondary_street_name",
+    "num_frontages",
+    "existing_footprint_m2",
+    "area_share",
+    "footprint_share",
+    "footprint_share_basis",
     "parkable_area_m2",
     "num_candidates",
     "num_governing_candidates",
@@ -543,7 +634,7 @@ _HBU_LOT_COLUMNS: tuple[str, ...] = (
 #: reader's first question about a chosen program is *which kind of building
 #: it is*, and answering it should not take four area columns and a rule.
 HBU_COLUMNS: tuple[str, ...] = (
-    *_HBU_LOT_COLUMNS,
+    *_HBU_PIECE_COLUMNS,
     *_CHOSEN_COLUMNS,
     "hbu_dominant_use",
 )
@@ -582,6 +673,14 @@ class ProgramAssumptions:
     #: comes back `FEASIBLE` or `UNKNOWN` rather than `OPTIMAL`, and the asset
     #: counts both, so a limit set too low is visible rather than silent.
     max_seconds: float = 10.0
+    #: Whether a candidate that holds nothing with its stalls - infeasible,
+    #: or solved and empty - is solved again without the obligation. On by
+    #: default: for a borough, "no program at all" is a worse answer about a
+    #: parcel than "this program, short this many stalls", and the row says
+    #: which it is through `parking_waived` and `waived_stalls`.
+    #: `program.solve_program` documents when the second solve happens and
+    #: why it never masks a printed minimum or a rent that does not pay.
+    waive_parking_if_empty: bool = True
 
     def as_metadata(self) -> dict[str, object]:
         """The object every row carries, so a program can be read back."""
@@ -589,16 +688,20 @@ class ProgramAssumptions:
             "stalls_per_dwelling": self.parking.stalls_per_dwelling,
             "stalls_per_1000_sqft": self.parking.stalls_per_1000_sqft,
             "underground_stall_area_sqft": self.parking.underground_area_sqft,
-            "above_grade_stall_area_sqft": self.parking.above_grade_area_sqft,
             "surface_stall_area_sqft": self.parking.surface_area_sqft,
             "garage_stall_area_sqft": self.parking.garage_area_sqft,
             "underground_stall_cost_cad": self.parking.underground_cost_cad,
-            "above_grade_stall_cost_cad": self.parking.above_grade_cost_cad,
             "surface_stall_cost_cad": self.parking.surface_cost_cad,
             "garage_stall_cost_cad": self.parking.garage_cost_cad,
             "max_underground_levels": self.parking.max_underground_levels,
+            "underground_lot_share": self.parking.underground_lot_share,
             "max_surface_stalls": self.parking.max_surface_stalls,
             "max_garage_stalls": self.parking.max_garage_stalls,
+            "parking_stall_rent_cad_month": self.parking.monthly_rent_cad,
+            "parking_stall_occupancy_pct": self.parking.occupancy_pct,
+            "market_stalls_per_dwelling": self.parking.market_stalls_per_dwelling,
+            "market_stalls_per_1000_sqft": self.parking.market_stalls_per_1000_sqft,
+            "parking_absorption_saving_months": self.parking.absorption_saving_months,
             "residential_cost_per_sqft_cad": (
                 self.construction.residential_cost_per_sqft
             ),
@@ -616,7 +719,6 @@ class ProgramAssumptions:
             "residential_storey_height_m": self.heights.residential_m,
             "commercial_storey_height_m": self.heights.commercial_m,
             "industrial_storey_height_m": self.heights.industrial_m,
-            "above_grade_parking_storey_height_m": self.heights.above_grade_parking_m,
             "months_per_year": MONTHS_PER_YEAR,
             "discount_rate_pct": self.investment.discount_rate_pct,
             "hold_years": self.investment.hold_years,
@@ -633,6 +735,7 @@ class ProgramAssumptions:
             "below_grade_cost_premium": self.construction.below_grade_premium,
             "basement_levels_allowed": self.basement_levels_allowed,
             "max_seconds": self.max_seconds,
+            "waive_parking_if_empty": self.waive_parking_if_empty,
         }
 
 
@@ -724,23 +827,45 @@ def zone_column_of(row: Mapping) -> ZoneColumn:
     )
 
 
+#: The area `lot_of` sizes a building on, in the order it looks for it.
+#:
+#: `piece_area_m2` is the ground *this zone* governs and is the right answer
+#: whenever it is there - see the module docstring on why a split lot is two
+#: sites rather than one. `lot_area_m2` is the fallback and it is exactly the
+#: old behaviour: a parquet written before `lot_zone_pieces` existed carries
+#: only the parcel, and reading it back should give the answer it gave then
+#: rather than fail. The two are equal on every unsplit lot, which is most of
+#: a borough.
+_PARCEL_AREA_COLUMNS: tuple[str, ...] = ("piece_area_m2", "lot_area_m2")
+
+
 def lot_of(row: Mapping) -> Lot:
     """One row of `lot_zoning_envelopes`, back as the parcel the solver sizes.
 
+    **The parcel is the piece, not the lot.** `piece_area_m2` is the ground the
+    row's zone actually governs, and on a lot two zones cut in two it is not
+    the lot's area - pricing eight storeys over a commercial strip the H grid
+    does not reach is the error this column exists to stop. `lot_area_m2` is
+    the documented fallback for a partition written before `lot_zone_pieces`,
+    and the two agree on every lot one zone covers whole.
+
     A missing frontage is 0 m rather than an error, which is the reading
-    `envelope_assets.meets_min_lot_width` gives it too: a lot nothing measured
-    satisfies no width minimum, and excluding it is the conservative answer.
+    `envelope_assets.meets_min_lot_width` gives it too: a piece nothing
+    measured satisfies no width minimum, and excluding it is the conservative
+    answer.
     `buildable_area_m2` is absent on a partition where `lot_buildable_setbacks`
     has not run, and `Lot` reads `None` as "no margin cap known" rather than as
     no buildable area at all.
 
     `parkable_area_m2` is absent on the same terms and reads the same way -
     "nobody measured the yard's shape", which leaves the surface stalls bounded
-    by the area arithmetic alone. It is measured off the cadastre rather than
-    off a zoning column, so unlike the buildable area it belongs to the lot and
-    is the same on every candidate row of it. A measured **0.0** is not absence
-    and must not be collapsed into it: it says this parcel parks no car on the
-    ground, and `_float_or_none` is careful to return it rather than None.
+    by the area arithmetic alone. It is measured off the *piece*, opened inside
+    the ground this zone governs: it used to be the whole parcel's yard, which
+    was the same thing while one zone answered for a lot and is a double count
+    now that both do - each piece would be handed the other's back garden.
+    A measured **0.0** is not absence and must not be collapsed into it: it
+    says this ground parks no car, and `_float_or_none` is careful to return it
+    rather than None.
 
     `placeable_area_m2` is absent on the same terms again, and it belongs to a
     zoning column the way `buildable_area_m2` does rather than to the lot: it
@@ -751,12 +876,31 @@ def lot_of(row: Mapping) -> Lot:
     rather than nothing - these margins hold no building at all.
     """
     return Lot(
-        area_m2=float(row["lot_area_m2"]),
+        area_m2=_parcel_area_of(row),
         frontage_m=_float_or_none(row.get("primary_frontage_m")) or 0.0,
         lot_number=_text_or_none(row.get("lot_number")),
         buildable_area_m2=_float_or_none(row.get("buildable_area_m2")),
         parkable_area_m2=_float_or_none(row.get("parkable_area_m2")),
         placeable_area_m2=_float_or_none(row.get("placeable_area_m2")),
+    )
+
+
+def _parcel_area_of(row: Mapping) -> float:
+    """The ground one envelope row is solved over, in square metres.
+
+    `_PARCEL_AREA_COLUMNS` in order, first present and non-null wins. Raises
+    `KeyError` naming both when neither is there, rather than defaulting to
+    zero: a parcel of no area is a `ProgramError` one function later and a
+    confusing one, since nothing in the message would say the area column was
+    simply missing.
+    """
+    for name in _PARCEL_AREA_COLUMNS:
+        value = _float_or_none(row.get(name))
+        if value is not None:
+            return value
+    raise KeyError(
+        f"no parcel area on this row: expected one of "
+        f"{', '.join(_PARCEL_AREA_COLUMNS)}"
     )
 
 
@@ -935,62 +1079,50 @@ def _frontage_of(record: Mapping) -> float:
     return 0.0 if frontage is None else frontage
 
 
-def governing_zone(envelopes: pd.DataFrame) -> pd.Series:
-    """The one zone that speaks for each lot, keyed by `lot_uid`.
+def primary_zone(envelopes: pd.DataFrame) -> pd.Series:
+    """The largest piece of each lot, as a zone number keyed by `lot_uid`.
 
-    The zone covering most of the parcel, which is the rule `_chosen` has
-    always applied between two solved programs and the module docstring has
-    always stated: two zones on one lot are two publishers' lines disagreeing,
-    not a menu the owner may order from.
+    A *label*, not a filter, and that is the whole of what changed here. This
+    function used to be `governing_zone`: it named the one zone that spoke for
+    a parcel, and `candidate_envelopes` dropped every row belonging to any
+    other zone before a solver saw it. Two zones on one lot were read as two
+    publishers' lines disagreeing, and the best-covered one won.
 
-    **Applied before the candidates are read, which is the point.** Deciding
-    between zones only among the rows that produced a program lets a zone that
-    produced none drop silently out of the contest, and the parcels whose zone
-    produces none are exactly the ones this is about - a park, a school, a
-    cemetery. On the 2026 Villeray-Saint-Michel-Parc-Extension partition, 343
-    lots were answered by a zone that is not theirs, 206 of them parcels whose
-    own zoning is *Équipements collectifs*. Parc Jarry is the case to picture:
-    1.59 km2 carrying 31 envelope rows over 14 zones, its own E04-019 covering
-    98.3% of it and the other thirteen between 1.7% and 0.000022% - a few
-    square centimetres of a residential zone at the corner of the park - and
-    any one of those slivers was enough to report it as a development site.
+    That reading is right about a sliver and wrong about a boundary that
+    genuinely crosses a large parcel, and the two are not distinguishable by
+    the rule it used. Both are now handled, and by different things.
+    `lot_zone_pieces` drops the sliver - under a per cent *and* under a square
+    metre of the lot, before a piece is written at all - so the few square
+    centimetres of residential zone at the corner of Parc Jarry never arrive.
+    What is left is real ground under a real grid, and it is solved rather than
+    ranked: see the module docstring on lot 1 740 794 and the 121 ha of VSMPE
+    that used to be priced under a grid that does not govern it.
 
-    **It ranks the zones the envelopes carry, not the zones on the map.**
-    `lot_zoning_envelopes` inner-joins the grid columns, so a zone whose PDF
-    did not parse contributes no row and cannot be picked here - 36 of the 633
-    VSMPE zones. A lot whose true dominant zone is one of those is governed by
-    the best-covered zone that *did* parse, which is the same answer the rest
-    of this module has always given and is worth knowing when reading a
-    surprising one: `zoning_grid_columns`' `num_documents_failed` is where the
-    coverage is reported.
+    So what this returns is only the answer to "if I want one row for this
+    parcel, which one" - the same question `is_primary_zone` answers on every
+    piece row, computed the same way. Prefer that column where it is there;
+    this is what a frame without it falls back on, and what keeps the ranking
+    in one place.
 
-    Ties are broken on `feature_id` so a lot split exactly evenly answers to
-    the same zone on every run rather than to whichever the join happened to
-    place first. A frame carrying no `pct_of_lot` - a hand-built one in a test
-    - leaves every zone in, since there is nothing to rank them by.
-
-    **The slivers no longer reach here.** `EnvelopeConfig.min_overlap_m2` drops
-    a zone clipping under a square metre of a lot before
-    `lot_zoning_envelopes` writes a row for it - the few square centimetres at
-    the corner of the park above is one of them - and `min_pct_of_lot` drops
-    one clipping under a per cent of it, which is the same artefact in the
-    measure a square metre cannot see: 1.19 m2 of a commercial zone on the
-    438 m2 of lot 6 291 714 is over the absolute cutoff and a quarter of a per
-    cent of the parcel. That changes the counts quoted here, which were
-    measured before either: this still decides every case, and now has fewer
-    to decide. Nothing about the rule changes, since the rows removed are the
-    ones it was already ranking last.
-
-    The rows removed were not always ranking last *and losing*, though, which
-    is why this matters beyond tidiness. `_chosen` sorts on coverage first but
-    only among the candidates that produced a solvable program, so a sliver
-    won whenever the zone actually covering the lot produced none - a grid
-    that would not parse, or one authorising only Equipements collectifs. Over
-    Villeray-Saint-Michel-Parc-Extension that was 182 parcels, 114 of which had
-    the real zone sitting right there and unchosen.
+    Ties are broken on `feature_id` so a lot split exactly evenly names the
+    same zone on every run rather than whichever the join placed first. A frame
+    carrying neither `is_primary_zone` nor `pct_of_lot` - a hand-built one in a
+    test - gets an empty Series, since there is nothing to rank by.
     """
     if "lot_uid" not in envelopes.columns or "feature_id" not in envelopes.columns:
         return pd.Series(dtype="object")
+    if "is_primary_zone" in envelopes.columns:
+        # Written by `lot_zone_pieces`, which ranked the pieces against the
+        # clip areas rather than against `pct_of_lot` rounded onto an envelope
+        # row. Preferred for that reason, and because it is the column the map
+        # and the gold tables carry.
+        marked = envelopes[envelopes["is_primary_zone"].fillna(False).astype(bool)]
+        if not marked.empty:
+            return (
+                marked.sort_values(["lot_uid", "feature_id"], kind="stable")
+                .drop_duplicates("lot_uid", keep="first")
+                .set_index("lot_uid")["feature_id"]
+            )
     if "pct_of_lot" not in envelopes.columns:
         return pd.Series(dtype="object")
     ranked = envelopes.sort_values(
@@ -1004,17 +1136,25 @@ def governing_zone(envelopes: pd.DataFrame) -> pd.Series:
 def candidate_envelopes(envelopes: pd.DataFrame) -> pd.DataFrame:
     """The rows `solve_program` can be asked about.
 
-    A candidate sits in the zone that governs its lot, authorises at least one
-    of the three priced families and parses into a solver input. The flags are
-    upstream columns read rather than re-derived - see the module docstring -
-    with `ensure_use_flags` as the documented fallback for a parquet written
-    before the commercial and industrial ones existed. A frame missing every
-    permits flag is treated as though each row passed, so a hand-built frame in
-    a test need not carry columns the test is not about.
+    A candidate authorises at least one of the three priced families and
+    parses into a solver input. The flags are upstream columns read rather than
+    re-derived - see the module docstring - with `ensure_use_flags` as the
+    documented fallback for a parquet written before the commercial and
+    industrial ones existed. A frame missing every permits flag is treated as
+    though each row passed, so a hand-built frame in a test need not carry
+    columns the test is not about.
 
-    `governing_zone` is why an Équipements parcel now stays one: its columns
-    were never candidates, and what used to make it a development site anyway
-    was a sliver of the zone next door.
+    **Every zone of a lot is a candidate now.** This used to narrow to the
+    lot's governing zone and it no longer narrows on the zone at all: a piece
+    of ground under a grid is a site, and which of a parcel's pieces is worth
+    the most is a question for a reader sorting a shortlist rather than one
+    this function should answer by deleting rows. What kept the slivers out was
+    never really this filter - it is the two cutoffs, and they now live in
+    `lot_zone_pieces` where they can be applied once and carried on the row.
+
+    An Équipements piece still stays one, and by the gate it always had rather
+    than by this: its columns are not candidates because `program` prices no
+    ``E`` family, and `equipment_zone_pieces` is what says so in `hbu_status`.
     """
     envelopes = ensure_use_flags(envelopes)
     permits = [
@@ -1030,11 +1170,6 @@ def candidate_envelopes(envelopes: pd.DataFrame) -> pd.DataFrame:
         mask = pd.Series(True, index=envelopes.index)
     if "solver_ready" in envelopes.columns:
         mask &= envelopes["solver_ready"].fillna(False).astype(bool)
-    zones = governing_zone(envelopes)
-    if not zones.empty:
-        mask &= envelopes["feature_id"].eq(
-            envelopes["lot_uid"].map(zones)
-        )
     return envelopes[mask]
 
 
@@ -1186,6 +1321,22 @@ def program_row(
         ),
         "monthly_gross_revenue_cad": program.gross_revenue_cad,
         "annual_gross_revenue_cad": program.gross_revenue_cad * MONTHS_PER_YEAR,
+        # The gross split by the family that earns it. Annual only, unlike the
+        # total above it: every reader of the split is downstream of the gap,
+        # which is annual on both sides, and three more monthly columns would
+        # be six columns to say one thing. The three sum to
+        # `annual_gross_revenue_cad` less `annual_parking_gross_revenue_cad`
+        # beside them - each carries its own basement plate, so this is not
+        # the area split and cannot be rebuilt from one.
+        "annual_residential_gross_revenue_cad": (
+            program.residential_gross_revenue_cad * MONTHS_PER_YEAR
+        ),
+        "annual_commercial_gross_revenue_cad": (
+            program.commercial_gross_revenue_cad * MONTHS_PER_YEAR
+        ),
+        "annual_industrial_gross_revenue_cad": (
+            program.industrial_gross_revenue_cad * MONTHS_PER_YEAR
+        ),
         "num_dwellings": program.total_dwellings,
         "units": json.dumps(dict(program.units), ensure_ascii=False),
         "floors": program.floors,
@@ -1202,12 +1353,12 @@ def program_row(
         "basement_commercial_area_m2": program.basement_commercial_area_m2,
         "basement_industrial_area_m2": program.basement_industrial_area_m2,
         "underground_area_m2": program.underground_area_m2,
+        "underground_plate_m2": program.underground_plate_m2,
         "garage_area_m2": program.garage_area_m2,
         "surface_area_m2": program.surface_area_m2,
         "residential_floors": program.residential_floors,
         "commercial_floors": program.commercial_floors,
         "industrial_floors": program.industrial_floors,
-        "above_grade_parking_floors": program.above_grade_parking_floors,
         "basement_levels": program.basement_levels,
         "basement_residential_levels": program.basement_residential_levels,
         "basement_commercial_levels": program.basement_commercial_levels,
@@ -1215,10 +1366,18 @@ def program_row(
         "basement_dwellings": program.basement_dwellings,
         "underground_levels": program.underground_levels,
         "underground_stalls": program.underground_stalls,
-        "above_grade_stalls": program.above_grade_stalls,
         "surface_stalls": program.surface_stalls,
         "garage_stalls": program.garage_stalls,
         "total_stalls": program.total_stalls,
+        "parking_waived": bool(program.parking_waived),
+        "waived_stalls": int(program.waived_stalls),
+        "rented_stalls": int(program.rented_stalls),
+        "annual_parking_gross_revenue_cad": (
+            program.parking_gross_revenue_cad * MONTHS_PER_YEAR
+        ),
+        "parking_coverage": program.parking_coverage,
+        "lease_up_months_saved": program.lease_up_months_saved,
+        "absorption_value_cad": program.absorption_value_cad,
         "floor_stack": json.dumps(
             floor_stack(program, heights=heights), ensure_ascii=False
         ),
@@ -1256,6 +1415,7 @@ def _program_row(
             investment=assumptions.investment,
             basement_levels_allowed=assumptions.basement_levels_allowed,
             max_seconds=assumptions.max_seconds,
+            waive_parking_if_empty=assumptions.waive_parking_if_empty,
         )
     except (ProgramError, ValueError, KeyError) as exc:
         # `ValueError` and `KeyError` beside `ProgramError` on purpose: a stale
@@ -1275,6 +1435,7 @@ _ERROR_PROGRAM_ROW: dict = {
     "status": "ERROR",
     "solved": False,
     "solve_error": None,
+    "parking_waived": False,
     "units": "{}",
     "floor_stack": "[]",
     "binding": "[]",
@@ -1294,18 +1455,26 @@ def select_highest_best_use(
     assessments: pd.DataFrame | None = None,
     road_lots: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """One row per lot: the program of the envelope that governs it.
+    """One row per **(lot, zone)**: the program of the piece that zone governs.
 
     ``programs`` is `solve_envelopes`' output and ``envelopes`` is the frame it
-    was built from - both, because a lot whose every envelope authorises
+    was built from - both, because a piece whose every envelope authorises
     commerce has no candidate row at all and would otherwise vanish from a table
-    that is meant to be an inventory. Every lot the envelopes reach keeps a row,
-    and `hbu_status` says which of `HBU_STATUSES` it is.
+    that is meant to be an inventory. Every piece the envelopes reach keeps a
+    row, and `hbu_status` says which of `HBU_STATUSES` it is.
 
-    The pick is the module docstring's: among the rows `governs_residential`
-    marks, the one whose zone covers most of the lot, ties broken by income and
-    then by column index. `num_candidates` and `num_zones` travel with it, so a
-    lot where the choice was real is distinguishable from one where it was not.
+    **The grain is the piece, and this function no longer chooses between
+    pieces.** It used to return one row per lot, picked among the zones by
+    coverage; a lot cut in two by a zoning boundary is two sites, so both are
+    reported and the ranking a reader wants is theirs to do. `is_primary_zone`
+    marks the largest, `num_lot_zones` says how many there are, and
+    `lot_number` is what groups them back into a parcel - on the map, in the
+    dashboard and in a `GROUP BY`. See the module docstring.
+
+    What is still chosen, and all that is, is *within* a piece: among the rows
+    `governs_residential` and its two siblings mark, the highest-earning, ties
+    broken by column index. `num_candidates` travels with it, so a piece where
+    the choice was real is distinguishable from one where it was not.
 
     ``assessments`` is `lot_assessment_comparables`, and the one thing read out
     of it is `dominant_use_code`: a lot the roll files under a CUBF road code
@@ -1331,42 +1500,47 @@ def select_highest_best_use(
     also where the arithmetic on why it cannot be widened into a whitelist is.
     """
     envelopes = ensure_use_flags(envelopes)
-    lots = _lot_index(envelopes)
-    if lots.empty:
+    pieces = _piece_index(envelopes)
+    if pieces.empty:
         return pd.DataFrame(columns=list(HBU_COLUMNS))
 
     # Both road predicates speak lot numbers and everything from here on speaks
-    # `lot_uid`, so the translation happens once, here, off the lot index that
-    # already holds both. Unioned before the translation: they are two ways of
-    # learning the same fact and they reach different parcels - the roll knows
-    # a right of way it assessed, the cadastre knows every street Montreal
-    # never put on the roll.
+    # (lot_uid, feature_id), so the translation happens once, here, off the
+    # piece index that already holds the lot number. Unioned before the
+    # translation: they are two ways of learning the same fact and they reach
+    # different parcels - the roll knows a right of way it assessed, the
+    # cadastre knows every street Montreal never put on the roll.
+    #
+    # A road parcel is a road parcel whole. Unlike the equipment gate beside
+    # it, this one is a fact about the *ground* rather than about a grid, so
+    # every piece of a street lot is street - splitting avenue Querbes between
+    # two zones does not make half of it a development site.
     road_numbers = (
         road_parcel_lots(assessments) if assessments is not None else frozenset()
     ) | cadastral_road_lots(road_lots, assessments)
-    road_uids = frozenset(
-        lots.index[lots["lot_number"].isin(road_numbers)]
-        if road_numbers and "lot_number" in lots.columns
+    road_keys = frozenset(
+        pieces.index[pieces["lot_number"].isin(road_numbers)]
+        if road_numbers and "lot_number" in pieces.columns
         else ()
     )
     chosen = _chosen(programs)
     # Before the join, so a road parcel's row is the same shape as any other
-    # lot without a program: nulls across the envelope and the program, and
+    # piece without a program: nulls across the envelope and the program, and
     # `hbu_status` carrying the reason.
-    chosen = chosen[~chosen.index.isin(road_uids)]
-    frame = lots.join(chosen, how="left")
+    chosen = chosen[~chosen.index.isin(road_keys)]
+    frame = pieces.join(chosen, how="left")
     frame["hbu_status"] = _hbu_status(
         frame,
         programs,
-        equipment_lots=equipment_zone_lots(envelopes),
-        road_lots=road_uids,
+        equipment_pieces=equipment_zone_pieces(envelopes),
+        road_pieces=road_keys,
     )
     frame["hbu_dominant_use"] = _dominant_use(frame)
     return frame.reset_index()[list(HBU_COLUMNS)]
 
 
 def _governs_any(programs: pd.DataFrame) -> pd.Series:
-    """Whether each candidate row governs its lot for *some* family.
+    """Whether each candidate row governs its piece for *some* family.
 
     Any of the three flags: a row that is the grid's own pick for the
     housing, the commerce or the industry is one the developer may build to.
@@ -1385,32 +1559,38 @@ def _governs_any(programs: pd.DataFrame) -> pd.Series:
 
 
 def _chosen(programs: pd.DataFrame) -> pd.DataFrame:
-    """The winning candidate of each lot, indexed by `lot_uid`.
+    """The winning candidate of each piece, indexed by (`lot_uid`,
+    `feature_id`).
 
-    One row per (lot, zone) reaches this now, each already the best building
-    its zone permits across all three families - the mix is `solve_program`'s
-    to decide, not this function's. What is left is a lot that two zones
-    overlap, and coverage settles it: two zones on one lot are a mapping
-    disagreement rather than a menu, so `pct_of_lot` decides and the profit
-    only breaks a tie between zones covering the lot equally.
+    One row per (lot, zone) reaches this, each already the best building its
+    zone permits across all three families - the mix is `solve_program`'s to
+    decide, not this function's - so ordinarily there is nothing left to
+    choose and this is a filter on "solved, and something governs it".
+
+    **It no longer ranks a lot's zones against each other.** It used to sort
+    on `pct_of_lot` and keep one row per lot, which is the rule the module
+    docstring now argues against: two zones cutting a large parcel are two
+    sites and both are reported. The `drop_duplicates` that remains is on the
+    piece and is a guard rather than a choice - a duplicate (lot, zone) would
+    mean one grid reached a piece twice, and keeping the higher-earning row of
+    an identical pair is the same answer either way.
     """
+    keys = ["lot_uid", "feature_id"]
     if programs.empty:
-        return pd.DataFrame(columns=list(_CHOSEN_COLUMNS)).rename_axis("lot_uid")
+        empty = pd.DataFrame(columns=list(_CHOSEN_COLUMNS))
+        empty.index = pd.MultiIndex.from_arrays([[], []], names=keys)
+        return empty
     solved = programs[
         _governs_any(programs) & programs["solved"].fillna(False).astype(bool)
     ]
     value = "npv_cad" if "npv_cad" in solved.columns else "monthly_net_operating_income_cad"
     ranked = solved.sort_values(
-        ["lot_uid", "pct_of_lot", value, "column_index"],
-        # Coverage first and descending: the zone that actually covers the
-        # lot decides, and the profit only ranks the envelopes within it.
-        ascending=[True, False, False, True],
+        [*keys, value, "column_index"],
+        ascending=[True, True, False, True],
         kind="stable",
-    ).drop_duplicates("lot_uid")
+    ).drop_duplicates(keys)
     wanted = [name for name in _CHOSEN_COLUMNS if name in ranked.columns]
-    return ranked.set_index("lot_uid")[wanted].reindex(
-        columns=list(_CHOSEN_COLUMNS)
-    )
+    return ranked.set_index(keys)[wanted].reindex(columns=list(_CHOSEN_COLUMNS))
 
 
 #: Share of the proposed usage floor one class must hold for the program to
@@ -1445,51 +1625,95 @@ def _dominant_use(frame: pd.DataFrame) -> pd.Series:
     return result
 
 
-def _lot_index(envelopes: pd.DataFrame) -> pd.DataFrame:
-    """One row per lot the envelopes reach, with what it is and how many.
-
-    `num_candidates` counts *candidates* rather than envelope rows: a lot under
-    a grid with one Habitation column and three Commerce ones had one choice,
-    not four, and reporting four would make the Habitation column look like
-    three failed parses.
-    """
-    if envelopes.empty:
-        empty = pd.DataFrame(
-            columns=[name for name in _HBU_LOT_COLUMNS if name != "lot_uid"]
-        )
-        empty.index.name = "lot_uid"
-        return empty
-    candidates = candidate_envelopes(envelopes)
-    aggregations = {
-        "lot_number": ("lot_number", "first"),
-        "neighborhood": ("neighborhood", "first"),
-        "scrape_date": ("scrape_date", "first"),
-        "lot_area_m2": ("lot_area_m2", "first"),
-        "primary_frontage_m": ("primary_frontage_m", "first"),
-        "num_zones": ("feature_id", "nunique"),
-    }
+#: The piece columns `_piece_index` carries straight through from the
+#: envelopes, as (name, aggregation). Every one is constant within a (lot,
+#: zone) group by construction - `lot_zoning_envelopes` writes them onto every
+#: column of a grid - so `first` is not a choice among differing values.
+#:
+#: `num_zones` is the exception and is computed rather than carried: it counts
+#: the zones of the *lot*, which is a fact about the parcel and therefore the
+#: same on each of its pieces, and it is what a reader checks before treating
+#: one row as the answer for a lot. It duplicates `num_lot_zones` where that
+#: column is present, and is what a frame without it falls back on.
+_PIECE_PASSTHROUGH: tuple[str, ...] = (
+    "lot_number",
+    "neighborhood",
+    "scrape_date",
+    "lot_area_m2",
+    "piece_area_m2",
+    "pct_of_lot",
+    "num_lot_zones",
+    "zone_rank",
+    "is_primary_zone",
+    "primary_frontage_m",
+    "primary_street_name",
+    "secondary_frontage_m",
+    "secondary_street_name",
+    "num_frontages",
+    "existing_footprint_m2",
+    "area_share",
+    "footprint_share",
+    "footprint_share_basis",
     # Optional the way `buildable_area_m2` is optional upstream: a frame from a
     # partition written before the cadastre was measured for parking simply has
-    # no such column, and a lot index that raised on it would cost the whole
+    # no such column, and an index that raised on it would cost the whole
     # borough its inventory over a number only the surface stalls read.
-    if "parkable_area_m2" in envelopes.columns:
-        aggregations["parkable_area_m2"] = ("parkable_area_m2", "first")
-    per_lot = envelopes.groupby("lot_uid", sort=False).agg(**aggregations)
-    if "parkable_area_m2" not in per_lot.columns:
-        per_lot["parkable_area_m2"] = pd.NA
-    per_lot["num_candidates"] = _count_by_lot(candidates, per_lot.index)
-    per_lot["num_governing_candidates"] = _count_by_lot(
-        candidates[_governs_any(candidates)], per_lot.index
+    "parkable_area_m2",
+)
+
+
+def _piece_index(envelopes: pd.DataFrame) -> pd.DataFrame:
+    """One row per (lot, zone) the envelopes reach, with what it is and how many.
+
+    The inventory this table is built on, and the grain change in one function:
+    it used to group by `lot_uid` alone and return one row per parcel. A lot a
+    zoning boundary crosses is two sites, so it is two rows, and everything
+    downstream - the gap, the shortlist, the map - inherits the pair.
+
+    `num_candidates` counts *candidates* rather than envelope rows: a piece
+    under a grid with one Habitation column and three Commerce ones had one
+    choice, not four, and reporting four would make the Habitation column look
+    like three failed parses.
+
+    A column `lot_zone_pieces` supplies but this frame lacks - an older parquet
+    - comes back null rather than raising, for the reason the parking area
+    always has: an inventory that refuses a borough over one missing measure is
+    worse than one that reports it as unknown.
+    """
+    keys = ["lot_uid", "feature_id"]
+    if envelopes.empty:
+        empty = pd.DataFrame(
+            columns=[name for name in _HBU_PIECE_COLUMNS if name not in keys]
+        )
+        empty.index = pd.MultiIndex.from_arrays([[], []], names=keys)
+        return empty
+    candidates = candidate_envelopes(envelopes)
+    present = [name for name in _PIECE_PASSTHROUGH if name in envelopes.columns]
+    per_piece = envelopes.groupby(keys, sort=False).agg(
+        **{name: (name, "first") for name in present}
     )
-    return per_lot
+    for name in _PIECE_PASSTHROUGH:
+        if name not in per_piece.columns:
+            per_piece[name] = pd.NA
+    # A fact about the parcel, so it is counted over the lot and broadcast back
+    # onto each of its pieces rather than aggregated within one.
+    zones_per_lot = envelopes.groupby("lot_uid", sort=False)["feature_id"].nunique()
+    per_piece["num_zones"] = (
+        per_piece.index.get_level_values("lot_uid").map(zones_per_lot).astype("int64")
+    )
+    per_piece["num_candidates"] = _count_by_piece(candidates, per_piece.index)
+    per_piece["num_governing_candidates"] = _count_by_piece(
+        candidates[_governs_any(candidates)], per_piece.index
+    )
+    return per_piece
 
 
-def _count_by_lot(frame: pd.DataFrame, index: pd.Index) -> pd.Series:
-    """How many rows of ``frame`` each lot of ``index`` has - 0, not null."""
+def _count_by_piece(frame: pd.DataFrame, index: pd.MultiIndex) -> pd.Series:
+    """How many rows of ``frame`` each piece of ``index`` has - 0, not null."""
     if frame.empty:
         return pd.Series(0, index=index, dtype="int64")
     return (
-        frame.groupby("lot_uid", sort=False)
+        frame.groupby(["lot_uid", "feature_id"], sort=False)
         .size()
         .reindex(index)
         .fillna(0)
@@ -1520,31 +1744,32 @@ def _permits_equipment(envelopes: pd.DataFrame) -> pd.Series:
     )
 
 
-def equipment_zone_lots(envelopes: pd.DataFrame) -> frozenset:
-    """The lots whose governing zone authorises *Équipements collectifs*.
+def equipment_zone_pieces(envelopes: pd.DataFrame) -> frozenset:
+    """The **(lot, zone) pieces** whose grid authorises *Équipements collectifs*.
 
-    A park, a school, a hospital, a cemetery, a fire station. Read off the
-    governing zone alone - `governing_zone`'s - so a lot properly zoned for
-    housing that clips the corner of the school's zone is not one of these.
+    A park, a school, a hospital, a cemetery, a fire station.
 
-    Membership here is not on its own a reason to have no program: a grid that
-    prints an ``E`` column beside an ``H`` one authorises both, and that lot
-    solves like any other. It is what tells `_hbu_status` *why* a lot with no
+    **Per piece, not per lot, and the difference is load-bearing.** This used
+    to read the lot's governing zone alone, because a lot had exactly one zone
+    that spoke for it and the others were slivers to be ignored. Now a lot has
+    as many sites as it has pieces, and a parcel that is half park and half
+    housing has one piece nobody may build on and one piece somebody may.
+    Answering "is this lot an equipment parcel" would have to lose one of them;
+    answering it per piece loses neither.
+
+    Membership is not on its own a reason to have no program: a grid that
+    prints an ``E`` column beside an ``H`` one authorises both, and that piece
+    solves like any other. It is what tells `_hbu_status` *why* a piece with no
     candidate has none - a use this module deliberately does not price, rather
     than a grid whose usage row it failed to read.
     """
     if envelopes.empty or "lot_uid" not in envelopes.columns:
         return frozenset()
-    zones = governing_zone(envelopes)
-    governing = envelopes
-    if not zones.empty:
-        governing = envelopes[
-            envelopes["feature_id"].eq(envelopes["lot_uid"].map(zones))
-        ]
-    if governing.empty:
+    if "feature_id" not in envelopes.columns:
         return frozenset()
-    permits = _permits_equipment(governing)
-    return frozenset(governing.loc[permits, "lot_uid"])
+    permits = _permits_equipment(envelopes)
+    marked = envelopes.loc[permits, ["lot_uid", "feature_id"]]
+    return frozenset(map(tuple, marked.to_numpy()))
 
 
 def cadastral_road_lots(
@@ -1682,52 +1907,68 @@ def _hbu_status(
     frame: pd.DataFrame,
     programs: pd.DataFrame,
     *,
-    equipment_lots: frozenset = frozenset(),
-    road_lots: frozenset = frozenset(),
+    equipment_pieces: frozenset = frozenset(),
+    road_pieces: frozenset = frozenset(),
 ) -> pd.Series:
-    """Why each lot has the row it has - one of `HBU_STATUSES`.
+    """Why each piece has the row it has - one of `HBU_STATUSES`.
 
     Written from the answer outwards, so what is reported is the *furthest* a
-    lot got: a lot with a program is `solved` whatever else is true of it, and a
-    lot without one is described by whether it had no candidates at all,
+    piece got: a piece with a program is `solved` whatever else is true of it,
+    and one without is described by whether it had no candidates at all,
     candidates but none governing, a governing candidate the solver refused, or
     one it could not build a model from.
+
+    **Per piece rather than per lot**, which is what lets a split parcel say
+    two different things about its two halves - `equipment_zone` on the park
+    side and `solved` on the housing side is the ordinary case, and a per-lot
+    answer would have to pick one of them.
 
     The two exclusions read in opposite directions and that is deliberate.
     `equipment_zone` *refines* the answer, splitting `no_candidate_column` in
     two, because it explains an absence the envelopes had already produced.
     `road_parcel` *overrides* it, applied last and regardless of what the
-    envelopes said, because it is a fact about the parcel rather than about the
+    envelopes said, because it is a fact about the ground rather than about the
     grid: the zone polygon over a roadway describes the block it serves.
 
-    ``road_lots`` here is already `lot_uid`s and already the union of the two
-    road predicates - `select_highest_best_use` does both translations, so this
-    function never learns which publisher called a given parcel a street.
+    ``road_pieces`` here is already (lot_uid, feature_id) pairs and already the
+    union of the two road predicates - `select_highest_best_use` does both
+    translations, so this function never learns which publisher called a given
+    parcel a street.
     """
     status = pd.Series("solved", index=frame.index, dtype="object")
-    lots = frame.index.to_series()
+    pieces = pd.Series(list(frame.index), index=frame.index, dtype="object")
     unsolved = frame["status"].isna()
     status[unsolved & (frame["num_candidates"] == 0)] = "no_candidate_column"
     status[unsolved & (frame["num_candidates"] > 0)] = "no_governing_column"
     status[
-        unsolved & (frame["num_candidates"] == 0) & lots.isin(equipment_lots)
+        unsolved & (frame["num_candidates"] == 0) & pieces.isin(equipment_pieces)
     ] = "equipment_zone"
     if not programs.empty:
         governing = programs[_governs_any(programs)]
         infeasible = set(
-            governing.loc[
-                ~governing["solved"].fillna(False).astype(bool)
-                & (governing["status"] != "ERROR"),
-                "lot_uid",
-            ]
+            map(
+                tuple,
+                governing.loc[
+                    ~governing["solved"].fillna(False).astype(bool)
+                    & (governing["status"] != "ERROR"),
+                    ["lot_uid", "feature_id"],
+                ].to_numpy(),
+            )
         )
-        status[unsolved & lots.isin(infeasible)] = "infeasible"
-        # Before `road_parcel` and after the rest, so a lot with one column that
-        # raised and another that was merely infeasible is reported as the
+        status[unsolved & pieces.isin(infeasible)] = "infeasible"
+        # Before `road_parcel` and after the rest, so a piece with one column
+        # that raised and another that was merely infeasible is reported as the
         # harder failure - the one that has a message to read.
-        errored = set(governing.loc[governing["status"] == "ERROR", "lot_uid"])
-        status[unsolved & lots.isin(errored)] = "solver_error"
-    status[lots.isin(road_lots)] = "road_parcel"
+        errored = set(
+            map(
+                tuple,
+                governing.loc[
+                    governing["status"] == "ERROR", ["lot_uid", "feature_id"]
+                ].to_numpy(),
+            )
+        )
+        status[unsolved & pieces.isin(errored)] = "solver_error"
+    status[pieces.isin(road_pieces)] = "road_parcel"
     return status
 
 
@@ -1795,10 +2036,30 @@ def use_gap(
     """The building that stands, the building that could, and the difference.
 
     ``hbu`` is `select_highest_best_use`' output and ``existing`` is
-    `lot_assessment_comparables`, joined on the lot number. One row per lot of
-    ``hbu`` and no more: this is a table about zoning envelopes, and a lot the
-    grids do not reach has nothing to compare against however well the roll
-    describes it.
+    `lot_assessment_comparables`, joined on the lot number. One row per (lot,
+    zone) of ``hbu`` and no more: this is a table about zoning envelopes, and a
+    piece the grids do not reach has nothing to compare against however well
+    the roll describes it.
+
+    **The roll is per lot and the answer is per piece, so the roll is split.**
+    A parcel a zoning boundary crosses is two sites with two programs, and the
+    assessment behind it is one row describing one building. Subtracting the
+    whole of that building from each half would report a teardown twice;
+    ignoring the split would report the piece with nothing on it as though the
+    neighbour's triplex stood there.
+
+    `_allocate_existing` is the split, and what it divides by is measured
+    rather than assumed: `footprint_share`, the share of the lot's building
+    footprint that actually stands on this piece, computed by
+    `postgis.compute_lot_zone_pieces` from `building_lot_intersections`. So a
+    corner commercial strip carrying the whole of the retail block is charged
+    the whole of it, and the yard behind is vacant land with its full envelope
+    to build. Land value goes by `area_share` instead, because the ground
+    divides by the ground. See that function for the argument, and for the
+    documented fallback where a lot carries no measured footprint at all.
+
+    A lot one zone covers whole has a share of 1 and every number below is
+    exactly what it was before the pieces existed.
 
     ``operating_expense_ratio`` is the one the comparables asset used, read off
     its own rows by `operating_expense_ratio_of` rather than restated - see the
@@ -1813,7 +2074,7 @@ def use_gap(
     building is exactly the case that column exists to find.
     """
     frame = hbu.copy()
-    joined = _join_existing(frame, existing)
+    joined = _allocate_existing(frame, _join_existing(frame, existing))
 
     for class_name in INCOME_CLASSES:
         built = _numeric(joined, _EXISTING_AREA_COLUMNS[class_name])
@@ -1834,6 +2095,21 @@ def use_gap(
     # The unit schedule beside the plate, so the corridors the residential rate
     # leaves unpriced are visible rather than only implied by the two differing.
     frame["hbu_unit_area_m2"] = _numeric(frame, "unit_area_m2")
+
+    # The commerce and the industry with the cellar under them, which the two
+    # `hbu_*_floor_area_m2` columns above deliberately exclude: those are the
+    # above-grade plates, because the roll's side of the gap is above-grade
+    # floor and a gap between two different definitions is not a gap. This
+    # pair is the whole of what the program would lease, and it is a *timing*
+    # input rather than a comparison - `urban_rag.proforma` divides it by an
+    # absorption rate in square feet a month to say how long the space takes
+    # to fill. The solve digs for shops across this borough, so the cellar is
+    # a third of the retail floor on a typical answer and leaving it out would
+    # lease the building a quarter faster than it fills.
+    for class_name in ("commercial", "industrial"):
+        frame[f"hbu_{class_name}_floor_area_with_cellar_m2"] = _numeric(
+            frame, f"{class_name}_area_m2"
+        ) + _numeric(frame, f"basement_{class_name}_area_m2")
 
     frame["existing_num_dwellings"] = _numeric(joined, "num_dwellings")
     frame["existing_num_storeys"] = _numeric(joined, "num_storeys")
@@ -1859,6 +2135,36 @@ def use_gap(
     frame["hbu_annual_stabilised_noi_cad"] = frame["hbu_annual_gross_income_cad"] * (
         1.0 - operating_expense_ratio
     )
+    # The same NOI split by the family that earns it, netted with the one
+    # ratio so the three sum to the total above rather than to something near
+    # it. This is the *income* mix and not the floor mix: the three
+    # `hbu_*_floor_area_m2` columns above are above-grade plates in square
+    # metres, and at the solver's own rates a square foot of commerce earns
+    # about four times what a square foot of housing does. A reader weighting
+    # anything by use - a blended cap rate, a lease-up, a thesis - wants
+    # these, and `urban_rag.proforma` is the reader this exists for.
+    #
+    # One ratio for all three is the same simplification the solve makes and
+    # is stated here rather than hidden: a triple-net retail lease leaves the
+    # landlord a far smaller expense load than an apartment does, so this
+    # understates the commercial share of NOI. Splitting the ratio is the
+    # obvious next input, and it belongs beside `operating_expense_ratio`
+    # rather than here.
+    # Each family's share of the *space* rent, applied to the whole NOI. The
+    # parking's rent is inside `annual_gross_revenue_cad` and belongs to no
+    # family, so netting each family's own rent would leave the three short
+    # of the total by exactly that; spreading it by share keeps them summing
+    # to the line above, with the parking income riding on the floor its
+    # tenants live in. Identical to netting each line where nothing is rented.
+    space_gross = sum(
+        _numeric(frame, f"annual_{class_name}_gross_revenue_cad").fillna(0.0)
+        for class_name in INCOME_CLASSES
+    )
+    for class_name in INCOME_CLASSES:
+        share = (
+            _numeric(frame, f"annual_{class_name}_gross_revenue_cad") / space_gross
+        ).where(space_gross > 0.0, 0.0)
+        frame[f"hbu_{class_name}_noi_cad"] = frame["hbu_annual_stabilised_noi_cad"] * share
     frame["annual_stabilised_noi_gap_cad"] = (
         frame["hbu_annual_stabilised_noi_cad"]
         - frame["existing_annual_stabilised_noi_cad"]
@@ -2027,15 +2333,14 @@ def program_assumptions_of(hbu: pd.DataFrame) -> ProgramAssumptions:
             stalls_per_dwelling=float(number("stalls_per_dwelling", parking.stalls_per_dwelling)),
             stalls_per_1000_sqft=float(number("stalls_per_1000_sqft", parking.stalls_per_1000_sqft)),
             underground_area_sqft=float(number("underground_stall_area_sqft", parking.underground_area_sqft)),
-            above_grade_area_sqft=float(number("above_grade_stall_area_sqft", parking.above_grade_area_sqft)),
             surface_area_sqft=float(number("surface_stall_area_sqft", parking.surface_area_sqft)),
             garage_area_sqft=float(number("garage_stall_area_sqft", parking.garage_area_sqft)),
             underground_cost_cad=float(number("underground_stall_cost_cad", parking.underground_cost_cad)),
-            above_grade_cost_cad=float(number("above_grade_stall_cost_cad", parking.above_grade_cost_cad)),
             surface_cost_cad=float(number("surface_stall_cost_cad", parking.surface_cost_cad)),
             garage_cost_cad=float(number("garage_stall_cost_cad", parking.garage_cost_cad)),
             amortization_months=int(number("amortization_months", parking.amortization_months)),
             max_underground_levels=int(number("max_underground_levels", parking.max_underground_levels)),
+            underground_lot_share=float(number("underground_lot_share", parking.underground_lot_share)),
             max_surface_stalls=(
                 None if payload.get("max_surface_stalls") is None
                 else int(payload["max_surface_stalls"])
@@ -2043,6 +2348,24 @@ def program_assumptions_of(hbu: pd.DataFrame) -> ProgramAssumptions:
             max_garage_stalls=(
                 None if payload.get("max_garage_stalls") is None
                 else int(payload["max_garage_stalls"])
+            ),
+            monthly_rent_cad=float(
+                number("parking_stall_rent_cad_month", parking.monthly_rent_cad)
+            ),
+            occupancy_pct=float(
+                number("parking_stall_occupancy_pct", parking.occupancy_pct)
+            ),
+            market_stalls_per_dwelling=float(
+                number("market_stalls_per_dwelling", parking.market_stalls_per_dwelling)
+            ),
+            market_stalls_per_1000_sqft=float(
+                number("market_stalls_per_1000_sqft", parking.market_stalls_per_1000_sqft)
+            ),
+            absorption_saving_months=float(
+                number(
+                    "parking_absorption_saving_months",
+                    parking.absorption_saving_months,
+                )
             ),
         )
         costs = default.construction
@@ -2065,7 +2388,6 @@ def program_assumptions_of(hbu: pd.DataFrame) -> ProgramAssumptions:
             residential_m=float(number("residential_storey_height_m", storeys.residential_m)),
             commercial_m=float(number("commercial_storey_height_m", storeys.commercial_m)),
             industrial_m=float(number("industrial_storey_height_m", storeys.industrial_m)),
-            above_grade_parking_m=float(number("above_grade_parking_storey_height_m", storeys.above_grade_parking_m)),
         )
         return ProgramAssumptions(
             parking=parking,
@@ -2077,6 +2399,9 @@ def program_assumptions_of(hbu: pd.DataFrame) -> ProgramAssumptions:
                 number("basement_levels_allowed", default.basement_levels_allowed)
             ),
             max_seconds=float(number("max_seconds", default.max_seconds)),
+            waive_parking_if_empty=bool(
+                number("waive_parking_if_empty", default.waive_parking_if_empty)
+            ),
         )
     except (ProgramError, TypeError, ValueError):
         return default
@@ -2114,8 +2439,132 @@ def operating_expense_ratio_of(existing: pd.DataFrame) -> float:
     return float(ratio) if isinstance(ratio, (int, float)) else default
 
 
+#: What the roll says about the *building*, and therefore what
+#: `footprint_share` divides. Every one of these is a quantity of building or
+#: an income it earns, so it belongs where the building stands: a corner strip
+#: with the whole of the block on it takes the whole of the floor area, the
+#: dwellings and the NOI, and the yard behind it takes none.
+_FOOTPRINT_ALLOCATED: tuple[str, ...] = (
+    *_EXISTING_AREA_COLUMNS.values(),
+    "num_dwellings",
+    "num_assessment_units",
+    "gross_income_cad",
+    "net_operating_income_cad",
+)
+
+#: What the roll says about the *ground*, and therefore what `area_share`
+#: divides. `total_assessed_value` is land and building together and the roll
+#: does not always separate them, so it goes by area: the alternative is to
+#: split one number by two rules, and an assessed value that does not sum back
+#: to the parcel's is worse than one allocated by the simpler measure.
+_AREA_ALLOCATED: tuple[str, ...] = ("total_assessed_value",)
+
+#: Which of the allocated columns are **counts** rather than quantities, and
+#: therefore have to come back as whole numbers.
+#:
+#: A share of a dwelling is not a dwelling. Nine tenths of a triplex is two
+#: dwellings or three, and `gold.lot_redevelopment_gap` types both of these
+#: `integer`, so an unrounded share reaches Postgres as
+#: `invalid input syntax for type integer: "0.984..."` - which is where this
+#: rule was learned.
+#:
+#: Rounded rather than truncated, for the reason `retained_building_of` rounds:
+#: a piece holding 60 per cent of a five-unit plex holds three dwellings, and
+#: `int()` would say two. The consequence is that a split lot's pieces can sum
+#: to one more or one fewer dwelling than the parcel has, and that is the right
+#: trade - a count that is wrong by one on two rows beats a count that is a
+#: fraction on both, and every *quantity* beside them (floor area, income,
+#: value) still sums back exactly.
+_ALLOCATED_COUNTS: frozenset[str] = frozenset(
+    {"num_dwellings", "num_assessment_units"}
+)
+
+#: What the roll says about the building that is not a quantity of it - the
+#: age, the storey count, the use code, the cap rate, the expense ratio. These
+#: are *descriptions*, and a description does not divide: half a triplex is
+#: still three storeys of 1910 construction. Carried onto every piece of the
+#: lot unchanged, which is why they are named here rather than left to fall
+#: through a default that would have scaled them.
+#:
+#: `num_storeys` is the one worth pausing on, because it is a count and looks
+#: divisible. It is the plate's divisor in `solve_enhancements` - floor area
+#: over storeys is the footprint the addition is built on - and the floor area
+#: above it is already allocated, so scaling the storeys too would divide the
+#: same share twice and put a half-height building on the piece.
+_UNALLOCATED: tuple[str, ...] = tuple(
+    name
+    for name in _EXISTING_COLUMNS
+    if name not in {*_FOOTPRINT_ALLOCATED, *_AREA_ALLOCATED}
+)
+
+
+def _allocate_existing(hbu: pd.DataFrame, joined: pd.DataFrame) -> pd.DataFrame:
+    """The roll's side of a lot, divided between that lot's zone pieces.
+
+    ``joined`` is `_join_existing`'s output - the whole parcel's assessment
+    repeated on each of its pieces - and this scales the columns that are
+    quantities of a building or of ground down to the piece's share of it.
+
+    Three rules and every column of `_EXISTING_COLUMNS` falls under exactly
+    one, named in `_FOOTPRINT_ALLOCATED`, `_AREA_ALLOCATED` and `_UNALLOCATED`
+    above rather than decided by a default here. The shares themselves are
+    `lot_zone_pieces`' - measured off the building footprints for the first and
+    off the clip areas for the second - and both sum to 1 across a lot's
+    pieces, so a borough's totals are unchanged by the split.
+
+    **A frame with no shares is returned untouched**, which is the whole of the
+    backward compatibility this needs: a partition written before
+    `lot_zone_pieces` has one row per lot, a share of 1 is what that means, and
+    multiplying by a column of nulls would silently empty the roll instead.
+    """
+    if joined.empty:
+        return joined
+    footprint = _share(hbu, "footprint_share")
+    area = _share(hbu, "area_share")
+    if footprint is None and area is None:
+        return joined
+    result = joined.copy()
+    for name, share in (
+        *((name, footprint) for name in _FOOTPRINT_ALLOCATED),
+        *((name, area) for name in _AREA_ALLOCATED),
+    ):
+        if name not in result.columns or share is None:
+            continue
+        scaled = _numeric(result, name) * share
+        # A count comes back whole; a quantity keeps its fraction. See
+        # `_ALLOCATED_COUNTS`. `Int64` rather than `int` so a lot the roll
+        # never reached keeps its null instead of becoming a zero, which is
+        # the distinction every other column here is careful about.
+        result[name] = (
+            scaled.round().astype("Int64")
+            if name in _ALLOCATED_COUNTS
+            else scaled
+        )
+    return result
+
+
+def _share(hbu: pd.DataFrame, column: str) -> pd.Series | None:
+    """One of `lot_zone_pieces`' two allocators, or None if it is not there.
+
+    A null share is read as 1.0 rather than as 0: it means "nothing said how
+    to divide this", and the answer to that is the whole parcel - the number
+    this table reported before there were pieces - not an empty building.
+    """
+    if column not in hbu.columns:
+        return None
+    values = pd.to_numeric(hbu[column], errors="coerce")
+    if values.notna().sum() == 0:
+        return None
+    return values.fillna(1.0)
+
+
 def _join_existing(hbu: pd.DataFrame, existing: pd.DataFrame) -> pd.DataFrame:
     """The roll's side of every lot, aligned to ``hbu``'s rows.
+
+    One row of the roll can now align to several rows of ``hbu`` - a lot two
+    zones cut in two has two - and that is what the `reindex` below does
+    naturally. `_allocate_existing` is what then divides it between them; this
+    function only repeats it.
 
     A left join on the lot number and nothing cleverer: both sides carry
     Infolot's own spelling of it - `lot_zoning_envelopes` from the cadastre it
@@ -2292,9 +2741,21 @@ ENHANCEMENT_COLUMNS: tuple[str, ...] = (
     "enhance_added_commercial_area_m2",
     "enhance_added_industrial_area_m2",
     "enhance_surface_stalls",
+    # The addition's counterpart of `parking_waived` / `waived_stalls`: the
+    # standing shop's floor owes stalls too, and a building with no yard to
+    # put them on had no enhancement at all until the parking was waived.
+    "enhance_parking_waived",
+    "enhance_waived_stalls",
     "enhance_capital_cost_cad",
     "enhance_added_annual_gross_income_cad",
     "enhance_added_annual_stabilised_noi_cad",
+    # The addition's income by the family that earns it, summing to the line
+    # above. The counterpart of the gap's `hbu_*_noi_cad` on the other future,
+    # and read for the same reason: an addition of retail leases at a
+    # different speed and sells at a different cap than one of flats.
+    "enhance_added_residential_noi_cad",
+    "enhance_added_commercial_noi_cad",
+    "enhance_added_industrial_noi_cad",
     "enhance_present_value_cad",
     "enhance_npv_cad",
     "enhance_disruption_cad",
@@ -2313,7 +2774,10 @@ FUTURE_COLUMNS: tuple[str, ...] = (
 
 
 def retained_building_of(
-    existing: Mapping, rules: EnhancementRules | None = None
+    existing: Mapping,
+    rules: EnhancementRules | None = None,
+    *,
+    share: float = 1.0,
 ) -> RetainedBuilding | None:
     """The roll's building, as the block the enhancement builds on.
 
@@ -2322,23 +2786,45 @@ def retained_building_of(
     footprint - which is exact for a plex and generous for a building with a
     setback storey; the BDOI footprint on `lot_profiles` is the better number
     where that asset has run, and is the obvious next input here.
+
+    ``share`` is `lot_zone_pieces`' `footprint_share`: the roll describes a
+    lot and an enhancement is solved on a *piece* of one, so the building has
+    to be split the same way `use_gap` splits it. What is scaled is every
+    quantity of building - the three floor areas, the dwellings, the gross -
+    and what is not is the **storey count**, because a description does not
+    divide: half a triplex is still three storeys, and scaling both would
+    divide the plate twice and put a half-height building on the piece.
+
+    A piece with no building on it comes back ``None`` and is correctly
+    reported as having nothing to enhance. 1.0 is the whole parcel, which is
+    what one zone covering a lot whole means and what every caller passed
+    before the pieces existed.
     """
     rules = rules or EnhancementRules()
+    share = 1.0 if share is None else max(float(share), 0.0)
     storeys = _int_or_none(existing.get("num_storeys"))
-    residential = _float_or_none(existing.get("residential_floor_area_m2")) or 0.0
-    commercial = _float_or_none(existing.get("commercial_floor_area_m2")) or 0.0
-    industrial = _float_or_none(existing.get("industrial_floor_area_m2")) or 0.0
+    residential = (
+        _float_or_none(existing.get("residential_floor_area_m2")) or 0.0
+    ) * share
+    commercial = (
+        _float_or_none(existing.get("commercial_floor_area_m2")) or 0.0
+    ) * share
+    industrial = (
+        _float_or_none(existing.get("industrial_floor_area_m2")) or 0.0
+    ) * share
     floor = residential + commercial + industrial
     if floor <= 0.0 or storeys is None or storeys < 1:
         return None
-    gross = _float_or_none(existing.get("gross_income_cad")) or 0.0
+    gross = (_float_or_none(existing.get("gross_income_cad")) or 0.0) * share
     return RetainedBuilding(
         footprint_m2=floor / storeys,
         storeys=storeys,
         residential_floor_area_m2=residential,
         commercial_floor_area_m2=commercial,
         industrial_floor_area_m2=industrial,
-        dwellings=_int_or_none(existing.get("num_dwellings")) or 0,
+        # Rounded rather than truncated: a piece holding 60 % of a five-unit
+        # plex holds three dwellings, and int() would say two.
+        dwellings=round((_int_or_none(existing.get("num_dwellings")) or 0) * share),
         monthly_gross_revenue_cad=gross / MONTHS_PER_YEAR,
         max_added_storeys=rules.max_added_storeys,
         addition_cost_premium=rules.addition_cost_premium,
@@ -2384,10 +2870,48 @@ def envelope_of(group: pd.DataFrame) -> ZoneEnvelope | None:
     return envelope
 
 
+def _income_shares(program) -> dict[str, float]:
+    """Each family's share of a program's gross, keyed by `INCOME_CLASSES`.
+
+    Shares rather than dollars because the caller multiplies them back onto an
+    NOI the solve already netted: one operating expense ratio covers the whole
+    building, so a share of the gross is the same share of the income and the
+    parts add back to the whole exactly. A program earning nothing is all
+    zeroes rather than a division by it.
+    """
+    parts = {
+        "residential": program.residential_gross_revenue_cad,
+        "commercial": program.commercial_gross_revenue_cad,
+        "industrial": program.industrial_gross_revenue_cad,
+    }
+    # Over the three family rents rather than over the gross: the parking's
+    # rent is inside the gross and belongs to no family, and dividing by the
+    # gross would leave the three shares summing to less than one. Spread this
+    # way the parking's income rides with the floor its tenants live in.
+    space_gross = sum(parts.values())
+    if space_gross <= 0.0:
+        return dict.fromkeys(parts, 0.0)
+    return {name: value / space_gross for name, value in parts.items()}
+
+
 def _enhancement_row(program, retained: RetainedBuilding, *, disruption: float) -> dict:
-    """One enhancement's answer, flattened."""
+    """One enhancement's answer, flattened.
+
+    ``disruption`` is what the works cost the standing building, and it is
+    charged only where there are works: an enhancement that adds nothing
+    (`nothing_pencils`, the solver's answer normalised to the standing
+    building) has no site, loses no rent, and is worth exactly what holding
+    is worth - its gain is 0, not minus a disruption on works nobody does.
+    """
     solved = program.status in ("OPTIMAL", "FEASIBLE")
+    # The addition's own income, split by what earns it. `program` here is the
+    # *addition* - the retained building's rent is `retained_monthly_gross_cad`
+    # and outside every figure below - so these are what the new floor adds,
+    # which is exactly what a return on the addition is computed from.
+    shares = _income_shares(program)
     nothing_added = solved and program.added_floor_area_m2 <= 0.0
+    if nothing_added:
+        disruption = 0.0
     added_commercial = max(
         program.commercial_area_m2 - retained.commercial_floor_area_m2, 0.0
     )
@@ -2412,6 +2936,8 @@ def _enhancement_row(program, retained: RetainedBuilding, *, disruption: float) 
         "enhance_added_commercial_area_m2": added_commercial if solved else 0.0,
         "enhance_added_industrial_area_m2": added_industrial if solved else 0.0,
         "enhance_surface_stalls": program.surface_stalls if solved else 0,
+        "enhance_parking_waived": bool(program.parking_waived) if solved else False,
+        "enhance_waived_stalls": int(program.waived_stalls) if solved else 0,
         "enhance_capital_cost_cad": program.total_capital_cost_cad if solved else 0.0,
         "enhance_added_annual_gross_income_cad": (
             program.gross_revenue_cad * MONTHS_PER_YEAR if solved else 0.0
@@ -2419,6 +2945,12 @@ def _enhancement_row(program, retained: RetainedBuilding, *, disruption: float) 
         "enhance_added_annual_stabilised_noi_cad": (
             program.annual_stabilised_noi_cad if solved else 0.0
         ),
+        **{
+            f"enhance_added_{name}_noi_cad": (
+                program.annual_stabilised_noi_cad * shares[name] if solved else 0.0
+            )
+            for name in INCOME_CLASSES
+        },
         "enhance_present_value_cad": program.present_value_cad if solved else 0.0,
         "enhance_npv_cad": npv,
         "enhance_disruption_cad": disruption if solved else 0.0,
@@ -2445,9 +2977,14 @@ _NO_ENHANCEMENT: dict = {
     "enhance_added_commercial_area_m2": 0.0,
     "enhance_added_industrial_area_m2": 0.0,
     "enhance_surface_stalls": 0,
+    "enhance_parking_waived": False,
+    "enhance_waived_stalls": 0,
     "enhance_capital_cost_cad": 0.0,
     "enhance_added_annual_gross_income_cad": 0.0,
     "enhance_added_annual_stabilised_noi_cad": 0.0,
+    "enhance_added_residential_noi_cad": 0.0,
+    "enhance_added_commercial_noi_cad": 0.0,
+    "enhance_added_industrial_noi_cad": 0.0,
     "enhance_present_value_cad": 0.0,
     "enhance_npv_cad": 0.0,
     "enhance_disruption_cad": 0.0,
@@ -2518,7 +3055,15 @@ def solve_enhancements(
             rows.append({**_NO_ENHANCEMENT, "enhance_status": "no_program"})
             continue
         standing = by_number.get(str(record.get("lot_number")))
-        retained = retained_building_of(standing, rules) if standing else None
+        # The piece's share of the parcel's building, the same allocator
+        # `use_gap` divides the roll by. A piece with nothing standing on it
+        # has nothing to enhance and reports `no_building`, which is the true
+        # answer rather than a gap.
+        share = _float_or_none(record.get("footprint_share"))
+        share = 1.0 if share is None else share
+        retained = (
+            retained_building_of(standing, rules, share=share) if standing else None
+        )
         if retained is None:
             rows.append({**_NO_ENHANCEMENT, "enhance_status": "no_building"})
             continue
@@ -2544,6 +3089,7 @@ def solve_enhancements(
                 basement_levels_allowed=0,
                 max_seconds=rules.max_seconds,
                 retained=retained,
+                waive_parking_if_empty=assumptions.waive_parking_if_empty,
             )
         except (ProgramError, ValueError, KeyError) as exc:
             rows.append(
@@ -2553,7 +3099,13 @@ def solve_enhancements(
         # What the works cost the building that keeps earning: a share of its
         # NOI for the months the site is one. Undiscounted, because it is
         # spent in the first year, where a dollar is a dollar.
-        standing_noi = _float_or_none(standing.get("net_operating_income_cad")) or 0.0
+        # Scaled by the same share as the building it is earned by: the works
+        # disturb the part of the parcel being built on, not the neighbour's
+        # half of it. `_enhancement_row` drops it where the solve adds
+        # nothing - no works, no site, nothing disturbed.
+        standing_noi = (
+            _float_or_none(standing.get("net_operating_income_cad")) or 0.0
+        ) * share
         disruption = (
             standing_noi * rules.disruption_share * rules.construction_months
             / MONTHS_PER_YEAR

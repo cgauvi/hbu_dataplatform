@@ -44,12 +44,18 @@ from __future__ import annotations
 
 import pytest
 
-from conftest import NEIGHBORHOOD, SCRAPE_DATE
+from conftest import (
+    NEIGHBORHOOD,
+    SCRAPE_DATE,
+    ZONE_SOURCE_TABLE,
+    whole_lot_clips,
+)
 
 from urban_rag.postgis import (
     DEFAULT_ROAD_LOT_MIN_STREET_M,
     compute_lot_buildable_setbacks,
     compute_lot_frontage,
+    compute_lot_zone_pieces,
 )
 
 #: The lot every assertion here is about. A rectangle, so the areas below are
@@ -150,10 +156,44 @@ def measured(connection, loaded, zoned):
                 scrape_date=SCRAPE_DATE,
                 min_street_m=DEFAULT_ROAD_LOT_MIN_STREET_M,
             )
+        # One zone covering each parcel whole, and the pieces cut from it.
+        # `compute_lot_buildable_setbacks` clips its carve to the piece, so
+        # without this every row would be dropped by that inner join - and
+        # with a whole-lot piece the carve is exactly the one this module's
+        # hand arithmetic is written against. The split case is
+        # `test_lot_zone_pieces.py`'s.
+        whole_lot_clips(connection, SCRAPE_DATE, FEATURE_ID)
         with connection.transaction():
-            return compute_lot_buildable_setbacks(
-                connection, neighborhood=NEIGHBORHOOD, scrape_date=SCRAPE_DATE
+            compute_lot_zone_pieces(
+                connection,
+                neighborhood=NEIGHBORHOOD,
+                scrape_date=SCRAPE_DATE,
+                zone_sources=(ZONE_SOURCE_TABLE,),
             )
+        # Run against a connection managing its own transactions, which is
+        # what this function needs and the only one of the three here that
+        # does. It publishes the borough in committed slices: each batch
+        # creates an `ON COMMIT DROP` staging table, fills it, and calls
+        # `connection.commit()` to end that batch. Neither of the other two
+        # shapes works for that - inside `connection.transaction()` psycopg
+        # refuses the explicit commit, and on the autocommit connection this
+        # module's other calls use, the staging table is dropped by the
+        # implicit commit that follows its own CREATE. So autocommit is turned
+        # off around the call and restored after it.
+        connection.autocommit = False
+        try:
+            return compute_lot_buildable_setbacks(
+                connection,
+                neighborhood=NEIGHBORHOOD,
+                scrape_date=SCRAPE_DATE,
+                # Off, because these tests re-run the same partition at several
+                # implantation modes and a resumed run would hand the second
+                # mode the first one's rows.
+                resume=False,
+            )
+        finally:
+            connection.commit()
+            connection.autocommit = True
 
     return run
 

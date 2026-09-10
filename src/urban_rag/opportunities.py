@@ -69,6 +69,10 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
+from urban_rag.proforma import ProformaAssumptions, Timing
+from urban_rag.proforma import returns as proforma_returns
+from urban_rag.proforma import screens as proforma_screens
+
 #: The theses a lot can be filed under, in the order every payload and every
 #: count lists them. `none` is not a thesis and is not rankable: it is a lot the
 #: solver produced no program for, kept so the facet counts add up to the
@@ -305,19 +309,22 @@ def rank_opportunities(
     gap = _numeric(frame, "annual_stabilised_noi_gap_cad")
     # Sorted rather than `groupby.rank`, because the tiebreak is a second
     # column: rank on yield, break ties on the dollars a year the
-    # redevelopment adds. `lot_uid` makes the order total, so a re-run of an
+    # redevelopment adds. The **pair** makes the order total, so a re-run of an
     # unchanged partition produces the same shortlist rather than reshuffling
-    # two lots that scored identically.
+    # two sites that scored identically - and the pair rather than `lot_uid`
+    # alone because a row is a piece of a lot now, and a parcel a zoning
+    # boundary crosses contributes two of them to the same thesis.
     order = pd.DataFrame(
         {
             "thesis": thesis,
             "yield": yields,
             "gap": gap,
             "tie": _numeric(frame, "lot_uid"),
+            "tie_zone": _zone_key(frame),
         }
     )[rankable].sort_values(
-        ["thesis", "yield", "gap", "tie"],
-        ascending=[True, False, False, True],
+        ["thesis", "yield", "gap", "tie", "tie_zone"],
+        ascending=[True, False, False, True, True],
         kind="stable",
     )
     ranks = order.groupby("thesis", sort=False).cumcount() + 1
@@ -441,12 +448,19 @@ class SiteRules:
 
     **Heritage.** ``exclude_heritage_sectors`` keeps every lot whose governing
     zone prints *Secteur d'interet patrimonial: Oui* out of the two theses
-    that demolish; the borough's demolition by-law refers those to committee,
-    and a contributing building is generally refused. ``exclude_piia_sectors``
-    does the same for a zone under the discretionary PIIA by-law and defaults
-    off: a PIIA is an architectural review of what is built, not a bar on
-    removing what stands, and it covers close to half the borough's zones. It
-    is flagged (`has_piia_review`) rather than screened.
+    that demolish - and only where something stands to be demolished, see
+    `heritage_flags`; the borough's demolition by-law refers those to
+    committee, and a contributing building is generally refused.
+    ``exclude_piia_sectors``
+    does the same for a zone under the discretionary PIIA by-law, and defaults
+    **on**: the review's whole subject is how a replacement building meets the
+    street, so a demolition-and-rebuild is the case it is written to refuse,
+    and a mandate that buys to knock down should not be shown those lots. It
+    screens only the theses that demolish - the building may still gain a
+    storey or an annex, so the lot keeps its `improvement` thesis and stays
+    ranked there, and a lot with no building at all keeps its `brownfield`
+    one. ``exclude_piia_sectors=False`` restores the older posture,
+    where the PIIA is flagged (`has_piia_review`) and not screened.
     ``demolition_review_year`` is the year below which the *Loi sur le
     patrimoine culturel* obliges a municipality's demolition by-law to apply -
     1940 - and a building older than that is flagged
@@ -472,6 +486,18 @@ class SiteRules:
     does; two is steel); ``improvement_min_floor_m2`` is the smallest addition
     worth filing - below it a permit and a crane swamp the arithmetic.
 
+    **The lane screen.** ``unassessed_vacant_max_coverage`` is the share of a
+    piece's ground a measured building footprint may cover and the piece
+    still be read as bare, *on ground the roll never listed*. A lot with no
+    assessment unit, no value, no floor, no dwelling and no use code, with
+    under that share of it under a building, is a *ruelle*, a park remnant
+    or a street sliver, and is kept out of `infill` - the one thesis an
+    off-roll lot can reach, and the one whose definition is that the ground
+    is ready to build on. 0.05 is the line: on VSMPE 2026-09-01 the pieces
+    below it have a median 3.7 m of frontage, and the ones above it carry a
+    garage or a shed the roll missed. Either condition alone is a site; see
+    `unassessed_vacant`. 0 turns the screen off.
+
     ``require_positive_npv`` is the rankability screen, the role
     `is_underbuilt` plays on the first axis: a lot keeps its site thesis
     whatever the verdict, and is *ranked* only where redeveloping beats
@@ -485,7 +511,7 @@ class SiteRules:
     min_storey_headroom: int = 2
     brownfield_use_prefixes: tuple[str, ...] = DEFAULT_BROWNFIELD_USE_PREFIXES
     exclude_heritage_sectors: bool = True
-    exclude_piia_sectors: bool = False
+    exclude_piia_sectors: bool = True
     demolition_review_year: int = 1940
     exclude_demolition_review: bool = False
     demolition_cost_cad_per_m2: float = 150.0
@@ -496,6 +522,7 @@ class SiteRules:
     addition_cost_premium: float = 1.5
     improvement_max_added_storeys: int = 1
     improvement_min_floor_m2: float = 40.0
+    unassessed_vacant_max_coverage: float = 0.05
     require_positive_npv: bool = True
 
     def __post_init__(self) -> None:
@@ -503,6 +530,11 @@ class SiteRules:
             raise ValueError(
                 "teardown_max_built_share is a share of the envelope and must "
                 f"be in (0, 1], got {self.teardown_max_built_share!r}"
+            )
+        if not 0.0 <= self.unassessed_vacant_max_coverage <= 1.0:
+            raise ValueError(
+                "unassessed_vacant_max_coverage is a share of the ground and "
+                f"must be in [0, 1], got {self.unassessed_vacant_max_coverage!r}"
             )
         if self.min_storey_headroom < 0:
             raise ValueError("min_storey_headroom must not be negative")
@@ -551,6 +583,7 @@ class SiteRules:
             "addition_cost_premium": self.addition_cost_premium,
             "improvement_max_added_storeys": self.improvement_max_added_storeys,
             "improvement_min_floor_m2": self.improvement_min_floor_m2,
+            "unassessed_vacant_max_coverage": self.unassessed_vacant_max_coverage,
             "require_positive_npv": self.require_positive_npv,
         }
 
@@ -577,6 +610,84 @@ def built_share(frame: pd.DataFrame) -> pd.Series:
     return standing / proposed.where(proposed > _MIN_PROGRAM_FLOOR_M2)
 
 
+def footprint_coverage(frame: pd.DataFrame) -> pd.Series:
+    """How much of the piece's ground a *measured* building covers, as a share.
+
+    ``existing_footprint_m2`` on the gap is the cadastre's building polygons
+    clipped to the piece by `lot_zone_pieces` - what stands on the ground,
+    whatever the roll says - over ``piece_area_m2``, or the parcel where a
+    frame from before the pieces has none. Zero where the clip found nothing;
+    null where the frame carries no measured footprint at all, which is a
+    partition older than the pieces, and null is not zero here: absence of
+    the measure is not absence of a building.
+
+    The same column name means something else on
+    `lot_investment_opportunities`: there it is `improvement_program`'s
+    inferred plate, the roll's floor over its storey count, and is null on
+    exactly the lots this share exists for. This reads the gap.
+    """
+    if "existing_footprint_m2" not in frame.columns:
+        return pd.Series(np.nan, index=frame.index, dtype="float64")
+    footprint = _numeric(frame, "existing_footprint_m2").fillna(0.0)
+    ground = _numeric(frame, "piece_area_m2")
+    ground = ground.where(ground.notna(), _numeric(frame, "lot_area_m2"))
+    return footprint / ground.where(ground > 0.0)
+
+
+def roll_reached(frame: pd.DataFrame) -> pd.Series:
+    """Whether the assessment roll describes this ground at all.
+
+    Any sign of it counts - an assessment unit, an assessed value, a stated
+    floor, a dwelling or a use code - and not the unit count alone. The count
+    is footprint-allocated across a split parcel's pieces and rounded to a
+    whole number (`hbu._allocate_existing`), so a bare yard behind an
+    assessed building carries ``0`` units while its area-allocated value is
+    still on the row: 97 such pieces on VSMPE 2026-09-01, every one of them
+    a real site. Nor `has_assessment`, which `use_gap` writes as "the join
+    returned something" and is true on every row. A lane, a park remnant or
+    a street sliver the roll never lists fails all five.
+    """
+    units = _numeric(frame, "existing_num_assessment_units")
+    value = _numeric(frame, "existing_total_assessed_value")
+    floor = _numeric(frame, "existing_floor_area_m2")
+    dwellings = _numeric(frame, "existing_num_dwellings")
+    use = _text(frame, "existing_dominant_use_code") != ""
+    return (
+        (units > 0.0).fillna(False)
+        | (value > 0.0).fillna(False)
+        | (floor > 0.0).fillna(False)
+        | (dwellings > 0.0).fillna(False)
+        | use
+    ).astype("bool")
+
+
+def unassessed_vacant(
+    frame: pd.DataFrame, rules: SiteRules | None = None
+) -> pd.Series:
+    """Ground the roll never reached, with nothing measurable standing on it.
+
+    Two conditions and both are required: `roll_reached` is false, and
+    `footprint_coverage` is under ``SiteRules.unassessed_vacant_max_coverage``.
+    Either alone is a site. An assessed parking lot with nothing on it is the
+    infill thesis's own case, and an off-roll parcel with a garage over a
+    tenth of it is something the roll missed rather than a lane. Both
+    together is what a *ruelle* looks like in this data: no unit, no value,
+    no use code, a few square metres of a neighbour's shed clipped onto it,
+    and no street frontage to speak of. Lot 2 249 035 was the case - 920 m2
+    with 16.7 m2 of building on it, nothing on the roll, no frontage - and
+    `assign_site_thesis` filed it as an infill, because `empty` is the
+    roll's silence and that is what a lane and a vacant lot have in common.
+    The measured footprint is what tells them apart.
+
+    Where the coverage is null - a frame with no measured footprint - the
+    screen does not fire. A threshold of 0 turns it off.
+    """
+    rules = rules or SiteRules()
+    coverage = footprint_coverage(frame)
+    bare = (coverage < float(rules.unassessed_vacant_max_coverage)).fillna(False)
+    return (~roll_reached(frame) & bare).astype("bool")
+
+
 def heritage_flags(
     frame: pd.DataFrame, rules: SiteRules | None = None
 ) -> pd.DataFrame:
@@ -586,7 +697,34 @@ def heritage_flags(
     patrimonial*; `has_piia_review` its *PIIA (secteur)*;
     `demolition_review_required` is the sector or a building older than
     `SiteRules.demolition_review_year`; `is_demolition_restricted` is which of
-    those the rules turn into a screen.
+    those the rules turn into a screen, **on a lot with a building to
+    demolish**.
+
+    That last clause is the whole difference between a sector flag and a
+    screen. A *secteur d'interet patrimonial* and a PIIA both restrict
+    removing something, and on a lot where the roll states no floor there is
+    nothing to remove: what a mandate proposes there is remediation and new
+    construction, which is what `infill` proposes on the same sector
+    unscreened. Without the clause the screen dropped `brownfield` off
+    exactly those lots and `infill` - which does not read this flag - caught
+    them, so a contaminated garage yard was filed under the one thesis whose
+    definition is that nothing stands on it. Lot 2 249 816 (grid C01-121,
+    CUBF 6419 *Autres services de l'automobile*, PIIA sector, no stated
+    floor) was the case: `is_brownfield_use` true and $115k of characterisation
+    and remediation charged against it, filed as an infill.
+
+    ``existing_floor_area_m2`` is the test because it is the module's
+    definition of a standing building everywhere else - `built_share`, the
+    `empty` that gates `infill`, and the demolition cost `site_costs` charges
+    all key on it. So the screen now bites exactly where the arithmetic pays
+    to demolish something.
+
+    Lifting it made `teardown` reachable on a lot with no floor, which is why
+    `assign_site_thesis` now requires standing floor there rather than a
+    stated year: `built_share` fills a missing floor with zero, so such a lot
+    passed the under-built test at 0.0 and proposed a demolition that cost
+    nothing to carry out. Seven VSMPE lots did exactly that before that term
+    was tightened.
     """
     rules = rules or SiteRules()
     heritage = _present(frame, "heritage_sector")
@@ -594,7 +732,8 @@ def heritage_flags(
     year = _numeric(frame, "existing_year_built")
     old = (year < float(rules.demolition_review_year)).fillna(False).astype("bool")
     review = heritage | old
-    restricted = (
+    demolishable = (_numeric(frame, "existing_floor_area_m2") > 0.0).fillna(False)
+    restricted = demolishable & (
         (heritage & rules.exclude_heritage_sectors)
         | (piia & rules.exclude_piia_sectors)
         | (review & rules.exclude_demolition_review)
@@ -885,9 +1024,11 @@ def assign_site_thesis(
     """Which site theses fire on each lot, and the one that names it.
 
     Returns the four `SITE_FLAG_COLUMNS`, the heritage flags,
-    `is_brownfield_use`, `storey_headroom`, `built_share`, the improvement
-    program and `site_thesis` - the first of `SITE_THESES` whose flag is set,
-    or ``none``.
+    `is_brownfield_use`, `storey_headroom`, `built_share`,
+    `existing_footprint_coverage` and `is_unassessed_vacant` (the lane
+    screen, see `unassessed_vacant`), the improvement program and
+    `site_thesis` - the first of `SITE_THESES` whose flag is set, or
+    ``none``.
 
     ``futures`` is `futures_economics`' frame, and with it the teardown
     follows the money: a lot whose enhancement is worth more to its owner
@@ -907,11 +1048,21 @@ def assign_site_thesis(
     year = _numeric(frame, "existing_year_built")
     headroom = storey_headroom(frame)
     share = built_share(frame)
+    coverage = footprint_coverage(frame)
+    off_roll = unassessed_vacant(frame, rules)
     use = brownfield_use(frame, rules)
     program = improvement_program(frame, rules)
 
+    # One definition of a standing building, and every thesis reads it: the
+    # roll's floor area. `built_share` divides by it, `site_costs` charges
+    # demolition on it, `empty` is its negation, and `heritage_flags` screens
+    # on it. A stated year of construction is not a second definition - a lot
+    # the roll dates but states no floor for was `standing` here and `empty`
+    # two lines down, which let a teardown fire on it: `built_share` fills a
+    # missing floor with zero rather than null, so 0.0 <= 0.40 passes the
+    # under-built test and the demolition it proposed cost nothing, because
+    # there was no floor to charge for.
     built = (floor > 0.0).fillna(False)
-    standing = built | year.notna()
     empty = ~built & (dwellings <= 0.0)
 
     enhance_beats_rebuild = pd.Series(False, index=frame.index)
@@ -924,7 +1075,7 @@ def assign_site_thesis(
 
     is_brownfield = use & has_program & ~restricted
     is_teardown = (
-        standing
+        built
         & has_program
         & underbuilt
         & (year <= float(rules.teardown_max_year_built)).fillna(False)
@@ -933,7 +1084,14 @@ def assign_site_thesis(
         & ~restricted
         & ~enhance_beats_rebuild
     )
-    is_infill = empty & has_program & underbuilt
+    # The one thesis ground the roll never listed can reach: the other three
+    # need a use code or a stated floor, which is the roll speaking. So a
+    # lane, a park remnant or a street sliver could only ever land here, and
+    # did - `empty` is the roll's silence, which a *ruelle* and a vacant lot
+    # have in common. `unassessed_vacant` reads the measured footprint to
+    # tell them apart; 610 VSMPE pieces with a median 3.7 m of frontage were
+    # filed as infills before it did.
+    is_infill = empty & has_program & underbuilt & ~off_roll
     is_improvement = (
         built
         & has_program
@@ -957,7 +1115,9 @@ def assign_site_thesis(
     result = pd.DataFrame(index=frame.index)
     result["storey_headroom"] = headroom.round(0).astype("Int64")
     result["built_share"] = share.round(4)
+    result["existing_footprint_coverage"] = coverage.round(4)
     result["is_brownfield_use"] = use
+    result["is_unassessed_vacant"] = off_roll
     for column in heritage.columns:
         result[column] = heritage[column]
     for column, flag in flags.items():
@@ -1012,34 +1172,54 @@ def site_yield_on_cost_pct(
     )
 
 
+#: The timing a partition from before the delay existed is read as: the
+#: building standing on day one, sold at the module's cap. Only reached when
+#: the caller hands over nothing, which the asset never does.
+_DEFAULT_TIMING = Timing(
+    construction_months=0, lease_up_months=0, hold_years=25,
+    terminal_cap_rate_pct=4.5, discount_rate_pct=5.0,
+)
+
+
 def rank_site_opportunities(
     frame: pd.DataFrame,
     *,
     rules: SiteRules | None = None,
     market_value_factor: float = 1.0,
     top_n: int = 25,
+    proforma: ProformaAssumptions | None = None,
+    rebuild_timing: Timing | None = None,
+    enhance_timing: Timing | None = None,
 ) -> pd.DataFrame:
     """``frame`` filed under its site thesis, costed, priced for the owner and
-    the buyer, and ranked within the thesis.
+    the buyer, its returns stated, and ranked within the thesis.
 
-    Returns everything `assign_site_thesis`, `site_yield_on_cost_pct` and
-    `futures_economics` add, plus ``site_thesis_rank``,
-    ``is_top_site_opportunity`` and ``num_ranked_in_site_thesis``, indexed
-    like ``frame``.
+    Returns everything `assign_site_thesis`, `site_yield_on_cost_pct`,
+    `futures_economics`, `proforma.returns` and `proforma.screens` add, plus
+    ``site_thesis_rank``, ``is_top_site_opportunity`` and
+    ``num_ranked_in_site_thesis``, indexed like ``frame``.
 
-    **Rank is within the site thesis**, on that thesis's own yield, for the
-    reason `rank_opportunities` ranks within the first axis. The tiebreak is
-    the owner's verdict - what rebuilding adds over holding, the site's costs
-    in, on the three theses that clear the ground; what the addition adds on
-    an improvement - and then `lot_uid`, so a re-run of an unchanged
-    partition produces the same list.
+    **Rank is within the site thesis**, on the buyer's IRR of that thesis's
+    own future - the addition on an improvement, the rebuild on the rest -
+    with the all-in yield on cost, then the owner's verdict, then `lot_uid`
+    as tiebreaks, so a re-run of an unchanged partition produces the same
+    list. A lot the roll never priced has no IRR and is unranked; its
+    thesis and the owner's numbers stand.
 
     **Only lots where the play pays are ranked** when
-    `SiteRules.require_positive_npv` holds: that same verdict above zero. A
-    lot filed under a thesis and left unranked is the inventory saying "the
-    site condition holds and the arithmetic does not", which is an answer.
+    `SiteRules.require_positive_npv` holds: the owner's verdict above zero.
+    `is_good_candidate` is the stricter test on top of the rank - the IRR
+    over the hurdle or the yield over the area's cap rate plus the spread,
+    either bar, which is what a screen should surface first.
+
+    ``rebuild_timing`` and ``enhance_timing`` are the months and the hold the
+    two futures were solved with, read off the rows by the asset; the module
+    default is a building standing on day one, for a caller that has none.
     """
     rules = rules or SiteRules()
+    proforma = proforma or ProformaAssumptions()
+    rebuild_timing = rebuild_timing or _DEFAULT_TIMING
+    enhance_timing = enhance_timing or rebuild_timing
     use = brownfield_use(frame, rules)
     costs = site_costs(frame, use, rules)
     futures = futures_economics(
@@ -1060,22 +1240,36 @@ def rank_site_opportunities(
     )
     verdict = rebuild_gain.mask(improving, improvement_verdict)
     result["site_verdict_cad"] = verdict.round(2)
-    yields = _numeric(result, "site_yield_on_cost_pct")
 
-    rankable = thesis.isin(SITE_THESES) & yields.notna()
+    # The returns: the all-in budget, the IRRs and the screens, on the rows
+    # as priced so far. `pd.concat` twice rather than once so the screens can
+    # read `site_verdict_cad` and `site_thesis` off the same frame.
+    priced = pd.concat([frame, result], axis=1)
+    priced = priced.loc[:, ~priced.columns.duplicated()]
+    stated = proforma_returns(priced, proforma, rebuild_timing, enhance_timing)
+    verdicts = proforma_screens(
+        pd.concat([priced, stated], axis=1), stated, proforma
+    )
+    result = pd.concat([result, stated, verdicts], axis=1)
+
+    irr = _numeric(verdicts, "site_irr_pct")
+    yields = _numeric(verdicts, "site_all_in_yield_on_cost_pct")
+    rankable = thesis.isin(SITE_THESES) & irr.notna()
     if rules.require_positive_npv:
         rankable &= (verdict > 0.0).fillna(False)
 
     order = pd.DataFrame(
         {
             "thesis": thesis,
+            "irr": irr,
             "yield": yields,
             "verdict": verdict,
             "tie": _numeric(frame, "lot_uid"),
+            "tie_zone": _zone_key(frame),
         }
     )[rankable].sort_values(
-        ["thesis", "yield", "verdict", "tie"],
-        ascending=[True, False, False, True],
+        ["thesis", "irr", "yield", "verdict", "tie", "tie_zone"],
+        ascending=[True, False, False, False, True, True],
         kind="stable",
     )
     ranks = order.groupby("thesis", sort=False).cumcount() + 1
@@ -1119,10 +1313,18 @@ def site_thesis_summary(frame: pd.DataFrame) -> pd.DataFrame:
                 "num_lots": int(len(in_thesis)),
                 "num_ranked": int(len(scored)),
                 "num_top": int(len(top)),
+                "num_good_candidates": int(
+                    scored["is_good_candidate"].fillna(False).sum()
+                ) if "is_good_candidate" in scored else 0,
                 "median_site_yield_on_cost_pct": _median(
                     scored, "site_yield_on_cost_pct"
                 ),
                 "best_site_yield_on_cost_pct": _max(scored, "site_yield_on_cost_pct"),
+                "median_site_irr_pct": _median(scored, "site_irr_pct"),
+                "best_site_irr_pct": _max(scored, "site_irr_pct"),
+                "median_all_in_yield_on_cost_pct": _median(
+                    scored, "site_all_in_yield_on_cost_pct"
+                ),
                 "total_verdict_cad": _total(scored, "site_verdict_cad"),
                 "top_project_cost_cad": _total(top, "site_total_project_cost_cad"),
                 "ranked_lot_area_ha": round(
@@ -1154,6 +1356,24 @@ def futures_summary(frame: pd.DataFrame) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(rows)
+
+
+def _zone_key(frame: pd.DataFrame) -> pd.Series:
+    """The zone of each row, as the second half of a total sort order.
+
+    A shortlist row is a piece of a lot since `lot_zone_pieces`, so `lot_uid`
+    alone no longer distinguishes two rows: a parcel a zoning boundary crosses
+    contributes one per zone, and two of them can land in the same thesis at
+    the same yield. Without this the order between them is whatever the sort
+    was handed, and a re-run of an unchanged partition can renumber a
+    shortlist - which is the one thing the tiebreak exists to prevent.
+
+    Empty string where the column is absent, which is a hand-built frame in a
+    test and orders the same way on every row.
+    """
+    if "feature_id" not in frame.columns:
+        return pd.Series("", index=frame.index, dtype="object")
+    return frame["feature_id"].astype("string").fillna("")
 
 
 def _numeric(frame: pd.DataFrame, column: str) -> pd.Series:
