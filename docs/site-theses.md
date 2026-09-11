@@ -9,10 +9,19 @@ be cleared off it first, and what that clearing costs.
 The second axis of the same table answers that. `site_thesis` is one of four
 values plus `none`, each a predicate over facts the platform already holds —
 the roll's year built and storey count, the solver's storeys and footprint,
-the CUBF use code, and the grid's own *Patrimoine* rows — and each carrying its
-own cost into its own yield. Nothing is re-solved; this is a classification
-and a few divisions over four parquet files, the same posture the first axis
-takes.
+the CUBF use code, the measured footprint on the piece, the grid's own
+*Patrimoine* rows and the owner's three futures — and each carrying its own
+cost into its own yield. Nothing is re-solved; this is a classification and a
+few divisions over four parquet files, the same posture the first axis takes.
+
+The row is the **lot × zone piece** since 2026-09-08, keyed on `lot_uid` and
+`feature_id`: a lot two zones cut in two has two rows, each filed on its own
+piece's program and its own share of the roll, and the map regularly shows two
+theses on one parcel. "Lot" below means a piece unless it says otherwise.
+VSMPE 2026-09-01 is 27,923 pieces on 24,785 lots, 22,597 of them carrying an
+assessed value. Every stated assumption on this page — and every other the
+chain makes, from the stall ratio to the discount rate — is collected in
+[assumptions.md](assumptions.md).
 
 ```bash
 make opportunities DATE=2026-09-01 NEIGHBORHOOD=VSMPE
@@ -31,17 +40,24 @@ columns are hbu_infra's `sql/021`; the grid rows are read by
 
 In Villeray the zoning envelope, not the building, is the binding constraint.
 Storey headroom — the solver's storey count less the roll's — on VSMPE's
-2026-09-01 partition:
+2026-09-01 partition as materialized on 2026-09-10, over the pieces carrying
+an assessed value (2,266 of those state no storey count and have no headroom
+to state):
 
-| headroom (storeys) | assessed lots |
+| headroom (storeys) | assessed pieces |
 | --- | --- |
-| −1 or less | 2,702 |
-| 0 | 14,986 |
-| 1 | 2,557 |
-| 2 or more | 575 |
+| −1 or less | 1,436 |
+| 0 | 13,564 |
+| 1 | 4,541 |
+| 2 or more | 790 |
 
-Over 85% of the stock cannot add a floor. A screen on "old building" alone
-would surface like-for-like replacements, not development plays. So the
+Three-quarters of the stock cannot add a floor, and under 4% has the two
+storeys of headroom the teardown thesis asks for. The distribution moved with
+the piece grain (2026-09-08) and with the level rows being read as a
+placement rather than a count (2026-09-10), so an older reading of this table
+— over 85% at zero or less — is the previous solve, not a different borough.
+A screen on "old building" alone would surface like-for-like replacements,
+not development plays. So the
 teardown thesis carries a headroom term, the improvement thesis *is* the
 headroom, and a lot with none of it can only be a brownfield or an infill.
 
@@ -65,7 +81,9 @@ lot with a building on it is not empty; improvement last because keeping the
 building is what remains once nothing argues for removing it.
 
 Every threshold below is config on `OpportunityConfig`, recorded on every row
-in `screen_assumptions`, and settable from `make opportunities`.
+in `screen_assumptions`, and settable from `make opportunities` — all but
+`improvement_min_floor_m2` and `exclude_demolition_review`, which have no make
+variable and take the Dagster config directly.
 
 ### Teardown: an obsolete improvement under an unused envelope
 
@@ -85,12 +103,19 @@ All of these at once, on a lot the gap table calls under-built:
   demolition whose `demolition_cost_cad` is nothing, there being no floor to
   charge the rate against. No VSMPE teardown was one of those; the term is what
   stops the [heritage clause](#heritage-and-the-piia) from creating seven.
+- and, where the futures are priced, `owner_gain_enhance_cad` not above
+  `owner_gain_rebuild_cad`: a lot whose owner does better adding a storey than
+  clearing the site is filed under `improvement` however old the building —
+  see [For the owner](#for-the-owner). On VSMPE 65 enhancements beat their
+  rebuild that way.
 
 Sized on VSMPE 2026-09-01, with the verdict positive (rebuilding beats holding,
 discounted). **These three rows predate both the proforma screens and the PIIA
 screen below**, and are kept because they are what moving the two thresholds
-costs, which has not changed; the partition itself now files 28 teardowns and
-ranks 15:
+costs, which has not changed. As materialized on 2026-09-10 the partition
+files 51 teardown pieces and ranks 36, at a 4.0% median site yield on cost,
+$2.0M of owner's verdict between them, $23M of assessed value and a 303 m²
+mean piece:
 
 | screen | lots | median yield on cost | NPV gain | assessed value | mean lot |
 | --- | --- | --- | --- | --- | --- |
@@ -142,7 +167,8 @@ list is by SCIAN, and the codebook snapshot
 the SCIAN correspondence per CUBF code, so a join can replace the prefix list.
 Until it does, the list is stated so a screen can be read back against it.
 
-Sized on VSMPE 2026-09-01:
+Sized on VSMPE 2026-09-01 when the thesis was written — per lot, before the
+PIIA screen and before the futures were priced:
 
 | step | lots |
 | --- | --- |
@@ -157,6 +183,12 @@ today is near zero. Gas stations are 9 of 11 NPV-positive. One machine shop on
 H04-072 (lot 1 740 794, 2.7 ha) carries $86M of the gain alone, and a transport
 yard on C04-083 another $34M. Overlap with the teardown screen is 4 lots, so
 the two are complementary rather than redundant.
+
+As materialized on 2026-09-10, per piece and with the PIIA screen on: 373
+pieces carry a risk use, 298 of them have a program and 83 a program with
+housing in it; 90 are filed `brownfield` — the screen takes the ones with a
+standing building in a heritage or PIIA sector — and 20 pay their owner and
+are ranked.
 
 Under [item 7 below](#not-only-residential) the remaining 300-odd — a
 warehouse in a pure-I zone the solver rebuilds as a warehouse — are filed too;
@@ -212,7 +244,11 @@ the pieces — the screen does not fire, because absence of the measure is not
 absence of a building; `0` turns it off. The 594 were unranked already (the
 roll never priced them, so there is no acquisition cost and no IRR), so the
 shortlist is unchanged; what changes is the inventory the map's Opportunities
-layer draws and the counts a borough total sums.
+layer draws and the counts a borough total sums. As materialized on
+2026-09-10, 457 pieces are filed `infill` — 279 on the roll and rankable, 178
+off it with something measurable standing on them — and 220 are ranked;
+4,730 pieces carry `is_unassessed_vacant`, most of them with no program to be
+filed under anything.
 
 ### Improvement: the building stays
 
@@ -228,8 +264,9 @@ the solver already respected:
 
 Both together are capped at the floor gap. The addition earns the solver's
 NOI per square metre for this lot's own program, costs its capital cost per
-square metre times `addition_cost_premium`, and is filed when it reaches
-`improvement_min_floor_m2` (40 m²). A lot the roll states no storey count for
+square metre times `addition_cost_premium`, and is filed, on a lot the gap
+calls under-built, when it reaches `improvement_min_floor_m2` (40 m²). A lot
+the roll states no storey count for
 gets no program: guessing a footprint would put an invented building on the
 shortlist, and `num_lots_storeys_unknown` in the run's metadata counts them.
 
@@ -310,8 +347,9 @@ the clause can never hand out a demolition play on a building the roll
 describes.
 
 The cost is real and worth stating: `piia_sector` is set on 279 of VSMPE's 632
-grids, and 9,449 lots carry `has_piia_review`, so this is the widest screen on
-the page. `EXCLUDE_PIIA_SECTORS=false` restores the flag-only posture for a
+grids, and 9,114 pieces carry `has_piia_review` (8,672 of them
+`is_demolition_restricted`, having a building to keep), so this is the widest
+screen on the page. `EXCLUDE_PIIA_SECTORS=false` restores the flag-only posture for a
 mandate that wants to see the demolition plays anyway.
 
 **The 1940 line.** Bill 69 (2021, c. 10, in force 1 April 2021) obliges every
@@ -370,7 +408,7 @@ lower one otherwise.
 
 What keeps those lots off the *ranked* list is the verdict. In this borough
 the solver's commercial and industrial programs mostly lose money at the
-surveyed rents (see [`hbu-solve-is-npv-multi-use`](../README.md)), so with
+surveyed rents (see [the objective](development-program.md#the-objective-discounted-net-profit)), so with
 `require_positive_npv` on — the default, and the role `is_underbuilt` plays on
 the first axis — an industrial teardown keeps its `site_thesis` and gets no
 `site_thesis_rank`. `REQUIRE_POSITIVE_NPV=false` ranks every filed lot on its
@@ -397,7 +435,11 @@ standing building handed in as a `RetainedBuilding`:
 - at most `max_added_storeys` (1) go on top, the structure's limit rather
   than the grid's, whose own ceiling still applies;
 - nothing is dug under it and no bay is carved out of its ground floor: the
-  addition parks on the yard or not at all;
+  addition parks on the yard or not at all — and where the yard cannot hold
+  the stalls the addition owes, the solve is run again with the obligation
+  waived, as the rebuild's is, and `enhance_parking_waived` and
+  `enhance_waived_stalls` say so (82 VSMPE enhancements, against 407
+  rebuilds);
 - the standing floor keeps earning what the roll says it earns; only the new
   floor is priced, at new-build rents and at `addition_cost_premium` (1.5)
   times the rates the rebuild was costed at;
@@ -420,7 +462,13 @@ on the under-built lots with a building — some 5,000 in VSMPE — and its
 rates are read back off the rebuild's rows by `program_assumptions_of`, so
 the two futures cannot drift apart. The improvement thesis reads the solve
 where the gap carries one (`improvement_source = 'solve'`) and falls back to
-the estimate on a partition that does not.
+the closed-form estimate wherever it does not — a partition from before the
+solve, **or a row whose enhancement came back `INFEASIBLE` or `ERROR`**. That
+second case is most of the thesis on VSMPE: of the 912 pieces filed
+`improvement` on 2026-09-10, 837 are estimates on a standing plate today's
+grid would not let stand again, and 75 are the solve's own — and since the
+estimate is what the rank reads, 837 of the 839 ranked improvements are the
+closed form. See the [open items](#open-items).
 
 The footprint is the roll's floor over its storeys, which is exact for a
 plex and generous for a setback storey; the BDOI footprint on `lot_profiles`
@@ -439,8 +487,11 @@ about 1.2 and not above it, with or without the half-stall a dwelling owes:
 | 1.3 | nothing | 0 | 0 |
 | 1.5 (the sourced default) | nothing | 0 | 0 |
 
-So at the default rate no enhancement in VSMPE pays, and the enhance column
-on the two panes reads "nothing pencils" borough-wide; that is the arithmetic
+So at the default rate almost no enhancement in VSMPE pays — 10,189 of the
+10,281 solved add nothing, 92 add a storey or an annex, 65 of those beat
+their own rebuild for the owner and 5 beat holding too — and the enhance
+column on the Deal pane reads "nothing pencils" nearly borough-wide; that is
+the arithmetic
 at rents a third over a stock average of $980, not a statement that plexes
 cannot take a storey. The rent side is the conservative one — new
 one-bedrooms in Villeray ask well over the $1,274 that premium produces —
@@ -466,9 +517,10 @@ The programs asset solves the rebuild at 18 and 6 months, which at 5% takes
 about 9% off its present value. The standing building's income is valued
 with `hold_pv_factor` and no delay, so `redevelopment_npv_gain_cad` now
 carries the months the site earns nothing. Capital is still spent at day
-one, undiscounted, which is the conservative side. Soft costs, financing and
-contingency are still not modelled, and the page says so where it says what
-the NPV is.
+one, undiscounted, which is the conservative side. Soft costs and
+contingency are not in this NPV — they enter the
+[returns](#yield-on-cost-and-irr) below, on the same budget — and financing
+is in neither; the page says so where it says what the NPV is.
 
 ### For the owner
 
@@ -481,7 +533,9 @@ before the site's own costs:
 | enhance | `enhance_value_cad` | hold, plus the addition's NPV, less the disruption; equal to hold where nothing pencils |
 | rebuild | `rebuild_value_cad` | the proposal's present value with its income delayed, less its capital |
 
-`best_future` is the largest, `hold` on a tie. The shortlist table repeats
+`best_future` is the largest, `hold` on a tie — on VSMPE as of 2026-09-10,
+`hold` on 26,749 pieces, `rebuild` on 1,169 and `enhance` on 5. The shortlist
+table repeats
 the three with the demolition, the characterisation and the remediation
 taken off the rebuild (`owner_*_value_cad`), states each against holding
 (`owner_gain_enhance_cad`, `owner_gain_rebuild_cad`) and names the winner
@@ -512,10 +566,16 @@ Each future is then its owner's value less that price (`buyer_npv_*_cad`),
 its stabilised NOI over everything paid to reach it (`buyer_yield_*_pct`),
 and the most a buyer could pay for it and still clear the discount rate,
 which is the value itself (`residual_price_*_cad`). `buyer_best_future` is
-the largest NPV. Every buyer column is null where the roll never assessed the
-lot: there is no price to pay. The map's **Buyer** and **Owner** panes show
-the three futures for one lot from these columns and nothing else, and the
-chat's `lot_futures` tool says the same in a sentence each.
+the largest NPV, `hold` on a tie, and `none` where even the largest is below
+zero: at that price the buyer walks, which is the fourth option a buyer has
+and an owner does not. On VSMPE as of 2026-09-10 that is the answer on 20,382
+of the 22,597 priced pieces; a buyer holds on 2,163, rebuilds on 49 and
+enhances on 3. Every buyer column is null where the roll never assessed the
+lot: there is no price to pay. The map's **Deal** pane shows the three
+futures for one lot from these columns — there was an Owner pane beside it,
+and it is gone, because the question it answered is not the one a
+transaction turns on — and the chat's `lot_futures` tool says the same in a
+sentence each.
 
 ## Yield on cost and IRR
 
@@ -600,6 +660,10 @@ green edge and can be narrowed to them, and every pane and tool says both
 numbers.
 
 ### The assumptions, and where they come from
+
+These are the proforma's own lines. Every other assumption in the chain — the
+solve's, the roll's, the enhancement's and the theses' — is collected with
+them in [assumptions.md](assumptions.md).
 
 | line | default | basis |
 | --- | --- | --- |
@@ -730,8 +794,11 @@ Added to `gold.lot_investment_opportunities` beside the first axis:
 | `hbu_residential_noi_cad`, `hbu_commercial_noi_cad`, `hbu_industrial_noi_cad`, and the `enhance_added_*_noi_cad` twins | the future's NOI by the family that earns it, summing to the whole; the weight behind every cap below |
 | `hbu_commercial_floor_area_with_cellar_m2`, `hbu_industrial_floor_area_with_cellar_m2` | the non-residential floor the program would actually lease, cellar included, which the `hbu_*_floor_area_m2` columns exclude; the lease-up is measured on these |
 | `market_cap_rate_enhance_pct`, `exit_cap_rate_rebuild_pct`, `exit_cap_rate_enhance_pct`, `hbu_non_residential_income_share`, `enhance_non_residential_income_share` | the cap each future is screened and sold at once blended to its own mix, and the share that did the blending |
+| `hbu_parking_waived`, `hbu_waived_stalls`, `enhance_parking_waived`, `enhance_waived_stalls` | whether the rebuild and the addition were solved without the stalls they owe, and how many |
+| `improvement_source`, `site_costs_cad`, `enhance_assumptions` | which of the solve and the estimate the addition is; the three site costs summed, which is what the rebuild carries and the other two futures do not; the enhancement's own settings |
+| `feature_id`, `piece_area_m2`, `num_lot_zones`, `is_primary_zone` | the piece: which zone polygon, its ground, how many pieces the lot has, and whether this is the largest |
 
-Every lot keeps its row; `site_thesis = 'none'` with the booleans false is a
+Every piece keeps its row; `site_thesis = 'none'` with the booleans false is a
 lot no condition held on, and a thesis with a null rank is one that held and
 does not pay. `screen_assumptions` carries every threshold and rate, and
 `heritage_source` says whether the zone columns carried the *Patrimoine* rows
@@ -768,11 +835,14 @@ target reads — `TEARDOWN_MAX_YEAR`, `TEARDOWN_MAX_BUILT_SHARE`,
 
 ## Where it is read
 
-The map draws an **Opportunities** layer from this table — the lots with a
-site thesis, coloured by it, with a filter per thesis and a *top of each*
-switch — and the HBU pane explains the lot's site thesis under the verdict:
-which conditions held, what the heritage rows say, and what the site's own
-denominator adds. `hbu_rag_map`'s README covers both.
+The map draws an **Opportunities** layer from this table — the pieces with a
+site thesis, coloured by it, with a filter per thesis, a *top of each* switch
+and a green edge on the good candidates — and the **Deal** pane explains the
+piece under *Why this site*: which conditions held, what the heritage rows
+say, what each of the three futures builds, and what the site's own
+denominator adds. The **Overview** pane totals the four theses for the
+borough. The HBU and Buyer panes that used to split the programme from the
+price were folded into Deal; `hbu_rag_map`'s README covers it.
 
 ## Open items
 
@@ -783,8 +853,18 @@ denominator adds. `hbu_rag_map`'s README covers both.
   SCIAN codes through the codebook's correspondence column.
 - **The building-value share**, as a second obsolescence signal for the
   teardown thesis.
-- **Soft costs, financing and contingency** on both the rebuild and the
-  addition; the timing is in, these are not.
+- **Financing, taxes on the gain and rent growth**, on both futures. Soft
+  costs, contingency and builder's risk are in the proforma returns since
+  2026-09-10 but not in the solve's objective or in `site_verdict_cad`, so a
+  rebuild can rank on an NPV its all-in yield does not clear.
+- **The estimate under an infeasible enhancement.** Where the solve comes
+  back `INFEASIBLE` — the standing plate is more than today's grid would let
+  stand — the improvement thesis falls back to the closed-form storey-and-
+  annex estimate, and on VSMPE that is 837 of the 912 improvements and 837 of
+  the 839 ranked. A solve that says the building cannot grow under this grid
+  and an estimate that adds a storey to it anyway are two answers on one
+  row; the honest thesis for an infeasible enhancement is probably `none`, or
+  the estimate should be reserved for the partitions the solve never ran on.
 - **Remediation per lot.** A Phase I on record beats any rate; there is no
   public source for one.
 
