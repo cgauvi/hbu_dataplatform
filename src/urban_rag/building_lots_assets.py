@@ -122,8 +122,9 @@ LOT_NUMBER_COLUMN = "NO_LOT"
 #: chunk - the two have to agree or the join they exist for matches nothing.
 #: Named here rather than imported from there because the dependency runs the
 #: wrong way: `rag_assets` builds the corpus, this builds the geometry it is
-#: about, and neither is downstream of the other.
-FEATURE_ID_COLUMNS = ("NUMERO_COMPLET", "ID")
+#: about, and neither is downstream of the other. ``IGDS_TEXT_STRING`` is the
+#: zone code on Quebec City's zoning layer - see `urban_rag.quebec`.
+FEATURE_ID_COLUMNS = ("NUMERO_COMPLET", "ID", "IGDS_TEXT_STRING")
 
 
 @asset(

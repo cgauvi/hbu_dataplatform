@@ -197,7 +197,7 @@ data/
 │   ├── cmhc_rent_survey/2026-09-01/
 │   │   └── quartier_average_rents.parquet
 │   ├── street_network/2026-09-01/
-│   │   └── street_sides.parquet
+│   │   └── street_segments.parquet
 │   ├── montreal_residential_costs/2026-09-01/
 │   │   └── residential_costs.parquet
 │   ├── montreal_nonresidential_costs/2026-09-01/

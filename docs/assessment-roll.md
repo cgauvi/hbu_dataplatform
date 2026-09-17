@@ -278,7 +278,7 @@ borough is read off the map instead: `assign_boroughs` puts every unit in the
 borough whose `reference_neighborhoods` outline its point falls inside, and
 `warehouse.publish_by_neighborhood` upserts all of them in one transaction.
 
-That is the same cut `neighborhood_streets` makes on the island-wide geobase,
+That is the same cut `neighborhood_streets` makes on the province-wide RQTT,
 made against points rather than lines — and it is why **the tree and the table
 do not hold the same rows**. The parquet carries every municipality
 `municipality_codes` kept (the whole province with `CODE_MUN='[]'`); the table

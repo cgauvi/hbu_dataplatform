@@ -49,7 +49,7 @@ def test_no_silver_or_gold_asset_carries_the_guard():
 def test_the_bronze_layer_is_not_accidentally_empty():
     """Both assertions above pass trivially if nothing is bronze."""
     bronze = [name for name, layer in ASSET_LAYERS.items() if layer is Layer.BRONZE]
-    assert len(bronze) == 16
+    assert len(bronze) == 17
 
 
 def test_an_unguarded_bronze_asset_is_a_load_error(monkeypatch):
@@ -95,3 +95,14 @@ def test_a_silver_asset_needs_no_guard(monkeypatch):
     monkeypatch.setattr(definitions, "ASSETS", [*definitions.ASSETS, derived])
 
     definitions._assert_bronze_assets_guarded()
+
+
+def test_the_repository_binds_every_resource_an_asset_requires():
+    """Building the repository is what a `dagster` CLI run does first.
+
+    An asset that names a resource `Definitions(resources=...)` does not bind
+    fails there, at load, and not at import - which is why this test exists:
+    the two import-time assertions above never see it.
+    """
+    repository = definitions.defs.get_repository_def()
+    assert repository.get_all_jobs()

@@ -207,6 +207,19 @@ TABLES: dict[str, Table] = {
         source="sql/008_silver_lot_frontage.sql",
         geometry="geom",
     ),
+    # Keyed on the publisher's own address UUID rather than on (lot, zone):
+    # the grain is one address point, and an address stands on exactly one
+    # parcel in exactly one of its pieces. `lot_uid`/`feature_id` are the
+    # columns the gold tables join *to*, and sql/026 indexes them, but keying
+    # on them here would let two points at the same address on one site
+    # overwrite each other - which is most of a walk-up.
+    "lot_addresses": Table(
+        asset="lot_addresses",
+        name="lot_addresses",
+        keys=("address_id",),
+        source="sql/026_silver_lot_addresses.sql",
+        geometry="geom",
+    ),
     "document_chunks": Table(
         asset="document_chunks",
         name="document_chunks",

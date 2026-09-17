@@ -1,15 +1,23 @@
-"""The street network at this platform's grain: one borough's street sides,
+"""The street network at this platform's grain: one borough's street segments,
 clipped to its boundary, measured in metres.
 
-`street_network` snapshots the geobase double island-wide, because that is how
-the city publishes it - 91,546 sides of street with no borough column of their
-own. Everything downstream of it is borough-scoped, so this is where the
-island is cut into partitions, the same hinge `neighborhood_buildings` turns
-on for BDOI and `neighborhood_lots` for Infolot. The difference is that those
-two cut in *bronze*, at the query, because the source is fetched per borough;
-this one cuts in silver, from a file already on disk, because one download
-serves every borough and re-downloading 91 MB per partition would be work done
-for nothing.
+`street_network` snapshots the RQTT - Quebec's province-wide road network -
+bounded to the cities this pipeline has boroughs in, because that is how the
+MRNF publishes it: one file for the province, with no borough column and no
+municipality column either. Everything downstream of it is borough-scoped, so
+this is where that file is cut into partitions, the same hinge
+`neighborhood_buildings` turns on for BDOI and `neighborhood_lots` for Infolot.
+The difference is that those two cut in *bronze*, at the query, because the
+source is fetched per borough; this one cuts in silver, from a file already on
+disk, because one download serves every borough and re-fetching 390 MB per
+partition would be work done for nothing.
+
+One source for every city, where there were three. Montreal's geobase double,
+Quebec City's `vque_18` and Saguenay's `sag-reseau-routier` each had their own
+id and name columns and their own branch here, and the dispatch that chose
+between them is gone: the RQTT has one schema, so `_as_street_sides` renames
+one pair of columns for every borough and a fourth city needs no street code at
+all.
 
 **Clipped, not selected.** A street side that crosses the borough line is
 `ST_Intersection`-ed against the boundary rather than kept whole, so the
@@ -50,14 +58,15 @@ from dagster import (
 from urban_rag.frames import count_invalid_geometries, write_frame
 from urban_rag.layers import key_prefix
 from urban_rag.open_data_assets import (
-    STREETS_FILE,
+    STREET_SEGMENTS_FILE,
     STREET_ID_COLUMN,
     STREET_NAME_COLUMN,
     borough_boundary,
     reference_neighborhoods,
     street_network,
 )
-from urban_rag.partitions import scrape_partitions
+from urban_rag.partitions import metric_crs_for, scrape_partitions
+from urban_rag.rqtt import STREET_ID_FIELD, STREET_NAME_FIELD
 from urban_rag.postgis import load_streets
 from urban_rag.rag.pgvector import PostgresUnavailable
 from urban_rag.resources import ParquetStore, PostgisResource
@@ -70,8 +79,10 @@ GROUP = "silver_streets"
 #: `silver/neighborhood_streets/<YYYY-MM-DD>/<neighborhood>/`.
 STREETS_FILE_OUT = "neighborhood_streets.parquet"
 
-#: Where lengths are measured. NAD83 / MTM zone 8 is the projected system the
-#: island is surveyed in; metres in it are metres on the ground.
+#: Where lengths are measured for a Montreal borough. NAD83 / MTM zone 8 is
+#: the projected system the island is surveyed in; metres in it are metres on
+#: the ground. A Quebec City borough is measured in zone 7 -
+#: `partitions.metric_crs_for` is what the asset actually consults.
 METRIC_CRS = "EPSG:32188"
 
 #: The 1-dimensional geometry types a clipped street side may legitimately be.
@@ -100,8 +111,8 @@ _LINE_TYPES = ("LineString", "MultiLineString", "LinearRing")
     group_name=GROUP,
     kinds={"postgres", "geoparquet"},
     description=(
-        "One borough's sides of street, cut out of that day's island-wide "
-        "geobase double against its boundary from reference_neighborhoods. "
+        "One borough's street segments, cut out of that day's RQTT snapshot "
+        "against its boundary from reference_neighborhoods. "
         "One row per COTE_RUE_ID, geometry clipped to the borough and valid, "
         "with the published length, the length inside the borough and the "
         "share of the segment that survived the cut, as silver/"
@@ -119,11 +130,13 @@ def neighborhood_streets(
     neighborhood = dimensions["neighborhood"]
     scrape_date = dimensions["date"][:10]
 
+    metric_crs = metric_crs_for(neighborhood)
     streets_path = join(
         store.partition_dir(street_network.key.path[-1], scrape_date),
-        STREETS_FILE,
+        STREET_SEGMENTS_FILE,
     )
     streets = _read_streets(streets_path, scrape_date=scrape_date)
+    streets = _as_street_sides(streets, STREET_ID_FIELD, STREET_NAME_FIELD)
     if streets.empty:
         raise Failure(f"{streets_path} holds no street side to cut.")
     if STREET_ID_COLUMN not in streets.columns:
@@ -135,8 +148,9 @@ def neighborhood_streets(
     boundary = borough_boundary(store, scrape_date, neighborhood)
 
     # Selected before clipped: `intersects` rides the spatial index, while
-    # `intersection` over 91,546 island-wide sides would clip every one of
-    # them against a borough most of them are nowhere near.
+    # `intersection` over the ninety-odd thousand segments in the snapshot
+    # would clip every one of them against a borough most of them are
+    # nowhere near.
     touching = streets[streets.intersects(boundary)].copy()
     if touching.empty:
         raise Failure(
@@ -144,7 +158,7 @@ def neighborhood_streets(
             f"reference_neighborhoods for {scrape_date} may be empty."
         )
 
-    published_length_m = _length_m(touching.geometry)
+    published_length_m = _length_m(touching.geometry, metric_crs)
     clipped = touching.set_geometry(
         gpd.GeoSeries(
             [_lines_only(geometry) for geometry in touching.geometry.intersection(boundary)],
@@ -163,7 +177,7 @@ def neighborhood_streets(
         )
 
     clipped["segment_length_m"] = published_length_m
-    clipped["length_in_borough_m"] = _length_m(clipped.geometry)
+    clipped["length_in_borough_m"] = _length_m(clipped.geometry, metric_crs)
     clipped["pct_in_borough"] = (
         100.0 * clipped["length_in_borough_m"] / clipped["segment_length_m"]
     ).where(clipped["segment_length_m"] > 0, 0.0)
@@ -231,7 +245,7 @@ def neighborhood_streets(
         metadata={
             "dagster/row_count": len(clipped),
             "num_street_sides": len(clipped),
-            "num_street_sides_island_wide": len(streets),
+            "num_segments_in_snapshot": len(streets),
             "num_streets_named": int(clipped[STREET_NAME_COLUMN].nunique())
             if STREET_NAME_COLUMN in clipped.columns
             else 0,
@@ -255,9 +269,48 @@ def _read_streets(path: str, *, scrape_date: str) -> gpd.GeoDataFrame:
         ) from exc
 
 
-def _length_m(geometry: gpd.GeoSeries):
-    """``geometry``'s length in metres, measured in `METRIC_CRS`."""
-    return geometry.to_crs(METRIC_CRS).length
+def _length_m(geometry: gpd.GeoSeries, metric_crs: str = METRIC_CRS):
+    """``geometry``'s length in metres, measured in ``metric_crs``."""
+    return geometry.to_crs(metric_crs).length
+
+
+def _as_street_sides(
+    segments: gpd.GeoDataFrame, id_column: str, name_column: str
+) -> gpd.GeoDataFrame:
+    """A centre-line network, under this platform's column names.
+
+    The RQTT publishes centre lines - one per segment of roadway - and not the
+    two sides the geobase double drew for Montreal. Silver is the layer that
+    speaks this platform's vocabulary, so the segment's key becomes
+    `COTE_RUE_ID` and its name `NOM_VOIE` here, and the publisher's own columns
+    travel alongside untouched.
+
+    **`COTE_RUE_ID` is now a historical name.** It means a *côté de rue*, and
+    nothing in this table is a side of a street any more. It is kept because it
+    is in the primary key of `silver.neighborhood_streets` and
+    `silver.lot_frontage`, denormalised into `gold.lot_profiles` and read by the
+    map's tile queries; the word is wrong, and re-keying that lineage to fix a
+    word would be the more expensive mistake.
+
+    **What a centre line changes downstream is the *fallback* frontage only.**
+    `lot_frontage`'s exact measure is the edge a lot shares with a road parcel
+    and needs no line at all, and a centre line still runs inside the road
+    parcel - more reliably than a curb side, which hugs the parcel's boundary -
+    which is how a road lot is recognised. The reach the fallback spends is
+    measured from the line, so a centre line sits half a roadway further from
+    the lot than a curb side would; see
+    `postgis.DEFAULT_FRONTAGE_FALLBACK_BUFFERS_M`, which is calibrated for it.
+
+    The names stay arguments rather than constants because this is the one
+    place a publisher's vocabulary is translated, and a second source arriving
+    should have somewhere to be translated from.
+    """
+    renamed = segments.rename(
+        columns={id_column: STREET_ID_COLUMN, name_column: STREET_NAME_COLUMN}
+    )
+    if STREET_ID_COLUMN in renamed.columns:
+        renamed[STREET_ID_COLUMN] = renamed[STREET_ID_COLUMN].astype(str)
+    return renamed
 
 
 def _lines_only(geometry):
@@ -283,10 +336,12 @@ def _lines_only(geometry):
 def _require_unique_streets(
     streets: gpd.GeoDataFrame, *, neighborhood: str, scrape_date: str
 ) -> None:
-    """One row per street side - the grain this asset declares.
+    """One row per street segment - the grain this asset declares.
 
-    `COTE_RUE_ID` is unique across the island in the published layer, so a
-    duplicate here means the same side arrived twice rather than that the city
+    `COTE_RUE_ID` is the RQTT's `AQRP_UUID`, which is one per segment across
+    the province - and is why the key is that column and not `IdRte`, which
+    has both nulls and duplicates (see `rqtt.STREET_ID_FIELD`). So a duplicate
+    here means the same segment arrived twice rather than that the publisher
     reuses the key. Left unchecked it would multiply every frontage pair the
     join downstream produces, which shows up as a plausible-looking number
     rather than as a crash.

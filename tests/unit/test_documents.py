@@ -12,6 +12,7 @@ import pytest
 
 from urban_rag.rag.documents import (
     DOCUMENT_SOURCES,
+    ZONING_SOURCES,
     DocumentError,
     PdfFetcher,
     chunk_text,
@@ -64,8 +65,29 @@ def make_fetcher(tmp_path, response):
 
 
 def test_the_corpus_is_built_from_the_zoning_grids():
-    """The registry is the whole definition of what gets indexed."""
-    assert DOCUMENT_SOURCES == {"Reglement_urbanisme__VSP_REG_ZONE": "LIEN_GRILLE"}
+    """The registry is the whole definition of what gets indexed.
+
+    One table per city, and only Montreal's publishes the link itself.
+    `_saguenay_features` resolves one grid id per zone and
+    `_quebec_features` formats a handler URL from the zone code; both write it
+    under Montreal's column name, which is what lets one corpus pipeline serve
+    three cities.
+    """
+    assert DOCUMENT_SOURCES == {
+        "Reglement_urbanisme__VSP_REG_ZONE": "LIEN_GRILLE",
+        "Zonage__ZONAGE_SAGUENAY": "LIEN_GRILLE",
+        "Zonage__ZONAGE_EN_VIGUEUR": "LIEN_GRILLE",
+    }
+
+
+def test_every_zoning_layer_is_also_a_document_source():
+    """True today, and the names stay apart because it need not be.
+
+    A table is a zone source if lots are cut against it and a document source
+    if it links prose worth retrieving. Quebec City was a zone source and not
+    a document source until its per-zone sheet was found.
+    """
+    assert set(ZONING_SOURCES) == set(DOCUMENT_SOURCES)
 
 
 def test_document_urls_are_distinct_and_keep_their_first_seen_order():
@@ -191,3 +213,53 @@ def test_chunk_text_rejects_an_impossible_geometry(max_tokens, overlap_tokens):
             max_tokens=max_tokens,
             overlap_tokens=overlap_tokens,
         )
+
+
+def test_a_quebec_zone_row_is_cited_by_its_zone_code():
+    """The id column each city's documents are cited by.
+
+    Quebec City's layer carries `IGDS_TEXT_STRING` and neither of Montreal's
+    two names, so this is what decides that a retrieved CIL passage says
+    "11004Mc" rather than nothing. It publishes no usage description either,
+    so the title is null - the one field a Quebec document is missing.
+    """
+    from urban_rag.rag_assets import _features_by_url
+
+    frame = pd.DataFrame(
+        {
+            "LIEN_GRILLE": [
+                "https://carte.ville.quebec.qc.ca/GrillesZonage/HandlerZonage.ashx?11004Mc",
+                "https://carte.ville.quebec.qc.ca/GrillesZonage/HandlerZonage.ashx?11007Hb",
+            ],
+            "IGDS_TEXT_STRING": ["11004Mc", "11007Hb"],
+            "NATURE": ["Zone", "Zone"],
+            "STATUT": ["En vigueur", "En vigueur"],
+        }
+    )
+
+    index = _features_by_url(frame, "LIEN_GRILLE")
+
+    entry = index[
+        "https://carte.ville.quebec.qc.ca/GrillesZonage/HandlerZonage.ashx?11004Mc"
+    ]
+    assert entry["feature_ids"] == '["11004Mc"]'
+    assert entry["title"] is None
+
+
+def test_montreals_zone_number_still_wins_where_both_columns_exist():
+    """`_ID_COLUMNS` is first-match-wins, so the order is load-bearing."""
+    from urban_rag.rag_assets import _features_by_url
+
+    frame = pd.DataFrame(
+        {
+            "LIEN_GRILLE": ["http://x/C01-001.pdf"],
+            "NUMERO_COMPLET": ["C01-001"],
+            "IGDS_TEXT_STRING": ["11004Mc"],
+            "USAGE": ["Commerce"],
+        }
+    )
+
+    entry = _features_by_url(frame, "LIEN_GRILLE")["http://x/C01-001.pdf"]
+
+    assert entry["feature_ids"] == '["C01-001"]'
+    assert entry["title"] == "Commerce"

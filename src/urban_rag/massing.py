@@ -1182,8 +1182,12 @@ def massing_frame(
     min_footprint_m2: float = MIN_FOOTPRINT_M2,
     min_parking_depth_m: float = MIN_PARKING_DEPTH_M,
     parking_max_bays: int = PARKING_MAX_BAYS,
+    metric_crs: str = METRIC_CRS,
 ):
     """One building rectangle per lot of ``hbu``, and its surface parking beside it.
+
+    ``metric_crs`` is the projected system the borough is surveyed in -
+    `partitions.metric_crs_for` - and every rectangle is drawn in it.
 
     ``hbu`` is `lot_highest_best_use`, ``setbacks`` is `lot_buildable_setbacks`
     as a GeoDataFrame, and ``lots`` is the cadastre - the parcel polygons keyed
@@ -1227,9 +1231,8 @@ def massing_frame(
     import geopandas as gpd
 
     frame = hbu.copy().reset_index(drop=True)
-    envelopes = _buildable_by_key(setbacks)
-    parcels = _lots_by_uid(lots)
-    metric_crs = METRIC_CRS
+    envelopes = _buildable_by_key(setbacks, metric_crs)
+    parcels = _lots_by_uid(lots, metric_crs)
 
     results: list[Massing] = []
     parked: list[Parking] = []
@@ -1400,8 +1403,8 @@ def _surface_parking_area(row) -> float:
     return float(stalls) * _surface_stall_area_m2()
 
 
-def to_metric(frame):
-    """``frame`` in `METRIC_CRS`, which is the CRS a fit has to happen in.
+def to_metric(frame, metric_crs: str = METRIC_CRS):
+    """``frame`` in ``metric_crs``, which is the CRS a fit has to happen in.
 
     NAD83 / MTM zone 8, the same projection `comparables` measures ground
     distance in and `postgis` computes frontage and setbacks in - named there
@@ -1412,10 +1415,10 @@ def to_metric(frame):
         return frame
     if frame.crs is None:
         frame = frame.set_crs("EPSG:4326")
-    return frame.to_crs(METRIC_CRS)
+    return frame.to_crs(metric_crs)
 
 
-def _buildable_by_key(setbacks) -> dict[tuple, BaseGeometry]:
+def _buildable_by_key(setbacks, metric_crs: str = METRIC_CRS) -> dict[tuple, BaseGeometry]:
     """The buildable polygon of each (lot, zone, column), in metres.
 
     A dict rather than a merge because the fit is a Python loop over rows
@@ -1427,7 +1430,7 @@ def _buildable_by_key(setbacks) -> dict[tuple, BaseGeometry]:
     required = ("lot_uid", "feature_id", "column_index")
     if any(name not in setbacks.columns for name in required):
         return {}
-    projected = to_metric(setbacks)
+    projected = to_metric(setbacks, metric_crs)
     return {
         (row.lot_uid, row.feature_id, row.column_index): row.geometry
         for row in projected.itertuples(index=False)
@@ -1435,7 +1438,7 @@ def _buildable_by_key(setbacks) -> dict[tuple, BaseGeometry]:
     }
 
 
-def _lots_by_uid(lots) -> dict:
+def _lots_by_uid(lots, metric_crs: str = METRIC_CRS) -> dict:
     """The ground a surface stall may stand on, in metres, keyed for lookup.
 
     Keyed on **(lot_uid, feature_id)** where the frame carries a zone - it is
@@ -1464,7 +1467,7 @@ def _lots_by_uid(lots) -> dict:
     if "lot_uid" not in lots.columns:
         return {}
     by_piece = "feature_id" in lots.columns
-    projected = to_metric(lots)
+    projected = to_metric(lots, metric_crs)
     return {
         ((row.lot_uid, row.feature_id) if by_piece else row.lot_uid): row.geometry
         for row in projected.itertuples(index=False)

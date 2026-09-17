@@ -73,6 +73,10 @@ SCHEMA_FILES = (
     # block is written to skip a table that is not there, which this ordering
     # is what exercises.
     "025_silver_lot_zone_pieces.sql",
+    # rag.addresses and silver.lot_addresses. After 025 because the join it
+    # backs places every address on a zone piece, so the table it reads has to
+    # exist before anything can be written against it.
+    "026_silver_lot_addresses.sql",
 )
 
 #: The feature layer a zoning clip is filed under, and the one

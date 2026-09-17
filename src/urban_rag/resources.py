@@ -49,6 +49,24 @@ from urban_rag.open_data import (
     DEFAULT_BASE_URL as OPEN_DATA_BASE_URL,
     CkanClient,
 )
+from urban_rag.adresses_quebec import (
+    DEFAULT_SERVICE_URL as ADDRESSES_SERVICE_URL,
+    DEFAULT_WMS_URL as ADDRESSES_WMS_URL,
+    MAX_RECORD_COUNT as ADDRESSES_MAX_RECORD_COUNT,
+    AdressesQuebecClient,
+)
+from urban_rag.quebec import (
+    DEFAULT_BATCH_SIZE as QUEBEC_BATCH_SIZE,
+    DEFAULT_GRID_URL as QUEBEC_GRID_URL,
+    DEFAULT_SHEET_URL_TEMPLATE as QUEBEC_SHEET_URL_TEMPLATE,
+    DEFAULT_ZONING_LAYER_URL as QUEBEC_ZONING_LAYER_URL,
+    QuebecZoningClient,
+)
+from urban_rag.saguenay import (
+    GRID_PDF_URL as SAGUENAY_GRID_PDF_URL,
+    ZONE_LOOKUP_URL as SAGUENAY_ZONE_LOOKUP_URL,
+    SaguenayZoningClient,
+)
 from urban_rag.rfu import (
     DEFAULT_BASE_URL as RFU_BASE_URL,
     RFU_YEAR_VAR,
@@ -59,6 +77,10 @@ from urban_rag.role_foncier import (
     ROLL_YEAR_VAR,
     RoleFetcher,
     default_roll_year,
+)
+from urban_rag.rqtt import (
+    DEFAULT_BASE_URL as RQTT_BASE_URL,
+    RqttFetcher,
 )
 from urban_rag.infolot import (
     DEFAULT_BASE_URL as INFOLOT_BASE_URL,
@@ -174,6 +196,167 @@ class OpenDataResource(ConfigurableResource):
             timeout_seconds=self.timeout_seconds,
             request_delay_seconds=self.request_delay_seconds,
             max_retries=self.max_retries,
+            ca_bundle=self.ca_bundle,
+        )
+
+
+class QuebecOpenDataResource(OpenDataResource):
+    """Connection settings for Données Québec, where Quebec City publishes.
+
+    The same CKAN API as the city of Montreal's portal - `OpenDataResource`
+    with another base URL - and kept as its own resource for the reason
+    `RfuResource` is: two publishers, two licences, two release cadences, and
+    a run pointed at one should not be able to silently read the other. It is
+    what `reference_neighborhoods` reads the arrondissement layer from and
+    `street_network` the public ways.
+    """
+
+    base_url: str = RFU_BASE_URL
+
+
+class QuebecZoningResource(ConfigurableResource):
+    """Connection settings for Quebec City's zoning layer and its grid.
+
+    The layer is an ArcGIS Online feature service and the grid a workbook on
+    the city's map server - see `urban_rag.quebec`. Same posture as
+    `InfolotResource`, which reads the same kind of service: paced and
+    patient, since one borough is a few batched requests against a live
+    municipal server with no quota to spend.
+    """
+
+    layer_url: str = QUEBEC_ZONING_LAYER_URL
+    grid_url: str = QUEBEC_GRID_URL
+    sheet_url_template: str = Field(
+        default=QUEBEC_SHEET_URL_TEMPLATE,
+        description=(
+            "Template for one zone's grid sheet, with a `{zone}` placeholder. "
+            "The URL it builds is written to each zone row as LIEN_GRILLE and "
+            "is what the corpus assets download."
+        ),
+    )
+    timeout_seconds: float = 120.0
+    request_delay_seconds: float = Field(
+        default=0.25, description="Pause before every request, in seconds."
+    )
+    max_retries: int = 3
+    batch_size: int = Field(
+        default=QUEBEC_BATCH_SIZE,
+        description="Zones per `objectIds` batch; the service caps a response at 2000.",
+    )
+    ca_bundle: str | None = Field(
+        default=None,
+        description=(
+            "PEM bundle to verify TLS against. Defaults to REQUESTS_CA_BUNDLE, "
+            "CURL_CA_BUNDLE or SSL_CERT_FILE, whichever is set."
+        ),
+    )
+
+    def client(self) -> QuebecZoningClient:
+        return QuebecZoningClient(
+            self.layer_url,
+            grid_url=self.grid_url,
+            sheet_url_template=self.sheet_url_template,
+            timeout_seconds=self.timeout_seconds,
+            request_delay_seconds=self.request_delay_seconds,
+            max_retries=self.max_retries,
+            batch_size=self.batch_size,
+            ca_bundle=self.ca_bundle,
+        )
+
+
+class SaguenayZoningResource(ConfigurableResource):
+    """Connection settings for Saguenay's zone lookup and its grid documents.
+
+    Two plain HTTP endpoints rather than a feature service - see
+    `urban_rag.saguenay`. The default pause is shorter than the other
+    publishers' because the index costs one request per zone and there are
+    2,837 of them: at a quarter of a second that is twelve minutes of waiting
+    on its own, and the endpoint is a cache in front of a read-only API rather
+    than a live query service. Raise it if the city asks.
+    """
+
+    lookup_url: str = SAGUENAY_ZONE_LOOKUP_URL
+    grid_url: str = SAGUENAY_GRID_PDF_URL
+    timeout_seconds: float = 120.0
+    request_delay_seconds: float = Field(
+        default=0.1, description="Pause before every request, in seconds."
+    )
+    max_retries: int = 3
+    ca_bundle: str | None = Field(
+        default=None,
+        description=(
+            "PEM bundle to verify TLS against. Defaults to REQUESTS_CA_BUNDLE, "
+            "CURL_CA_BUNDLE or SSL_CERT_FILE, whichever is set."
+        ),
+    )
+
+    def client(self) -> SaguenayZoningClient:
+        return SaguenayZoningClient(
+            lookup_url=self.lookup_url,
+            grid_url=self.grid_url,
+            timeout_seconds=self.timeout_seconds,
+            request_delay_seconds=self.request_delay_seconds,
+            max_retries=self.max_retries,
+            ca_bundle=self.ca_bundle,
+        )
+
+
+class AdressesQuebecResource(ConfigurableResource):
+    """Connection settings for Adresses Quebec, the province's civic addresses.
+
+    An ArcGIS MapServer at the MRNF - see `urban_rag.adresses_quebec`, which
+    also says why the REST layer is read rather than the WMS endpoint the
+    product is advertised under. Same posture as `QuebecZoningResource` and
+    `InfolotResource`: paced and patient against a live provincial server with
+    no quota to spend.
+
+    The page size is the one setting worth touching, and only downwards. The
+    service caps a response at `ADDRESSES_MAX_RECORD_COUNT` and a larger value
+    is silently truncated rather than refused, so the client clamps it; a
+    *smaller* one is the lever for a flaky link, at the cost of more round
+    trips over a borough of a hundred thousand addresses.
+    """
+
+    service_url: str = ADDRESSES_SERVICE_URL
+    #: Not read. Recorded so the published entry point travels with the
+    #: configuration of the thing that stands in for it, and lands in the
+    #: bronze asset's metadata as `source_wms_url`.
+    wms_url: str = ADDRESSES_WMS_URL
+    timeout_seconds: float = 120.0
+    request_delay_seconds: float = Field(
+        default=0.25, description="Pause before every request, in seconds."
+    )
+    max_retries: int = 3
+    page_size: int = Field(
+        default=ADDRESSES_MAX_RECORD_COUNT,
+        description=(
+            "Addresses per page; the service caps a response at 1000 and "
+            "truncates a larger request rather than refusing it."
+        ),
+    )
+    max_pages: int = Field(
+        default=5000,
+        description=(
+            "Stop after this many full pages. A guard against a service that "
+            "ignores resultOffset, which would otherwise page for ever."
+        ),
+    )
+    ca_bundle: str | None = Field(
+        default=None,
+        description=(
+            "PEM bundle to verify TLS against. Defaults to REQUESTS_CA_BUNDLE, "
+            "CURL_CA_BUNDLE or SSL_CERT_FILE, whichever is set."
+        ),
+    )
+
+    def client(self) -> AdressesQuebecClient:
+        return AdressesQuebecClient(
+            self.service_url,
+            timeout_seconds=self.timeout_seconds,
+            request_delay_seconds=self.request_delay_seconds,
+            max_retries=self.max_retries,
+            page_size=self.page_size,
+            max_pages=self.max_pages,
             ca_bundle=self.ca_bundle,
         )
 
@@ -457,6 +640,58 @@ class RoleResource(ConfigurableResource):
 
     def fetcher(self) -> RoleFetcher:
         return RoleFetcher(
+            cache_dir=self.cache_dir,
+            base_url=self.base_url,
+            timeout_seconds=self.timeout_seconds,
+            request_delay_seconds=self.request_delay_seconds,
+            max_retries=self.max_retries,
+            ca_bundle=self.ca_bundle,
+        )
+
+
+class RqttResource(ConfigurableResource):
+    """Where to cache the RQTT, Quebec's province-wide road network.
+
+    The same posture as `RoleResource`, and for one of the same two reasons:
+    the archive is 390 MB and the GeoPackage unpacked beside it is 1.27 GB, so
+    it is cached outside the partition tree and shared across every scrape
+    date, and the cache is always local, since a GeoPackage has to be on a
+    filesystem to be read at all.
+
+    Where it *differs* from the roll is the reason there is no `version` field
+    to match `RoleResource.roll_year`. A roll year is in the URL, so a year can
+    be asked for; the RQTT's URL has no version in it at all and always serves
+    whatever is current. So the vintage is discovered rather than requested -
+    `RqttFetcher` reads it from `Last-Modified` and names the cache entry after
+    it - and it travels back out of `fetch` so the asset can record which one a
+    partition was built from. Pinning a vintage here would be a promise this
+    source cannot keep: once the MRNF rotates the file, the one before it has
+    no URL any more.
+
+    The file is reissued three times a year (April, July, December) while this
+    pipeline's date axis is monthly, so most months find the cache already
+    holding the vintage the `HEAD` names and move no bytes at all.
+    """
+
+    cache_dir: str
+    base_url: str = RQTT_BASE_URL
+    # 30 minutes, as `RoleResource`: this is a 390 MB download on a link the
+    # rest of the pipeline never stresses, and a retry costs the whole file.
+    timeout_seconds: float = 1800.0
+    request_delay_seconds: float = Field(
+        default=0.25, description="Pause before the download, in seconds."
+    )
+    max_retries: int = 3
+    ca_bundle: str | None = Field(
+        default=None,
+        description=(
+            "PEM bundle to verify TLS against. Defaults to REQUESTS_CA_BUNDLE, "
+            "CURL_CA_BUNDLE or SSL_CERT_FILE, whichever is set."
+        ),
+    )
+
+    def fetcher(self) -> RqttFetcher:
+        return RqttFetcher(
             cache_dir=self.cache_dir,
             base_url=self.base_url,
             timeout_seconds=self.timeout_seconds,

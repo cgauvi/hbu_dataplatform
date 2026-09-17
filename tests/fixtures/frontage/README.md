@@ -20,7 +20,7 @@ Bordeaux and rue Jarry as parcels of their own — the `3 946 xxx` family, some
 13.5 m wide — and lot 3 790 556's frontage is the 15.24 m of boundary it shares
 with 3 946 200.
 
-- The road lots carry **105 m to 325 m** of geobase street line each and every
+- The road lots carry **105 m to 325 m** of street line each and every
   other parcel carries **none**, so identifying them has two orders of
   magnitude of headroom. `test_the_measure_does_not_move_with_the_cutoff`
   sweeps `min_street_m` from 0.5 to 100 and the frontage does not move.

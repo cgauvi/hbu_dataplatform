@@ -103,7 +103,7 @@ from urban_rag.marketbeat import (
     market_total,
     parse_submarkets,
 )
-from urban_rag.partitions import date_partitions, scrape_partitions, submarket_for
+from urban_rag.partitions import City, city_of, date_partitions, scrape_partitions, submarket_for
 from urban_rag.rag.pgvector import PostgresUnavailable
 from urban_rag.resources import (
     CrspiResource,
@@ -471,6 +471,9 @@ def commercial_rents(
         metadata={
             "dagster/row_count": len(frame),
             "submarket": wanted or "none (island-wide)",
+            # True for a borough outside Montreal: every measured class on
+            # this partition is another city's rate, and reads as such.
+            "priced_by_proxy_city": city_of(neighborhood) is not City.MONTREAL,
             "num_submarket_rates": int(frame["is_submarket_rate"].sum()),
             **{
                 f"{name}_rent_psf_cad": round(
@@ -519,6 +522,10 @@ def _measured_rate(
         matched = rows[keys == _submarket_key(wanted)]
     is_submarket = not matched.empty
     row = matched.iloc[0] if is_submarket else market_total(rows)
+    # Cushman & Wakefield publishes no MarketBeat for Quebec City at all, so a
+    # borough there is priced at the Montreal market's row - a proxy from
+    # another city, said on the row rather than passed off as local.
+    other_city = city_of(neighborhood) is not City.MONTREAL
 
     period = str(row["report_period_start"])[:7]
     level, index_period, basis = escalate(
@@ -535,7 +542,9 @@ def _measured_rate(
         "published_additional_rent_psf_cad": _optional(
             row.get("additional_rent_psf_cad")
         ),
-        "submarket": str(row["submarket"]),
+        "submarket": (
+            f"{row['submarket']} (Montreal proxy)" if other_city else str(row["submarket"])
+        ),
         "is_submarket_rate": is_submarket,
         "source": "cushman_wakefield_marketbeat",
         "source_period": str(row["report_period"]),
@@ -543,9 +552,14 @@ def _measured_rate(
         "index_building_type": RENT_CLASSES[rent_class],
         "index_period": index_period,
         "rent_basis": basis,
-        "note": ""
-        if is_submarket
-        else f"no MarketBeat submarket mapped for {neighborhood}",
+        "note": (
+            f"no MarketBeat covers {city_of(neighborhood)}; the Montreal "
+            "whole-market rate is a proxy from another city"
+            if other_city
+            else ""
+            if is_submarket
+            else f"no MarketBeat submarket mapped for {neighborhood}"
+        ),
     }
 
 

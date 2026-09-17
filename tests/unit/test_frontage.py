@@ -136,6 +136,7 @@ def stub_postgis(
         scrape_date,
         min_street_m,
         fallback_buffers_m=(),
+        metric_srid=None,
     ):
         # The ladder rides in the same tuple rather than in a key of its own:
         # `test_nothing_is_loaded_here` reads `set(calls)` to prove this asset

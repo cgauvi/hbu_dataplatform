@@ -1,5 +1,16 @@
-"""Assets: discover the named tables, then snapshot one borough per day."""
+"""Assets: discover the named tables, then snapshot one borough per day.
 
+Three cities, one asset. A Montreal key snapshots every table its Spectrum
+namespace publishes; a Quebec City key snapshots the city's zoning layer
+bounded by the borough outline, and the specification grid rows for the
+zones it holds - see `urban_rag.quebec`; a Saguenay key snapshots the
+municipal zoning layer with a grid link resolved per zone - see
+`urban_rag.saguenay`. All three land under
+`bronze/neighborhood_features/<date>/<neighborhood>/` as one parquet per
+table, which is the only shape anything downstream reads.
+"""
+
+import json
 from collections import Counter
 from datetime import datetime, timezone
 
@@ -21,9 +32,36 @@ from urban_rag.frames import (
     table_slug,
     write_frame,
 )
+from urban_rag.infolot import esri_polygon
 from urban_rag.layers import key_prefix
-from urban_rag.partitions import date_partitions, namespace_for, scrape_partitions
-from urban_rag.resources import ParquetStore, SpectrumResource
+from urban_rag.open_data_assets import borough_boundary, reference_neighborhoods
+from urban_rag.partitions import (
+    City,
+    city_of,
+    date_partitions,
+    municipality_code_for,
+    namespace_for,
+    scrape_partitions,
+)
+from urban_rag import saguenay
+from urban_rag.saguenay import SaguenayZoningError
+from urban_rag.quebec import (
+    GRID_SLUG,
+    GRID_URL_COLUMN,
+    GRID_ZONE_COLUMN,
+    ZONE_CODE_FIELD,
+    ZONING_SLUG,
+    QuebecZoningError,
+    borough_prefix,
+    read_zoning_grid,
+)
+from urban_rag.resources import (
+    ParquetStore,
+    QuebecOpenDataResource,
+    QuebecZoningResource,
+    SaguenayZoningResource,
+    SpectrumResource,
+)
 from urban_rag.spectrum import SpectrumError
 from urban_rag.storage import (
     basename,
@@ -96,7 +134,16 @@ def spectrum_table_catalog(
             partition_mapping=MultiToSingleDimensionPartitionMapping(
                 partition_dimension_name="date"
             ),
-        )
+        ),
+        # Only a Quebec City key reads this - its zoning fetch is bounded by
+        # the borough outline - but the lineage is declared for both, since
+        # the dependency is on the asset and not on which city ran.
+        AssetDep(
+            reference_neighborhoods,
+            partition_mapping=MultiToSingleDimensionPartitionMapping(
+                partition_dimension_name="date"
+            ),
+        ),
     ],
     group_name=GROUP,
     kinds={"geoparquet", "parquet"},
@@ -104,18 +151,43 @@ def spectrum_table_catalog(
         "One (geo)parquet file per source table, under "
         "bronze/neighborhood_features/<YYYY-MM-DD>/<neighborhood>/. Geometry is "
         "reprojected to EPSG:4326 by the service; tables without geometry land "
-        "as plain parquet."
+        "as plain parquet. A Montreal borough is every table under its "
+        "Spectrum namespace; a Quebec City borough is the city's 'Zonage en "
+        f"vigueur' layer clipped to its outline ({ZONING_SLUG}) and the "
+        f"specification-grid rows for those zones ({GRID_SLUG})."
     ),
 )
 @guard_current_scrape_month
 def neighborhood_features(
     context: AssetExecutionContext,
     spectrum: SpectrumResource,
+    quebec_zoning: QuebecZoningResource,
+    saguenay_zoning: SaguenayZoningResource,
+    quebec_open_data: QuebecOpenDataResource,
     store: ParquetStore,
 ) -> MaterializeResult:
     dimensions = context.partition_key.keys_by_dimension
     neighborhood = dimensions["neighborhood"]
     scrape_date = dimensions["date"][:10]
+
+    city = city_of(neighborhood)
+    if city is City.QUEBEC:
+        return _quebec_features(
+            context,
+            quebec_zoning,
+            store,
+            neighborhood=neighborhood,
+            scrape_date=scrape_date,
+        )
+    if city is City.SAGUENAY:
+        return _saguenay_features(
+            context,
+            saguenay_zoning,
+            quebec_open_data,
+            store,
+            neighborhood=neighborhood,
+            scrape_date=scrape_date,
+        )
 
     prefix = f"/{namespace_for(neighborhood)}/"
     catalog = _read_catalog(store, scrape_date)
@@ -209,6 +281,294 @@ def neighborhood_features(
                 if failed
                 else {}
             ),
+        }
+    )
+
+
+def _quebec_features(
+    context: AssetExecutionContext,
+    quebec_zoning: QuebecZoningResource,
+    store: ParquetStore,
+    *,
+    neighborhood: str,
+    scrape_date: str,
+) -> MaterializeResult:
+    """One Quebec City borough's zoning, as two tables.
+
+    The zone polygons come from the city's ArcGIS layer, bounded by the
+    borough outline the way `neighborhood_lots` bounds the cadastre - a bound
+    on what is asked for, not an interpretation of what comes back, so a zone
+    straddling the arrondissement line is in both partitions. The grid rows
+    are the workbook's, filtered to the zone codes just fetched, with the
+    workbook's own column names; reading them is `zoning_grid_columns`' job.
+    """
+    boundary = borough_boundary(store, scrape_date, neighborhood)
+    output_dir = store.partition_dir(
+        context.asset_key.path[-1], scrape_date, neighborhood
+    )
+
+    client = quebec_zoning.client()
+    try:
+        object_ids = client.zone_ids(esri_polygon(boundary))
+        context.log.info(
+            "%s: %d zone(s) intersect the borough boundary",
+            neighborhood,
+            len(object_ids),
+        )
+        features = list(client.fetch_zones(object_ids))
+        grid = read_zoning_grid(client.fetch_grid())
+    except QuebecZoningError as exc:
+        raise Failure(
+            f"Quebec City zoning read for {neighborhood} {scrape_date} failed: {exc}"
+        )
+    if not features:
+        raise Failure(
+            f"The zoning layer returned no zone inside {neighborhood}; its "
+            f"outline in reference_neighborhoods for {scrape_date} may be empty."
+        )
+
+    _clear_partition(context, output_dir)
+    scraped_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    provenance = {
+        "neighborhood": neighborhood,
+        "scrape_date": scrape_date,
+        "scraped_at": scraped_at,
+    }
+    zones = features_to_frame(
+        features, extra_columns={"source_table": ZONING_SLUG, **provenance}
+    )
+    if ZONE_CODE_FIELD not in zones.columns:
+        raise Failure(
+            f"The zoning layer publishes no {ZONE_CODE_FIELD} field; it has "
+            f"{', '.join(sorted(zones.columns))}."
+        )
+    # The link is built here, which is what puts Quebec City on the path the
+    # other two cities already take. The city serves one grid sheet per zone
+    # from a handler keyed on the zone code, so unlike Saguenay's there is no
+    # id to resolve and nothing to request - a formatted string per row, under
+    # the column name Montreal's zone table uses. From here the corpus assets
+    # are ordinary: `linked_documents` downloads one document per distinct
+    # link, chunks it, embeds it, and `document_index` publishes it.
+    #
+    # The workbook this asset also writes is not made redundant by it. That is
+    # where the solver's norms come from; the sheet is where the by-law's prose
+    # is, and retrieval has had nothing to answer a Quebec City question with.
+    zones[GRID_URL_COLUMN] = [
+        client.sheet_url_for(code) for code in zones[ZONE_CODE_FIELD].astype(str)
+    ]
+
+    zones_path = write_frame(zones, join(output_dir, f"{ZONING_SLUG}.parquet"))
+    invalid = count_invalid_geometries(zones)
+    if invalid:
+        context.log.warning("%s: %d invalid geometr(ies)", ZONING_SLUG, invalid)
+
+    codes = set(zones[ZONE_CODE_FIELD].astype(str))
+    borough_grid = grid[grid[GRID_ZONE_COLUMN].astype(str).isin(codes)].copy()
+    for column, value in {"source_table": GRID_SLUG, **provenance}.items():
+        borough_grid[column] = value
+    grid_path = write_frame(borough_grid, join(output_dir, f"{GRID_SLUG}.parquet"))
+    missing = sorted(codes - set(borough_grid[GRID_ZONE_COLUMN].astype(str)))
+    if missing:
+        context.log.warning(
+            "%s: %d zone(s) drawn on the map have no grid row, e.g. %s",
+            neighborhood,
+            len(missing),
+            ", ".join(missing[:5]),
+        )
+    by_borough = Counter(borough_prefix(code) or "?" for code in codes)
+    context.log.info(
+        "%s %s: %d zone(s) -> %s; %d grid row(s) -> %s",
+        neighborhood,
+        scrape_date,
+        len(zones),
+        basename(zones_path),
+        len(borough_grid),
+        basename(grid_path),
+    )
+
+    return MaterializeResult(
+        metadata={
+            "dagster/row_count": len(zones),
+            "num_tables_written": 2,
+            "num_zones": len(zones),
+            "num_zone_codes": len(codes),
+            "num_grid_rows": len(borough_grid),
+            "num_zones_without_grid_row": len(missing),
+            "num_invalid_geometries": invalid,
+            "grid_title": grid.attrs.get("title", ""),
+            "output_dir": MetadataValue.path(str(output_dir)),
+            # The zone code's leading digit is the arrondissement, so this is
+            # how many of the zones fetched belong to the borough itself and
+            # how many are neighbours straddling its line.
+            "zones_by_arrondissement_digit": MetadataValue.md(
+                _markdown_table(
+                    f"Zones by arrondissement digit — {neighborhood} {scrape_date}",
+                    ("digit", "zones"),
+                    [(digit, str(n)) for digit, n in sorted(by_borough.items())],
+                )
+            ),
+            "num_grid_sheets_linked": int(zones[GRID_URL_COLUMN].notna().sum()),
+            "source_url": MetadataValue.url(quebec_zoning.layer_url),
+            "grid_url": MetadataValue.url(quebec_zoning.grid_url),
+            "sheet_url_template": quebec_zoning.sheet_url_template,
+        }
+    )
+
+
+def _saguenay_features(
+    context: AssetExecutionContext,
+    saguenay_zoning: SaguenayZoningResource,
+    quebec_open_data: QuebecOpenDataResource,
+    store: ParquetStore,
+    *,
+    neighborhood: str,
+    scrape_date: str,
+) -> MaterializeResult:
+    """Saguenay's zoning, as one table carrying a link per zone.
+
+    The polygons come off Données Québec whole - the city publishes one
+    municipal file and this partition is the whole municipality, so unlike the
+    other two cities there is nothing to bound the fetch by. The outline is
+    still read and still used: a polygon that falls outside it is a
+    neighbouring municipality's row in a file that claims to be Saguenay's,
+    which is worth knowing about rather than loading.
+
+    **The link is built here, and that is what makes the rest ordinary.** Each
+    zone's grid is its own PDF behind an id the polygons do not carry, so this
+    resolves the id per zone and writes the resulting URL as `LIEN_GRILLE` -
+    the column name Montreal's zone table uses. From that point Saguenay is on
+    Montreal's path: `linked_documents` downloads one document per distinct
+    link, `zoning_grid_columns` parses it, and the corpus assets index it.
+    `_quebec_features` writes the same column for the same reason, from a URL
+    template rather than a lookup - all three cities meet here.
+
+    The id lookup is the expensive step - one request per zone, because the
+    city's proxy forwards no other parameter - so it is done once here and
+    read back from bronze by everything downstream.
+    """
+    boundary = borough_boundary(store, scrape_date, neighborhood)
+    output_dir = store.partition_dir(
+        context.asset_key.path[-1], scrape_date, neighborhood
+    )
+
+    client = quebec_open_data.client()
+    package = client.package(saguenay.ZONING_DATASET)
+    resource = package.resource(saguenay.ZONING_GEOJSON)
+    scraped_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    provenance = {
+        "source_table": saguenay.ZONING_SLUG,
+        "neighborhood": neighborhood,
+        "scrape_date": scrape_date,
+        "scraped_at": scraped_at,
+    }
+    try:
+        payload = json.loads(client.download(resource))
+    except ValueError as exc:
+        raise Failure(f"{resource.filename}: not valid JSON ({exc})") from exc
+    features = payload.get("features") or []
+    if not features:
+        raise Failure(f"{resource.filename}: the portal returned no features")
+    # The same normalization the Spectrum scrape and the other two cities'
+    # layers get - nested values JSON-encoded, style dropped, EPSG:4326
+    # asserted. The file names no `crs` member, which in GeoJSON *is* WGS 84.
+    zones = features_to_frame(features, extra_columns=provenance)
+    if saguenay.ZONE_CODE_FIELD not in zones.columns:
+        raise Failure(
+            f"{resource.filename} has no {saguenay.ZONE_CODE_FIELD} column; it "
+            f"publishes {', '.join(sorted(zones.columns))}."
+        )
+
+    # The layer stamps every row with the city's *code géographique*. A row
+    # carrying another is a neighbour's, and dropping it silently would put
+    # someone else's by-law on a Saguenay parcel.
+    expected = municipality_code_for(City.SAGUENAY)
+    stated = zones[saguenay.MUNICIPALITY_FIELD].astype(str)
+    foreign = zones[stated != expected]
+    if not foreign.empty:
+        context.log.warning(
+            "%s: %d row(s) carry %s != %s and are dropped",
+            resource.filename,
+            len(foreign),
+            saguenay.MUNICIPALITY_FIELD,
+            expected,
+        )
+        zones = zones[stated == expected].copy()
+
+    outside = int((~zones.intersects(boundary)).sum())
+    if outside:
+        context.log.warning(
+            "%s: %d zone(s) fall outside the %s outline and are dropped",
+            resource.filename,
+            outside,
+            neighborhood,
+        )
+        zones = zones[zones.intersects(boundary)].copy()
+    if zones.empty:
+        raise Failure(
+            f"No zoning polygon survives the {neighborhood} outline; its "
+            f"limits in reference_neighborhoods for {scrape_date} may be empty."
+        )
+
+    codes = [str(code) for code in zones[saguenay.ZONE_CODE_FIELD]]
+    grid_client = saguenay_zoning.client()
+    try:
+        index = grid_client.zone_ids(codes, progress=context.log.info)
+    except SaguenayZoningError as exc:
+        raise Failure(
+            f"Saguenay grid index for {neighborhood} {scrape_date} failed: {exc}"
+        )
+    missing = sorted({code for code in codes if code not in index})
+    if missing:
+        context.log.warning(
+            "%s: %d zone(s) drawn on the map have no grid in the zoning "
+            "service, e.g. %s",
+            neighborhood,
+            len(missing),
+            ", ".join(missing[:5]),
+        )
+
+    _clear_partition(context, output_dir)
+    zones[saguenay.GRID_URL_COLUMN] = [
+        grid_client.grid_url_for(index[code]) if code in index else None
+        for code in codes
+    ]
+    zones["zone_id"] = [index.get(code) for code in codes]
+
+    path = write_frame(zones, join(output_dir, f"{saguenay.ZONING_SLUG}.parquet"))
+    invalid = count_invalid_geometries(zones)
+    if invalid:
+        context.log.warning(
+            "%s: %d invalid geometr(ies)", saguenay.ZONING_SLUG, invalid
+        )
+    context.log.info(
+        "%s %s: %d zone(s), %d with a grid -> %s",
+        neighborhood,
+        scrape_date,
+        len(zones),
+        len(index),
+        basename(path),
+    )
+
+    return MaterializeResult(
+        metadata={
+            "dagster/row_count": len(zones),
+            "num_tables_written": 1,
+            "num_zones": len(zones),
+            "num_zone_codes": int(zones[saguenay.ZONE_CODE_FIELD].nunique()),
+            # The count that decides how much of the borough gets an envelope:
+            # a zone with no grid has no norms to solve and no document to
+            # index, and it is the one gap this asset can see on its own.
+            "num_zones_with_grid": len(index),
+            "num_zones_without_grid": len(missing),
+            "num_zones_outside_outline": outside,
+            "num_invalid_geometries": invalid,
+            "output_dir": MetadataValue.path(str(output_dir)),
+            "source_url": MetadataValue.url(
+                f"{quebec_open_data.base_url}/dataset/{saguenay.ZONING_DATASET}"
+            ),
+            "grid_url": MetadataValue.url(saguenay.GRID_PDF_URL),
+            "zoning_last_modified": resource.last_modified or "unknown",
+            "license": package.license_title or "unknown",
         }
     )
 

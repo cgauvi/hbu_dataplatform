@@ -1,19 +1,24 @@
-"""Offline tests for the street network: the island-wide snapshot and the
-borough slice cut out of it.
+"""Offline tests for the street network: the RQTT snapshot and the borough
+slice cut out of it.
 
-Nothing here touches the network - the CKAN payload and the GeoJSON are
-canned, and both assets run against a temp directory through
-`dagster.materialize`.
+Nothing here touches the network. The province-wide archive is stubbed the way
+`test_rqtt` stubs it - a tiny real GeoPackage, written in the MTQ Lambert the
+MRNF publishes in and zipped under `OGC(GPKG)/` - so what runs is GDAL's own
+reading and the real bbox push-down, and both assets run against a temp
+directory through `dagster.materialize`.
 
-The geometry is deliberately small and rectilinear, and sits where Montreal
-does, because `neighborhood_streets` measures in EPSG:32188 and a shape
-somewhere else would project to numbers that mean nothing.
+The geometry is deliberately small and rectilinear, and sits where the three
+cities do, because `neighborhood_streets` measures in each city's MTM zone and
+a shape somewhere else would project to numbers that mean nothing. The
+fixture's `AQRP_UUID`s are numeric strings rather than real uuids so the
+assertions below can read as `[1, 2]`.
 """
 
 from __future__ import annotations
 
-import json
+import zipfile
 from contextlib import contextmanager
+from pathlib import Path
 
 import geopandas as gpd
 import pytest
@@ -23,16 +28,24 @@ from shapely.geometry import LineString, MultiLineString, Polygon, box
 from asset_helpers import materialization_metadata
 
 from urban_rag.frames import write_frame
-from urban_rag.open_data import CkanClient
 from urban_rag.open_data_assets import (
     QUARTIERS_FILE,
-    STREETS_DATASET,
-    STREETS_FILE,
+    QUEBEC_BOROUGHS_FILE,
+    SAGUENAY_LIMITS_FILE,
     STREET_ID_COLUMN,
+    STREET_SEGMENTS_FILE,
     reference_neighborhoods,
     street_network,
 )
-from urban_rag.resources import OpenDataResource, ParquetStore, PostgisResource
+from urban_rag.resources import ParquetStore, PostgisResource, RqttResource
+from urban_rag.rqtt import (
+    PUBLISHED_CRS,
+    ROAD_LAYER,
+    STREET_ID_FIELD,
+    STREET_NAME_FIELD,
+    WGS84,
+    RqttFetcher,
+)
 from urban_rag.storage import join
 from urban_rag import street_assets
 from urban_rag.street_assets import STREETS_FILE_OUT, neighborhood_streets
@@ -42,91 +55,119 @@ NEIGHBORHOOD = "VSMPE"
 #: `partitions.NEIGHBORHOOD_BOROUGH_CODES["VSMPE"]` - what `borough_boundary`
 #: cuts the reference layer on.
 BOROUGH_CODE = "25"
-DOWNLOAD_BASE = "https://donnees.montreal.ca/dataset/abc/resource/def/download"
 
 #: A square kilometre of "borough", give or take, in the middle of the island.
 BOROUGH = box(-73.630, 45.540, -73.620, 45.550)
+#: One arrondissement each for the other two cities, drawn where they are.
+QUEBEC_BOROUGH = box(-71.25, 46.79, -71.20, 46.84)
+SAGUENAY_CITY = box(-71.17, 48.38, -71.12, 48.42)
 
-PACKAGE_PAYLOAD = {
-    "success": True,
-    "result": {
-        "name": STREETS_DATASET,
-        "title": "Géobase double - côtés de rue du réseau routier",
-        "license_title": "Creative Commons Attribution 4.0 International",
-        "resources": [
-            {
-                "id": "16f7fa0a",
-                "name": "Géobase double",
-                "format": "JSON",
-                "url": f"{DOWNLOAD_BASE}/gbdouble.json",
-                "last_modified": "2026-08-20T18:51:00",
-            },
-            {
-                "id": "9acb6c57",
-                "name": "Géobase double",
-                "format": "ZIP",
-                "url": f"{DOWNLOAD_BASE}/gbdouble.zip",
-                "last_modified": "2026-08-20T18:51:00",
-            },
-        ],
-    },
-}
+#: The vintage the stubbed server publishes.
+VERSION = "20260703"
+LAST_MODIFIED = "Fri, 03 Jul 2026 17:15:26 GMT"
 
 
-def side(cote_rue_id: int, name: str, coordinates: list[list[float]]) -> dict:
-    """One street side, spelled the way the city spells it."""
+def segment(
+    uid: str,
+    name: str,
+    coordinates: list[list[float]],
+    *,
+    road_class: str = "Locale",
+    characteristic=None,
+) -> dict:
+    """One road segment, spelled the way the MRNF spells it."""
     return {
-        "type": "Feature",
         "properties": {
-            "COTE_RUE_ID": cote_rue_id,
-            "ID_TRC": cote_rue_id // 10,
-            "NOM_VOIE": name,
-            "NOM_VILLE": "MTL",
-            "COTE": "Gauche",
-            "TYPE_F": "rue",
+            STREET_ID_FIELD: uid,
+            STREET_NAME_FIELD: name,
+            "ClsRte": road_class,
+            "CaractRte": characteristic,
+            "IdRte": f"rte-{uid}",
+            "Gestion": "Municipal",
+            "NoRte": None,
+            "Version": "AQ20260501",
         },
-        "geometry": {"type": "MultiLineString", "coordinates": [coordinates]},
+        "coordinates": coordinates,
     }
 
 
-#: Three sides: one wholly inside the borough, one running out through its
-#: eastern edge, and one entirely outside it.
-INSIDE = side(1, "Jarry", [[-73.628, 45.545], [-73.624, 45.545]])
-STRADDLING = side(2, "Papineau", [[-73.624, 45.547], [-73.616, 45.547]])
-OUTSIDE = side(3, "Saint-Denis", [[-73.610, 45.547], [-73.605, 45.547]])
+#: Three Montreal segments: one wholly inside the borough, one running out
+#: through its eastern edge, and one a kilometre beyond it.
+INSIDE = segment("1", "Jarry", [[-73.628, 45.545], [-73.624, 45.545]])
+STRADDLING = segment("2", "Papineau", [[-73.624, 45.547], [-73.616, 45.547]])
+OUTSIDE = segment("3", "Saint-Denis", [[-73.610, 45.547], [-73.605, 45.547]])
+
+#: One segment in each of the other two cities, so the bbox-per-city read has
+#: something to find and `num_segments_by_city` has something to report.
+QUEBEC_SEGMENT = segment("10", "Rue Saint-Joseph", [[-71.23, 46.81], [-71.22, 46.81]])
+SAGUENAY_SEGMENT = segment("20", "Rue Louis-Hudon", [[-71.15, 48.40], [-71.14, 48.40]])
+
+#: A ferry link across the river: `Liaison maritime` is one of the classes
+#: `rqtt.roadway_only` drops, because a line through open water would otherwise
+#: make whatever parcel it crosses a road lot.
+FERRY = segment(
+    "4", "Traverse", [[-73.629, 45.541], [-73.621, 45.541]], road_class="Liaison maritime"
+)
 
 
-def geojson(*features: dict) -> bytes:
-    return json.dumps({"type": "FeatureCollection", "features": list(features)}).encode(
-        "utf-8"
+def road_frame(segments: list[dict]) -> gpd.GeoDataFrame:
+    """The segments as the archive publishes them: MTQ Lambert, its columns."""
+    frame = gpd.GeoDataFrame(
+        [item["properties"] for item in segments],
+        geometry=[LineString(item["coordinates"]) for item in segments],
+        crs=WGS84,
     )
+    return frame.to_crs(PUBLISHED_CRS)
+
+
+def zipped_geopackage(directory: Path, segments: list[dict]) -> bytes:
+    """The road layer as a real GeoPackage, zipped the way the RQTT ships."""
+    directory.mkdir(parents=True, exist_ok=True)
+    gpkg = directory / "RQTT.gpkg"
+    road_frame(segments).to_file(gpkg, layer=ROAD_LAYER, driver="GPKG")
+    archive = directory / "RQTT_GPKG.zip"
+    with zipfile.ZipFile(archive, "w") as handle:
+        handle.write(gpkg, f"OGC(GPKG)/{gpkg.name}")
+    payload = archive.read_bytes()
+    gpkg.unlink()
+    archive.unlink()
+    return payload
 
 
 class FakeResponse:
-    def __init__(self, content: bytes, *, content_type="application/json"):
+    def __init__(self, content: bytes, *, headers=None):
         self.content = content
-        self.headers = {"Content-Type": content_type}
+        self.headers = {"Content-Type": "application/zip", **(headers or {})}
         self.status_code = 200
 
     def raise_for_status(self):
         return None
 
-    def json(self):
-        return json.loads(self.content)
+    def iter_content(self, chunk_size):
+        for start in range(0, len(self.content), chunk_size):
+            yield self.content[start : start + chunk_size]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
 
 
 class FakeSession:
-    """Replays the canned package and one canned download."""
+    """Answers HEAD with a vintage and GET with the canned archive."""
 
-    def __init__(self, content: bytes | None = None):
-        self.content = content if content is not None else geojson(INSIDE, STRADDLING)
-        self.calls: list[tuple[str, dict]] = []
+    def __init__(self, content: bytes):
+        self.content = content
+        self.calls: list[str] = []
 
-    def get(self, url, params=None, timeout=None):
-        self.calls.append((url, params or {}))
-        if url.endswith("package_show"):
-            return FakeResponse(json.dumps(PACKAGE_PAYLOAD).encode("utf-8"))
-        return FakeResponse(self.content, content_type="application/json")
+    def head(self, url, timeout=None, allow_redirects=True):
+        self.calls.append(f"HEAD {url}")
+        return FakeResponse(b"", headers={"Last-Modified": LAST_MODIFIED})
+
+    def get(self, url, timeout=None, stream=False):
+        self.calls.append(f"GET {url}")
+        return FakeResponse(self.content)
 
 
 @pytest.fixture
@@ -139,7 +180,7 @@ def write_quartiers(store, *, geometry=None, code=BOROUGH_CODE):
     frame = gpd.GeoDataFrame(
         {"no_qr": ["01"], "no_arr": [code], "nom_qr": ["Villeray"]},
         geometry=[geometry if geometry is not None else BOROUGH],
-        crs="EPSG:4326",
+        crs=WGS84,
     )
     write_frame(
         frame,
@@ -150,119 +191,180 @@ def write_quartiers(store, *, geometry=None, code=BOROUGH_CODE):
     )
 
 
+def write_outlines(store):
+    """Every city's outline, which is what `city_bounds` reads to draw a box.
+
+    `street_network` is bounded per city, so unlike the silver tests below -
+    which only ever cut VSMPE - bronze needs all three files present.
+    """
+    write_quartiers(store)
+    outline_dir = store.partition_dir(reference_neighborhoods.key.path[-1], DATE)
+    write_frame(
+        gpd.GeoDataFrame(
+            {"abreviation": ["CIL"], "nom": ["La Cité-Limoilou"]},
+            geometry=[QUEBEC_BOROUGH],
+            crs=WGS84,
+        ),
+        join(outline_dir, QUEBEC_BOROUGHS_FILE),
+    )
+    write_frame(
+        gpd.GeoDataFrame(
+            {"nom": ["Saguenay"], "type": ["ville"]},
+            geometry=[SAGUENAY_CITY],
+            crs=WGS84,
+        ),
+        join(outline_dir, SAGUENAY_LIMITS_FILE),
+    )
+
+
 # -- bronze: street_network ------------------------------------------------
 
 
-def materialize_bronze(store, monkeypatch, *, session=None, scrape_date=DATE):
-    """Run `street_network` with the portal stubbed out.
+def materialize_bronze(store, monkeypatch, tmp_path, *, segments=None, scrape_date=DATE):
+    """Run `street_network` against a stubbed archive.
 
     Patched on the class rather than on an instance: Dagster rebuilds the
     resource from its config before the run, so an instance attribute would not
     survive into the asset.
     """
-    session = session or FakeSession()
-    monkeypatch.setattr(
-        OpenDataResource,
-        "client",
-        lambda self: CkanClient(
-            "https://portal", request_delay_seconds=0, session=session
-        ),
+    if segments is None:
+        segments = [INSIDE, STRADDLING, OUTSIDE, QUEBEC_SEGMENT, SAGUENAY_SEGMENT]
+    session = FakeSession(zipped_geopackage(tmp_path / "src", segments))
+    fetcher = RqttFetcher(
+        cache_dir=tmp_path / "cache",
+        base_url="https://example/rqtt",
+        request_delay_seconds=0,
+        session=session,
     )
+    monkeypatch.setattr(RqttResource, "fetcher", lambda self: fetcher)
     return materialize(
         [street_network],
         partition_key=scrape_date,
-        resources={"open_data": OpenDataResource(), "store": store},
+        resources={"rqtt": RqttResource(cache_dir=str(tmp_path / "cache")), "store": store},
+    )
+
+
+def bronze_frame(tmp_path) -> gpd.GeoDataFrame:
+    return gpd.read_parquet(
+        tmp_path / "store" / "bronze" / "street_network" / DATE / STREET_SEGMENTS_FILE
     )
 
 
 def test_the_snapshot_lands_under_the_date_partition(store, monkeypatch, tmp_path):
-    result = materialize_bronze(store, monkeypatch)
+    write_outlines(store)
+
+    result = materialize_bronze(store, monkeypatch, tmp_path)
 
     assert result.success
-    path = tmp_path / "store" / "bronze" / "street_network" / DATE / STREETS_FILE
-    frame = gpd.read_parquet(path)
-    assert len(frame) == 2
-    assert frame.crs.to_string() == "EPSG:4326"
+    frame = bronze_frame(tmp_path)
+    # `Saint-Denis` is outside every city's box and never reaches the file;
+    # the other four are one per city plus the straddler.
+    assert len(frame) == 4
+    assert frame.crs.to_string() == WGS84
     # The prefix carries bare values, so the date has to travel as a column.
-    assert frame["scrape_date"].tolist() == [DATE, DATE]
-    assert {"source_file", "scraped_at"} <= set(frame.columns)
+    assert set(frame["scrape_date"]) == {DATE}
+    assert {"source_file", "scraped_at", "rqtt_version"} <= set(frame.columns)
 
 
-def test_the_publishers_column_names_survive_bronze(store, monkeypatch, tmp_path):
-    """Unlike `reference_neighborhoods`, which lower-cases to join its two files.
+def test_the_publisher_column_names_survive_bronze(store, monkeypatch, tmp_path):
+    """Silver is where `AQRP_UUID` becomes `COTE_RUE_ID`, not bronze.
 
-    `COTE_RUE_ID` is the key silver declares its grain on and the one loaded
-    into `rag.streets.cote_rue_id`; renaming it here would break both.
+    The rest of the lot lineage carries its publishers' names through bronze
+    untouched, and renaming here would put the translation in two places.
     """
-    materialize_bronze(store, monkeypatch)
+    write_outlines(store)
 
-    frame = gpd.read_parquet(
-        tmp_path / "store" / "bronze" / "street_network" / DATE / STREETS_FILE
-    )
-    assert STREET_ID_COLUMN in frame.columns
-    assert "cote_rue_id" not in frame.columns
-    assert {"NOM_VOIE", "COTE", "TYPE_F"} <= set(frame.columns)
+    materialize_bronze(store, monkeypatch, tmp_path)
+
+    frame = bronze_frame(tmp_path)
+    assert STREET_ID_FIELD in frame.columns
+    assert STREET_ID_COLUMN not in frame.columns
+    assert {"ClsRte", "IdRte", "Gestion"} <= set(frame.columns)
 
 
-def test_bronze_metadata_reports_the_counts_and_the_licence(store, monkeypatch):
-    result = materialize_bronze(store, monkeypatch)
+def test_the_box_is_drawn_per_city(store, monkeypatch, tmp_path):
+    """Three boxes, hundreds of kilometres apart, out of one province-wide read."""
+    write_outlines(store)
+
+    result = materialize_bronze(store, monkeypatch, tmp_path)
 
     metadata = materialization_metadata(result, street_network)
-    assert metadata["dagster/row_count"].value == 2
-    assert metadata["num_street_sides"].value == 2
-    assert metadata["num_street_ids"].value == 2
-    assert metadata["num_street_names"].value == 2
-    assert metadata["num_invalid_geometries"].value == 0
-    assert "Creative Commons" in metadata["license"].value
+    assert metadata["num_segments_by_city"].data == {
+        "montreal": 2,
+        "quebec": 1,
+        "saguenay": 1,
+    }
+    assert metadata["num_street_segments"].value == 4
+    assert metadata["rqtt_version"].value == VERSION
+    assert "CC-BY" in metadata["license"].value
 
 
-def test_a_layer_without_the_street_id_is_refused(store, monkeypatch):
-    """The key everything downstream is grained on; a snapshot without it is
-    not a snapshot of this layer."""
-    renamed = json.loads(geojson(INSIDE))
-    renamed["features"][0]["properties"].pop("COTE_RUE_ID")
+def test_what_is_not_a_roadway_is_dropped(store, monkeypatch, tmp_path):
+    """A ferry link crosses water, and a line through water would make
+    whatever parcel it crosses a road lot."""
+    write_outlines(store)
 
-    with pytest.raises(Failure, match=STREET_ID_COLUMN):
+    result = materialize_bronze(
+        store,
+        monkeypatch,
+        tmp_path,
+        segments=[INSIDE, FERRY, QUEBEC_SEGMENT, SAGUENAY_SEGMENT],
+    )
+
+    frame = bronze_frame(tmp_path)
+    assert sorted(frame[STREET_ID_FIELD].astype(int)) == [1, 10, 20]
+    assert materialization_metadata(result, street_network)["num_not_roadway"].value == 1
+
+
+def test_a_city_the_snapshot_cannot_reach_is_a_failure(store, monkeypatch, tmp_path):
+    """Not an empty box: a city with no road in it is a broken outline or a
+    broken archive, never a city with no roads."""
+    write_outlines(store)
+
+    with pytest.raises(Failure, match="no road segment inside"):
         materialize_bronze(
-            store, monkeypatch, session=FakeSession(json.dumps(renamed).encode("utf-8"))
+            store, monkeypatch, tmp_path, segments=[INSIDE, QUEBEC_SEGMENT]
         )
 
 
+def test_a_missing_outline_names_the_asset_to_run(store, monkeypatch, tmp_path):
+    with pytest.raises(Failure, match="materialize reference_neighborhoods"):
+        materialize_bronze(store, monkeypatch, tmp_path)
+
+
 def test_a_bronze_rerun_replaces_the_previous_snapshot(store, monkeypatch, tmp_path):
+    write_outlines(store)
     partition = tmp_path / "store" / "bronze" / "street_network" / DATE
-    partition.mkdir(parents=True)
-    stale = partition / "gbdouble_retired.parquet"
+    partition.mkdir(parents=True, exist_ok=True)
+    stale = partition / "street_sides_retired.parquet"
     gpd.GeoDataFrame(
-        {"a": [1]}, geometry=[LineString([(0, 0), (1, 1)])], crs="EPSG:4326"
+        {"a": [1]}, geometry=[LineString([(0, 0), (1, 1)])], crs=WGS84
     ).to_parquet(stale)
 
-    materialize_bronze(store, monkeypatch)
+    materialize_bronze(store, monkeypatch, tmp_path)
 
     assert not stale.exists()
-    assert (partition / STREETS_FILE).exists()
+    assert (partition / STREET_SEGMENTS_FILE).exists()
 
 
 # -- silver: neighborhood_streets ------------------------------------------
 
 
-def write_bronze(store, *features, scrape_date=DATE):
-    """The island-wide snapshot, as `street_network` writes it."""
-    if not features:
-        features = (INSIDE, STRADDLING, OUTSIDE)
-    payload = json.loads(geojson(*features))
+def write_bronze(store, *segments, scrape_date=DATE):
+    """The snapshot, as `street_network` writes it: WGS84, publisher columns."""
+    if not segments:
+        segments = (INSIDE, STRADDLING, OUTSIDE)
     frame = gpd.GeoDataFrame(
-        [feature["properties"] for feature in payload["features"]],
-        geometry=[
-            LineString(feature["geometry"]["coordinates"][0])
-            for feature in payload["features"]
-        ],
-        crs="EPSG:4326",
+        [item["properties"] for item in segments],
+        geometry=[LineString(item["coordinates"]) for item in segments],
+        crs=WGS84,
     )
     frame["scrape_date"] = scrape_date
     write_frame(
         frame,
         join(
-            store.partition_dir(street_network.key.path[-1], scrape_date), STREETS_FILE
+            store.partition_dir(street_network.key.path[-1], scrape_date),
+            STREET_SEGMENTS_FILE,
         ),
     )
 
@@ -318,7 +420,7 @@ def read_silver(tmp_path) -> gpd.GeoDataFrame:
     )
 
 
-def test_only_the_sides_reaching_the_borough_are_kept(store, tmp_path):
+def test_only_the_segments_reaching_the_borough_are_kept(store, tmp_path):
     write_quartiers(store)
     write_bronze(store)
 
@@ -329,15 +431,29 @@ def test_only_the_sides_reaching_the_borough_are_kept(store, tmp_path):
     assert sorted(frame[STREET_ID_COLUMN].astype(int)) == [1, 2]
 
 
-def test_a_side_crossing_the_boundary_is_cut_at_it(store, tmp_path):
+def test_the_publishers_key_becomes_this_platforms(store, tmp_path):
+    """`_as_street_sides` is the one place a publisher's vocabulary is
+    translated, and it now runs for every city rather than for two of three."""
+    write_quartiers(store)
+    write_bronze(store)
+
+    materialize_silver(store)
+
+    frame = read_silver(tmp_path)
+    assert STREET_ID_COLUMN in frame.columns
+    # The publisher's own columns travel alongside untouched.
+    assert {"ClsRte", "IdRte"} <= set(frame.columns)
+
+
+def test_a_segment_crossing_the_boundary_is_cut_at_it(store, tmp_path):
     write_quartiers(store)
     write_bronze(store)
 
     materialize_silver(store)
 
     frame = read_silver(tmp_path).set_index(STREET_ID_COLUMN)
-    inside = frame.loc[1]
-    straddling = frame.loc[2]
+    inside = frame.loc["1"]
+    straddling = frame.loc["2"]
     # Wholly inside: nothing was taken off it.
     assert inside["length_in_borough_m"] == pytest.approx(
         inside["segment_length_m"], rel=1e-9
@@ -372,7 +488,7 @@ def test_the_partition_travels_as_columns(store, tmp_path):
     frame = read_silver(tmp_path)
     assert set(frame["neighborhood"]) == {NEIGHBORHOOD}
     assert set(frame["scrape_date"]) == {DATE}
-    assert frame.crs.to_string() == "EPSG:4326"
+    assert frame.crs.to_string() == WGS84
 
 
 def test_silver_metadata_reports_the_cut(store):
@@ -383,7 +499,7 @@ def test_silver_metadata_reports_the_cut(store):
 
     assert metadata["dagster/row_count"].value == 2
     assert metadata["num_street_sides"].value == 2
-    assert metadata["num_street_sides_island_wide"].value == 3
+    assert metadata["num_segments_in_snapshot"].value == 3
     assert metadata["num_streets_named"].value == 2
     # One of the two straddles the boundary; the other is wholly inside.
     assert metadata["num_boundary_clipped"].value == 1
@@ -391,10 +507,10 @@ def test_silver_metadata_reports_the_cut(store):
     assert metadata["total_length_km"].value > 0
 
 
-def test_a_side_that_only_grazes_the_boundary_is_dropped(store, tmp_path):
+def test_a_segment_that_only_grazes_the_boundary_is_dropped(store, tmp_path):
     """It intersects, and clips to a point. A point is not a street inside the
     borough, and a zero-length row would be one."""
-    grazing = side(4, "Grazing", [[-73.620, 45.545], [-73.615, 45.545]])
+    grazing = segment("4", "Grazing", [[-73.620, 45.545], [-73.615, 45.545]])
     write_quartiers(store)
     write_bronze(store, INSIDE, grazing)
 
@@ -404,11 +520,13 @@ def test_a_side_that_only_grazes_the_boundary_is_dropped(store, tmp_path):
     assert sorted(frame[STREET_ID_COLUMN].astype(int)) == [1]
 
 
-def test_the_same_side_arriving_twice_is_refused(store):
+def test_the_same_segment_arriving_twice_is_refused(store):
     """One row per COTE_RUE_ID is the grain; a duplicate would multiply every
     frontage pair the join downstream produces."""
     write_quartiers(store)
-    write_bronze(store, INSIDE, side(1, "Jarry", [[-73.627, 45.546], [-73.625, 45.546]]))
+    write_bronze(
+        store, INSIDE, segment("1", "Jarry", [[-73.627, 45.546], [-73.625, 45.546]])
+    )
 
     with pytest.raises(Failure, match="appear more than once"):
         materialize_silver(store)
@@ -445,7 +563,7 @@ def test_a_silver_rerun_replaces_the_previous_partition(store, tmp_path):
     partition.mkdir(parents=True)
     stale = partition / "neighborhood_streets_retired.parquet"
     gpd.GeoDataFrame(
-        {"a": [1]}, geometry=[LineString([(0, 0), (1, 1)])], crs="EPSG:4326"
+        {"a": [1]}, geometry=[LineString([(0, 0), (1, 1)])], crs=WGS84
     ).to_parquet(stale)
     write_quartiers(store)
     write_bronze(store)
@@ -474,13 +592,15 @@ def test_a_failure_message_carries_the_partition(store):
     """Every guard in this asset names the borough and the date, because a
     backfill fails one partition at a time and the message is what says which."""
     write_quartiers(store)
-    write_bronze(store, INSIDE, side(1, "Jarry", [[-73.627, 45.546], [-73.625, 45.546]]))
+    write_bronze(
+        store, INSIDE, segment("1", "Jarry", [[-73.627, 45.546], [-73.625, 45.546]])
+    )
 
     with pytest.raises(Failure, match=f"{NEIGHBORHOOD} {DATE}"):
         materialize_silver(store)
 
 
-def test_load_streets_promotes_every_side_to_multi(monkeypatch):
+def test_load_streets_promotes_every_segment_to_multi(monkeypatch):
     """The column is `geometry(MultiLineString, 4326)`, and a typmod rejects a
     bare `LineString` rather than promoting it - so `load_streets` promotes.
 
@@ -509,7 +629,7 @@ def test_load_streets_promotes_every_side_to_multi(monkeypatch):
                 ]
             ),
         ],
-        crs="EPSG:4326",
+        crs=WGS84,
     )
 
     postgis.load_streets(

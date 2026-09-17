@@ -584,3 +584,107 @@ def test_batch_lots_zero_does_the_whole_partition_in_one_transaction():
     result = compute(cursor, batch_lots=0)
 
     assert result["num_batches"] == 1
+
+
+# -- the on-street margin, chosen per lot ------------------------------------
+
+
+def _insert(cursor) -> str:
+    """The statement that carves the lots, out of what the fake cursor saw."""
+    return next(
+        statement
+        for statement, _ in cursor.statements
+        if "secondary_setback_rule" in statement and "oriented" in statement
+    )
+
+
+def test_the_second_street_edge_is_sorted_the_way_the_rest_of_the_boundary_is():
+    """One threshold, used twice, and it has to be the same one.
+
+    A rank-2 street edge is a side line on a corner lot and the rear line on a
+    through lot. The sort that tells those apart is the sine test this file
+    already runs against the front edge, so a by-law pricing the two cases
+    differently needs no new geometry - only the same test pointed at the edge
+    the frontage layer set aside.
+    """
+    cursor = FakeCursor()
+
+    compute(cursor)
+
+    sort = next(
+        statement
+        for statement, _ in cursor.statements
+        if "CREATE TEMP TABLE" in statement and "secondary_is_rear" in statement
+    )
+    # Segmentized at the same step and compared at the same max_sin as the
+    # boundary sort above it, rather than with a threshold of its own.
+    assert "secondary_pieces" in sort and "secondary_class" in sort
+    assert sort.count("%(max_sin)s") == 2
+    assert sort.count("%(step_m)s") == 2
+
+
+def test_a_majority_of_the_edge_decides_rather_than_all_of_it():
+    """A through lot whose rear line kinks still has a rear line."""
+    cursor = FakeCursor()
+
+    compute(cursor)
+
+    sort = next(
+        statement
+        for statement, _ in cursor.statements
+        if "CREATE TEMP TABLE" in statement and "secondary_is_rear" in statement
+    )
+    assert "parallel_m * 2.0 > sc.secondary_m" in sort
+    # A lot with no second street edge is not a rear-on-street lot; the LEFT
+    # join has to leave it false rather than NULL.
+    assert "COALESCE(sc.parallel_m * 2.0 > sc.secondary_m, false)" in sort
+
+
+def test_the_rear_on_street_margin_is_taken_only_when_the_grid_states_one():
+    """Montreal and Quebec City state one on-street margin; nothing changes.
+
+    Their envelope rows carry a NULL `rear_on_street_margin_min_m`, so the
+    CASE has to fall through to the reading those boroughs have always had
+    rather than to a zero.
+    """
+    cursor = FakeCursor()
+
+    compute(cursor)
+
+    insert = _insert(cursor)
+    assert "a.rear_on_street_setback_m IS NOT NULL" in insert
+    assert "ELSE a.side_on_street_setback_m" in insert
+
+
+def test_both_readings_are_named_on_the_row_that_used_one():
+    """`secondary_setback_rule` is to this what `side_setback_rule` is to the
+    mode: the row says which reading produced it, so it can be read back."""
+    cursor = FakeCursor()
+
+    compute(cursor)
+
+    insert = _insert(cursor)
+    assert "'rear_on_street'" in insert
+    assert "'secondary_front'" in insert
+    assert "m.secondary_setback_rule" in insert
+
+
+def test_the_carve_buffers_the_chosen_margin_and_not_the_candidate():
+    """The buffer has to see `oriented`'s answer, not the raw candidate.
+
+    `oriented` is what the carve selects from, so the
+    `a.secondary_front_setback_m` the buffer names is the chosen figure. The
+    thing that must not appear there is the unchosen one - if the carve ever
+    buffered `side_on_street_setback_m` directly it would set back every
+    through lot by the corner-lot margin, silently and only in Saguenay.
+    """
+    cursor = FakeCursor()
+
+    compute(cursor)
+
+    insert = _insert(cursor)
+    assert "FROM oriented a" in insert
+    carve = insert[insert.index("carved AS") : insert.index("measured AS")]
+    assert "a.secondary_front_setback_m" in carve
+    assert "side_on_street_setback_m" not in carve
+    assert "rear_on_street_setback_m" not in carve

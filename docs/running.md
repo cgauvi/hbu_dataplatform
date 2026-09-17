@@ -105,9 +105,23 @@ run started on any other day of the month lands on that same key.
 
 ## Adding neighborhoods
 
-Add keys to `ENABLED_NEIGHBORHOODS` in [partitions.py](../src/urban_rag/partitions.py);
-all 17 borough namespaces are already mapped there. Existing partitions are
-untouched, and the new borough starts at the **current** month.
+The neighborhood axis is a `DynamicPartitionsDefinition`: which boroughs the
+pipeline scrapes is recorded in the Dagster instance - the `dagster` schema on
+Postgres, or the local home - rather than in code. Register a key with
+
+```bash
+make neighborhood-add NEIGHBORHOOD=CIL      # `make neighborhoods` lists them
+```
+
+which refuses anything `known_neighborhoods()` in
+[partitions.py](../src/urban_rag/partitions.py) cannot resolve into its
+sources. All 17 Montreal borough namespaces and Quebec City's six
+arrondissements are mapped there; a fresh instance is seeded with
+`DEFAULT_NEIGHBORHOODS` (`VSMPE` and `CIL`) the first time anything reads the
+axis. The schedules, the roll's borough cut and the UI's partition dialog all
+read the same registered list. Existing partitions are untouched, and the new
+borough starts at the **current** month. A Quebec City key reads other
+publishers on the way in - see [quebec-city.md](quebec-city.md).
 
 Adding a key crosses it with every month since `SCRAPE_START_DATE`, so the UI
 will show the borough's earlier partitions as missing and offer to backfill

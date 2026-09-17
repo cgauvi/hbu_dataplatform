@@ -76,6 +76,7 @@ def stub_postgis(
         batch_lots=None,
         resume=None,
         progress=None,
+        metric_srid=None,
     ):
         calls["compute"] = (
             neighborhood,

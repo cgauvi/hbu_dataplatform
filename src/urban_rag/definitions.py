@@ -21,6 +21,7 @@ from dagster import (
     schedule,
 )
 
+from urban_rag.address_assets import lot_addresses, neighborhood_addresses
 from urban_rag.aggregate_assets import map_cell_aggregates
 from urban_rag.assets import neighborhood_features, spectrum_table_catalog
 from urban_rag.bdoi_assets import neighborhood_buildings
@@ -58,8 +59,8 @@ from urban_rag.lot_profiles_assets import lot_profiles
 from urban_rag.massing_assets import lot_building_massing
 from urban_rag.open_data_assets import reference_neighborhoods, street_network
 from urban_rag.partitions import (
-    ENABLED_NEIGHBORHOODS,
     date_partitions,
+    enabled_neighborhoods,
     scrape_partitions,
 )
 from urban_rag.rag_assets import (
@@ -69,6 +70,7 @@ from urban_rag.rag_assets import (
     linked_documents,
 )
 from urban_rag.resources import (
+    AdressesQuebecResource,
     BdoiResource,
     CmhcResource,
     CrspiResource,
@@ -82,8 +84,12 @@ from urban_rag.resources import (
     PdfCache,
     PgVectorResource,
     PostgisResource,
+    QuebecOpenDataResource,
+    QuebecZoningResource,
     RfuResource,
     RoleResource,
+    RqttResource,
+    SaguenayZoningResource,
     SpectrumResource,
 )
 from urban_rag.rfu_assets import uniformized_property_wealth
@@ -110,6 +116,7 @@ ASSETS = [
     cmhc_vacancy_survey,
     cmhc_rent_survey,
     street_network,
+    neighborhood_addresses,
     linked_documents,
     montreal_residential_costs,
     montreal_nonresidential_costs,
@@ -127,6 +134,7 @@ ASSETS = [
     average_rents,
     building_lot_intersections,
     neighborhood_streets,
+    lot_addresses,
     lot_frontage,
     document_chunks,
     document_embeddings,
@@ -242,7 +250,7 @@ lot_profiles_job = define_asset_job(
     partitions_def=scrape_partitions,
 )
 
-# The geobase double is one 91 MB download for the whole island, so DATE only -
+# The RQTT is one 390 MB download for the whole province, so DATE only -
 # same posture as reference_neighborhoods and the two CMHC surveys. The borough
 # axis appears one asset later, in neighborhood_streets.
 street_network_job = define_asset_job(
@@ -390,6 +398,23 @@ lot_zone_pieces_job = define_asset_job(
     partitions_def=scrape_partitions,
 )
 
+# The addresses, in two jobs rather than one. The fetch is a few minutes of
+# paging against a provincial server and the join is a point-in-polygon over
+# rows already in Postgres, so re-running the join after a change to the snap
+# tolerance should not re-scrape a hundred thousand points to do it - the same
+# split `lot_zone_pieces_job` makes behind `zoning_envelopes_job`.
+neighborhood_addresses_job = define_asset_job(
+    "neighborhood_addresses_job",
+    selection=AssetSelection.assets(neighborhood_addresses),
+    partitions_def=scrape_partitions,
+)
+
+lot_addresses_job = define_asset_job(
+    "lot_addresses_job",
+    selection=AssetSelection.assets(lot_addresses),
+    partitions_def=scrape_partitions,
+)
+
 # The envelope pair, kept off the corpus job: the grids are parsed from the
 # PDFs that job already downloaded, and re-reading them as tables is cheap
 # enough to re-run on its own whenever the parser changes - which it will, for
@@ -514,7 +539,7 @@ def monthly_catalog_schedule(context: ScheduleEvaluationContext) -> RunRequest:
 )
 def monthly_features_schedule(context: ScheduleEvaluationContext):
     scrape_date = _scrape_month(context)
-    for neighborhood in ENABLED_NEIGHBORHOODS:
+    for neighborhood in enabled_neighborhoods(context.instance):
         yield RunRequest(
             run_key=f"features-{neighborhood}-{scrape_date}",
             partition_key=MultiPartitionKey(
@@ -542,11 +567,12 @@ def monthly_reference_neighborhoods_schedule(
 @schedule(
     job=street_network_job,
     # Alongside reference_neighborhoods and the CMHC surveys rather than behind
-    # them: the geobase double has no upstream in this pipeline. One run for the
+    # them: street_network's only upstream is reference_neighborhoods, which is
+    # on the same date axis and runs before it. One run for the
     # whole island; the boroughs are cut out of it an hour and a half later.
     cron_schedule="50 4 1 * *",
     execution_timezone=TIMEZONE,
-    description="Snapshot the island-wide geobase double for this month.",
+    description="Snapshot the RQTT road network for this month.",
 )
 def monthly_street_network_schedule(context: ScheduleEvaluationContext) -> RunRequest:
     scrape_date = _scrape_month(context)
@@ -595,7 +621,7 @@ def monthly_assessment_roll_schedule(context: ScheduleEvaluationContext) -> RunR
 )
 def monthly_lot_assessed_values_schedule(context: ScheduleEvaluationContext):
     scrape_date = _scrape_month(context)
-    for neighborhood in ENABLED_NEIGHBORHOODS:
+    for neighborhood in enabled_neighborhoods(context.instance):
         yield RunRequest(
             run_key=f"lot-assessed-values-{neighborhood}-{scrape_date}",
             partition_key=MultiPartitionKey(
@@ -634,7 +660,7 @@ def monthly_commercial_rent_sources_schedule(
 )
 def monthly_commercial_rents_schedule(context: ScheduleEvaluationContext):
     scrape_date = _scrape_month(context)
-    for neighborhood in ENABLED_NEIGHBORHOODS:
+    for neighborhood in enabled_neighborhoods(context.instance):
         yield RunRequest(
             run_key=f"commercial-rents-{neighborhood}-{scrape_date}",
             partition_key=MultiPartitionKey(
@@ -663,7 +689,7 @@ def monthly_commercial_rents_schedule(context: ScheduleEvaluationContext):
 )
 def monthly_lot_assessment_comparables_schedule(context: ScheduleEvaluationContext):
     scrape_date = _scrape_month(context)
-    for neighborhood in ENABLED_NEIGHBORHOODS:
+    for neighborhood in enabled_neighborhoods(context.instance):
         yield RunRequest(
             run_key=f"lot-comparables-{neighborhood}-{scrape_date}",
             partition_key=MultiPartitionKey(
@@ -682,7 +708,7 @@ def monthly_lot_assessment_comparables_schedule(context: ScheduleEvaluationConte
 )
 def monthly_lots_schedule(context: ScheduleEvaluationContext):
     scrape_date = _scrape_month(context)
-    for neighborhood in ENABLED_NEIGHBORHOODS:
+    for neighborhood in enabled_neighborhoods(context.instance):
         yield RunRequest(
             run_key=f"lots-{neighborhood}-{scrape_date}",
             partition_key=MultiPartitionKey(
@@ -701,7 +727,7 @@ def monthly_lots_schedule(context: ScheduleEvaluationContext):
 )
 def monthly_buildings_schedule(context: ScheduleEvaluationContext):
     scrape_date = _scrape_month(context)
-    for neighborhood in ENABLED_NEIGHBORHOODS:
+    for neighborhood in enabled_neighborhoods(context.instance):
         yield RunRequest(
             run_key=f"buildings-{neighborhood}-{scrape_date}",
             partition_key=MultiPartitionKey(
@@ -723,7 +749,7 @@ def monthly_buildings_schedule(context: ScheduleEvaluationContext):
 )
 def monthly_building_lots_schedule(context: ScheduleEvaluationContext):
     scrape_date = _scrape_month(context)
-    for neighborhood in ENABLED_NEIGHBORHOODS:
+    for neighborhood in enabled_neighborhoods(context.instance):
         yield RunRequest(
             run_key=f"building-lots-{neighborhood}-{scrape_date}",
             partition_key=MultiPartitionKey(
@@ -796,7 +822,7 @@ def monthly_uniformized_property_wealth_schedule(
 )
 def monthly_vacancy_rates_schedule(context: ScheduleEvaluationContext):
     scrape_date = _scrape_month(context)
-    for neighborhood in ENABLED_NEIGHBORHOODS:
+    for neighborhood in enabled_neighborhoods(context.instance):
         yield RunRequest(
             run_key=f"vacancy-rates-{neighborhood}-{scrape_date}",
             partition_key=MultiPartitionKey(
@@ -815,7 +841,7 @@ def monthly_vacancy_rates_schedule(context: ScheduleEvaluationContext):
 )
 def monthly_average_rents_schedule(context: ScheduleEvaluationContext):
     scrape_date = _scrape_month(context)
-    for neighborhood in ENABLED_NEIGHBORHOODS:
+    for neighborhood in enabled_neighborhoods(context.instance):
         yield RunRequest(
             run_key=f"average-rents-{neighborhood}-{scrape_date}",
             partition_key=MultiPartitionKey(
@@ -832,11 +858,11 @@ def monthly_average_rents_schedule(context: ScheduleEvaluationContext):
     # share no input.
     cron_schedule="20 6 1 * *",
     execution_timezone=TIMEZONE,
-    description="Cut this month's geobase double into every enabled borough.",
+    description="Cut this month's road network into every enabled borough.",
 )
 def monthly_neighborhood_streets_schedule(context: ScheduleEvaluationContext):
     scrape_date = _scrape_month(context)
-    for neighborhood in ENABLED_NEIGHBORHOODS:
+    for neighborhood in enabled_neighborhoods(context.instance):
         yield RunRequest(
             run_key=f"neighborhood-streets-{neighborhood}-{scrape_date}",
             partition_key=MultiPartitionKey(
@@ -954,6 +980,8 @@ defs = Definitions(
         commercial_rent_sources_job,
         commercial_rents_job,
         lot_frontage_job,
+        neighborhood_addresses_job,
+        lot_addresses_job,
         lot_zone_pieces_job,
         zoning_envelopes_job,
         lot_buildable_setbacks_job,
@@ -993,6 +1021,18 @@ defs = Definitions(
     resources={
         "spectrum": SpectrumResource(),
         "open_data": OpenDataResource(),
+        # Quebec City's and Saguenay's publishers - Données Québec for the
+        # outlines and the public ways of both, the ArcGIS zoning layer and
+        # grid workbook of the first, the grid documents of the second.
+        "quebec_open_data": QuebecOpenDataResource(),
+        "quebec_zoning": QuebecZoningResource(),
+        # Saguenay's zone lookup and its per-zone grid documents. Its polygons
+        # come through `quebec_open_data` above - one portal, two cities.
+        "saguenay_zoning": SaguenayZoningResource(),
+        # Adresses Quebec, the MRNF's province-wide address points. No
+        # cache_dir: it is queried per borough with that borough's outline, so
+        # there is nothing shared between partitions to keep.
+        "addresses": AdressesQuebecResource(),
         "infolot": InfolotResource(),
         # One tree for every asset: `<root>/<asset>/<date>[/<neighborhood>]`,
         # where the root is `s3://<S3_BUCKET>` when that is set and `data/`
@@ -1046,6 +1086,14 @@ defs = Definitions(
             # by every scrape date. Always local - the GeoPackage has to be on
             # a filesystem to be read at all, since SQLite reads it by seeking.
             cache_dir=str(DATA_ROOT / "cache" / "role"),
+        ),
+        "rqtt": RqttResource(
+            # The second of the two large caches, and the one whose vintage is
+            # discovered rather than named: the 390 MB archive and the 1.27 GB
+            # GeoPackage beside it are fetched once per *published* vintage -
+            # three a year - and shared by every scrape date in between. Always
+            # local, for the reason "role" is.
+            cache_dir=str(DATA_ROOT / "cache" / "rqtt"),
         ),
         "embedding_model": EmbeddingModel(),
         # The query side's store. Every field defaults to its URBAN_RAG_PG_*

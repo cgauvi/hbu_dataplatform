@@ -20,6 +20,8 @@ reasons the code reads it the way it does.
 | | |
 | --- | --- |
 | [cadastre.md](cadastre.md) | Montreal's 91 reference neighborhoods, and the Infolot lots inside a borough |
+| [quebec-city.md](quebec-city.md) | The second city: its outlines, zoning layer and specification grid, what the grid translation does, and what a Quebec City partition does not yet carry |
+| [saguenay.md](saguenay.md) | The third city, as one key for the whole municipality: its per-zone grid documents, the six margins its by-law states and how four of them are chosen, and what it is priced with instead of its own rents |
 | [assessment-roll.md](assessment-roll.md) | Quebec's *rôle d'évaluation foncière*, and what every lot is assessed at |
 | [comparables.md](comparables.md) | What each lot yields on that assessment, and which lots the roll says are like it |
 | [maintenance.md](maintenance.md) | What age costs a building, and why the standing one and the proposed one are charged differently |
@@ -27,7 +29,9 @@ reasons the code reads it the way it does.
 | [cmhc-surveys.md](cmhc-surveys.md) | Vacancy rates and average rents, and the crosswalk from CMHC's quartiers to boroughs |
 | [construction-costs.md](construction-costs.md) | The Altus cost guide's Montreal column — and why parking is priced per stall |
 | [lot-documents.md](lot-documents.md) | The spatial join from a lot to the map features covering it, and on to their PDFs |
-| [street-frontage.md](street-frontage.md) | The *géobase double*, and how much street each lot actually fronts on |
+| [street-frontage.md](street-frontage.md) | The RQTT road network, and how much street each lot actually fronts on |
+| [rqtt.md](rqtt.md) | The province-wide road network: the archive, its vintages, and what it replaced |
+| [addresses.md](addresses.md) | Adresses Québec's official address points, and the spatial join that puts each one on a parcel — the key that lets a map and the corpus name a site by its street rather than by its lot number |
 | [lot-profiles.md](lot-profiles.md) | `gold.lot_profiles` — every lot in the borough, one row each |
 | [development-program.md](development-program.md) | `urban_rag.program` and `silver.lot_development_programs` — the CP-SAT model behind every answer: its decision variables, the printed norms and the three shape caps that bind them, the four places a stall can go, the discounted-net-profit objective, and the `binding` vocabulary that says why an answer is not bigger |
 | [opportunities.md](opportunities.md) | `gold.lot_investment_opportunities` — the under-built lots worth looking at first, faceted by investment thesis and ranked on yield on cost |

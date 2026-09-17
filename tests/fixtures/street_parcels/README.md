@@ -31,7 +31,7 @@ now stops that, off `lot_frontage`'s road lots.
 The same two orders of magnitude the Chabot fixture has, on a busier slice:
 
 - **14 of the 114 lots** are the roadway. They carry **126 m to 606 m** of
-  geobase double street line each — Querbes, Ball, Saint-Roch, Durocher,
+  street line each — Querbes, Ball, Saint-Roch, Durocher,
   De L'Épée and Bloomfield.
 - The other **100** carry at most **0.32 m**, all of it at corners where the
   two publishers disagree by a few centimetres. Lots 2 249 342 and 2 249 343

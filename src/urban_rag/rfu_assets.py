@@ -23,7 +23,7 @@ from urban_rag.guards import guard_current_scrape_month
 from urban_rag.frames import write_frame
 from urban_rag.layers import key_prefix
 from urban_rag.open_data import OpenDataError, decode_csv
-from urban_rag.partitions import date_partitions
+from urban_rag.partitions import City, MUNICIPALITY_CODES, date_partitions
 from urban_rag.resources import ParquetStore, RfuResource
 from urban_rag.rfu import (
     COMPARATIVE_FACTOR_COLUMN,
@@ -117,6 +117,10 @@ def uniformized_property_wealth(
     )
 
     factor = _montreal_factor(frame)
+    quebec_factor = _montreal_factor(frame, geo_code=MUNICIPALITY_CODES[City.QUEBEC])
+    saguenay_factor = _montreal_factor(
+        frame, geo_code=MUNICIPALITY_CODES[City.SAGUENAY]
+    )
     if factor is None:
         # Reported, not raised: the province publishes the file, and a run that
         # fetched it correctly has done its job. Montreal missing from it is a
@@ -136,6 +140,17 @@ def uniformized_property_wealth(
         # to read as a market one. `make comparables MARKET_FACTOR=<this>`.
         "montreal_comparative_factor": factor
         if factor is not None
+        else MetadataValue.text("absent"),
+        # Quebec City's, for `make comparables MARKET_FACTOR=... NEIGHBORHOOD=CIL`.
+        "quebec_comparative_factor": quebec_factor
+        if quebec_factor is not None
+        else MetadataValue.text("absent"),
+        # ...and Saguenay's, for the same call with NEIGHBORHOOD=SAG. Each
+        # municipality files its own roll and its own factor, so a borough
+        # priced with another city's would be reading the wrong year's market
+        # into its assessed values.
+        "saguenay_comparative_factor": saguenay_factor
+        if saguenay_factor is not None
         else MetadataValue.text("absent"),
         "output_path": MetadataValue.path(str(path)),
         "source_url": MetadataValue.url(
@@ -221,15 +236,19 @@ def _postes_to_frame(
     return frame
 
 
-def _montreal_factor(frame: pd.DataFrame) -> float | None:
-    """Ville de Montréal's *facteur comparatif*, or ``None`` if it has no row.
+def _montreal_factor(
+    frame: pd.DataFrame, *, geo_code: str = MONTREAL_GEO_CODE
+) -> float | None:
+    """One municipality's *facteur comparatif*, or ``None`` if it has no row.
 
-    The agglomeration files one roll, so every on-island municipality carries
-    the same factor and reading the city's row is reading all sixteen.
+    Ville de Montréal's by default. The agglomeration files one roll, so
+    every on-island municipality carries the same factor and reading the
+    city's row is reading all sixteen; Quebec City files its own, under
+    `partitions.MUNICIPALITY_CODES[City.QUEBEC]`.
     """
     if GEO_CODE_COLUMN not in frame.columns:
         return None
-    rows = frame.loc[frame[GEO_CODE_COLUMN] == MONTREAL_GEO_CODE]
+    rows = frame.loc[frame[GEO_CODE_COLUMN] == geo_code]
     if rows.empty:
         return None
     value = pd.to_numeric(rows[COMPARATIVE_FACTOR_COLUMN], errors="coerce").iloc[0]

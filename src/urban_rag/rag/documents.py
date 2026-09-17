@@ -41,9 +41,31 @@ from urban_rag.spectrum import default_ca_bundle
 #: ``EN_SAVOIR_PLUS`` - and is left out only because a project-specific
 #: resolution answers a different question than a zone's standing rules; add
 #: it here when that question is worth indexing.
+#:
+#: All three cities are here on the same terms, and none of the other two
+#: publishes the link as an attribute. Saguenay's polygons carry no link, so
+#: `assets._saguenay_features` resolves one grid id per zone and writes the
+#: URL under Montreal's column name. Quebec City's carry none either, but its
+#: sheets are served from a handler keyed on the zone code the polygons do
+#: carry, so `assets._quebec_features` formats the URL rather than resolving
+#: it. Either way the column exists by the time this runs, which is what lets
+#: one corpus pipeline serve three cities.
 DOCUMENT_SOURCES: dict[str, str] = {
     "Reglement_urbanisme__VSP_REG_ZONE": "LIEN_GRILLE",
+    "Zonage__ZONAGE_SAGUENAY": "LIEN_GRILLE",
+    "Zonage__ZONAGE_EN_VIGUEUR": "LIEN_GRILLE",
 }
+
+#: Every scraped table that *is* a zoning layer - the ones `lot_zone_pieces`
+#: cuts lots against and `lot_zoning_envelopes` joins grid columns to. Equal to
+#: `DOCUMENT_SOURCES` today, and kept as its own name because the two answer
+#: different questions: a table is a zone source if lots are cut against it,
+#: and a document source if it links prose worth retrieving. Quebec City was
+#: the case that separated them - it is a zone source whose norms are read
+#: from a workbook, and it became a document source only once the per-zone
+#: sheet behind `quebec.DEFAULT_SHEET_URL_TEMPLATE` was found. A table could
+#: still be one and not the other, so the distinction stays.
+ZONING_SOURCES: tuple[str, ...] = tuple(DOCUMENT_SOURCES)
 
 DEFAULT_MAX_TOKENS = 512
 DEFAULT_OVERLAP_TOKENS = 64

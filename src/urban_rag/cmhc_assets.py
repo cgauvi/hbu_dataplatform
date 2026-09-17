@@ -45,14 +45,16 @@ from dagster import (
 
 from urban_rag.guards import guard_current_scrape_month
 from urban_rag.cmhc import (
-    BEDROOM_TYPES,
-    DWELLING_TYPES,
     AVERAGE_RENTS_READING_MODE_URL,
+    BEDROOM_TYPES,
+    CMHC_GEOGRAPHY_IDS,
+    CmhcError,
+    DWELLING_TYPES,
     STATUS_NO_UNITS,
     STATUS_PUBLISHED,
     STATUS_SUPPRESSED,
     TOTAL_LABEL,
-    CmhcError,
+    average_rents_url_for,
     normalize_quartier,
     read_average_rents_reading_mode,
     read_quartier_sheet,
@@ -60,7 +62,7 @@ from urban_rag.cmhc import (
 )
 from urban_rag.frames import write_frame
 from urban_rag.layers import key_prefix
-from urban_rag.partitions import date_partitions, quartiers_for, scrape_partitions
+from urban_rag.partitions import CMHC_CENTRES, cmhc_centre_for, date_partitions, quartiers_for, scrape_partitions
 from urban_rag.rag.pgvector import PostgresUnavailable
 from urban_rag.resources import CmhcResource, ParquetStore, PostgisResource
 from urban_rag.storage import clear_parquet, filesystem, join, storage_options
@@ -135,13 +137,29 @@ def cmhc_vacancy_survey(
     except CmhcError as exc:
         raise Failure(f"CMHC {survey_year} survey read failed: {exc}")
 
+    # Every centre a registered borough can belong to - Montréal and Québec -
+    # out of the national workbook. A scope on what is asked for, applied in
+    # bronze, and the crosswalk that cuts a centre into boroughs stays in
+    # silver, where `cmhc_centre_for` picks the borough's centre back out.
+    centres = list(CMHC_CENTRES.values())
     montreal = survey[
-        (survey["province"] == PROVINCE) & (survey["centre"] == CENTRE)
+        (survey["province"] == PROVINCE) & (survey["centre"].isin(centres))
     ].copy()
+    absent = [centre for centre in centres if centre not in set(montreal["centre"])]
     if montreal.empty:
         raise Failure(
             f"The survey publishes no rows for Province={PROVINCE!r}, "
-            f"Centre={CENTRE!r}; the workbook's geography labels may have changed."
+            f"Centre={centres}; the workbook's geography labels may have changed."
+        )
+    if absent:
+        # A second centre missing from the workbook costs that city's boroughs
+        # in silver, where `_borough_rows` names what it could not find; it
+        # does not cost the centres that were published.
+        context.log.warning(
+            "The survey publishes no rows for Province=%r, Centre=%s; "
+            "their boroughs cannot be cut from this snapshot.",
+            PROVINCE,
+            absent,
         )
 
     montreal = _with_provenance(
@@ -197,26 +215,67 @@ def cmhc_rent_survey(
     store: ParquetStore,
 ) -> MaterializeResult:
     scrape_date = context.partition_key
-    try:
-        table = read_average_rents_reading_mode(
-            cmhc.reading_mode_fetcher().fetch_average_rents()
+    fetcher = cmhc.reading_mode_fetcher()
+    frames: list[pd.DataFrame] = []
+    survey_year = None
+    survey_period = None
+    # One page per centre: the configured URL is the Montréal CMA's, and every
+    # other centre's page is the same table under its own HMIP geography id.
+    skipped: list[str] = []
+    for centre in CMHC_CENTRES.values():
+        if centre != CENTRE and centre not in CMHC_GEOGRAPHY_IDS:
+            # A centre the survey covers and the reading-mode tool does not
+            # publish - see `CMHC_GEOGRAPHY_IDS`. Its vacancy rows still land,
+            # from the workbook; only the average rent is missing, and saying
+            # so here is better than a KeyError that costs every city's
+            # snapshot for one city's absent page.
+            context.log.warning(
+                "%s: HMIP publishes no average-rent page; the centre is "
+                "skipped and its boroughs get no measured rent from it",
+                centre,
+            )
+            skipped.append(centre)
+            continue
+        url = (
+            None
+            if centre == CENTRE
+            else average_rents_url_for(CMHC_GEOGRAPHY_IDS[centre])
         )
-    except CmhcError as exc:
-        raise Failure(f"CMHC average-rent reading-mode page read failed: {exc}")
-
-    montreal = table.frame[table.frame["centre"] == CENTRE].copy()
-    if montreal.empty:
-        raise Failure(
-            f"The average-rent page publishes no rows for Centre={CENTRE!r}; "
-            "the page geography may have changed."
+        try:
+            table = read_average_rents_reading_mode(
+                fetcher.fetch_average_rents(url), centre=centre
+            )
+        except CmhcError as exc:
+            if centre == CENTRE:
+                raise Failure(
+                    f"CMHC average-rent reading-mode page read failed for "
+                    f"{centre}: {exc}"
+                )
+            # The configured page is the snapshot; another centre's page not
+            # answering costs that city's boroughs in silver, not this run.
+            context.log.warning(
+                "%s: average-rent page not read (%s); the centre is skipped",
+                centre,
+                exc,
+            )
+            continue
+        rows = table.frame[table.frame["centre"] == centre].copy()
+        if rows.empty:
+            raise Failure(
+                f"The average-rent page publishes no rows for Centre={centre!r}; "
+                "the page geography may have changed."
+            )
+        frames.append(
+            _with_provenance(
+                rows,
+                survey_year=table.survey_year,
+                period=table.survey_period,
+                scrape_date=scrape_date,
+            )
         )
-
-    montreal = _with_provenance(
-        montreal,
-        survey_year=table.survey_year,
-        period=table.survey_period,
-        scrape_date=scrape_date,
-    )
+        survey_year = table.survey_year
+        survey_period = table.survey_period
+    montreal = pd.concat(frames, ignore_index=True)
     output_dir = _partition_dir(context, store, scrape_date)
     _clear(context, output_dir)
     path = write_frame(montreal, join(output_dir, QUARTIER_AVERAGE_RENTS_FILE))
@@ -234,14 +293,20 @@ def cmhc_rent_survey(
             "dagster/row_count": len(montreal),
             "num_quartiers": len(quartiers),
             "quartiers": MetadataValue.text(", ".join(quartiers)),
+            # Centres the survey covers whose average-rent page HMIP does not
+            # publish. Their boroughs are priced without a measured rent from
+            # this source, which is a gap worth seeing on the run rather than
+            # only in the log.
+            "centres_without_a_page": ", ".join(skipped) or "none",
             "num_published_cells": int(
                 (montreal["status"] == STATUS_PUBLISHED).sum()
             ),
             "num_suppressed_cells": int(
                 (montreal["status"] == STATUS_SUPPRESSED).sum()
             ),
-            "survey_year": table.survey_year,
-            "survey_period": table.survey_period,
+            "survey_year": survey_year,
+            "survey_period": survey_period,
+            "num_centres": int(montreal["centre"].nunique()),
             "output_path": MetadataValue.path(str(path)),
             "source_url": MetadataValue.url(AVERAGE_RENTS_SOURCE_URL),
         }
@@ -572,6 +637,11 @@ def _borough_rows(
     here, in silver, so the bronze snapshot it was read from survives the
     failure and can be looked at.
     """
+    # The borough's own centre first: bronze holds both cities' quartiers,
+    # and a Montréal name could in principle be printed under Québec too.
+    centre = cmhc_centre_for(neighborhood)
+    if "centre" in survey.columns:
+        survey = survey[survey["centre"] == centre]
     # The zone subtotals repeat their quartiers' rows and would double-count.
     # Bronze keeps them because the survey prints them; the guard belongs
     # here. None of the mapped names is "Total" anyway, so this only guards
@@ -584,7 +654,7 @@ def _borough_rows(
     if missing:
         available = sorted(set(published_rows["quartier"]))
         raise Failure(
-            f"{neighborhood}: the {CENTRE} survey snapshot publishes no quartier "
+            f"{neighborhood}: the {centre} survey snapshot publishes no quartier "
             f"named {', '.join(repr(q) for q in missing)}. It has: "
             f"{', '.join(available)}"
         )

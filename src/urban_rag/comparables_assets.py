@@ -113,7 +113,7 @@ from urban_rag.program import (
     MAX_MAINTENANCE_PREMIUM,
 )
 from urban_rag.rent_assets import COMMERCIAL_RENTS_FILE, commercial_rents
-from urban_rag.partitions import scrape_partitions
+from urban_rag.partitions import metric_crs_for, scrape_partitions
 from urban_rag.rag.pgvector import PostgresUnavailable
 from urban_rag.resources import ParquetStore, PostgisResource
 from urban_rag.role_assets import (
@@ -381,7 +381,7 @@ def lot_assessment_comparables(
         pairs, units, lot_column=LOT_NUMBER_COLUMN, join_key=JOIN_KEY
     )
 
-    frame = _assemble(lots, characteristics)
+    frame = _assemble(lots, characteristics, metric_crs=metric_crs_for(neighborhood))
     subjects = _subject_frame(frame)
     neighbours = nearest_comparables(
         subjects,
@@ -458,7 +458,10 @@ def lot_assessment_comparables(
 
 
 def _assemble(
-    lots: gpd.GeoDataFrame, characteristics: pd.DataFrame
+    lots: gpd.GeoDataFrame,
+    characteristics: pd.DataFrame,
+    *,
+    metric_crs: str = METRIC_CRS,
 ) -> gpd.GeoDataFrame:
     """The lot frame, plus its geometry measured and the roll summed onto it.
 
@@ -473,7 +476,7 @@ def _assemble(
     because on an ordinary single-unit lot the two agreeing is worth being able
     to check.
     """
-    projected = lots.to_crs(METRIC_CRS)
+    projected = lots.to_crs(metric_crs)
     centroids = projected.geometry.centroid
     frame = lots.copy()
     frame["lot_area_m2"] = projected.geometry.area.astype("float64")

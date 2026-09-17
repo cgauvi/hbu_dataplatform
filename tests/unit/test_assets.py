@@ -18,7 +18,13 @@ from urban_rag.assets import (
     neighborhood_features,
     spectrum_table_catalog,
 )
-from urban_rag.resources import ParquetStore, SpectrumResource
+from urban_rag.resources import (
+    ParquetStore,
+    QuebecOpenDataResource,
+    QuebecZoningResource,
+    SaguenayZoningResource,
+    SpectrumResource,
+)
 from urban_rag.spectrum import Column, TableMetadata
 
 DATE = "2026-08-01"
@@ -84,7 +90,13 @@ def materialize_catalog(store, *, scrape_date=DATE):
     result = materialize(
         [spectrum_table_catalog],
         partition_key=scrape_date,
-        resources={"spectrum": SpectrumResource(), "store": store},
+        resources={
+            "spectrum": SpectrumResource(),
+            "quebec_zoning": QuebecZoningResource(),
+            "saguenay_zoning": SaguenayZoningResource(),
+            "quebec_open_data": QuebecOpenDataResource(),
+            "store": store,
+        },
     )
     assert result.success
     return result
@@ -96,7 +108,13 @@ def materialize_features(store, *, scrape_date=DATE, neighborhood=NEIGHBORHOOD):
         partition_key=MultiPartitionKey(
             {"date": scrape_date, "neighborhood": neighborhood}
         ),
-        resources={"spectrum": SpectrumResource(), "store": store},
+        resources={
+            "spectrum": SpectrumResource(),
+            "quebec_zoning": QuebecZoningResource(),
+            "saguenay_zoning": SaguenayZoningResource(),
+            "quebec_open_data": QuebecOpenDataResource(),
+            "store": store,
+        },
     )
 
 

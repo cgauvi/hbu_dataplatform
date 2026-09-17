@@ -122,7 +122,7 @@ from pydantic import Field
 from urban_rag.building_lots_assets import building_lot_intersections
 from urban_rag.frames import write_frame
 from urban_rag.layers import key_prefix
-from urban_rag.partitions import scrape_partitions
+from urban_rag.partitions import metric_srid_for, scrape_partitions
 from urban_rag.hbu import ROAD_LOT_FLAG_COLUMN
 from urban_rag.postgis import (
     DEFAULT_FRONTAGE_FALLBACK_BUFFERS_M,
@@ -253,6 +253,7 @@ def lot_frontage(
                 connection,
                 neighborhood=neighborhood,
                 scrape_date=scrape_date,
+                metric_srid=metric_srid_for(neighborhood),
                 min_street_m=config.min_street_m,
                 fallback_buffers_m=tuple(config.fallback_buffers_m),
             )

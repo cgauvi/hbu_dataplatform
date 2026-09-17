@@ -15,13 +15,15 @@ from dagster import materialize
 
 from asset_helpers import materialization_metadata
 
+from urban_rag import saguenay
 from urban_rag.open_data import CkanClient, OpenDataError, Resource, decode_csv
 from urban_rag.open_data_assets import (
     DWELLINGS_CSV,
     QUARTIERS_GEOJSON,
+    QUEBEC_BOROUGHS_GEOJSON,
     reference_neighborhoods,
 )
-from urban_rag.resources import OpenDataResource, ParquetStore
+from urban_rag.resources import OpenDataResource, ParquetStore, QuebecOpenDataResource
 
 DOWNLOAD_BASE = "https://donnees.montreal.ca/dataset/abc/resource/def/download"
 
@@ -131,6 +133,175 @@ class FakeSession:
         return FakeResponse(
             self.files[filename], content_type="application/octet-stream"
         )
+
+
+# -- Quebec City's portal, stubbed the same way ------------------------------
+
+QUEBEC_PACKAGE_PAYLOAD = {
+    "success": True,
+    "result": {
+        "name": "vque",
+        "title": "Ville de Québec",
+        "license_title": "Creative Commons Attribution 4.0 International",
+        "resources": [
+            {
+                "id": "5c5671d1",
+                "name": "Arrondissements",
+                "format": "GeoJSON",
+                "url": f"https://www.donneesquebec.ca/x/{QUEBEC_BOROUGHS_GEOJSON}",
+                "last_modified": "2026-08-01T00:00:00",
+            },
+        ],
+    },
+}
+
+#: One arrondissement, drawn well away from the Montreal fixtures.
+QUEBEC_GEOJSON = json.dumps(
+    {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {"ID": "1", "NOM": "La Cité-Limoilou", "ABREVIATION": "CIL"},
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [
+                        [[-71.25, 46.79], [-71.20, 46.79], [-71.20, 46.84], [-71.25, 46.79]]
+                    ],
+                },
+            }
+        ],
+    }
+).encode("utf-8")
+
+
+
+#: Saguenay's limits, on the same portal. Three rows of three kinds, because
+#: selecting the city out of them on `type` as well as `nom` is the thing
+#: `_saguenay_boundary` has to get right - *Chicoutimi* is both an
+#: arrondissement and a secteur in the published file.
+SAGUENAY_LIMITS_BYTES = json.dumps(
+    {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {
+                    "id": 1000,
+                    "type": "ville",
+                    "nom": "Saguenay",
+                    "municipalite": "94068",
+                },
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [
+                        [[-71.2, 48.3], [-71.0, 48.3], [-71.0, 48.5], [-71.2, 48.5], [-71.2, 48.3]]
+                    ],
+                },
+            },
+            {
+                "type": "Feature",
+                "properties": {
+                    "id": 1001,
+                    "type": "arrondissement",
+                    "nom": "Chicoutimi",
+                    "municipalite": "94068",
+                },
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [
+                        [[-71.2, 48.3], [-71.1, 48.3], [-71.1, 48.5], [-71.2, 48.5], [-71.2, 48.3]]
+                    ],
+                },
+            },
+            {
+                "type": "Feature",
+                "properties": {
+                    "id": 1002,
+                    "type": "secteur",
+                    "nom": "Chicoutimi",
+                    "municipalite": "94068",
+                },
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [
+                        [[-71.2, 48.3], [-71.15, 48.3], [-71.15, 48.4], [-71.2, 48.4], [-71.2, 48.3]]
+                    ],
+                },
+            },
+        ],
+    }
+).encode("utf-8")
+
+
+
+def _saguenay_package(name: str, filename: str) -> dict:
+    return {
+        "success": True,
+        "result": {
+            "name": name,
+            "title": "Ville de Saguenay",
+            "license_title": "Creative Commons Attribution 4.0 International",
+            "resources": [
+                {
+                    "id": "b9d12f95",
+                    "name": name,
+                    "format": "GeoJSON",
+                    "url": f"https://www.donneesquebec.ca/x/{filename}",
+                    "last_modified": "2026-08-01T00:00:00",
+                }
+            ],
+        },
+    }
+
+
+class QuebecFakeSession:
+    """Replays Données Québec's packages and their downloads.
+
+    One portal, two cities - so unlike the Montreal stub this answers
+    `package_show` by the dataset asked for rather than with one payload.
+    """
+
+    def __init__(self):
+        self.calls: list[tuple[str, dict]] = []
+
+    def get(self, url, params=None, timeout=None):
+        self.calls.append((url, params or {}))
+        if url.endswith("package_show"):
+            dataset = (params or {}).get("id")
+            packages = {
+                saguenay.LIMITS_DATASET: _saguenay_package(
+                    saguenay.LIMITS_DATASET, saguenay.LIMITS_GEOJSON
+                ),
+                saguenay.ZONING_DATASET: _saguenay_package(
+                    saguenay.ZONING_DATASET, saguenay.ZONING_GEOJSON
+                ),
+            }
+            payload = packages.get(dataset, QUEBEC_PACKAGE_PAYLOAD)
+            return FakeResponse(json.dumps(payload).encode("utf-8"))
+        filename = url.rsplit("/", 1)[-1]
+        files = {
+            QUEBEC_BOROUGHS_GEOJSON: QUEBEC_GEOJSON,
+            saguenay.LIMITS_GEOJSON: SAGUENAY_LIMITS_BYTES,
+        }
+        if filename not in files:
+            raise AssertionError(f"unexpected Données Québec download: {url}")
+        return FakeResponse(files[filename], content_type="application/octet-stream")
+
+
+def stub_quebec_portal(monkeypatch) -> QuebecFakeSession:
+    """Patch `QuebecOpenDataResource.client` the way the Montreal one is."""
+    session = QuebecFakeSession()
+    monkeypatch.setattr(
+        QuebecOpenDataResource,
+        "client",
+        lambda self: CkanClient(
+            "https://www.donneesquebec.ca/recherche",
+            request_delay_seconds=0,
+            session=session,
+        ),
+    )
+    return session
 
 
 def make_client(session: FakeSession | None = None) -> tuple[CkanClient, FakeSession]:
@@ -252,11 +423,13 @@ def materialize_partition(
             "https://portal", request_delay_seconds=0, session=session
         ),
     )
+    stub_quebec_portal(monkeypatch)
     result = materialize(
         [reference_neighborhoods],
         partition_key=scrape_date,
         resources={
             "open_data": OpenDataResource(),
+            "quebec_open_data": QuebecOpenDataResource(),
             "store": ParquetStore(root_dir=str(tmp_path)),
         },
     )
@@ -268,10 +441,23 @@ def test_asset_writes_both_files_under_the_date_partition(tmp_path, monkeypatch)
     materialize_partition(tmp_path, monkeypatch, scrape_date="2026-08-01")
 
     partition = tmp_path / "bronze" / "reference_neighborhoods" / "2026-08-01"
+    # Montreal's two files, and the other two cities' outlines beside them.
     assert sorted(p.name for p in partition.glob("*.parquet")) == [
+        "arrondissements_quebec.parquet",
+        "limites_saguenay.parquet",
         "nombre_logements.parquet",
         "quartiers.parquet",
     ]
+    quebec = gpd.read_parquet(partition / "arrondissements_quebec.parquet")
+    assert quebec["abreviation"].tolist() == ["CIL"]
+    assert quebec.crs.to_string() == "EPSG:4326"
+
+    # Saguenay's limits arrive whole - all three kinds of polygon - because
+    # selecting the city out of them is `borough_boundary`'s job and not this
+    # snapshot's. See `test_saguenay.py` for the selection itself.
+    limits = gpd.read_parquet(partition / "limites_saguenay.parquet")
+    assert sorted(limits["type"]) == ["arrondissement", "secteur", "ville"]
+    assert limits.crs.to_string() == "EPSG:4326"
 
     layer = gpd.read_parquet(partition / "quartiers.parquet")
     assert len(layer) == 2

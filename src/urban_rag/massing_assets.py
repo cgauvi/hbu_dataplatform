@@ -101,7 +101,7 @@ from urban_rag.massing import (
     SHRINK_STEPS,
     massing_frame,
 )
-from urban_rag.partitions import scrape_partitions
+from urban_rag.partitions import metric_crs_for, scrape_partitions
 from urban_rag.rag.pgvector import PostgresUnavailable
 from urban_rag.resources import ParquetStore, PostgisResource
 from urban_rag.setback_assets import LOT_SETBACKS_FILE, lot_buildable_setbacks
@@ -268,6 +268,7 @@ def lot_building_massing(
         min_footprint_m2=config.min_footprint_m2,
         min_parking_depth_m=config.min_parking_depth_m,
         parking_max_bays=config.parking_max_bays,
+        metric_crs=metric_crs_for(neighborhood),
     )
     frame["neighborhood"] = neighborhood
     frame["scrape_date"] = scrape_date

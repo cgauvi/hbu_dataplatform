@@ -15,6 +15,16 @@ pointing at 632 distinct "grille des usages et des normes" documents for
 VSMPE (two zones share a grid) — and three assets turn them into an embedded
 corpus:
 
+**Only Montreal publishes that column.** The other two cities serve a sheet
+per zone and name it nowhere in their zoning layer, so their
+`neighborhood_features` asset writes `LIEN_GRILLE` itself before the corpus
+ever reads it — Saguenay by resolving a grid id per zone (one request each),
+Quebec City by formatting its map server's handler URL against the zone code
+the polygons already carry (no request at all). `rag.documents.DOCUMENT_SOURCES`
+therefore lists one zoning table per city, all three keyed on the same column
+name. Anything that changes how a document is reached belongs in that asset,
+not here; this pipeline only ever sees a URL.
+
 | Asset | Output |
 | --- | --- |
 | `linked_documents` | One row per distinct link: the PDF fetched and flattened to text |

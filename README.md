@@ -7,7 +7,7 @@ it to the provincial cadastre, the assessment roll, CMHC's rental surveys and th
 zoning grids — so that what may be built on a lot, what that would cost, and what
 the ground is already worth read off one row.
 
-Currently enabled: **VSMPE** (Villeray–Saint-Michel–Parc-Extension, 24 tables).
+Registered by default: **VSMPE** (Villeray–Saint-Michel–Parc-Extension, 24 Spectrum tables) and **CIL** (La Cité-Limoilou, Quebec City - its zoning layer and specification grid; see [docs/quebec-city.md](docs/quebec-city.md)). **SAG** (Ville de Saguenay, one key for the whole municipality - its zoning layer and a grid PDF per zone; see [docs/saguenay.md](docs/saguenay.md)) is known and is registered on request. The list lives in the Dagster instance: `make neighborhoods` shows it, `make neighborhood-add NEIGHBORHOOD=<key>` widens it.
 
 Full documentation is in **[docs/](docs/README.md)**.
 
@@ -62,19 +62,19 @@ tree: [docs/architecture.md](docs/architecture.md).
 
 ## The assets
 
-36 assets, listed with their partitions and outputs in
+41 assets, listed with their partitions and outputs in
 [docs/assets.md](docs/assets.md).
 
 | Layer | |
 | --- | --- |
-| **bronze** | `spectrum_table_catalog` `neighborhood_features` `reference_neighborhoods` `neighborhood_lots` `neighborhood_buildings` `cmhc_vacancy_survey` `cmhc_rent_survey` `street_network` `montreal_residential_costs` `montreal_nonresidential_costs` `property_assessment_roll` `uniformized_property_wealth` `montreal_commercial_rents` `commercial_rent_index` `linked_documents` |
-| **silver** | `vacancy_rates` `average_rents` `building_lot_intersections` `assessment_units` `lot_assessed_values` `lot_assessment_comparables` `commercial_rents` `neighborhood_streets` `lot_frontage` `zoning_grid_columns` `lot_zone_pieces` `lot_zoning_envelopes` `lot_buildable_setbacks` `lot_development_programs` `document_chunks` `document_embeddings` |
-| **gold** | `lot_profiles` `lot_highest_best_use` `lot_redevelopment_gap` `lot_investment_opportunities` `lot_building_massing` `document_index` |
+| **bronze** | `spectrum_table_catalog` `neighborhood_features` `reference_neighborhoods` `neighborhood_lots` `neighborhood_buildings` `cmhc_vacancy_survey` `cmhc_rent_survey` `street_network` `neighborhood_addresses` `linked_documents` `montreal_residential_costs` `montreal_nonresidential_costs` `property_assessment_roll` `cubf_use_codes` `uniformized_property_wealth` `montreal_commercial_rents` `commercial_rent_index` |
+| **silver** | `assessment_units` `lot_assessed_values` `lot_assessment_comparables` `commercial_rents` `vacancy_rates` `average_rents` `building_lot_intersections` `neighborhood_streets` `lot_addresses` `lot_frontage` `document_chunks` `document_embeddings` `zoning_grid_columns` `lot_zone_pieces` `lot_zoning_envelopes` `lot_buildable_setbacks` `lot_development_programs` |
+| **gold** | `lot_profiles` `lot_highest_best_use` `lot_redevelopment_gap` `lot_building_massing` `lot_investment_opportunities` `map_cell_aggregates` `document_index` |
 
-They read seven publishers: Spectrum and the open-data portal (Ville de
-Montréal), Infolot and the assessment roll (Québec), BDOI, CMHC, and the Altus
-cost guide. Why each is read the way it is — and what each one gets wrong — is a
-page per source under [docs/](docs/README.md#the-data).
+They read eight publishers: Spectrum and the open-data portal (Ville de
+Montréal), Infolot, the assessment roll and Adresses Québec (Québec), BDOI,
+CMHC, and the Altus cost guide. Why each is read the way it is — and what each
+one gets wrong — is a page per source under [docs/](docs/README.md#the-data).
 
 `lot_development_programs` is where the highest-and-best-use question
 actually gets solved — one `urban_rag.program.solve_program` CP-SAT run per
@@ -118,21 +118,36 @@ parcel too narrow to stand a car on cannot park on the ground at all, and
 its programme has to dig, deck or bay the stalls instead.
 `make massing`, and [docs/massing.md](docs/massing.md).
 
-### Seven assets are blocked
+`lot_addresses` gives every one of those answers a name a person recognises.
+Adresses Québec publishes the province's official civic addresses as points and
+records **no lot number on any of them**, so putting an address on a parcel is a
+spatial join or it does not happen; `silver.lot_addresses` does it at the
+`(lot_uid, feature_id)` grain the gold tables are keyed on, which is what lets
+the map label a site *7430 Rue Lajeunesse* rather than *2 784 705* and lets the
+corpus answer a question asked as a street and a number. A row is an addressable
+*unit* rather than a front door — roughly half of them carry an apartment prefix
+— so the units on a site and the doors on it are counted separately, and
+`is_primary_address` marks the one a label takes. The product is advertised
+under a WMS endpoint, which renders pictures and cannot answer this; the REST
+face of the same server can. `make addresses`, and
+[docs/addresses.md](docs/addresses.md).
 
-`lot_frontage`, `lot_buildable_setbacks`, `lot_profiles`,
-`lot_development_programs`, `lot_highest_best_use`, `lot_redevelopment_gap` and
-`lot_building_massing` are registered and have jobs, but **no schedule**: each
-reads a relation hbu_infra creates. The SQL files all exist; what is
+### Nine assets are blocked
+
+`lot_frontage`, `lot_zone_pieces`, `lot_addresses`, `lot_buildable_setbacks`,
+`lot_profiles`, `lot_development_programs`, `lot_highest_best_use`,
+`lot_redevelopment_gap` and `lot_building_massing` are registered and have jobs,
+but **no schedule**: each reads a relation hbu_infra creates. The SQL files all exist; what is
 outstanding is `db.py init` against the target database — twice for
 `lot_profiles`, since `sql/006_lot_documents.sql` carries a
 `-- requires: rag.chunks` header and only lands after `document_index`
 has run.
 
 Each fails up front naming the file to apply, rather than letting psycopg raise.
-Run them by hand with `make frontage`, `make zone-pieces`, `make setbacks`,
-`make lot-profiles`, `make programs`, `make hbu` and `make massing`; the
-envelope pair they all sit behind has no schedule either (`make envelopes`).
+Run them by hand with `make frontage`, `make zone-pieces`, `make addresses`,
+`make setbacks`, `make lot-profiles`, `make programs`, `make hbu` and `make
+massing`; the envelope pair they all sit behind has no schedule either (`make
+envelopes`).
 `zone-pieces` is the first of the zoning chain rather than an addition to it —
 the envelopes join the ground each zone governs rather than the raw overlaps,
 so nothing below it is correct until it has run for the partition. Details, and

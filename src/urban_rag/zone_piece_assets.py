@@ -72,7 +72,7 @@ from urban_rag.building_lots_assets import building_lot_intersections
 from urban_rag.frames import write_frame
 from urban_rag.frontage_assets import lot_frontage
 from urban_rag.layers import key_prefix
-from urban_rag.partitions import scrape_partitions
+from urban_rag.partitions import metric_srid_for, scrape_partitions
 from urban_rag.postgis import (
     DEFAULT_ZONE_PIECE_EDGE_TOLERANCE_M,
     MIN_ZONE_OVERLAP_M2,
@@ -82,7 +82,7 @@ from urban_rag.postgis import (
     compute_lot_zone_pieces,
     fetch_lot_zone_pieces,
 )
-from urban_rag.rag.documents import DOCUMENT_SOURCES
+from urban_rag.rag.documents import ZONING_SOURCES
 from urban_rag.rag.pgvector import PostgresUnavailable
 from urban_rag.resources import ParquetStore, PostgisResource
 from urban_rag.storage import clear_parquet, join
@@ -202,7 +202,8 @@ def lot_zone_pieces(
                 connection,
                 neighborhood=neighborhood,
                 scrape_date=scrape_date,
-                zone_sources=tuple(DOCUMENT_SOURCES),
+                metric_srid=metric_srid_for(neighborhood),
+                zone_sources=tuple(ZONING_SOURCES),
                 min_pct_of_lot=config.min_pct_of_lot,
                 min_overlap_m2=config.min_overlap_m2,
                 min_piece_area_m2=config.min_piece_area_m2,
@@ -216,7 +217,7 @@ def lot_zone_pieces(
                 # under the cutoffs.
                 raise Failure(
                     f"{neighborhood} {scrape_date}: no lot is covered by a "
-                    f"{'/'.join(DOCUMENT_SOURCES)} feature at or above "
+                    f"{'/'.join(ZONING_SOURCES)} feature at or above "
                     f"{config.min_pct_of_lot}% and {config.min_overlap_m2} m2, "
                     f"or {config.min_piece_area_m2} m2 outright, so there is "
                     "no piece to state. Check that "

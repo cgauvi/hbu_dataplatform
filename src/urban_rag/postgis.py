@@ -726,21 +726,36 @@ def compute_lot_features(
 #: reaching a parcel is a fact about tenure; it is not a map of the street
 #: network, and `hbu.road_parcel_lots` says the same thing from the other side.
 #:
-#: So the street network identifies the street, which is what it is for. A
-#: geobase double side is drawn along the roadway, so it runs *within* the
-#: parcel that is the roadway and enters no other. Measured over the fixture,
-#: the separation is total rather than marginal: the fourteen road lots carry
-#: between 105 m and 325 m of street line each, every other parcel carries
-#: none, and the rule picks out all fourteen with no false positive and no
-#: false negative. One metre is therefore a guard against a side clipping the
-#: corner of an ordinary parcel where the two publishers disagree, not a
-#: threshold anything real sits near.
+#: So the street network identifies the street, which is what it is for. The
+#: line is drawn along the roadway, so it runs *within* the parcel that is the
+#: roadway and enters no other. Measured over the fixture when the network was
+#: the geobase double, the separation was total rather than marginal: the
+#: fourteen road lots carried between 105 m and 325 m of street line each,
+#: every other parcel carried none, and the rule picked out all fourteen with
+#: no false positive and no false negative. One metre is therefore a guard
+#: against a line clipping the corner of an ordinary parcel where the two
+#: publishers disagree, not a threshold anything real sits near.
 #:
-#: It also settles the lanes without a second rule. The geobase double draws
-#: the public roadway and no ruelle, so the borough's lane parcels - three of
-#: them in the fixture, 3.6 to 4.5 m wide - are not road lots, and a lot
-#: backing onto one gets no frontage from it. That is the intended reading: a
-#: lane is access, not street edge.
+#: **A centre line should make that separation cleaner, not weaker.** Since the
+#: network became the RQTT (`urban_rag.rqtt`) the line runs down the axis of the
+#: roadway rather than along its curb, and a curb side is the one that could
+#: stray: it hugs the boundary the road parcel shares with its neighbours, so
+#: it is the drawing most likely to clip the parcel next door. The axis cannot.
+#:
+#: **The lanes are still settled without a second rule, and still by coverage
+#: rather than by a rule.** This was the risk worth checking when the source
+#: changed, because a network that drew Montreal's ruelles would turn every lot
+#: backing onto one into a lot fronting one, and that would move front and rear
+#: setbacks, `num_frontages` and the corner-lot counts all at once. It does not:
+#: the RQTT publishes no `Ruelle` class at all, and only 50 of the 93,521
+#: segments in the Montreal box carry "Ruelle" in their name - the named
+#: laneways, not the thousands of back lanes. So the borough's lane parcels are
+#: still not road lots, and a lot backing onto one still gets no frontage from
+#: it. That remains the intended reading: a lane is access, not street edge.
+#:
+#: It is coverage and not a rule, though, so it is worth re-checking whenever
+#: the RQTT vintage changes - see `rqtt.ROAD_CLASS_FIELD` for the counts this
+#: paragraph rests on.
 DEFAULT_ROAD_LOT_MIN_STREET_M = 1.0
 
 #: What `compute_lot_frontage` reports each road lot as, and the schema of the
@@ -877,6 +892,24 @@ _SLIVER_GAP_M = 0.5
 #: crediting interior lots with the street beyond their neighbours. The tier
 #: that produced a row is written to `silver.lot_frontage.buffer_m`, so which
 #: measure answered is on the row rather than inferred.
+#:
+#: **These two numbers are the one thing the move to the RQTT did not settle,
+#: and they are still the geobase double's.** Every sentence above measures the
+#: reach from a *curb* line. The RQTT draws the axis of the roadway
+#: (`urban_rag.rqtt`), which sits half a carriageway further from the lot - five
+#: to ten metres on a Villeray street - and that inverts both halves of the
+#: argument at once: 8 m may no longer clear the widening strips it was chosen
+#: to clear, and 16 m no longer stays under half a roadway, so it can reach a
+#: line that belongs to the pavement on the *far* side of the street.
+#:
+#: Nothing here is inferred from that, because the reach is an empirical
+#: number and the borough is what sets it. Until a partition has been cut with
+#: the new network and the ladder measured against it - the `by_buffer` split
+#: `_measure_fallback_frontage` reports, and
+#: `num_lots_near_road_without_frontage` - these stay where they are, and a
+#: partition's `buffer_m` rows should be read as the estimates they have always
+#: been rather than as calibrated ones. `FrontageConfig.fallback_buffers_m` is
+#: how a run tries other values without editing this line.
 DEFAULT_FRONTAGE_FALLBACK_BUFFERS_M: tuple[float, ...] = (8.0, 16.0)
 
 #: How much of a boundary segment has to run *along* a street side for the
@@ -1108,8 +1141,13 @@ def compute_lot_frontage(
     scrape_date: str,
     min_street_m: float = DEFAULT_ROAD_LOT_MIN_STREET_M,
     fallback_buffers_m: Sequence[float] = DEFAULT_FRONTAGE_FALLBACK_BUFFERS_M,
+    metric_srid: int = FRONTAGE_METRIC_SRID,
 ) -> dict[str, object]:
     """(Re)compute `silver.lot_frontage` for one (neighborhood, scrape_date).
+
+    ``metric_srid`` is the projected system the borough is surveyed in -
+    `partitions.metric_srid_for`; MTM zone 8 for Montreal, zone 7 for Quebec
+    City - and is what every metre below is measured in.
 
     How much street each lot faces, and which street. A lot with 30 m on a
     boulevard is a different development site from the one behind it with 6 m
@@ -1223,7 +1261,7 @@ def compute_lot_frontage(
     """
     cursor = connection.cursor()
     _require_relations(cursor, _FRONTAGE_RELATIONS)
-    srid = int(FRONTAGE_METRIC_SRID)
+    srid = int(metric_srid)
 
     # Both sides of the join, projected once and indexed, in temp tables rather
     # than CTEs. The projection is what every predicate below runs against, and
@@ -1750,6 +1788,38 @@ edges AS (
                AS side_edge_m
       FROM classified
      GROUP BY lot_uid
+),
+-- The same sort, pointed at the *second street edge* rather than at what is
+-- left of the boundary. `frontage_rank = 2` is one class here and two
+-- different lot lines out there: on a corner lot it runs into the front edge
+-- and is a side line, on a through lot it runs parallel to the front and is
+-- the rear line. A by-law that prices those two differently - Saguenay does,
+-- with *Latérale sur rue* and *Arrière sur rue* - needs to know which it is,
+-- and this is the fact that decides it. Montreal and Quebec City state one
+-- on-street margin, so nothing reads this for them.
+secondary_pieces AS (
+    SELECT p.lot_uid, (seg).geom AS geom
+      FROM parcels p
+      JOIN street s ON s.lot_uid = p.lot_uid
+      CROSS JOIN LATERAL ST_DumpSegments(
+          ST_Segmentize(s.secondary_geom, %(step_m)s::double precision)
+      ) AS seg
+     WHERE s.front_geom IS NOT NULL
+       AND s.secondary_geom IS NOT NULL
+),
+secondary_class AS (
+    SELECT c.lot_uid,
+           COALESCE(sum(ST_Length(c.geom)) FILTER (
+               WHERE abs(
+                         ST_Distance(ST_StartPoint(c.geom), s.front_geom)
+                       - ST_Distance(ST_EndPoint(c.geom), s.front_geom)
+                     ) / ST_Length(c.geom) <= %(max_sin)s::double precision
+           ), 0.0) AS parallel_m,
+           COALESCE(sum(ST_Length(c.geom)), 0.0) AS secondary_m
+      FROM secondary_pieces c
+      JOIN street s ON s.lot_uid = c.lot_uid
+     WHERE ST_Length(c.geom) > 0
+     GROUP BY c.lot_uid
 )
 SELECT p.lot_uid,
        p.lot_number,
@@ -1762,13 +1832,21 @@ SELECT p.lot_uid,
        COALESCE(ST_Length(s.front_geom), 0.0) AS front_edge_m,
        COALESCE(ST_Length(s.secondary_geom), 0.0) AS secondary_front_edge_m,
        COALESCE(e.rear_edge_m, 0.0) AS rear_edge_m,
-       COALESCE(e.side_edge_m, 0.0) AS side_edge_m
+       COALESCE(e.side_edge_m, 0.0) AS side_edge_m,
+       -- Whether more of the rank-2 street edge runs parallel to the front
+       -- than does not, and so whether it is the lot's rear line. A majority
+       -- of its length rather than all of it: a through lot whose rear line
+       -- kinks still has a rear line, and the test is already a threshold.
+       -- False where there is no second street edge, which is most lots and
+       -- is the answer that leaves *Avant secondaire* governing.
+       COALESCE(sc.parallel_m * 2.0 > sc.secondary_m, false) AS secondary_is_rear
   FROM parcels p
   JOIN street s ON s.lot_uid = p.lot_uid
   -- LEFT, unlike the join above: a lot whose entire boundary was measured as
   -- street edge - a through lot, an island parcel - has a front and no other
   -- class, and is a row with two zero lengths rather than a row that is gone.
   LEFT JOIN edges e ON e.lot_uid = p.lot_uid
+  LEFT JOIN secondary_class sc ON sc.lot_uid = p.lot_uid
  WHERE s.front_geom IS NOT NULL
 """
 
@@ -1876,8 +1954,12 @@ def compute_lot_buildable_setbacks(
     batch_lots: int = DEFAULT_SETBACK_BATCH_LOTS,
     resume: bool = True,
     progress: "Callable[[str], None] | None" = None,
+    metric_srid: int = SETBACK_METRIC_SRID,
 ) -> dict[str, object]:
     """(Re)compute `silver.lot_buildable_setbacks` for one partition.
+
+    ``metric_srid`` is the borough's surveyed projection, as for
+    `compute_lot_frontage`.
 
     What is left of each lot once the four margins its zoning grid states are
     taken off it, at the grain the grid states them: one row per (lot, zone,
@@ -1895,11 +1977,24 @@ def compute_lot_buildable_setbacks(
     * **front** - `silver.lot_frontage.geom` at `frontage_rank = 1`, which is
       the boundary that asset *measured* as running along a street rather than
       an edge guessed at from the parcel's shape.
-    * **secondary** - the same at rank 2. Only a corner lot has one, and it
-      takes *Avant secondaire*, falling back to *Avant principale* where the
-      grid states only the one - a corner lot's second street edge is still a
-      street edge, and leaving it unregulated would hand a corner parcel more
+    * **secondary** - the same at rank 2. Only a corner or a through lot has
+      one, and it takes *Avant secondaire*, falling back to *Avant principale*
+      where the grid states only the one - a second street edge is still a
+      street edge, and leaving it unregulated would hand such a parcel more
       room than the mid-block lot beside it.
+
+      **Where the by-law prices two on-street margins, the lot picks.** That
+      rank-2 edge is one class here and two different lot lines out there: on
+      a corner lot it runs into the front and is a side line, on a through lot
+      it runs parallel to the front and is the rear line. Saguenay prices
+      those apart - *Latérale sur rue* and *Arrière sur rue* - so both travel
+      on the envelope row and the choice is made here, by segmentizing the
+      rank-2 edge and running the same sine test against the front edge: the
+      edge is the rear line when more of its length comes back parallel than
+      not. `secondary_setback_rule` records which was read. Montreal states
+      one on-street margin and Quebec City states none, so
+      `rear_on_street_margin_min_m` is NULL on their rows, the test is never
+      consulted and the rule reads 'secondary_front' throughout.
     * **rear** - of what is left, the pieces running within `SETBACK_MAX_SIN`
       of parallel to the front.
     * **side** - of what is left, everything else.
@@ -2007,7 +2102,7 @@ def compute_lot_buildable_setbacks(
     parameters: dict[str, Any] = {
         "neighborhood": neighborhood,
         "scrape_date": scrape_date,
-        "srid": int(SETBACK_METRIC_SRID),
+        "srid": int(metric_srid),
         "step_m": float(SETBACK_SEGMENT_M),
         "max_sin": float(SETBACK_MAX_SIN),
         "tolerance_m": tolerance,
@@ -2116,6 +2211,7 @@ def compute_lot_buildable_setbacks(
                 "front_edge_m", "secondary_front_edge_m", "side_edge_m",
                 "rear_edge_m",
                 "implantation_mode", "side_setback_rule", "side_margin_min_m",
+                "secondary_setback_rule",
                 "front_setback_m", "secondary_front_setback_m", "side_setback_m",
                 "rear_setback_m",
                 "buildable_area_m2", "buildable_pct_of_lot",
@@ -2164,7 +2260,12 @@ def compute_lot_buildable_setbacks(
                     -- neither. See the docstring.
                     COALESCE(
                         e.secondary_front_margin_min_m, e.front_margin_min_m, 0.0
-                    ) AS secondary_front_setback_m,
+                    ) AS side_on_street_setback_m,
+                    -- ...and the other on-street margin, where a by-law states
+                    -- one. NULL is "this grid prices every street edge alike",
+                    -- which is what keeps `oriented` below a no-op for the two
+                    -- cities that do.
+                    e.rear_on_street_margin_min_m AS rear_on_street_setback_m,
                     COALESCE(e.rear_margin_min_m, 0.0) AS rear_setback_m
                   FROM silver.lot_zoning_envelopes e
                  WHERE e.neighborhood = %(neighborhood)s
@@ -2178,6 +2279,34 @@ def compute_lot_buildable_setbacks(
                            ELSE COALESCE(n.side_margin_min_m, 0.0)
                        END AS side_setback_m
                   FROM norms n
+            ),
+            -- Which of the grid's on-street margins the rank-2 edge takes.
+            -- The zone states both and the lot decides between them, so this
+            -- is the first point at which the question can be answered: the
+            -- margins arrive per (lot, zone, column) and the orientation of
+            -- the edge arrives per lot.
+            --
+            -- A grid stating one on-street margin - Montreal's *Avant
+            -- secondaire*, and Quebec City's nothing at all - has a NULL
+            -- `rear_on_street_setback_m`, so the CASE falls through to the
+            -- reading those cities have always had and the rule column says
+            -- so on every row.
+            oriented AS (
+                SELECT a.*,
+                       CASE
+                           WHEN b.secondary_is_rear
+                            AND a.rear_on_street_setback_m IS NOT NULL
+                               THEN 'rear_on_street'
+                           ELSE 'secondary_front'
+                       END AS secondary_setback_rule,
+                       CASE
+                           WHEN b.secondary_is_rear
+                            AND a.rear_on_street_setback_m IS NOT NULL
+                               THEN a.rear_on_street_setback_m
+                           ELSE a.side_on_street_setback_m
+                       END AS secondary_front_setback_m
+                  FROM applied a
+                  JOIN {setback_edges} b ON b.lot_uid = a.lot_uid
             ),
             -- The ground each zone governs, which is what the carve below is
             -- finally clipped to. Projected here rather than in the temp table
@@ -2246,7 +2375,7 @@ def compute_lot_buildable_setbacks(
                            ),
                            3
                        ) AS buildable_geom
-                  FROM applied a
+                  FROM oriented a
                   JOIN {setback_edges} b ON b.lot_uid = a.lot_uid
                   -- An inner join, so a column whose zone governs no ground on
                   -- this lot gets no row. That is the sliver cutoff reaching
@@ -2302,6 +2431,7 @@ def compute_lot_buildable_setbacks(
                 m.implantation_mode,
                 m.side_setback_rule,
                 m.side_margin_min_m,
+                m.secondary_setback_rule,
                 m.front_setback_m,
                 m.secondary_front_setback_m,
                 m.side_setback_m,
@@ -2602,8 +2732,12 @@ def compute_lot_zone_pieces(
     min_overlap_m2: float = MIN_ZONE_OVERLAP_M2,
     min_piece_area_m2: float = MIN_ZONE_PIECE_AREA_M2,
     edge_tolerance_m: float = DEFAULT_ZONE_PIECE_EDGE_TOLERANCE_M,
+    metric_srid: int = ZONE_PIECE_METRIC_SRID,
 ) -> dict[str, object]:
     """(Re)compute `silver.lot_zone_pieces` for one (neighborhood, scrape_date).
+
+    ``metric_srid`` is the borough's surveyed projection, as for
+    `compute_lot_frontage`.
 
     The piece of a lot that one zone governs, as a site in its own right: its
     own area, its own street, and its own share of what already stands on the
@@ -2679,7 +2813,7 @@ def compute_lot_zone_pieces(
 
     cursor = connection.cursor()
     _require_relations(cursor, _ZONE_PIECE_RELATIONS)
-    srid = int(ZONE_PIECE_METRIC_SRID)
+    srid = int(metric_srid)
 
     parameters: dict[str, Any] = {
         "neighborhood": neighborhood,
@@ -4890,6 +5024,566 @@ def fetch_lot_zone_pieces(
         FROM silver.lot_zone_pieces
         WHERE neighborhood = %s AND scrape_date = %s::date
         ORDER BY lot_uid, zone_rank, feature_id
+        """,
+        [neighborhood, scrape_date],
+    )
+
+
+# ---------------------------------------------------------------------------
+# the addresses
+# ---------------------------------------------------------------------------
+
+#: What `compute_lot_addresses` reads, and the hbu_infra file that creates it.
+#: `rag.lots` is checked too, and separately from `WORKING_SET_RELATIONS`,
+#: because a database can legitimately hold the working set and not this.
+_ADDRESS_RELATIONS: tuple[tuple[str, str], ...] = (
+    ("rag.addresses", "sql/026_silver_lot_addresses.sql"),
+    ("rag.lots", "sql/002_spatial.sql"),
+    ("silver.lot_zone_pieces", "sql/025_silver_lot_zone_pieces.sql"),
+)
+
+#: How far off a parcel an address point may sit and still be that parcel's.
+#:
+#: Zero would be defensible and is wrong in practice. The address points and
+#: the cadastre are two publishers' surveys of the same ground - MRNF's and
+#: Infolot's - and where a point was digitised against a building face rather
+#: than a lot line it lands just outside the parcel it belongs to. Two metres
+#: is the tolerance that recovers those without reaching across a street; the
+#: row records which basis it matched on, so a borough leaning on the snap is
+#: visible rather than assumed.
+#:
+#: The same posture `silver.lot_frontage.buffer_m` takes towards a lot whose
+#: edge does not touch the street it obviously fronts.
+DEFAULT_ADDRESS_SNAP_M = 2.0
+
+#: Metres in one degree of latitude. The candidate filter below works in
+#: degrees so it can use the GiST index on `geom`, and this is what converts
+#: the snap tolerance into one.
+#:
+#: **It is divided by `cos(latitude)`**, and that is not a refinement. A degree
+#: of longitude is *shorter* than a degree of latitude - 78 km against 111 km
+#: at Montreal, 52 km at the top of Quebec - so a radius computed from latitude
+#: alone is too small in the east-west direction, and the filter silently
+#: misses a point 2 m due east of a parcel while finding one 2 m due north.
+#: Dividing by the cosine makes the radius the *longitude* one, which is the
+#: larger of the two and therefore covers both. Being generous costs nothing:
+#: every candidate it admits is then measured exactly with `geography`.
+_M_PER_DEGREE_LAT = 111_320.0
+
+#: The temp tables `compute_lot_addresses` builds, in creation order.
+_ADDRESS_TEMP_TABLES: tuple[str, ...] = (
+    "_address_piece",
+    "_address_match",
+    "_address_points",
+)
+
+
+def load_addresses(
+    connection: "Connection",
+    frame: gpd.GeoDataFrame,
+    *,
+    neighborhood: str,
+    scrape_date: str,
+    address_id_column: str = "address_id",
+) -> int:
+    """Replace this borough's rows in `rag.addresses` with ``frame``.
+
+    The third member of the `rag` working set, and the first one made of
+    points. `_replace_partition` cannot load it: that function measures an
+    `area_m2` and wraps every geometry in `ST_Multi`, both of which are
+    polygon-shaped and neither of which means anything for an address.
+
+    ``frame`` is the *parsed* bronze snapshot - `urban_rag.address_assets`
+    splits `AdresseFormatee` into its parts before the load - so everything it
+    carries beyond the geometry and the id lands in `attributes`, and the join
+    below reads the street name out of there rather than re-parsing it in SQL.
+
+    The publisher's `IdAdr` is a real key, unique across the province, so a
+    duplicate inside one load - a point returned by two overlapping pages -
+    resolves with `ON CONFLICT ... DO NOTHING` the way `load_lots` does.
+    """
+    cursor = connection.cursor()
+    cursor.execute(
+        "DELETE FROM rag.addresses WHERE neighborhood = %s AND scrape_date = %s::date",
+        [neighborhood, scrape_date],
+    )
+    if frame.empty:
+        analyze(connection, "rag.addresses")
+        return 0
+
+    _psycopg()
+    from psycopg.types.json import Jsonb
+    import shapely.wkb
+
+    cursor.execute(
+        "CREATE TEMP TABLE rag_addresses_load "
+        "(address_id text, neighborhood text, scrape_date date, "
+        "attributes jsonb, geom bytea) ON COMMIT DROP"
+    )
+
+    geometry_name = frame.geometry.name
+    exclude = set(_ALWAYS_EXCLUDED) | {geometry_name, address_id_column}
+    attribute_columns = [c for c in frame.columns if c not in exclude]
+    attrs = (
+        json.loads(
+            frame[attribute_columns].to_json(orient="records", date_format="iso")
+        )
+        if attribute_columns
+        else [{}] * len(frame)
+    )
+
+    inserted = 0
+    partition_date = _as_date(scrape_date)
+    statement = (
+        "COPY rag_addresses_load "
+        "(address_id, neighborhood, scrape_date, attributes, geom) "
+        "FROM STDIN (FORMAT BINARY)"
+    )
+    with cursor.copy(statement) as copy:
+        copy.set_types(["text", "text", "date", "jsonb", "bytea"])
+        for index, row in enumerate(frame.itertuples(index=False)):
+            geometry = getattr(row, geometry_name)
+            if geometry is None or geometry.is_empty:
+                continue
+            copy.write_row(
+                [
+                    _as_text(getattr(row, address_id_column)),
+                    neighborhood,
+                    partition_date,
+                    Jsonb(attrs[index]),
+                    shapely.wkb.dumps(geometry),
+                ]
+            )
+            inserted += 1
+
+    cursor.execute(
+        """
+        INSERT INTO rag.addresses (
+            address_id, neighborhood, scrape_date, attributes, geom
+        )
+        SELECT address_id, neighborhood, scrape_date, attributes,
+               ST_SetSRID(ST_GeomFromWKB(geom), 4326)
+          FROM rag_addresses_load
+        ON CONFLICT (address_id, scrape_date) DO NOTHING
+        """
+    )
+    analyze(connection, "rag.addresses")
+    return inserted
+
+
+def compute_lot_addresses(
+    connection: "Connection",
+    *,
+    neighborhood: str,
+    scrape_date: str,
+    max_snap_m: float = DEFAULT_ADDRESS_SNAP_M,
+) -> dict[str, object]:
+    """(Re)compute `silver.lot_addresses` for one (neighborhood, scrape_date).
+
+    Every address point on a parcel, carried at the grain of the *piece* the
+    rest of this platform answers at: one row per address, stating the lot it
+    stands on, the zone piece it stands in, and where it ranks among that
+    piece's addresses. That is what makes it joinable to the gold tables, which
+    are keyed on `(lot_uid, feature_id)` - see `compute_lot_zone_pieces`.
+
+    **The publisher has no lot number**, so this join is the only thing that
+    puts an address on a parcel. `urban_rag.adresses_quebec` says why: the
+    layer publishes ten fields and not one of them is cadastral.
+
+    **Three matching bases, and the row says which it used.**
+
+    ``within``   the point is inside the parcel. The ordinary case.
+    ``snapped``  the point is outside every parcel but within ``max_snap_m``
+                 of one, and is given to the nearest. Two surveys of the same
+                 ground disagree at the edges - see `DEFAULT_ADDRESS_SNAP_M`.
+    (unmatched)  the point is on nobody's parcel. Not written: the grain of
+                 this table is an address *on a lot*, and a row with no lot
+                 would be a null in the column every reader joins on. Counted
+                 and returned as ``num_unmatched`` instead, which is the number
+                 to watch - a borough where it is large is one whose cadastre
+                 did not land, not one without addresses.
+
+    **A point inside a lot but inside none of its pieces** is the third state
+    and it is neither of the above. The zone-piece cutoffs drop slivers, so a
+    parcel's pieces need not cover it entirely; an address in the gap is given
+    the lot's *primary* piece and records ``piece_basis = 'primary'``. A lot
+    with no pieces at all - one no zoning layer governs - takes ``'-'`` for the
+    zone, the same dash `sql/025` writes for a migrated row, so the column
+    stays non-null and a reader can tell the two apart.
+
+    **A row is an addressable unit, not a front door.** Roughly half the points
+    in a dense borough carry a unit prefix, so `num_piece_addresses` counts
+    units and `num_piece_civic_addresses` counts distinct civic addresses.
+    Reporting only the first would make an eight-plex look like eight
+    buildings.
+    """
+    snap = float(max_snap_m)
+    if snap < 0:
+        raise ValueError(f"max_snap_m must not be negative, got {max_snap_m!r}")
+
+    cursor = connection.cursor()
+    _require_relations(cursor, _ADDRESS_RELATIONS)
+
+    parameters: dict[str, Any] = {
+        "neighborhood": neighborhood,
+        "scrape_date": scrape_date,
+        "max_snap_m": snap,
+        "m_per_degree_lat": _M_PER_DEGREE_LAT,
+    }
+
+    for table in _ADDRESS_TEMP_TABLES:
+        cursor.execute(f"DROP TABLE IF EXISTS {table}")
+
+    # The points, with the parsed parts lifted out of the jsonb once rather
+    # than in each of the three statements below.
+    cursor.execute(
+        """
+        CREATE TEMP TABLE _address_points AS
+        SELECT a.address_uid,
+               a.address_id,
+               a.geom,
+               a.attributes->>'formatted_address'          AS formatted_address,
+               a.attributes->>'unit'                       AS unit,
+               (a.attributes->>'civic_number')::integer    AS civic_number,
+               a.attributes->>'civic_suffix'               AS civic_suffix,
+               a.attributes->>'civic_address'              AS civic_address,
+               a.attributes->>'street_name'                AS street_name,
+               a.attributes->>'municipality'               AS municipality,
+               a.attributes->>'postal_code'                AS postal_code,
+               (a.attributes->>'num_units')::integer       AS num_units,
+               a.attributes->>'characteristic'             AS characteristic,
+               a.attributes->>'source_version'             AS source_version,
+               (a.attributes->>'object_id')::bigint        AS object_id
+          FROM rag.addresses a
+         WHERE a.neighborhood = %(neighborhood)s
+           AND a.scrape_date = %(scrape_date)s::date
+           AND a.geom IS NOT NULL
+        """,
+        parameters,
+    )
+    cursor.execute("CREATE INDEX ON _address_points USING gist (geom)")
+    cursor.execute("CREATE INDEX ON _address_points (address_uid)")
+    cursor.execute("ANALYZE _address_points")
+
+    # The parcel each point belongs to. `within` first; whatever is left over
+    # gets one chance at the nearest parcel inside the snap.
+    #
+    # DISTINCT ON takes the *smallest* containing parcel, which is the answer
+    # that is right when the cadastre overlaps itself - a point on a shared
+    # boundary belongs to the lot it is a bigger fraction of, and a condominium
+    # parcel drawn inside its base lot is the address's own.
+    cursor.execute(
+        """
+        CREATE TEMP TABLE _address_match AS
+        WITH within AS (
+            SELECT DISTINCT ON (p.address_uid)
+                   p.address_uid, l.lot_uid, l.lot_number,
+                   'within'::text AS match_basis,
+                   0.0::double precision AS snap_distance_m
+              FROM _address_points p
+              JOIN rag.lots l
+                ON l.neighborhood = %(neighborhood)s
+               AND l.scrape_date = %(scrape_date)s::date
+               AND ST_Intersects(l.geom, p.geom)
+             ORDER BY p.address_uid, ST_Area(l.geom), l.lot_uid
+        ),
+        leftover AS (
+            SELECT p.address_uid, p.geom
+              FROM _address_points p
+             WHERE NOT EXISTS (
+                     SELECT 1 FROM within w WHERE w.address_uid = p.address_uid
+                   )
+        ),
+        snapped AS (
+            SELECT DISTINCT ON (o.address_uid)
+                   o.address_uid, l.lot_uid, l.lot_number,
+                   'snapped'::text AS match_basis,
+                   ST_Distance(l.geom::geography, o.geom::geography)
+                       AS snap_distance_m
+              FROM leftover o
+              JOIN rag.lots l
+                ON l.neighborhood = %(neighborhood)s
+               AND l.scrape_date = %(scrape_date)s::date
+               -- The index-using candidate filter, in degrees. The radius is
+               -- taken at *this point's* latitude and divided by its cosine,
+               -- which makes it the longitude radius - the larger of the two,
+               -- so it covers an east-west offset as well as a north-south
+               -- one. See `_M_PER_DEGREE_LAT`. The exact metric distance
+               -- below is what actually decides.
+               AND ST_DWithin(
+                       l.geom, o.geom,
+                       %(max_snap_m)s
+                           / (%(m_per_degree_lat)s
+                              * greatest(cos(radians(ST_Y(o.geom))), 0.01))
+                   )
+             WHERE ST_Distance(l.geom::geography, o.geom::geography)
+                   <= %(max_snap_m)s
+             ORDER BY o.address_uid,
+                      ST_Distance(l.geom::geography, o.geom::geography),
+                      l.lot_uid
+        )
+        SELECT * FROM within
+        UNION ALL
+        SELECT * FROM snapped
+        """,
+        parameters,
+    )
+    cursor.execute("CREATE INDEX ON _address_match (address_uid)")
+    cursor.execute("CREATE INDEX ON _address_match (lot_uid)")
+    cursor.execute("ANALYZE _address_match")
+
+    # The zone piece each matched point stands in, and the fallbacks the
+    # docstring argues for when it stands in none of them.
+    cursor.execute(
+        """
+        CREATE TEMP TABLE _address_piece AS
+        WITH inside AS (
+            SELECT DISTINCT ON (m.address_uid)
+                   m.address_uid, z.feature_id, z.source_table,
+                   'piece'::text AS piece_basis
+              FROM _address_match m
+              JOIN _address_points p ON p.address_uid = m.address_uid
+              JOIN silver.lot_zone_pieces z
+                ON z.neighborhood = %(neighborhood)s
+               AND z.scrape_date = %(scrape_date)s::date
+               AND z.lot_uid = m.lot_uid
+               AND ST_Intersects(z.geom, p.geom)
+             ORDER BY m.address_uid, z.zone_rank, z.feature_id
+        ),
+        primary_piece AS (
+            SELECT DISTINCT ON (z.lot_uid)
+                   z.lot_uid, z.feature_id, z.source_table
+              FROM silver.lot_zone_pieces z
+             WHERE z.neighborhood = %(neighborhood)s
+               AND z.scrape_date = %(scrape_date)s::date
+             ORDER BY z.lot_uid, z.zone_rank, z.feature_id
+        )
+        SELECT m.address_uid,
+               COALESCE(i.feature_id, pp.feature_id, '-')  AS feature_id,
+               COALESCE(i.source_table, pp.source_table)    AS source_table,
+               CASE
+                   WHEN i.address_uid IS NOT NULL THEN 'piece'
+                   WHEN pp.lot_uid IS NOT NULL    THEN 'primary'
+                   ELSE 'none'
+               END AS piece_basis
+          FROM _address_match m
+          LEFT JOIN inside i        ON i.address_uid = m.address_uid
+          LEFT JOIN primary_piece pp ON pp.lot_uid = m.lot_uid
+        """,
+        parameters,
+    )
+    cursor.execute("CREATE INDEX ON _address_piece (address_uid)")
+    cursor.execute("ANALYZE _address_piece")
+
+    result = warehouse.upsert_select(
+        cursor,
+        "lot_addresses",
+        _LOT_ADDRESS_COLUMNS,
+        _LOT_ADDRESS_SELECT,
+        parameters,
+        neighborhood=neighborhood,
+        scrape_date=scrape_date,
+    )
+
+    cursor.execute(
+        """
+        SELECT count(*),
+               count(DISTINCT lot_uid),
+               count(*) FILTER (WHERE match_basis = 'snapped'),
+               count(*) FILTER (WHERE piece_basis = 'primary'),
+               count(*) FILTER (WHERE piece_basis = 'none'),
+               count(*) FILTER (WHERE unit IS NOT NULL),
+               count(DISTINCT (lot_uid, feature_id)),
+               count(*) FILTER (WHERE street_name IS NULL)
+          FROM silver.lot_addresses
+         WHERE neighborhood = %(neighborhood)s
+           AND scrape_date = %(scrape_date)s::date
+        """,
+        parameters,
+    )
+    (
+        num_addresses,
+        num_lots,
+        num_snapped,
+        num_primary_piece,
+        num_no_piece,
+        num_units_addressed,
+        num_pieces,
+        num_unparsed,
+    ) = cursor.fetchone()
+
+    # The points that reached no parcel at all. Asked of the temp tables rather
+    # than of the target, because by definition they are not in it.
+    cursor.execute(
+        """
+        SELECT count(*)
+          FROM _address_points p
+         WHERE NOT EXISTS (
+                 SELECT 1 FROM _address_match m WHERE m.address_uid = p.address_uid
+               )
+        """
+    )
+    (num_unmatched,) = cursor.fetchone()
+    cursor.execute("SELECT count(*) FROM _address_points")
+    (num_points,) = cursor.fetchone()
+
+    for table in _ADDRESS_TEMP_TABLES:
+        cursor.execute(f"DROP TABLE IF EXISTS {table}")
+
+    return {
+        **result,
+        "num_addresses": int(num_addresses),
+        "num_lots": int(num_lots),
+        "num_pieces": int(num_pieces),
+        "num_points": int(num_points),
+        # The number to watch: addresses the cadastre could not place at all.
+        "num_unmatched": int(num_unmatched),
+        "num_snapped": int(num_snapped),
+        "num_primary_piece": int(num_primary_piece),
+        "num_no_piece": int(num_no_piece),
+        "num_unit_addresses": int(num_units_addressed),
+        "num_unparsed": int(num_unparsed),
+        "max_snap_m": snap,
+    }
+
+
+#: `silver.lot_addresses`, in the order sql/026 declares it.
+_LOT_ADDRESS_COLUMNS: tuple[str, ...] = (
+    "scrape_date", "neighborhood", "address_id",
+    "lot_uid", "lot_number", "feature_id", "source_table",
+    "match_basis", "snap_distance_m", "piece_basis",
+    "formatted_address", "unit", "civic_number", "civic_suffix",
+    "civic_address", "street_name", "municipality", "postal_code",
+    "num_units", "characteristic", "source_version", "object_id",
+    "address_rank", "is_primary_address",
+    "num_piece_addresses", "num_piece_civic_addresses", "num_lot_addresses",
+    "geom",
+)
+
+#: The statement behind those columns.
+#:
+#: Two things in it are worth reading twice.
+#:
+#: **The ranking.** `address_rank` orders a piece's addresses by civic number
+#: and then by unit, so rank 1 is the lowest-numbered door on the site - which
+#: is what a map label and a RAG answer both want when they can show one
+#: address for a parcel and not forty. Ordering by the publisher's `OBJECTID`
+#: instead would be stable and meaningless.
+#:
+#: **The counts are aggregated in a CTE rather than windowed.** Postgres has no
+#: `count(DISTINCT ...) OVER (...)` - it raises `DISTINCT is not implemented
+#: for window functions` - so the per-site totals are grouped once and joined
+#: back. A row whose address did not parse counts as a door of its own
+#: (`coalesce(civic_address, address_id)`): the alternative is `count(DISTINCT)`
+#: skipping its null and reporting a site of eight unparsed addresses as having
+#: no doors at all.
+_LOT_ADDRESS_SELECT = """
+WITH placed AS (
+    SELECT m.lot_uid,
+           m.lot_number,
+           m.match_basis,
+           m.snap_distance_m,
+           z.feature_id,
+           z.source_table,
+           z.piece_basis,
+           p.address_id,
+           p.formatted_address,
+           p.unit,
+           p.civic_number,
+           p.civic_suffix,
+           p.civic_address,
+           p.street_name,
+           p.municipality,
+           p.postal_code,
+           p.num_units,
+           p.characteristic,
+           p.source_version,
+           p.object_id,
+           p.geom
+      FROM _address_match m
+      JOIN _address_points p ON p.address_uid = m.address_uid
+      JOIN _address_piece z  ON z.address_uid = m.address_uid
+),
+site_counts AS (
+    SELECT lot_uid, feature_id,
+           count(*)::integer AS num_piece_addresses,
+           count(DISTINCT coalesce(civic_address, address_id))::integer
+               AS num_piece_civic_addresses
+      FROM placed
+     GROUP BY lot_uid, feature_id
+),
+lot_counts AS (
+    SELECT lot_uid, count(*)::integer AS num_lot_addresses
+      FROM placed
+     GROUP BY lot_uid
+)
+SELECT %(scrape_date)s::date,
+       %(neighborhood)s::text,
+       pl.address_id,
+       pl.lot_uid,
+       pl.lot_number,
+       pl.feature_id,
+       pl.source_table,
+       pl.match_basis,
+       pl.snap_distance_m,
+       pl.piece_basis,
+       pl.formatted_address,
+       pl.unit,
+       pl.civic_number,
+       pl.civic_suffix,
+       pl.civic_address,
+       pl.street_name,
+       pl.municipality,
+       pl.postal_code,
+       pl.num_units,
+       pl.characteristic,
+       pl.source_version,
+       pl.object_id,
+       row_number() OVER piece_order AS address_rank,
+       row_number() OVER piece_order = 1 AS is_primary_address,
+       sc.num_piece_addresses,
+       sc.num_piece_civic_addresses,
+       lc.num_lot_addresses,
+       pl.geom
+  FROM placed pl
+  JOIN site_counts sc
+    ON sc.lot_uid = pl.lot_uid AND sc.feature_id = pl.feature_id
+  JOIN lot_counts lc ON lc.lot_uid = pl.lot_uid
+WINDOW piece_order AS (
+    PARTITION BY pl.lot_uid, pl.feature_id
+    ORDER BY pl.civic_number NULLS LAST, pl.civic_suffix NULLS FIRST,
+             pl.unit NULLS FIRST, pl.address_id
+)
+"""
+
+#: `silver.lot_addresses`, for the parquet the asset writes beside the table.
+_LOT_ADDRESS_FETCH_COLUMNS: tuple[str, ...] = (
+    "neighborhood", "lot_uid", "lot_number", "feature_id", "source_table",
+    "address_id", "formatted_address", "unit", "civic_number", "civic_suffix",
+    "civic_address", "street_name", "municipality", "postal_code",
+    "num_units", "characteristic", "source_version", "object_id",
+    "match_basis", "snap_distance_m", "piece_basis",
+    "address_rank", "is_primary_address",
+    "num_piece_addresses", "num_piece_civic_addresses", "num_lot_addresses",
+)
+
+
+def fetch_lot_addresses(
+    connection: "Connection", *, neighborhood: str, scrape_date: str
+) -> gpd.GeoDataFrame:
+    """This partition's `silver.lot_addresses` rows, grouped by site.
+
+    Ordered by lot, then by zone piece, then by the rank within it, so a
+    reader taking the top of a lot's rows gets its primary piece's lowest
+    civic number - the address a map labels the parcel with.
+    """
+    return _fetch_partition(
+        connection,
+        _LOT_ADDRESS_FETCH_COLUMNS,
+        """
+        FROM silver.lot_addresses
+        WHERE neighborhood = %s AND scrape_date = %s::date
+        ORDER BY lot_uid, feature_id, address_rank
         """,
         [neighborhood, scrape_date],
     )

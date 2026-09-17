@@ -69,9 +69,10 @@ from dagster import (
     asset,
 )
 
+from urban_rag.assets import neighborhood_features
 from urban_rag.frames import write_frame
 from urban_rag.layers import key_prefix
-from urban_rag.partitions import scrape_partitions
+from urban_rag.partitions import City, city_of, scrape_partitions
 from urban_rag.program import (
     ProgramError,
     ZoneColumn,
@@ -80,6 +81,7 @@ from urban_rag.program import (
     permitted_floors,
     select_governing_column,
 )
+from urban_rag.quebec import GRID_SLUG, GRID_ZONE_COLUMN, ZONING_SLUG, grid_columns
 from urban_rag.rag.documents import DOCUMENT_SOURCES
 from urban_rag.rag.pgvector import PostgresUnavailable
 from urban_rag.rag_assets import DOCUMENTS_FILE, linked_documents
@@ -87,6 +89,7 @@ from urban_rag.resources import ParquetStore, PdfCache, PostgisResource
 from urban_rag.storage import clear_parquet, filesystem, join, storage_options
 from urban_rag.warehouse import MissingRelation, publish, published_metadata
 from urban_rag.zone_piece_assets import LOT_ZONE_PIECES_FILE, lot_zone_pieces
+from urban_rag.saguenay import parse_grid_pdf as parse_saguenay_grid_pdf
 from urban_rag.zoning_grid import (
     ZONE_FIELDS,
     GridColumn,
@@ -168,6 +171,11 @@ NORM_FIELDS = (
     "secondary_front_margin_max_m",
     "side_margin_min_m",
     "rear_margin_min_m",
+    # Saguenay's only, and NULL on the other two cities' columns - see
+    # `GridColumn.rear_on_street_margin_min_m`. It reaches
+    # `silver.lot_buildable_setbacks` through here and is chosen between, per
+    # lot, in `postgis.compute_lot_buildable_setbacks`.
+    "rear_on_street_margin_min_m",
     "only_permitted_usages",
     "excluded_usages",
 )
@@ -181,7 +189,7 @@ USAGE_CATEGORIES = ("habitation", "commerce", "industrie", "equipements")
 @asset(
     key_prefix=key_prefix("zoning_grid_columns"),
     partitions_def=scrape_partitions,
-    deps=[linked_documents],
+    deps=[linked_documents, neighborhood_features],
     group_name=GROUP,
     kinds={"pypdf", "postgres", "parquet"},
     description=(
@@ -193,6 +201,9 @@ USAGE_CATEGORIES = ("habitation", "commerce", "industrie", "equipements")
         "density, dwelling ceiling and the four margins - as columns. Emitted "
         "once per (document, feature_id, column), so a grid two zones share "
         "reaches both. A norm the grid prints as '-' is null and not zero. "
+        "A Quebec City borough reads the city's specification workbook "
+        f"({GRID_SLUG}) instead of PDFs, one row per zone, into the same "
+        "columns - see urban_rag.quebec.grid_columns for what is translated. "
         f"Writes silver/zoning_grid_columns/<YYYY-MM-DD>/<neighborhood>/"
         f"{ZONE_COLUMNS_FILE} and upserts silver.zoning_grid_columns on "
         "(scrape_date, neighborhood, source_table, feature_id, column_index)."
@@ -205,59 +216,90 @@ def zoning_grid_columns(
     postgis: PostgisResource,
 ) -> MaterializeResult:
     neighborhood, scrape_date = _partition(context)
-    documents = _read(
-        store.partition_dir(linked_documents.key.path[-1], scrape_date, neighborhood),
-        DOCUMENTS_FILE,
-    )
-    # The corpus indexes whatever `DOCUMENT_SOURCES` links to; only the zone
-    # table's links are grids, and the others would each cost a parse failure.
-    grids = documents[documents["source_table"].isin(DOCUMENT_SOURCES)]
-    if grids.empty:
-        raise Failure(
-            f"{neighborhood} {scrape_date}: linked_documents holds no document "
-            f"from {', '.join(DOCUMENT_SOURCES)}, so there is no grid to read."
+    if city_of(neighborhood) is City.QUEBEC:
+        # The city publishes its norms as a workbook, snapshotted beside the
+        # zoning layer by `neighborhood_features`; there is no PDF to read.
+        grids = _read(
+            store.partition_dir(
+                neighborhood_features.key.path[-1], scrape_date, neighborhood
+            ),
+            f"{GRID_SLUG}.parquet",
+        )
+        if grids.empty:
+            raise Failure(
+                f"{neighborhood} {scrape_date}: {GRID_SLUG} holds no zone row, "
+                "so there is no grid to read."
+            )
+        rows, failures = _quebec_grid_rows(
+            grids, neighborhood=neighborhood, scrape_date=scrape_date
+        )
+        num_documents = int(grids[GRID_ZONE_COLUMN].nunique()) - len(failures)
+    else:
+        documents = _read(
+            store.partition_dir(linked_documents.key.path[-1], scrape_date, neighborhood),
+            DOCUMENTS_FILE,
+        )
+        # The corpus indexes whatever `DOCUMENT_SOURCES` links to; only the zone
+        # table's links are grids, and the others would each cost a parse failure.
+        grids = documents[documents["source_table"].isin(DOCUMENT_SOURCES)]
+        if grids.empty:
+            raise Failure(
+                f"{neighborhood} {scrape_date}: linked_documents holds no document "
+                f"from {', '.join(DOCUMENT_SOURCES)}, so there is no grid to read."
+            )
+
+        # The same on-disk cache `linked_documents` filled, keyed by URL: a grid is
+        # reissued under a new file when its zone is amended rather than edited in
+        # place, so this re-reads bytes rather than re-downloading them.
+        fetcher = pdf_cache.fetcher()
+
+        # Both cities publish a grid per zone and neither publishes the same
+        # document. Montreal's is a borough template typeset by the borough;
+        # Saguenay's is generated by its zoning service from the by-law, with
+        # its own sections, its own vocabulary and its rows laid out up the
+        # page rather than down it - so the reader is chosen by city and the
+        # rest of this branch is shared. See `urban_rag.saguenay`.
+        parse = (
+            parse_saguenay_grid_pdf
+            if city_of(neighborhood) is City.SAGUENAY
+            else parse_grid_pdf
         )
 
-    # The same on-disk cache `linked_documents` filled, keyed by URL: a grid is
-    # reissued under a new file when its zone is amended rather than edited in
-    # place, so this re-reads bytes rather than re-downloading them.
-    fetcher = pdf_cache.fetcher()
+        rows: list[dict] = []
+        failures: dict[str, str] = {}
+        num_documents = 0
+        for document in grids.itertuples(index=False):
+            try:
+                content, _ = fetcher.fetch(document.url)
+                columns = parse(content, url=document.url)
+            except (GridParseError, OSError) as exc:
+                # One unreadable grid costs its zone, not the borough - the same
+                # posture `linked_documents` takes towards a dead link.
+                failures[document.url] = str(exc)
+                context.log.warning("%s", exc)
+                continue
 
-    rows: list[dict] = []
-    failures: dict[str, str] = {}
-    num_documents = 0
-    for document in grids.itertuples(index=False):
-        try:
-            content, _ = fetcher.fetch(document.url)
-            columns = parse_grid_pdf(content, url=document.url)
-        except (GridParseError, OSError) as exc:
-            # One unreadable grid costs its zone, not the borough - the same
-            # posture `linked_documents` takes towards a dead link.
-            failures[document.url] = str(exc)
-            context.log.warning("%s", exc)
-            continue
-
-        num_documents += 1
-        feature_ids = _feature_ids(document) or [None]
-        rows.extend(
-            {
-                "doc_id": document.doc_id,
-                "source_table": document.source_table,
-                "neighborhood": neighborhood,
-                "scrape_date": scrape_date,
-                "url": document.url,
-                # What the map calls this zone, and what the join downstream is
-                # keyed on. `grid_zone` is what the page prints; the two agree
-                # except where a grid is shared, which is the case this grain
-                # exists for.
-                "feature_id": feature_id,
-                "grid_zone": column.zone,
-                **_column_row(column),
-            }
-            for feature_id in feature_ids
-            for column in columns
-            if not column.is_empty
-        )
+            num_documents += 1
+            feature_ids = _feature_ids(document) or [None]
+            rows.extend(
+                {
+                    "doc_id": document.doc_id,
+                    "source_table": document.source_table,
+                    "neighborhood": neighborhood,
+                    "scrape_date": scrape_date,
+                    "url": document.url,
+                    # What the map calls this zone, and what the join downstream is
+                    # keyed on. `grid_zone` is what the page prints; the two agree
+                    # except where a grid is shared, which is the case this grain
+                    # exists for.
+                    "feature_id": feature_id,
+                    "grid_zone": column.zone,
+                    **_column_row(column),
+                }
+                for feature_id in feature_ids
+                for column in columns
+                if not column.is_empty
+            )
 
     if not rows:
         raise Failure(
@@ -516,6 +558,45 @@ def lot_zoning_envelopes(
             **published_metadata(loaded),
         }
     )
+
+
+def _quebec_grid_rows(
+    grids: pd.DataFrame, *, neighborhood: str, scrape_date: str
+) -> tuple[list[dict], dict[str, str]]:
+    """The workbook rows of one borough, as the rows of this table.
+
+    One zone is one grid, keyed by its own code - the same code the zoning
+    layer carries in `IGDS_TEXT_STRING`, which is what `rag.features` has as
+    `feature_id` and what `lot_zoning_envelopes` joins on. `doc_id` and
+    `url` are null: the workbook is one document for the city, not one per
+    zone, and nothing in the corpus cites it.
+    """
+    rows: list[dict] = []
+    failures: dict[str, str] = {}
+    for record in grids.to_dict("records"):
+        zone = str(record.get(GRID_ZONE_COLUMN) or "").strip()
+        if not zone:
+            continue
+        try:
+            columns = grid_columns(record)
+        except (GridParseError, ProgramError, ValueError, TypeError) as exc:
+            failures[zone] = str(exc)
+            continue
+        rows.extend(
+            {
+                "doc_id": None,
+                "source_table": ZONING_SLUG,
+                "neighborhood": neighborhood,
+                "scrape_date": scrape_date,
+                "url": None,
+                "feature_id": zone,
+                "grid_zone": column.zone,
+                **_column_row(column),
+            }
+            for column in columns
+            if not column.is_empty
+        )
+    return rows, failures
 
 
 def _threshold(frame: pd.DataFrame, column: str) -> float:

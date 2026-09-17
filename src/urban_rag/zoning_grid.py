@@ -278,6 +278,19 @@ class GridColumn:
     secondary_front_margin_max_m: float | None = None
     side_margin_min_m: float | None = None
     rear_margin_min_m: float | None = None
+    #: The margin a *rear* lot line takes where that line faces a street, for
+    #: a by-law that states one apart from the side-on-street margin. Saguenay
+    #: does - its grid prints *Arrière sur rue* beside *Latérale sur rue* - and
+    #: neither Montreal nor Quebec City does, so it is ``None`` on their
+    #: columns and `secondary_front_margin_min_m` governs every street edge
+    #: after the first.
+    #:
+    #: The two cannot be collapsed here, because which one applies is a fact
+    #: about the *lot*: the second street edge of a corner lot is a side line
+    #: and of a through lot is its rear line, and a zone has both kinds in it.
+    #: `postgis.compute_lot_buildable_setbacks` is where the choice is made,
+    #: by the angle test it already runs to tell the two apart.
+    rear_on_street_margin_min_m: float | None = None
     only_permitted_usages: str | None = None
     excluded_usages: str | None = None
 

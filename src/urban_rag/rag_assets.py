@@ -76,9 +76,16 @@ EMBEDDINGS_FILE = "embeddings.parquet"
 #: The id is whichever citation number a user would actually reference - for
 #: ``VSP_REG_ZONE`` that is ``NUMERO_COMPLET``, the zone number printed on the
 #: grid itself ("C01-001"), which is also what `neighborhood_features` joins a
-#: parcel to. ``ID`` and the other titles are kept for tables added to
-#: `DOCUMENT_SOURCES` later; the zone table carries neither.
-_ID_COLUMNS = ("NUMERO_COMPLET", "ID")
+#: parcel to. ``no_zone`` is Saguenay's equivalent and is the number printed on
+#: its grids ("70520"); ``IGDS_TEXT_STRING`` is Quebec City's ("11004Mc"), and
+#: doubles as the key its sheet is served under. ``ID`` is the name the Données
+#: Québec export of the same Quebec layer gives that code, kept for a partition
+#: read from there rather than from the feature service.
+#:
+#: Quebec City reaches `_TITLE_COLUMNS` with none of them: its layer publishes
+#: ``NATURE`` and ``STATUT`` and no usage description, so its documents carry a
+#: null title and are cited by zone code alone.
+_ID_COLUMNS = ("NUMERO_COMPLET", "no_zone", "ID", "IGDS_TEXT_STRING")
 _TITLE_COLUMNS = ("USAGE", "DESCRIPTION", "NOM_CAT")
 
 

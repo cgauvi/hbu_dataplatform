@@ -197,10 +197,15 @@ class FakeSession:
 
 
 class FakeReadingModeFetcher:
+    """The Montreal page only: another centre's URL answers as CMHC would
+    for a geography it does not publish, and the asset carries on without it."""
+
     def __init__(self, html: str = AVERAGE_RENTS_HTML):
         self.html = html
 
-    def fetch_average_rents(self) -> str:
+    def fetch_average_rents(self, url: str | None = None) -> str:
+        if url:
+            raise CmhcError(f"{url}: no page in this fixture")
         return self.html
 
 
@@ -404,9 +409,12 @@ def test_the_reference_month_is_read_off_the_sheet(workbook, tmp_path):
 
 
 def test_every_mapped_borough_is_a_known_partition_key():
-    from urban_rag.partitions import NEIGHBORHOOD_NAMESPACES
+    from urban_rag.partitions import NEIGHBORHOOD_NAMESPACES, known_neighborhoods
 
-    assert set(CMHC_QUARTIERS) == set(NEIGHBORHOOD_NAMESPACES)
+    # Every Montreal borough is mapped, and nothing is mapped that is not a
+    # key of one city or the other.
+    assert set(NEIGHBORHOOD_NAMESPACES) <= set(CMHC_QUARTIERS)
+    assert set(CMHC_QUARTIERS) <= set(known_neighborhoods())
 
 
 def test_no_quartier_is_claimed_by_two_boroughs():

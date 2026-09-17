@@ -58,6 +58,8 @@ UV_SYNC_STAMP := $(CURDIR)/.venv/.uv-sync-stamp
 # as a prerequisite - only the docker ones, which bind-mount it, still do.
 DAGSTER := uv run python -m urban_rag.dagster_home dagster
 DAGSTER_DAEMON := uv run python -m urban_rag.dagster_home dagster-daemon
+# The same instance config, for a command of this package's own.
+URBAN_RAG_PYTHON := uv run python -m urban_rag.dagster_home python
 
 # Assets are selected by their full `<layer>/<asset>` key, which is what
 # `key_prefix` in urban_rag.layers gives them. A bare name resolves to no
@@ -74,6 +76,10 @@ MODULE := urban_rag.definitions
 # so an earlier DATE would write today's data under an earlier month's key.
 # They refuse it; see urban_rag.guards and docs/running.md.
 DATE ?= $(shell date +%Y-%m-01)
+# A key from urban_rag.partitions.known_neighborhoods(): a Montreal borough
+# (VSMPE, RPP, ...) or a Quebec City arrondissement (CIL, RIV, ...). It has to
+# be registered on the partition axis first - `make neighborhood-add` - since
+# the axis is dynamic and lives in the Dagster instance, not in code.
 NEIGHBORHOOD ?= VSMPE
 PORT ?= 2500
 K ?= 5
@@ -81,7 +87,7 @@ K ?= 5
 # the shared Postgres/pgvector one (configured from URBAN_RAG_PG_*, see
 # docs/corpus.md). `make index BACKEND=postgres` reloads the latter from parquet.
 BACKEND ?= duckdb
-# How much geobase street line must run inside a parcel before `make frontage`
+# How much street line must run inside a parcel before `make frontage`
 # reads that parcel as the roadway itself. It decides which parcels are street,
 # not what any lot then measures - the frontage is the boundary a lot shares
 # with a street parcel, taken exactly, and has no setting of its own. Replaces
@@ -107,11 +113,21 @@ TOLERANCE_M ?= 0.05
 # a stable link. See urban_rag.postgis.DEFAULT_SETBACK_BATCH_LOTS.
 SETBACK_BATCH ?= 2000
 SETBACK_RESUME ?= true
+# How far off a parcel an address point may sit and still be that parcel's,
+# for `make addresses`. Not a rounding allowance like TOLERANCE_M above: the
+# address points and the cadastre are two publishers' surveys of the same
+# ground, and a point digitised against a building face lands just outside the
+# lot line. 0 disables the fallback and drops those addresses instead; the
+# rows record which basis they matched on either way. See
+# urban_rag.postgis.DEFAULT_ADDRESS_SNAP_M.
+ADDRESS_SNAP_M ?= 2.0
 # Which municipalities' assessment rolls `make roll` keeps out of the
 # province-wide archive, as a JSON list of five-digit `code_mun` values.
-# Defaults to Ville de Montréal, which is every borough this pipeline has; `[]`
-# keeps the province. See docs/assessment-roll.md.
-CODE_MUN ?= ["66023"]
+# Defaults to Ville de Montréal, Ville de Québec and Ville de Saguenay, the
+# three cities this pipeline has keys in
+# (urban_rag.partitions.MUNICIPALITY_CODES); `[]` keeps the province. See
+# docs/assessment-roll.md.
+CODE_MUN ?= ["66023","23027","94068"]
 # Whether `make lot-values` falls back to the assessment point for the units
 # the roll's own lot-number crosswalk cannot place - which is every divided
 # co-ownership, since those name private lots Infolot does not draw. `false`
@@ -268,6 +284,7 @@ DOCKER_RUN := docker run --rm -it \
 	-p $(PORT):2500
 
 .PHONY: help sync dagster_run daemon test materialize catalog features \
+	neighborhoods neighborhood-add neighborhood-remove lots buildings building-lots \
 	quartiers cmhc costs vacancy rents envelopes setbacks lot-profiles \
 	programs hbu massing map_cells \
 	streets borough-streets roll lot-values comparables \
@@ -329,8 +346,35 @@ catalog: | $(UV_SYNC_STAMP) ## Materialize spectrum_table_catalog for DATE
 features: | $(UV_SYNC_STAMP) ## Materialize neighborhood_features for DATE x NEIGHBORHOOD
 	$(DAGSTER) asset materialize --select bronze/neighborhood_features --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
 
-quartiers: | $(UV_SYNC_STAMP) ## Materialize reference_neighborhoods for DATE
+quartiers: | $(UV_SYNC_STAMP) ## Materialize reference_neighborhoods for DATE (both cities' outlines)
 	$(DAGSTER) asset materialize --select bronze/reference_neighborhoods --partition $(DATE) -m $(MODULE)
+
+# The neighborhood axis is a DynamicPartitionsDefinition: its keys are held in
+# the Dagster instance (the `dagster` schema on Postgres, or the local home)
+# rather than in code, so a borough is switched on by registering it. `add`
+# refuses a key urban_rag.partitions cannot resolve into its sources.
+neighborhoods: | $(UV_SYNC_STAMP) ## List the boroughs registered on the partition axis, and the ones that could be
+	$(URBAN_RAG_PYTHON) -m urban_rag.neighborhoods list
+
+neighborhood-add: | $(UV_SYNC_STAMP) ## Register NEIGHBORHOOD on the partition axis (e.g. NEIGHBORHOOD=CIL)
+	$(URBAN_RAG_PYTHON) -m urban_rag.neighborhoods add $(NEIGHBORHOOD)
+
+neighborhood-remove: | $(UV_SYNC_STAMP) ## Take NEIGHBORHOOD off the axis; its partitions stay on disk
+	$(URBAN_RAG_PYTHON) -m urban_rag.neighborhoods remove $(NEIGHBORHOOD)
+
+# The three borough-scoped loads that feed building_lot_intersections. Each
+# needs `quartiers` for the same DATE; `lots` and `buildings` read province-wide
+# services bounded by the borough outline, `building-lots` joins them in
+# Postgres and reloads rag.lots (see docs/cadastre.md for what that reminting
+# costs downstream).
+lots: | $(UV_SYNC_STAMP) ## Materialize neighborhood_lots (Infolot cadastre) for DATE x NEIGHBORHOOD
+	$(DAGSTER) asset materialize --select bronze/neighborhood_lots --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
+
+buildings: | $(UV_SYNC_STAMP) ## Materialize neighborhood_buildings (BDOI footprints) for DATE x NEIGHBORHOOD
+	$(DAGSTER) asset materialize --select bronze/neighborhood_buildings --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
+
+building-lots: | $(UV_SYNC_STAMP) ## Materialize building_lot_intersections (loads rag.lots/buildings/features) for DATE x NEIGHBORHOOD
+	$(DAGSTER) asset materialize --select silver/building_lot_intersections --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
 
 # Bronze: one workbook read for the whole island, so DATE only.
 cmhc: | $(UV_SYNC_STAMP) ## Snapshot both CMHC surveys for DATE
@@ -359,6 +403,17 @@ rents: | $(UV_SYNC_STAMP) ## Materialize average_rents for DATE x NEIGHBORHOOD
 # PostGIS pass, about five seconds on a borough.
 zone-pieces: | $(UV_SYNC_STAMP) ## Materialize lot_zone_pieces for DATE x NEIGHBORHOOD
 	$(DAGSTER) asset materialize --select silver/lot_zone_pieces --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
+
+# Adresses Quebec's civic address points, and the join that puts them on the
+# cadastre. Needs rag.addresses and silver.lot_addresses (hbu_infra sql/026)
+# applied, and `zone-pieces` run first for the same partition - an address is
+# placed on the lot x zone piece grain the gold tables are keyed on, so without
+# the pieces there is nothing to key it to. The bronze half is a few minutes of
+# paging against a provincial server; re-running only the join is
+# `--select silver/lot_addresses`.
+addresses: | $(UV_SYNC_STAMP) ## Materialize the address points and their lot join for DATE x NEIGHBORHOOD
+	$(DAGSTER) asset materialize --select "bronze/neighborhood_addresses,silver/lot_addresses" --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE) \
+		--config-json '{"ops":{"silver__lot_addresses":{"config":{"max_snap_m":$(ADDRESS_SNAP_M)}}}}'
 
 # The two envelope assets, which lot_profiles now reads: the grids are
 # parsed from the PDFs the corpus already downloaded. Both also upsert into
@@ -454,8 +509,17 @@ map_cells: | $(UV_SYNC_STAMP) ## Dissolve DATE x NEIGHBORHOOD's map layers onto 
 	$(DAGSTER) asset materialize --select gold/map_cell_aggregates --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE) \
 		--config-json '{"ops":{"gold__map_cell_aggregates":{"config":{"layers":$(LAYERS)}}}}'
 
-# Bronze: one 91 MB download for the whole island, so DATE only.
-streets: | $(UV_SYNC_STAMP) ## Snapshot the island-wide geobase double for DATE
+# Bronze: one download for the whole province, so DATE only. Needs `quartiers`
+# first - the read is bounded by each city's outline, since the RQTT publishes
+# no municipality code to filter on.
+#
+# The first run of a vintage downloads 390 MB and unpacks a 1.27 GB GeoPackage
+# into data/cache/rqtt/; every later scrape date reuses both. The MRNF reissues
+# the file three times a year (April, July, December) at a URL with no version
+# in it, so the cache is keyed on the Last-Modified the server reports and a
+# month that finds the same vintage moves no bytes at all. Which vintage a
+# partition was built from is in its `rqtt_version` metadata.
+streets: | $(UV_SYNC_STAMP) ## Snapshot the province-wide RQTT road network for DATE
 	$(DAGSTER) asset materialize --select bronze/street_network --partition $(DATE) -m $(MODULE)
 
 # Owns silver.neighborhood_streets (hbu_infra sql/007), which `frontage` below

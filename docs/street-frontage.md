@@ -21,17 +21,26 @@ buffer, no tolerance, no angle test, nothing to tune — because abutting parcel
 in this cadastre share their vertices rather than merely coming close. See
 [why zero tolerance is safe](#why-zero-tolerance-is-safe-and-why-a-small-buffer-is-not).
 
-The street layer is still needed, and the *géobase double*, not the plain
-géobase:
+The street layer is still needed, and it is now the **RQTT** — the MRNF's
+province-wide road network, which replaced Montreal's *géobase double*, Quebec
+City's `vque_18` and Saguenay's `sag-reseau-routier` all at once. See
+[rqtt.md](rqtt.md).
 
-- [donnees.montreal.ca/dataset/geobase-double](https://donnees.montreal.ca/dataset/geobase-double),
-  CC BY 4.0, ~91 MB of GeoJSON, 91,546 features.
+- `diffusion.mern.gouv.qc.ca/.../RQTT_GPKG.zip`, CC BY 4.0, 390 MB zipped and
+  1.27 GB unpacked, reissued three times a year.
 
-The plain géobase draws one centre line per segment. The double projects that
-onto the curb and sidewalk limits and draws **one line per side of street**.
-`COTE_RUE_ID` is the publisher's key for a side and is unique island-wide,
-which is what lets `silver.neighborhood_streets` upsert against a real natural
-key rather than replace a partition wholesale.
+The géobase double drew **one line per side of street**, projected onto the
+curb and sidewalk limits. The RQTT draws **one centre line per segment**, down
+the axis of the roadway. `COTE_RUE_ID` now holds the RQTT's `AQRP_UUID`, which
+is one per segment across the province — and not its `IdRte`, which carries
+both nulls and duplicates — which is what lets `silver.neighborhood_streets`
+upsert against a real natural key rather than replace a partition wholesale.
+
+The column is still called `COTE_RUE_ID`, a *côté de rue*, and nothing in the
+table is a side of a street any more. The name is kept on purpose: it is in two
+primary keys, denormalised into `gold.lot_profiles` and read by the map's tile
+queries, and re-keying that lineage to win a better noun is the more expensive
+mistake.
 
 Three assets, and the borough axis appears in the middle one:
 
@@ -42,23 +51,32 @@ silver/lot_frontage          date × borough  the shared edges, in metres
 ```
 
 `street_network` is partitioned by date alone because one download serves every
-borough. The cut to a borough happens in silver, from a file already on disk,
-since re-downloading 91 MB per partition would be work done for nothing. It is
-a real clip: a side crossing the borough line is `ST_Intersection`-ed against
-the boundary, and what was published survives beside it in
-`segment_length_m`, `length_in_borough_m` and `pct_in_borough`.
+borough — and now every *city*. The cut to a borough happens in silver, from a
+file already on disk, since re-fetching 390 MB per partition would be work done
+for nothing. It is a real clip: a segment crossing the borough line is
+`ST_Intersection`-ed against the boundary, and what was published survives
+beside it in `segment_length_m`, `length_in_borough_m` and `pct_in_borough`.
 
-VSMPE's first snapshot: 4,262 sides of the island's 91,546, 445.8 km, 170 of
-them cut at the boundary. Lengths are computed in **EPSG:32188** (NAD83 / MTM
-zone 8), not in the 4326 the geometry is stored in — a degree is not a metre.
+Bronze is bounded by a **bounding box per city**, not by an attribute filter:
+the RQTT publishes no municipality code, so there is nothing to push into OGR
+the way the assessment roll pushes `code_mun`. The box rides the GeoPackage's
+R-tree, and the real boundary does the rest in silver. The Montreal box holds
+93,521 segments of the published vintage.
+
+Lengths are computed in each city's own MTM zone — **EPSG:32188** (zone 8) for
+Montreal, **32187** (zone 7) for the other two — not in the 4326 the geometry is
+stored in, and not in the **EPSG:3798** (NAD83 / MTQ Lambert) the RQTT
+publishes in. A degree is not a metre.
 
 ## What the street layer is for now
 
 Three things, and measuring is not one of them.
 
-**It says which parcels are the roadway.** A géobase double side is drawn along
-the roadway, so it runs *inside* the parcel that is the roadway and enters no
-other. A lot is a road lot when at least `min_street_m` of street line runs
+**It says which parcels are the roadway.** A street line is drawn along the
+roadway, so it runs *inside* the parcel that is the roadway and enters no
+other. A centre line does this more reliably than a curb side did: the side
+hugs the boundary the road parcel shares with its neighbours and is the drawing
+most likely to clip the parcel next door, while the axis cannot. A lot is a road lot when at least `min_street_m` of street line runs
 within it. Over the fixture the separation is total rather than marginal:
 
 | | street line inside the parcel |
@@ -73,12 +91,12 @@ threshold anything real sits near. `test_the_measure_does_not_move_with_the_cuto
 sweeps it from 0.5 m to 100 m and no frontage moves.
 
 **It names the street.** A cadastral parcel has no street name, so each shared
-edge is labelled with the nearest géobase side *that runs inside the road lot
+edge is labelled with the nearest street line *that runs inside the road lot
 the edge came from*. The restriction matters. A corner lot's two edges belong
 to two road lots, and the nearest side overall labels both with whichever
 street happens to be closer — lot 3 790 549 comes back as Chabot twice. With
 the restriction it reads 31.2 m on Jarry and 13.1 m on Chabot, which is what it
-is. Naming is all the géobase does to the numbers: a label landing on the wrong
+is. Naming is all the street layer does to the numbers: a label landing on the wrong
 side of a corner costs a name, never a metre.
 
 **And it publishes the road lots**, as `road_lots.parquet` beside
@@ -131,7 +149,7 @@ under-built and `gold.lot_investment_opportunities` as a ranked opportunity.
 
 Avenue Querbes between Ball and Saint-Roch is the worked example: lots
 **2 249 179** and **2 249 339**, 3,319 m² and 3,298 m², each about 9 m wide and
-a block long, each carrying some 365 m of géobase street line, and neither on
+a block long, each carrying some 365 m of street line, and neither on
 the roll. Nothing in the cadastre's own attributes separates them from a house
 lot — same `CO_TYPE_POLGN`, same `CO_STATT_LOT`, same `CO_TYPE_MORCL`. The
 street network is the only thing that does.
@@ -190,12 +208,22 @@ building, a local shopping centre. The run reports it as
 
 ## Lanes settle themselves
 
-The géobase double draws the public roadway and no *ruelle*, so the borough's
-lane parcels — three of them in the fixture, 3.6 to 4.5 m wide — are not road
-lots, and a lot backing onto one gets no frontage from it. That is the intended
-reading: a lane is access, not street edge. It needs no second rule and no
-CUBF 456 exclusion, because the street layer never claimed them in the first
-place.
+The street layer draws the public roadway and essentially no *ruelle*, so the
+borough's lane parcels — three of them in the fixture, 3.6 to 4.5 m wide — are
+not road lots, and a lot backing onto one gets no frontage from it. That is the
+intended reading: a lane is access, not street edge. It needs no second rule
+and no CUBF 456 exclusion, because the street layer never claimed them in the
+first place.
+
+**This was the thing to check when the source changed**, because a network that
+drew Montreal's ruelles would turn every lot backing onto one into a lot
+fronting one, and that moves front and rear setbacks, `num_frontages` and the
+corner-lot counts together. The RQTT does not: it publishes no `Ruelle` class
+at all, and only **50** of the 93,521 segments in the Montreal box carry
+"Ruelle" in their name — the named laneways, not the thousands of back lanes.
+
+It settles itself by *coverage* rather than by a rule, though, which is a
+weaker guarantee than it looks. Re-check it whenever the RQTT vintage changes.
 
 ## What this replaced, and why
 

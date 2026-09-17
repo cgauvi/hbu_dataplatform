@@ -53,6 +53,33 @@ AVERAGE_RENTS_READING_MODE_URL = (
     "&GeographyId=1060&GeographyType=MetropolitanMajorArea&RowField=24"
 )
 
+#: HMIP's own id for each census metropolitan area this pipeline reads, keyed
+#: by the survey centre the workbook labels it with. 1060 is the Montréal
+#: CMA, the one `AVERAGE_RENTS_READING_MODE_URL` names; 1400 is the Québec
+#: CMA, whose neighbourhood rows (Limoilou, Saint-Roch, Montcalm, ...) are
+#: what `partitions.CMHC_QUARTIERS` maps a Quebec City borough onto.
+#:
+#: **A surveyed centre is not necessarily a published one.** Saguenay is a
+#: centre of the Rental Market Survey and the vacancy workbook carries its
+#: eight quartiers, but HMIP serves no average-rent table for it: every id
+#: from 1 to 3000 was walked in September 2026 and the tool publishes 21
+#: metropolitan areas, Saguenay not among them. So a centre with no entry
+#: here is skipped by `cmhc_rent_survey` with a warning rather than looked up
+#: and crashed on, and its boroughs price their dwellings off the vacancy
+#: survey and the roll alone. Add an id here if the tool starts publishing one.
+CMHC_GEOGRAPHY_IDS: dict[str, int] = {
+    "Montréal": 1060,
+    "Québec": 1400,
+}
+
+
+def average_rents_url_for(geography_id: int) -> str:
+    """`AVERAGE_RENTS_READING_MODE_URL` with another CMA's id in it."""
+    return AVERAGE_RENTS_READING_MODE_URL.replace(
+        "GeographyId=1060", f"GeographyId={int(geography_id)}"
+    )
+
+
 #: The HMIP table is the annual Rental Market Survey, whose reference month is
 #: October even though the reading-mode selector lists every month.
 AVERAGE_RENTS_SURVEY_MONTH = "October"
@@ -294,20 +321,20 @@ class CmhcReadingModeFetcher:
         self.request_delay_seconds = request_delay_seconds
         self._session = session or CmhcFetcher._build_session(max_retries, ca_bundle)
 
-    def fetch_average_rents(self) -> str:
+    def fetch_average_rents(self, url: str | None = None) -> str:
+        """The reading-mode page, for the configured CMA or for ``url``."""
+        url = url or self.average_rents_url
         if self.request_delay_seconds:
             time.sleep(self.request_delay_seconds)
         try:
-            response = self._session.get(
-                self.average_rents_url, timeout=self.timeout_seconds
-            )
+            response = self._session.get(url, timeout=self.timeout_seconds)
             response.raise_for_status()
         except requests.RequestException as exc:
-            raise CmhcError(f"{self.average_rents_url}: {exc}") from exc
+            raise CmhcError(f"{url}: {exc}") from exc
 
         html = response.text
         if "Average Rent" not in html:
-            raise CmhcError(f"{self.average_rents_url}: response is not the rent table")
+            raise CmhcError(f"{url}: response is not the rent table")
         return html
 
 
@@ -370,12 +397,16 @@ def read_quartier_sheet(path: Path | str) -> pd.DataFrame:
     return frame
 
 
-def read_average_rents_reading_mode(html: str) -> ReadingModeRentTable:
+def read_average_rents_reading_mode(
+    html: str, *, centre: str = "Montr\u00e9al"
+) -> ReadingModeRentTable:
     """HMIP reading-mode average rents, unpivoted by bedroom type.
 
     Columns: `centre`, `quartier`, `bedroom_type`, `average_rent_cad`,
     `reliability` and `status`. Rents are in dollars as published and null
-    wherever CMHC suppresses a cell.
+    wherever CMHC suppresses a cell. The page names no centre, so ``centre``
+    is what the rows are labelled with - the caller knows which CMA it asked
+    for, and the label has to agree with the vacancy workbook's spelling.
     """
     rows = _html_table_rows(html) or _pipe_table_rows(html)
     table = _average_rent_table(rows)
@@ -407,7 +438,7 @@ def read_average_rents_reading_mode(html: str) -> ReadingModeRentTable:
             )
             records.append(
                 {
-                    "centre": "Montr\u00e9al",
+                    "centre": centre,
                     "quartier": strip_bilingual(quartier),
                     "bedroom_type": bedroom_type,
                     "average_rent_cad": rent,

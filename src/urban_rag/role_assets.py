@@ -108,6 +108,7 @@ publishers part company, so the choice is visible rather than assumed.
 """
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -140,9 +141,12 @@ from urban_rag.layers import key_prefix
 from urban_rag.open_data_assets import GROUP as OPEN_DATA_GROUP
 from urban_rag.open_data_assets import borough_boundary, reference_neighborhoods
 from urban_rag.partitions import (
-    ENABLED_NEIGHBORHOODS,
+    MUNICIPALITY_CODES,
+    City,
     borough_code_for,
+    city_of,
     date_partitions,
+    enabled_neighborhoods,
     scrape_partitions,
 )
 from urban_rag.rag.pgvector import PostgresUnavailable
@@ -259,14 +263,15 @@ class AssessmentRollConfig(Config):
     Montreal's 437 thousand, so the bound is also the difference between a few
     hundred megabytes of memory and a few gigabytes.
 
-    It defaults to Ville de Montréal, which is every borough this pipeline has.
-    Set it to `[]` for the whole province, or add codes for the other on-island
+    It defaults to the two cities this pipeline has boroughs in - Ville de
+    Montréal and Ville de Québec, `partitions.MUNICIPALITY_CODES`. Set it to
+    `[]` for the whole province, or add codes for the other on-island
     municipalities - Westmount, Mont-Royal, Côte-Saint-Luc and the rest file
     their own rolls and are not boroughs.
     """
 
     municipality_codes: list[str] = Field(
-        default=[MONTREAL_CODE_MUN],
+        default=list(MUNICIPALITY_CODES.values()),
         description=(
             "Five-digit `code_mun` values to keep. Empty keeps the province."
         ),
@@ -517,7 +522,22 @@ def assessment_units(
     # file is written, the posture every silver asset here takes - the roll is
     # a 572 MB download and a merge over 437 thousand rows, so a database that
     # is down should cost the load rather than the merge.
-    cut = assign_boroughs(store, merged, scrape_date=scrape_date)
+    neighborhoods = enabled_neighborhoods(context.instance)
+    cut = assign_boroughs(
+        store, merged, scrape_date=scrape_date, neighborhoods=neighborhoods
+    )
+    if cut.skipped:
+        # Loud rather than fatal: the roll is one merge for every borough, and
+        # an outline missing for one of them - a reference_neighborhoods
+        # snapshot taken before that city's layer was written - should cost
+        # that borough's partition and not the province's.
+        context.log.warning(
+            "%s: no outline in reference_neighborhoods for %s; their units "
+            "were not cut out. Re-materialize reference_neighborhoods for "
+            "this date and re-run.",
+            scrape_date,
+            ", ".join(cut.skipped),
+        )
     if not cut.frames:
         # The same refusal `neighborhood_streets` makes when nothing intersects
         # the borough, and for the same reason: silver is the layer that is
@@ -527,7 +547,7 @@ def assessment_units(
         # and not the download.
         raise Failure(
             f"{path} was written, but no assessment unit fell inside any of "
-            f"{', '.join(ENABLED_NEIGHBORHOODS)} for {scrape_date}. The "
+            f"{', '.join(neighborhoods)} for {scrape_date}. The "
             "outlines in reference_neighborhoods may be empty for that date."
         )
 
@@ -1007,10 +1027,16 @@ class BoroughCut:
     placed: int
     outside: int
     arrond_mismatch: int
+    #: Boroughs whose outline the reference snapshot did not hold.
+    skipped: tuple[str, ...] = ()
 
 
 def assign_boroughs(
-    store: ParquetStore, units: gpd.GeoDataFrame, *, scrape_date: str
+    store: ParquetStore,
+    units: gpd.GeoDataFrame,
+    *,
+    scrape_date: str,
+    neighborhoods: Sequence[str],
 ) -> BoroughCut:
     """Put every unit in the borough its point falls inside.
 
@@ -1035,12 +1061,23 @@ def assign_boroughs(
     them are the point of the count: with `CODE_MUN='[]'` the merge is the
     whole province, and this table is the boroughs'.
     """
+    outlines: dict[str, object] = {}
+    skipped: list[str] = []
+    missing: list[Failure] = []
+    for name in neighborhoods:
+        try:
+            outlines[name] = borough_boundary(store, scrape_date, name)
+        except Failure as exc:
+            # One city's layer absent from the reference snapshot costs that
+            # city's boroughs, and is reported; every outline absent is the
+            # snapshot itself missing, and that is the failure to raise.
+            skipped.append(name)
+            missing.append(exc)
+    if not outlines and missing:
+        raise missing[0]
     boroughs = gpd.GeoDataFrame(
-        {"neighborhood": list(ENABLED_NEIGHBORHOODS)},
-        geometry=[
-            borough_boundary(store, scrape_date, name)
-            for name in ENABLED_NEIGHBORHOODS
-        ],
+        {"neighborhood": list(outlines)},
+        geometry=list(outlines.values()),
         crs=units.crs,
     )
     joined = gpd.sjoin(units, boroughs, how="inner", predicate="intersects")
@@ -1069,6 +1106,7 @@ def assign_boroughs(
         placed=inside,
         outside=len(units) - inside,
         arrond_mismatch=_arrond_mismatches(frames),
+        skipped=tuple(skipped),
     )
 
 
@@ -1084,7 +1122,9 @@ def _arrond_mismatches(frames: dict[str, gpd.GeoDataFrame]) -> int:
     """
     total = 0
     for neighborhood, frame in frames.items():
-        if ARROND_COLUMN not in frame.columns:
+        # `REM<no_arr>` is Montreal's spelling; Quebec City's roll files its
+        # arrondissement differently and is not cross-checked here.
+        if ARROND_COLUMN not in frame.columns or city_of(neighborhood) is not City.MONTREAL:
             continue
         expected = f"{ARROND_PREFIX}{borough_code_for(neighborhood)}"
         stated = frame[ARROND_COLUMN]

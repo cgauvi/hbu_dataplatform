@@ -63,7 +63,7 @@ from urban_rag.envelope_assets import lot_zoning_envelopes
 from urban_rag.frames import write_frame
 from urban_rag.frontage_assets import lot_frontage
 from urban_rag.layers import key_prefix
-from urban_rag.partitions import scrape_partitions
+from urban_rag.partitions import metric_srid_for, scrape_partitions
 from urban_rag.postgis import (
     DEFAULT_SETBACK_BATCH_LOTS,
     DEFAULT_SETBACK_EDGE_TOLERANCE_M,
@@ -168,6 +168,7 @@ def lot_buildable_setbacks(
                 connection,
                 neighborhood=neighborhood,
                 scrape_date=scrape_date,
+                metric_srid=metric_srid_for(neighborhood),
                 edge_tolerance_m=config.edge_tolerance_m,
                 batch_lots=config.batch_lots,
                 resume=config.resume,
