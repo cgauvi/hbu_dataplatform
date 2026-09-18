@@ -27,10 +27,10 @@ is `gold.lot_profiles`. Every one of those tables is partitioned by
 gold tables](#the-silver-and-gold-tables).
 
 Two things in Postgres sit outside that rule and are not exceptions to it.
-`rag.lots`, `rag.buildings` and `rag.features` are *bronze* snapshots loaded
-into PostGIS because the silver joins are computed over them there; `rag.chunks`
-is the pgvector index `document_index` publishes. Neither is a silver or gold
-dataset's own table.
+`rag.lots`, `rag.buildings`, `rag.features` and `rag.addresses` are *bronze*
+snapshots loaded into PostGIS because the silver joins are computed over them
+there; `rag.chunks` is the pgvector index `document_index` publishes. Neither
+is a silver or gold dataset's own table.
 
 The tree is the record — losing the database costs a reload rather than a
 re-scrape, which for a live municipal source no later run can undo.
@@ -74,13 +74,24 @@ DO UPDATE SET ...
 | `silver.lot_features` | `lot_uid`, `source_table`, `feature_id` |
 | `silver.neighborhood_streets` | `cote_rue_id` |
 | `silver.lot_frontage` | `lot_uid`, `cote_rue_id` |
+| `silver.lot_addresses` | `address_id` |
 | `silver.document_chunks` | `chunk_id` |
 | `silver.zoning_grid_columns` | `source_table`, `feature_id`, `column_index` |
+| `silver.lot_zone_pieces` | `lot_uid`, `feature_id` |
 | `silver.lot_zoning_envelopes` | `lot_uid`, `feature_id`, `column_index` |
 | `silver.lot_buildable_setbacks` | `lot_uid`, `feature_id`, `column_index` |
-| `silver.lot_assessed_values` | `lot_number` |
+| `silver.lot_development_programs` | `lot_uid`, `feature_id`, `column_index` |
 | `silver.assessment_units` | `id_provinc` |
+| `silver.lot_assessed_values` | `lot_number` |
+| `silver.lot_assessment_comparables` | `lot_number` |
+| `silver.commercial_rents` | `rent_class` |
 | `gold.lot_profiles` | `lot_number` |
+| `gold.lot_highest_best_use` | `lot_uid`, `feature_id` |
+| `gold.lot_redevelopment_gap` | `lot_uid`, `feature_id` |
+| `gold.lot_investment_opportunities` | `lot_uid`, `feature_id` |
+| `gold.lot_building_massing` | `lot_uid`, `feature_id` |
+| `gold.lot_surface_parking` | `lot_uid`, `feature_id` |
+| `gold.map_cell_aggregates` | `layer`, `cell_z`, `cell_x`, `cell_y` |
 
 **A write is an upsert, and a partition is still a snapshot.** The frame is
 COPYed into a staging table shaped `LIKE` the target, upserted in one
@@ -232,11 +243,30 @@ data/
 │   │   └── lot_zoning_envelopes.parquet
 │   ├── document_chunks/2026-09-01/VSMPE/
 │   │   └── chunks.parquet
-│   └── document_embeddings/2026-09-01/VSMPE/
-│       └── embeddings.parquet
+│   ├── document_embeddings/2026-09-01/VSMPE/
+│   │   └── embeddings.parquet
+│   ├── lot_zone_pieces/2026-09-01/VSMPE/
+│   │   └── lot_zone_pieces.parquet
+│   ├── lot_addresses/2026-09-01/VSMPE/
+│   │   └── lot_addresses.parquet
+│   ├── lot_buildable_setbacks/2026-09-01/VSMPE/
+│   │   └── lot_buildable_setbacks.parquet
+│   └── lot_development_programs/2026-09-01/VSMPE/
+│       └── lot_development_programs.parquet
 └── gold/
-    └── lot_profiles/2026-09-01/VSMPE/
-        └── lot_profiles.parquet
+    ├── lot_profiles/2026-09-01/VSMPE/
+    │   └── lot_profiles.parquet
+    ├── lot_highest_best_use/2026-09-01/VSMPE/
+    │   └── lot_highest_best_use.parquet
+    ├── lot_redevelopment_gap/2026-09-01/VSMPE/
+    │   └── lot_redevelopment_gap.parquet
+    ├── lot_investment_opportunities/2026-09-01/VSMPE/
+    │   └── lot_investment_opportunities.parquet
+    ├── lot_building_massing/2026-09-01/VSMPE/
+    │   └── lot_building_massing.parquet   # two geometry columns:
+    │                                      #   the building and its asphalt
+    └── map_cell_aggregates/2026-09-01/VSMPE/
+        └── map_cell_aggregates.parquet
 ```
 
 `<root>` is `data/` by default and `s3://$S3_BUCKET/` when that is set — see

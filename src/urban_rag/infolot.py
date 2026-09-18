@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from typing import Any
 
 import pandas as pd
@@ -58,6 +58,11 @@ OBJECT_ID_FIELD = "NO_INTER_ELEMN_GEOMT"
 
 WGS84 = 4326
 
+#: How a caller watches a long read - `context.log.info` from an asset, or
+#: None from a script that does not care. Kept as a plain callable so this
+#: module stays free of Dagster imports.
+Progress = Callable[[str], None] | None
+
 #: Rows per ``objectIds`` batch. The service caps a single response at
 #: ``maxRecordCount`` (1000); this stays well under it so that one slow batch
 #: is cheap to retry.
@@ -67,9 +72,31 @@ DEFAULT_BATCH_SIZE = 250
 #: and the last time its geometry was edited. See `normalize_dates`.
 EPOCH_MS_COLUMNS = ("DA_STATT_LOT", "DH_DERNR_MODFC_GEOMT")
 
+#: Batches between progress lines. A borough is a few hundred batches over
+#: several minutes, so this is what makes a run that dies halfway legible as
+#: "it had 55,000 of 72,000 lots" rather than as silence.
+PROGRESS_EVERY_BATCHES = 25
+
+#: Transport failures worth another attempt. These are the ones the adapter's
+#: `Retry` cannot reach: urllib3 retries cover getting the response *headers*,
+#: while a connection that dies mid-body surfaces out here, from the
+#: `iter_content` that `requests` runs to fill `.content`. A read timeout
+#: arrives as `ConnectionError` rather than `ReadTimeout` when it happens that
+#: late, which is why both are listed.
+TRANSIENT_ERRORS = (
+    requests.exceptions.ChunkedEncodingError,
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+)
+
 
 class InfolotError(RuntimeError):
-    """The service answered, but with an error rather than features."""
+    """The service answered with an error rather than features, or not at all.
+
+    Transport failures are wrapped in this too, once the retries are spent, so
+    that a caller has one exception type to catch for "the read did not
+    happen" - the same posture as `SaguenayZoningError`.
+    """
 
 
 class InfolotClient:
@@ -91,6 +118,7 @@ class InfolotClient:
         self.layer = layer
         self.timeout_seconds = timeout_seconds
         self.request_delay_seconds = request_delay_seconds
+        self.max_retries = max_retries
         self.batch_size = batch_size
         self._session = session or self._build_session(max_retries, ca_bundle)
 
@@ -117,14 +145,44 @@ class InfolotClient:
 
     # -- transport ---------------------------------------------------------
 
-    def _post(self, data: dict[str, Any]) -> dict:
-        # Be a polite guest: this is the Registre foncier's live server.
-        if self.request_delay_seconds:
-            time.sleep(self.request_delay_seconds)
+    def _request(self, data: dict[str, Any], progress: Progress = None):
+        """POST once, retrying a connection that dies before the body is in.
 
-        response = self._session.post(
-            self.query_url, data=data, timeout=self.timeout_seconds
-        )
+        The body is pulled inside the guard rather than left to `.json()`:
+        `.content` is exactly where a half-delivered response fails, so
+        reading it here is what brings that failure inside the retry. It is
+        cached on the response afterwards, so `.json()` costs nothing.
+        """
+        attempts = self.max_retries + 1
+        for attempt in range(1, attempts + 1):
+            # Be a polite guest: this is the Registre foncier's live server.
+            if self.request_delay_seconds:
+                time.sleep(self.request_delay_seconds)
+            try:
+                response = self._session.post(
+                    self.query_url, data=data, timeout=self.timeout_seconds
+                )
+                response.content
+                return response
+            except TRANSIENT_ERRORS as exc:
+                if attempt == attempts:
+                    raise InfolotError(
+                        f"{self.query_url}: no answer after {attempts} "
+                        f"attempt(s): {exc}"
+                    ) from exc
+                # Same shape as the adapter's `backoff_factor=1.5`.
+                pause = 1.5 * 2 ** (attempt - 1)
+                if progress:
+                    progress(
+                        f"Infolot request failed ({type(exc).__name__}: "
+                        f"{_excerpt(str(exc), 120)}); retrying in {pause:.0f}s, "
+                        f"attempt {attempt + 1} of {attempts}"
+                    )
+                time.sleep(pause)
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    def _post(self, data: dict[str, Any], *, progress: Progress = None) -> dict:
+        response = self._request(data, progress)
         if "json" not in response.headers.get("Content-Type", ""):
             # The GeoCortex module renders its refusals as HTML error pages.
             raise InfolotError(
@@ -144,7 +202,9 @@ class InfolotClient:
 
     # -- api ---------------------------------------------------------------
 
-    def lot_ids(self, geometry: dict, *, in_srs: int = WGS84) -> list[int]:
+    def lot_ids(
+        self, geometry: dict, *, in_srs: int = WGS84, progress: Progress = None
+    ) -> list[int]:
         """Object ids of every lot intersecting ``geometry``.
 
         ``geometry`` is an Esri geometry object - see `esri_polygon`. This is
@@ -160,12 +220,17 @@ class InfolotClient:
                 "where": "1=1",
                 "returnIdsOnly": "true",
                 "f": "json",
-            }
+            },
+            progress=progress,
         )
         return list(payload.get("objectIds") or [])
 
     def fetch_lots(
-        self, object_ids: Iterable[int], *, target_srs: int = WGS84
+        self,
+        object_ids: Iterable[int],
+        *,
+        target_srs: int = WGS84,
+        progress: Progress = None,
     ) -> Iterator[dict]:
         """Yield GeoJSON features for ``object_ids``, one batch at a time.
 
@@ -174,7 +239,10 @@ class InfolotClient:
         have to be converted - orientation, holes and all - on this side.
         """
         ids = list(object_ids)
-        for start in range(0, len(ids), self.batch_size):
+        batches = -(-len(ids) // self.batch_size)
+        for position, start in enumerate(
+            range(0, len(ids), self.batch_size), start=1
+        ):
             batch = ids[start : start + self.batch_size]
             payload = self._post(
                 {
@@ -186,7 +254,8 @@ class InfolotClient:
                     "returnGeometry": "true",
                     "outSR": str(target_srs),
                     "f": "geojson",
-                }
+                },
+                progress=progress,
             )
             features = payload.get("features") or []
             if len(features) != len(batch):
@@ -195,6 +264,13 @@ class InfolotClient:
                 raise InfolotError(
                     f"Asked for {len(batch)} lots by id, got {len(features)}; "
                     "the service dropped rows from the batch."
+                )
+            if progress and (
+                position % PROGRESS_EVERY_BATCHES == 0 or position == batches
+            ):
+                progress(
+                    f"fetched {start + len(batch)} of {len(ids)} lot(s), "
+                    f"batch {position} of {batches}"
                 )
             yield from features
 

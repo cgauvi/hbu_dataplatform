@@ -1,13 +1,13 @@
 # Every lot, profiled
 
-`lot_profiles` is the gold table of the lot lineage. Four upstreams each hold
+`lot_profiles` is the gold table of the lot lineage. Five upstreams each hold
 one row per (lot × something), and each of them is the wrong shape for the
 question a person actually asks:
 
 | upstream | grain | what it contributes |
 |---|---|---|
 | `silver.building_lot_intersections` | (building, lot) | `num_buildings`, `built_area_m2`, `category` |
-| `silver.lot_frontage` | (lot, street side) | `primary_*` and `secondary_*`, `num_frontages` |
+| `silver.lot_frontage` | (lot, street segment) | `primary_*` and `secondary_*`, `num_frontages` |
 | `rag.lot_documents` | (lot, feature, document) | `doc_*` and the `documents` array |
 | `silver/lot_zoning_envelopes` | (lot, grid column) | `num_zoning_envelopes` and the `zoning_envelopes` array |
 | `silver.lot_buildable_setbacks` | (lot, zone, grid column) | `buildable_area_m2`, `footprint_cap_m2` and the buildable figures merged into each `zoning_envelopes` entry |
@@ -136,7 +136,7 @@ applied to them.
 
 ## The two frontages
 
-`silver.lot_frontage` is one row per (lot, street side), ranked longest first;
+`silver.lot_frontage` is one row per (lot, street segment), ranked longest first;
 these are its top two, pivoted. Ranks beyond the second are counted in
 `num_frontages` and summed into `total_frontage_m` rather than given a third
 pair of columns every other row would leave empty. Which edge is primary is

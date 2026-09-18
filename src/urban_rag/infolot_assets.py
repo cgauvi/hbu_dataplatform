@@ -86,11 +86,14 @@ def neighborhood_lots(
 
     client = infolot.client()
     try:
-        object_ids = client.lot_ids(esri_polygon(boundary))
+        object_ids = client.lot_ids(esri_polygon(boundary), progress=context.log.info)
         context.log.info(
             "%s: %d lot(s) intersect the borough boundary", neighborhood, len(object_ids)
         )
-        features = list(client.fetch_lots(object_ids))
+        # A big borough is a few hundred batches with nothing written until the
+        # last one returns, so the log is the only place a run in flight can be
+        # seen - and the only record of how far a run that dies got.
+        features = list(client.fetch_lots(object_ids, progress=context.log.info))
     except InfolotError as exc:
         # Unlike the Spectrum scrape there is no per-table salvage to do here:
         # the borough is one query, so a failure costs the whole partition.

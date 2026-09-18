@@ -849,8 +849,8 @@ def lot_development_programs(
             # The yard's *shape*, measured off the cadastre. A row without it
             # has its surface stalls bounded on area alone, which is what every
             # run did before this existed; a row measuring zero sits on a
-            # parcel no car can stand on, and its program had to dig, deck or
-            # bay the stalls instead - `binding` says `surface_parking_shape`
+            # parcel no car can stand on, and its program had to dig or bay
+            # the stalls instead - `binding` says `surface_parking_shape`
             # on exactly those.
             "num_with_parkable_area": _notna_count(frame, "parkable_area_m2"),
             "num_without_parkable_area": len(frame)

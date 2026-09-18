@@ -269,6 +269,8 @@ from __future__ import annotations
 
 import json
 import math
+import os
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
@@ -944,14 +946,114 @@ def solve_envelopes(
     candidates = candidate_envelopes(envelopes)
     if candidates.empty:
         return pd.DataFrame(columns=[*CANDIDATE_COLUMNS, *PROGRAM_COLUMNS])
-    rows = [
-        _envelope_row(group, economics, assumptions)
-        for _, group in candidates.groupby(["lot_uid", "feature_id"], sort=False)
-    ]
+    rows = _solve_candidates(candidates, economics, assumptions)
     frame = pd.DataFrame(rows, columns=[*CANDIDATE_COLUMNS, *PROGRAM_COLUMNS])
     return frame.sort_values(
         ["lot_uid", "feature_id", "column_index"], kind="stable"
     ).reset_index(drop=True)
+
+
+#: How many worker processes `solve_envelopes` splits its models across.
+#: ``0`` or ``1`` keeps the serial path, which is what the tests run and what a
+#: caller already inside a process pool wants. Read from the environment so a
+#: constrained box can turn it down without a config change.
+SOLVE_WORKERS_ENV = "URBAN_RAG_SOLVE_WORKERS"
+
+
+def _default_solve_workers() -> int:
+    """Workers to use when the caller names none.
+
+    Capped at 8. The models are independent, but each one is milliseconds of
+    CP-SAT over a frame that has to be pickled to reach the worker, so the
+    curve flattens well before a large machine's core count and the extra
+    processes only add copies of the candidate frame.
+    """
+    raw = os.environ.get(SOLVE_WORKERS_ENV)
+    if raw is not None and raw.strip():
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            return 1
+    return min(8, os.cpu_count() or 1)
+
+
+def _solve_groups(
+    frame: pd.DataFrame, economics: UnitEconomics, assumptions: ProgramAssumptions
+) -> list[dict]:
+    """Every (lot, zone) group in ``frame``, solved. The unit of parallel work."""
+    return [
+        _envelope_row(group, economics, assumptions)
+        for _, group in frame.groupby(["lot_uid", "feature_id"], sort=False)
+    ]
+
+
+def _solve_shard(
+    args: tuple[pd.DataFrame, UnitEconomics, ProgramAssumptions],
+) -> list[dict]:
+    """`_solve_groups` behind a single picklable argument, for `Executor.map`."""
+    return _solve_groups(*args)
+
+
+def _solve_candidates(
+    candidates: pd.DataFrame,
+    economics: UnitEconomics,
+    assumptions: ProgramAssumptions,
+    *,
+    max_workers: int | None = None,
+) -> list[dict]:
+    """One `solve_program` per (lot, zone), across processes when it is worth it.
+
+    **Why this is safe to parallelise, and why that needed checking.** The
+    models are independent - one envelope's program says nothing about the
+    next - so the arithmetic is trivial. The risk is not correctness of the
+    split but `ProgramAssumptions.max_seconds`: CP-SAT stops at a wall-clock
+    limit, so a model that only just proves optimality when it has a core to
+    itself could come back merely `FEASIBLE` when eight solvers share the
+    machine, and the partition's answer would quietly depend on load.
+
+    Measured on VSMPE 2026-09-01 before this was written: of 26,932 rows,
+    25,370 are `OPTIMAL` and 1,562 `INFEASIBLE`, and **none is `FEASIBLE`** -
+    every model proves its answer, averaging ~20 ms against a 10 s cap. For
+    contention to change a verdict it would have to slow a model by roughly
+    500x, which eight workers on fourteen cores does not do. If that ever stops
+    being true the symptom is `FEASIBLE` rows appearing, and the fix is to set
+    `URBAN_RAG_SOLVE_WORKERS=1` while the cap is revisited.
+
+    Shards are cut on the *group* key, so a (lot, zone) is never split across
+    workers and each worker re-groups only its own rows. `solve_envelopes`
+    sorts the result, so which shard finished first cannot reach the output.
+    """
+    if max_workers is None:
+        max_workers = _default_solve_workers()
+
+    groups = candidates.groupby(["lot_uid", "feature_id"], sort=False).ngroup()
+    n_groups = int(groups.max()) + 1 if len(groups) else 0
+    # Below this the pool costs more than it saves: each worker is handed a
+    # pickled slice of the frame before it solves anything.
+    if max_workers <= 1 or n_groups < 64:
+        return _solve_groups(candidates, economics, assumptions)
+
+    workers = min(max_workers, n_groups)
+    shards = [
+        candidates[(groups % workers) == i]
+        for i in range(workers)
+    ]
+    shards = [shard for shard in shards if not shard.empty]
+
+    try:
+        with ProcessPoolExecutor(max_workers=len(shards)) as pool:
+            solved = list(
+                pool.map(
+                    _solve_shard,
+                    [(shard, economics, assumptions) for shard in shards],
+                )
+            )
+    except Exception:
+        # A pool that cannot start - a restricted sandbox, a nested executor,
+        # a platform without fork - is a reason to be slow, not to fail. The
+        # serial path is the same computation.
+        return _solve_groups(candidates, economics, assumptions)
+    return [row for shard_rows in solved for row in shard_rows]
 
 
 def _envelope_row(

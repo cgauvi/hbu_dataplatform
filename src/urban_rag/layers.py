@@ -37,10 +37,10 @@ from this table rather than writing a schema name down twice, the same way
 layers moves its table with it.
 
 Two things in Postgres are outside that rule and are not exceptions to it.
-`rag.lots`, `rag.buildings` and `rag.features` are *bronze* snapshots loaded
-into PostGIS because the silver joins are computed over them there, and
-`rag.chunks` is the vector index `document_index` publishes; neither is a
-silver or gold dataset's own table.
+`rag.lots`, `rag.buildings`, `rag.features` and `rag.addresses` are *bronze*
+snapshots loaded into PostGIS because the silver joins are computed over them
+there, and `rag.chunks` is the vector index `document_index` publishes;
+neither is a silver or gold dataset's own table.
 
 The tree is the record - a table can be rebuilt from it, and losing the
 database costs a reload rather than a re-scrape, which for a live municipal

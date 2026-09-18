@@ -65,7 +65,7 @@ being leased at housing's speed and sold at housing's cap, and neither was a
 number anyone had chosen. What the corrections do not touch is the income
 itself - the solve already prices every square foot of commerce it builds, and
 the yield on cost has always had it in the numerator. Whether a ground floor
-of shops beats the empty storey or the parking deck that a *Tous sauf le RDC*
+of shops beats the empty storey or the parking bays that a *Tous sauf le RDC*
 column otherwise leaves at grade is now a question this module answers on the
 commerce's own terms instead of on the dwellings'.
 

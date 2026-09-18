@@ -92,13 +92,13 @@ parcel four metres wide - where 27.87 m2 of "yard" is a ribbon down one side
 and no car can stand in it at any price. That is the same class of error
 `lot_building_massing` exists to catch for the footprint, arriving here on the
 cheapest option in the model, so it is caught rather than reported:
-`Lot.parkable_area_m2` is the largest parking-shaped rectangle the parcel
-actually holds - at least a stall's 5.5 m deep, measured off the cadastre by
-`massing.parking_capacity_m2` - and it is a second ceiling on `surface_stalls`
-beside the area one. A parcel that measures 0 parks nothing on the ground and
-must dig, deck, bay it into the ground floor, or build less; `binding` reports
-`surface_parking_shape` where the shape is what stopped it, because no printed
-norm will say so.
+`Lot.parkable_area_m2` is the ground the parcel actually holds a car on -
+the yard opened by half a stall's 5.5 m, so what survives is clear in every
+direction, measured by `massing.parking_capacity_m2` - and it is a second
+ceiling on `surface_stalls` beside the area one. A parcel that measures 0
+parks nothing on the ground and must dig, bay it into the ground floor, or
+build less; `binding` reports `surface_parking_shape` where the shape is what
+stopped it, because no printed norm will say so.
 
 The bound is measured on the yard rather than on the parcel - ``parcel less the
 placeable rectangle``, opened by half a stall's depth - so it is the ground the
@@ -376,6 +376,11 @@ from enum import Enum
 
 import numpy as np
 from ortools.sat.python import cp_model
+
+#: Fixed so a solve is reproducible - see `solve_program` on why CP-SAT is not
+#: deterministic without it. The value is arbitrary; that it never changes is
+#: the point.
+SOLVER_RANDOM_SEED = 20260917
 
 #: Square metres in a square foot, exactly. The grid's areas, widths and
 #: ratios are metric; the unit schedule below is in square feet.
@@ -1443,7 +1448,7 @@ class Lot:
 
     What remains strict is the by-law dimension, and deliberately: 5.5 m clear
     in every direction, so the ribbon, the sliver and the tail of the L park
-    nothing at any length and those programs dig, deck or bay their stalls
+    nothing at any length and those programs dig or bay their stalls
     instead. `binding` reports `surface_parking_shape` where that is what
     stopped them. `lot_building_massing` draws the same region afterwards with
     the same function, so `surface_parking_fit_pct` is now a check that can
@@ -1453,8 +1458,8 @@ class Lot:
     ``None`` means nobody measured, and leaves the stalls bounded by the area
     arithmetic alone - which is what every caller did before this existed.
     ``0.0`` is a measurement and a different statement: this parcel parks
-    nothing on the ground, so the program must dig, deck, bay it into the
-    ground floor, or be smaller.
+    nothing on the ground, so the program must dig, bay it into the ground
+    floor, or be smaller.
 
     ``placeable_area_m2`` is what ``buildable_area_m2`` is missing, and it is
     the same omission `parkable_area_m2` fixes one paragraph up: an envelope's
@@ -1699,7 +1704,7 @@ class ParkingRules:
     #: modelling bounds rather than norms, and both exist because "would this
     #: parcel still work without that option" is a question worth being able
     #: to ask - of a site whose yard is spoken for, and of every test below
-    #: that is about the dig-against-deck trade rather than about the yard.
+    #: that is about the dig-against-bay trade rather than about the yard.
     max_surface_stalls: int | None = None
     #: The same knob for the garage: ``None`` for as many bays as the ground
     #: floor holds - which `solve_program` already bounds at one storey - and
@@ -2191,8 +2196,8 @@ class RetainedBuilding:
     the model adds - a storey on the plate, an annex beside it, dwellings and
     commerce in the new floor - is priced at new-build rents and at
     ``addition_cost_premium`` times the new-build cost. Nothing is dug under
-    it, no deck is stacked on it and no bay is carved out of its ground floor:
-    the yard is the only parking the addition may provide.
+    it and no bay is carved out of its ground floor: the yard is the only
+    parking the addition may provide.
 
     The areas are what the roll states by income class - `lot_assessment_
     comparables`' three floor columns - and ``footprint_m2`` is the plate they
@@ -3436,7 +3441,7 @@ def solve_program(
 
     ``retained`` turns the solve into an **enhancement**: the standing
     building is a lower bound on the plate and the usage storeys, at most
-    ``max_added_storeys`` go on top, nothing is dug or decked, the addition's
+    ``max_added_storeys`` go on top, nothing is dug, the addition's
     floor is costed at ``addition_cost_premium`` times the rates, and every
     money figure returned is the addition's own - see `RetainedBuilding`.
 
@@ -4599,7 +4604,7 @@ def solve_program(
     # has an at-grade garage too - and it is where it is because the
     # non-residential revenue is priced on the whole plate, so carving a bay
     # out of one would have to come off the rent as well. A pure C or I column
-    # still parks: on the yard, on a deck, or underground.
+    # still parks: on the yard, or underground.
     model.Add(
         sum(
             _scale_area(priced[unit_type] * M2_PER_SQFT) * count
@@ -4967,6 +4972,28 @@ def solve_program(
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = max_seconds
+    # One worker and a fixed seed, so the same envelope gives the same building
+    # every time.
+    #
+    # CP-SAT defaults `num_search_workers` to 0, meaning "pick a number" - in
+    # practice several portfolio workers racing on separate threads. When a
+    # model has more than one optimal solution, and these routinely do (a
+    # footprint-by-storeys product hits the same floor area several ways), the
+    # answer returned is whichever worker won the race. That is not a tie-break
+    # this module chose; it is a thread schedule.
+    #
+    # It was measurable. Re-running `programs` for VSMPE 2026-09-01 twice with
+    # no code change and no input change moved `footprint_m2` on 2,760 of
+    # 26,932 rows, `gross_floor_area_m2` on 2,497, and `floor_stack` on most of
+    # them - about 10% of the partition getting a different building each run.
+    # Gold is built on these columns, so `lot_highest_best_use` inherited it.
+    #
+    # Single-threaded search is slower per model and the loss is bought back
+    # many times over by `hbu._solve_candidates`, which runs whole models in
+    # parallel instead of splitting one - and that parallelism is deterministic
+    # because each model is.
+    solver.parameters.num_search_workers = 1
+    solver.parameters.random_seed = SOLVER_RANDOM_SEED
     status = solver.Solve(model)
     status_name = solver.StatusName(status)
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
@@ -5660,7 +5687,7 @@ def _binding_caps(
         # which is a different answer from the yard being full. A reader seeing
         # this is being told that the cheapest parking the model has ran out on
         # the parcel's geometry rather than on its area - so the stalls above
-        # this point were dug, decked or bayed at eight to ten times the price,
+        # this point were dug or bayed at eight to ten times the price,
         # and the program is smaller or dearer for the shape of the land.
         #
         # Reported whenever the shape is what stopped the surface stalls, even

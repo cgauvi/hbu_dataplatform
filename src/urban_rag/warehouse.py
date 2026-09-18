@@ -839,11 +839,39 @@ def _merge(
 
     pruned = 0
     if prune:
-        # IS NOT DISTINCT FROM rather than `=`: a key column is NOT NULL in
-        # every table here, but a staging row that somehow carries NULL would
-        # match nothing under `=` and silently prune the row it stands for.
+        # `=` on a NOT NULL key column, `IS NOT DISTINCT FROM` on a nullable
+        # one, decided from the catalog rather than assumed.
+        #
+        # This used to be `IS NOT DISTINCT FROM` on every key, guarding a
+        # staging row that "somehow" carried NULL. It cannot: the staging table
+        # is `CREATE TEMP TABLE ... (LIKE target)`, and `LIKE` copies NOT NULL
+        # unconditionally - so a NULL key is rejected on the COPY, long before
+        # this statement runs. The guard was for a case the schema already
+        # forbids.
+        #
+        # It was not free. `IS NOT DISTINCT FROM` is not hashable, so the
+        # planner cannot build a hash anti-join and falls back to a nested loop
+        # over the whole staging table for every target row. On VSMPE's
+        # `silver.lot_features` - 118,937 rows both sides - that is 1.4e10
+        # comparisons: measured at 27 minutes and still running when it was
+        # killed. `EXPLAIN` on the same partition, same data:
+        #
+        #     IS NOT DISTINCT FROM -> Nested Loop Anti Join, cost 407,342,402
+        #     =                    -> Hash Anti Join,        cost      23,825
+        #
+        # A ~17,000x difference on the statement that every table's load ends
+        # with, which is where the bulk of this pipeline's wall clock went.
+        #
+        # `_nullable_keys` is one catalog query per merge, so a key column that
+        # is genuinely nullable still gets the null-safe form and still prunes
+        # correctly - the behaviour the old comment wanted, without paying for
+        # it on the columns that cannot be null.
+        nullable = _nullable_keys(cursor, table)
         match = " AND ".join(
-            f"s.{name} IS NOT DISTINCT FROM t.{name}" for name in table.keys
+            f"s.{name} IS NOT DISTINCT FROM t.{name}"
+            if name in nullable
+            else f"s.{name} = t.{name}"
+            for name in table.keys
         )
         cursor.execute(
             f"DELETE FROM {table.qualified} t "
@@ -883,6 +911,33 @@ def _create_staging(cursor: "Cursor", table: Table) -> str:
         "ON COMMIT DROP"
     )
     return staging
+
+
+def _nullable_keys(cursor: "Cursor", table: Table) -> frozenset[str]:
+    """Which of ``table.keys`` the catalog says may be NULL.
+
+    The prune in `_merge` needs `IS NOT DISTINCT FROM` only where a key can
+    actually be NULL; everywhere else `=` is equivalent and lets the planner
+    build a hash anti-join instead of a nested loop. Asked of the catalog
+    rather than hard-coded, so a table that later gains a nullable key keeps
+    pruning correctly without anyone remembering this function exists.
+
+    Read off the *target*, which is also the staging table's shape: staging is
+    `CREATE TEMP TABLE ... (LIKE target)`, and `LIKE` copies NOT NULL whether
+    or not any `INCLUDING` clause is given.
+    """
+    cursor.execute(
+        """
+        SELECT a.attname
+        FROM pg_attribute a
+        WHERE a.attrelid = %s::regclass
+          AND a.attnum > 0
+          AND NOT a.attisdropped
+          AND NOT a.attnotnull
+        """,
+        [table.qualified],
+    )
+    return frozenset(row[0] for row in cursor.fetchall()) & frozenset(table.keys)
 
 
 def _target_columns(cursor: "Cursor", table: Table) -> list[str]:

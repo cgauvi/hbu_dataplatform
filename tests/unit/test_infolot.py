@@ -10,6 +10,7 @@ from __future__ import annotations
 import geopandas as gpd
 import pandas as pd
 import pytest
+import requests
 import shapely
 from dagster import Failure, MultiPartitionKey, materialize
 from shapely.geometry import Polygon, box
@@ -39,13 +40,20 @@ class FakeResponse:
         self.headers = {"Content-Type": content_type}
         self.text = text
         self.status_code = 200
+        # Read by the client before `json()`, because that is where a
+        # half-delivered response fails for real.
+        self.content = b"{}"
 
     def json(self):
         return self._payload
 
 
 class FakeSession:
-    """Replays one canned payload per call and records what was posted."""
+    """Replays one canned payload per call and records what was posted.
+
+    A payload that is an exception instance is raised instead of returned,
+    which is how a connection dying mid-body is staged.
+    """
 
     def __init__(self, payloads):
         self.payloads = list(payloads)
@@ -53,7 +61,10 @@ class FakeSession:
 
     def post(self, url, data=None, timeout=None):
         self.calls.append((url, data or {}))
-        return FakeResponse(self.payloads.pop(0))
+        payload = self.payloads.pop(0)
+        if isinstance(payload, Exception):
+            raise payload
+        return FakeResponse(payload)
 
 
 def make_client(payloads, **kwargs):
@@ -131,6 +142,76 @@ def test_service_errors_arrive_with_http_200():
         client.lot_ids(esri_polygon(box(0, 0, 1, 1)))
 
 
+# -- transport failures ---------------------------------------------------
+#
+# The adapter's `Retry` covers getting the response headers. A borough is a
+# few hundred batches over many minutes, which is long enough for a suspend or
+# a dropped link to land while a body is still streaming - past where urllib3
+# can help, and the failure that cost the SAG 2026-09-01 run.
+
+
+@pytest.fixture(autouse=True)
+def no_backoff(monkeypatch):
+    """Retry pauses are 1.5s upward; no test should wait them out."""
+    monkeypatch.setattr("urban_rag.infolot.time.sleep", lambda _seconds: None)
+
+
+def dropped_connection():
+    return requests.exceptions.ConnectionError("Read timed out.")
+
+
+def test_a_connection_that_dies_mid_body_is_retried():
+    payloads = [dropped_connection(), {"features": [lot_feature(1)]}]
+    client, session = make_client(payloads, batch_size=1)
+
+    assert len(list(client.fetch_lots([1]))) == 1
+    # The same batch, asked for twice.
+    assert [data["objectIds"] for _, data in session.calls] == ["1", "1"]
+
+
+def test_a_read_that_never_lands_fails_as_an_infolot_error():
+    """Wrapped, so the asset's one `except InfolotError` still catches it."""
+    client, session = make_client([dropped_connection() for _ in range(4)])
+
+    with pytest.raises(InfolotError, match="no answer after 4 attempt"):
+        client.lot_ids(esri_polygon(box(0, 0, 1, 1)))
+
+    assert len(session.calls) == 4
+
+
+def test_retries_are_bounded_by_max_retries():
+    client, session = make_client([dropped_connection() for _ in range(2)], max_retries=1)
+
+    with pytest.raises(InfolotError, match="no answer after 2 attempt"):
+        client.lot_ids(esri_polygon(box(0, 0, 1, 1)))
+
+    assert len(session.calls) == 2
+
+
+def test_a_retry_is_reported_through_progress():
+    payloads = [dropped_connection(), {"objectIds": [7]}]
+    client, _ = make_client(payloads)
+    said: list[str] = []
+
+    client.lot_ids(esri_polygon(box(0, 0, 1, 1)), progress=said.append)
+
+    assert len(said) == 1
+    assert "attempt 2 of 4" in said[0]
+    assert "ConnectionError" in said[0]
+
+
+def test_fetch_lots_reports_how_far_it_got():
+    payloads = [{"features": [lot_feature(i)]} for i in (1, 2, 3)]
+    client, _ = make_client(payloads, batch_size=1)
+    said: list[str] = []
+
+    list(client.fetch_lots([1, 2, 3], progress=said.append))
+
+    # Under `PROGRESS_EVERY_BATCHES` the last batch still reports, so a short
+    # read is never silent about where it stopped.
+    assert said == ["fetched 3 of 3 lot(s), batch 3 of 3"]
+
+
 def test_esri_polygon_carries_holes_and_multipolygon_parts():
     ring = box(0, 0, 10, 10)
     hole = box(2, 2, 4, 4)
@@ -166,11 +247,11 @@ class FakeInfolotClient:
         self.features = features
         self.queried_with = None
 
-    def lot_ids(self, geometry, *, in_srs=4326):
+    def lot_ids(self, geometry, *, in_srs=4326, progress=None):
         self.queried_with = geometry
         return [f["properties"][OBJECT_ID_FIELD] for f in self.features]
 
-    def fetch_lots(self, object_ids, *, target_srs=4326):
+    def fetch_lots(self, object_ids, *, target_srs=4326, progress=None):
         wanted = set(object_ids)
         return (
             f for f in self.features if f["properties"][OBJECT_ID_FIELD] in wanted

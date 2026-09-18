@@ -84,12 +84,21 @@ def test_the_screen_is_in_the_statement(captured):
     run()
     select = captured["select"]
 
-    assert "ST_Dimension(clipped.geom) = 2" in select
+    assert "ST_Dimension(clipped_geom) = 2" in select
     assert "%(min_overlap_m2)s" in select
     assert "%(min_pct_of_building)s" in select
 
-    screen = select[select.index("ST_Dimension(clipped.geom) = 2"):]
+    screen = select[select.index("ST_Dimension(clipped_geom) = 2"):]
     assert " OR " in screen
+
+    # The clip and the two geodesic areas are each computed once, behind a
+    # `MATERIALIZED` fence. Without it the planner flattens the subquery and
+    # re-evaluates `ST_Intersection` at every mention - five times on VSMPE,
+    # which cost 24.2s against 8.1s for the fenced form on identical output.
+    # This is the assertion that stops the fence being dropped as noise.
+    assert select.count("AS MATERIALIZED (") == 2
+    assert select.count("ST_Intersection(") == 1
+    assert select.count("ST_Area(geography(") == 2
 
 
 def test_the_cutoffs_are_bound_parameters_at_their_documented_values(captured):

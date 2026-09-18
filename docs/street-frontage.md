@@ -45,7 +45,7 @@ mistake.
 Three assets, and the borough axis appears in the middle one:
 
 ```
-bronze/street_network        date            the island, as published
+bronze/street_network        date            the province, bounded per city
 silver/neighborhood_streets  date × borough  clipped to one borough
 silver/lot_frontage          date × borough  the shared edges, in metres
 ```
@@ -60,8 +60,25 @@ beside it in `segment_length_m`, `length_in_borough_m` and `pct_in_borough`.
 Bronze is bounded by a **bounding box per city**, not by an attribute filter:
 the RQTT publishes no municipality code, so there is nothing to push into OGR
 the way the assessment roll pushes `code_mun`. The box rides the GeoPackage's
-R-tree, and the real boundary does the rest in silver. The Montreal box holds
-93,521 segments of the published vintage.
+R-tree, and the real boundary does the rest in silver. The 2026-09-01 snapshot
+of the 2026-07-03 vintage: **125,177 segments** — Montreal 86,017, Quebec City
+26,789, Saguenay 13,418 — with 1,047 dropped as not roadway and no duplicate
+ids at all.
+
+**What the change of source did to a borough, measured.** VSMPE, same date,
+against the géobase double's first snapshot:
+
+| | géobase double | RQTT |
+| --- | --- | --- |
+| rows in the borough | 4,262 sides | **2,190 segments** |
+| length | 445.8 km | **247.0 km** |
+| cut at the boundary | 170 | **159** |
+
+Both numbers roughly halve, which is the whole of the change: two lines per
+street became one. The length ratio (0.55) is a little above the row ratio
+(0.51) because a curb side runs the longer way around a corner. Nothing else
+moved — no unnamed segments, no duplicate ids, no invalid geometry, and **no
+segment named *Ruelle*** anywhere in the borough.
 
 Lengths are computed in each city's own MTM zone — **EPSG:32188** (zone 8) for
 Montreal, **32187** (zone 7) for the other two — not in the 4326 the geometry is

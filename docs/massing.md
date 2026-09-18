@@ -96,11 +96,18 @@ So the same asset draws a second shape and publishes it to
 [sql/024](../../hbu_infra/sql/024_gold_lot_surface_parking.sql). One asset, one
 parquet with two geometry columns, two tables in one transaction.
 
-**The yard is the parcel, not the envelope.** A setback is a margin a
+**The yard is the ground, not the envelope.** A setback is a margin a
 *building* keeps. A car in a side or rear yard stands exactly where the margin
-said no building may go, so the container is the lot boundary less the drawn
-building — and `lot_building_massing` reads `rag.lots` for it, because no
-downstream table carries a parcel outline.
+said no building may go, so the container is the boundary less the drawn
+building — `yard_of` — and not the buildable polygon the building was fitted
+into.
+
+**And the ground is the piece where there are pieces.** The asset reads
+`silver.lot_zone_pieces` for it, falling back to `rag.lots` for a partition
+whose pieces have not been materialized, and saying so in the log. The fallback
+is the weaker answer on exactly the lots the piece grain exists for: checking
+both programs of a split parcel against the whole parcel would offer each of
+them a yard the other has already built on.
 
 **Nothing is reserved for reaching it.** A surface stall need not front the
 street and usually does not — it is reached from the back lane, or across the
@@ -111,11 +118,25 @@ can stand on. That is a stated assumption, not a forgotten check.
 **A stall is 5.5 m long, and that is the whole point.** The stalls are already
 bounded upstream by `surface_stall_area × stalls + footprint <= lot area`,
 which is an area against an area and is satisfied on a parcel two metres wide.
-So a bay here is fitted **depth first** — at least `MIN_PARKING_DEPTH_M`, and
-at least `MIN_PARKING_WIDTH_M` across — and the width follows from the area.
-Note which dimension goes with which: a four-metre strip is a *driveway*, and
-it parks cars in single file parallel to its own length. Only a parcel that
-takes a car in neither orientation is unparkable.
+So the ground is tested for *depth*, by a **morphological opening**:
+`parkable_ground` erodes the yard by half of `MIN_PARKING_DEPTH_M` (5.5 m) and
+dilates it back, so ground that cannot hold a disc of 2.75 m vanishes and
+everything else survives as its own shape. `fit_parking` then grows a band out
+from the drawn building until it holds the program's `surface_area_m2`, so the
+asphalt hugs the plate and takes the shape of the yard it was cut from — a
+ring, an L, the wedge behind a corner building.
+
+A disc fits only where 5.5 m is clear **in every direction**, which is the
+strict reading and the expensive one: a 3 m side-yard ribbon parks nothing at
+any length rather than parking cars in single file down it. That is the
+intended answer — it is the narrow-lot tail, and those programs dig or bay
+their stalls instead. The looser reading, half a stall's *width*, is what the
+old rectangle bays implied; `MIN_PARKING_DEPTH_M` is where to change it.
+
+Why the rectangles went: the ordinary Montreal yard is a band wrapping the
+building, and three rectangles read a band at a little over half its area.
+Across 600 real VSMPE yards the bays kept a median 34 % of the ground and the
+opening keeps 79, at 0.12 ms against 4.4.
 
 | column | what it says |
 | --- | --- |
@@ -123,7 +144,7 @@ takes a car in neither orientation is unparkable.
 | `placed_surface_parking_m2` | the asphalt that actually fits |
 | `surface_parking_fit_pct` | `100 × placed / reserved` — **the column to read** |
 | `placed_surface_stalls` | how many cars that ground really holds |
-| `num_parking_bays` | 1, or a front yard and a rear one |
+| `num_parking_bays` | 1, or a front yard and a rear one — at most `PARKING_MAX_BAYS` |
 
 `parking_status` is `fitted`, `shrunk`, `no_fit`, `no_yard`, `no_lot_geometry`,
 `no_parking` or `no_program`. Only the first two reach Postgres — a lot that
@@ -132,24 +153,37 @@ parks underground has no polygon, and the warehouse skips a shapeless row.
 **Up to three patches, unlike the building.** A building is one massing or it
 is nothing; parking honestly comes in pieces, and a building across the middle
 of its parcel leaves a front yard and a rear yard with stalls in both. The
-search places the biggest bay, cuts it out, and looks again. Greedy, so it can
-under-state a yard and can never claim ground that is not there.
+opening returns a MultiPolygon where that happens, and `_largest_bays` keeps
+its `PARKING_MAX_BAYS` (3) largest pieces and drops the rest — a scrap of
+asphalt nobody would pave costs a pin on the map and a fraction of a stall in
+the arithmetic. The constant survives the rectangle search it was written for
+with its meaning intact; what changed is that the pieces are now found rather
+than placed.
 
 ## And the solver is stopped before it gets here
 
 `Lot.parkable_area_m2` is a **real constraint on the solve**, not a report
-about it: the largest parking-shaped rectangle a parcel holds, measured off
-`rag.lots` by `massing.parking_capacity_m2` and handed to `solve_program`
-beside the area bound. A parcel measuring 0 parks nothing on the ground and its
-program must dig, bay it into the ground floor, or be smaller —
-`binding` says `surface_parking_shape` on exactly those rows, because no
-printed norm will.
+about it: `massing.parking_capacity_m2` measures the parkable region and hands
+it to `solve_program` beside the area bound. A parcel measuring 0 parks nothing
+on the ground and its program must dig, bay it into the ground floor, or be
+smaller — `binding` says `surface_parking_shape` on exactly those rows, because
+no printed norm will.
 
-That cap errs both ways and both are stated in `parking_capacity_m2`: it
-ignores the building, which makes it generous, and it measures one rectangle
-where `fit_parking` allows three, which makes it strict on a two-lobed parcel.
-`surface_parking_fit_pct` is the exact question, asked once a real building is
-standing.
+**One rule, two uses, and that is deliberate.** `parking_capacity_m2` is
+`parkable_ground` measured and `fit_parking` is the same region drawn, so the
+bound and the polygon cannot disagree. They used to: a rectangle search bounded
+the solve and a three-rectangle search drew it, so the solve priced parking the
+placer could not lay out and `surface_parking_fit_pct` came back under 100 on
+about half the borough. It should now almost always read 100, and anything
+under it is a real disagreement worth chasing rather than the ordinary case —
+the drawn plate shrank where the measured one did not, or the band landed in
+more pieces than `PARKING_MAX_BAYS` allows.
+
+What it is measured *on* is the yard — the ground less the building — wherever
+the building is known, which since `placeable_area_m2` fixes the plate before
+the solve is everywhere the setbacks have geometry. Passing the bare parcel is
+the fallback for a partition whose envelopes have no polygon, and it overstates
+the yard by whatever the building will stand on.
 
 ## What it is not
 
@@ -198,10 +232,10 @@ tables that read the answer.
 make massing DATE=2026-08-24 NEIGHBORHOOD=VSMPE
 ```
 
-needs `hbu` and `setbacks` for the same partition, and `rag.lots` loaded for
-the borough — the parcel outlines the parking is fitted onto are read from
-Postgres, and without them every row is `no_lot_geometry` and the buildings are
-drawn regardless. Then open
+needs `hbu` and `setbacks` for the same partition, and the ground the parking
+is fitted onto loaded for the borough — `silver.lot_zone_pieces`, or `rag.lots`
+as the fallback. Both are read from Postgres, and without either every row is
+`no_lot_geometry` and the buildings are drawn regardless. Then open
 
 ```
 data/gold/lot_building_massing/2026-08-24/VSMPE/lot_building_massing.parquet
@@ -214,8 +248,8 @@ sanity check is visual: the rectangle inside the envelope inside the lot.
 One file, **two** geometry columns: `geometry` is the building and
 `parking_geometry` is the asphalt. QGIS asks which to use when it opens the
 file, so open it twice to see both — and the second sanity check is that they
-never overlap, and that the parking is inside the lot without being inside the
-envelope.
+never overlap, and that the parking is inside the piece without being inside
+the envelope.
 
 Sort on `footprint_fit_pct` ascending to get the lots where the solver's
 footprint does not fit the ground it was costed on — the run's metadata reports

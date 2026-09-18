@@ -37,13 +37,13 @@ uv run dagster asset materialize --select silver/vacancy_rates --partition "2026
 # the CMHC average rents for that borough, also independent
 uv run dagster asset materialize --select silver/average_rents --partition "2026-09-01|VSMPE" -m urban_rag.definitions
 
-# the island-wide street network, date-partitioned only
+# the province-wide RQTT road network, date-partitioned only
 uv run dagster asset materialize --select bronze/street_network --partition 2026-09-01 -m urban_rag.definitions
 
 # the Montreal construction cost rates, date-partitioned only
 uv run dagster asset materialize --select bronze/montreal_residential_costs,bronze/montreal_nonresidential_costs --partition 2026-09-01 -m urban_rag.definitions
 
-# that borough's sides of street, cut out of it
+# that borough's road centre lines, cut out of it
 uv run dagster asset materialize --select silver/neighborhood_streets --partition "2026-09-01|VSMPE" -m urban_rag.definitions
 
 # the province-wide assessment roll and the merge that makes it readable, both
@@ -86,19 +86,34 @@ uv run dagster asset materialize --select "silver/zoning_grid_columns,silver/lot
 uv run dagster asset materialize --select gold/lot_profiles --partition "2026-09-01|VSMPE" -m urban_rag.definitions
 ```
 
-Schedules run monthly in `America/Toronto`, all on the 1st: the catalog at 04:00, the features
-at 04:20, the reference neighborhoods at 04:40, the vacancy rates at 04:45 and
-the average rents at 04:50 (the CMHC assets are independent of the Spectrum
-assets — the minutes only keep them from overlapping), then the lots at 05:40,
-the buildings at 05:50, the borough's street sides at 06:20 and the
-building × lot join at 07:00 behind them. The
-island-wide street network is snapshot at 04:50, alongside the other sources
-that have no upstream here. The assessment lineage runs on its own chain: the
-province-wide roll and its merge at 04:52, the per-lot totals at 06:30 behind
-the cadastre, and the cap rates and comparables at 06:40 behind those and the
-CMHC pair. `lot_frontage`, the envelope pair and `lot_profiles` have no schedule yet — see
-[Assets](assets.md). All target *this month's*
-partition — `end_offset=1` on the monthly partitions exists for that reason,
+Schedules run monthly in `America/Toronto`, all on the 1st. Eighteen of them,
+in three bands — the sources that have no upstream here first, then the
+borough cuts, then the joins over them:
+
+| | |
+| --- | --- |
+| 04:00 | `spectrum_table_catalog` |
+| 04:20 | `neighborhood_features` |
+| 04:40 | `reference_neighborhoods` |
+| 04:45 | the two CMHC surveys · `uniformized_property_wealth` |
+| 04:47 | the MarketBeats and the rent index · the two cost snapshots |
+| 04:50 | `street_network` — the province-wide RQTT |
+| 04:52 | `property_assessment_roll` and `assessment_units` |
+| 05:40 | `neighborhood_lots` |
+| 05:50 | `neighborhood_buildings` |
+| 05:55 | `vacancy_rates` |
+| 05:58 | `average_rents` |
+| 06:10 | `commercial_rents` |
+| 06:20 | `neighborhood_streets` — the borough's cut of the RQTT |
+| 06:30 | `lot_assessed_values` |
+| 06:40 | `lot_assessment_comparables` |
+| 07:00 | `building_lot_intersections` |
+
+The minutes inside a band only keep independent fetches from overlapping; the
+gaps between bands are real dependencies. Eleven assets have no schedule at
+all, and neither do the envelope pair, the corpus chain or
+`neighborhood_addresses` — see [Assets](assets.md). All scheduled runs target
+*this month's* partition — `end_offset=1` on the monthly partitions exists for that reason,
 since "scrape date" means the month the fetch happened in, not a closed event
 window. A partition key is always the first of its month (`2026-09-01`), and a
 run started on any other day of the month lands on that same key.
@@ -115,13 +130,14 @@ make neighborhood-add NEIGHBORHOOD=CIL      # `make neighborhoods` lists them
 
 which refuses anything `known_neighborhoods()` in
 [partitions.py](../src/urban_rag/partitions.py) cannot resolve into its
-sources. All 17 Montreal borough namespaces and Quebec City's six
-arrondissements are mapped there; a fresh instance is seeded with
-`DEFAULT_NEIGHBORHOODS` (`VSMPE` and `CIL`) the first time anything reads the
-axis. The schedules, the roll's borough cut and the UI's partition dialog all
+sources. All 17 Montreal borough namespaces, Quebec City's six
+arrondissements and Saguenay's single `SAG` key are mapped there; a fresh
+instance is seeded with `DEFAULT_NEIGHBORHOODS` (`VSMPE` and `CIL`) the first
+time anything reads the axis. The schedules, the roll's borough cut and the UI's partition dialog all
 read the same registered list. Existing partitions are untouched, and the new
 borough starts at the **current** month. A Quebec City key reads other
-publishers on the way in - see [quebec-city.md](quebec-city.md).
+publishers on the way in - see [quebec-city.md](quebec-city.md); so does
+`SAG` - see [saguenay.md](saguenay.md).
 
 Adding a key crosses it with every month since `SCRAPE_START_DATE`, so the UI
 will show the borough's earlier partitions as missing and offer to backfill

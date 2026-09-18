@@ -80,7 +80,7 @@ one gets wrong — is a page per source under [docs/](docs/README.md#the-data).
 actually gets solved — one `urban_rag.program.solve_program` CP-SAT run per
 candidate envelope, maximising discounted net profit (`npv_cad`) over the mix
 of dwellings, commerce, industry and parking. The model itself — its caps, the
-four places a stall can go, and the `binding` vocabulary that says why an
+three places a stall can go, and the `binding` vocabulary that says why an
 answer is not bigger — is
 [docs/development-program.md](docs/development-program.md).
 `lot_highest_best_use` picks the governing envelope's program for each lot,
@@ -112,10 +112,11 @@ Its `footprint_fit_pct` is a check on the solver rather than a decoration —
 whether a building of that area has a shape the parcel can take.
 It draws the parking as a *second* polygon, into
 `gold.lot_surface_parking`: a surface stall is not a building, so it is
-fitted onto the parcel rather than into the setback envelope, at least one
-stall deep. That shape check also runs upstream, where it can act - a
-parcel too narrow to stand a car on cannot park on the ground at all, and
-its programme has to dig, deck or bay the stalls instead.
+fitted into the *piece* that zone governs rather than into the setback
+envelope, with 5.5 m clear in every direction. That shape check also runs
+upstream, where it can act — a parcel too narrow to stand a car on cannot
+park on the ground at all, and its programme has to dig or bay the stalls
+instead.
 `make massing`, and [docs/massing.md](docs/massing.md).
 
 `lot_addresses` gives every one of those answers a name a person recognises.
@@ -132,11 +133,13 @@ under a WMS endpoint, which renders pictures and cannot answer this; the REST
 face of the same server can. `make addresses`, and
 [docs/addresses.md](docs/addresses.md).
 
-### Nine assets are blocked
+### Eleven assets are blocked
 
 `lot_frontage`, `lot_zone_pieces`, `lot_addresses`, `lot_buildable_setbacks`,
 `lot_profiles`, `lot_development_programs`, `lot_highest_best_use`,
-`lot_redevelopment_gap` and `lot_building_massing` are registered and have jobs,
+`lot_redevelopment_gap`, `lot_building_massing`,
+`lot_investment_opportunities` and `map_cell_aggregates` are registered and
+have jobs,
 but **no schedule**: each reads a relation hbu_infra creates. The SQL files all exist; what is
 outstanding is `db.py init` against the target database — twice for
 `lot_profiles`, since `sql/006_lot_documents.sql` carries a
@@ -145,9 +148,11 @@ has run.
 
 Each fails up front naming the file to apply, rather than letting psycopg raise.
 Run them by hand with `make frontage`, `make zone-pieces`, `make addresses`,
-`make setbacks`, `make lot-profiles`, `make programs`, `make hbu` and `make
-massing`; the envelope pair they all sit behind has no schedule either (`make
-envelopes`).
+`make setbacks`, `make lot-profiles`, `make programs`, `make hbu`, `make
+massing`, `make opportunities` and `make map_cells`; the envelope pair they all
+sit behind has no schedule either (`make envelopes`), and neither does
+`neighborhood_addresses`, the bronze half `make addresses` materializes with
+its silver join.
 `zone-pieces` is the first of the zoning chain rather than an addition to it —
 the envelopes join the ground each zone governs rather than the raw overlaps,
 so nothing below it is correct until it has run for the partition. Details, and

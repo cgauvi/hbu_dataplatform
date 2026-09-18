@@ -530,44 +530,79 @@ def compute_intersections(
             "geom",
         ),
         """
+        -- Two MATERIALIZED CTEs, and the fences are the whole point.
+        --
+        -- This was one statement with the clip in a `CROSS JOIN LATERAL`, on
+        -- the reasoning that a LATERAL computes it once where writing it
+        -- inline three times would not. The planner does not honour that: it
+        -- flattens a single-row LATERAL subquery into the outer query and then
+        -- re-evaluates the expression at every mention. `EXPLAIN VERBOSE` on
+        -- VSMPE showed `st_intersection(b.geom, l.geom)` five times across the
+        -- output list and the filter, and `st_area(geography(...))` nine
+        -- times. `MATERIALIZED` is the one spelling Postgres treats as an
+        -- optimisation fence, so each clip and each geodesic area is computed
+        -- exactly once.
+        --
+        -- Measured on VSMPE 2026-09-01 (24,952 lots x 9,996 buildings):
+        -- 24.2s -> 8.1s, identical 29,562 rows, identical keys, and a maximum
+        -- absolute area difference of 0.0 - the same answer, three times
+        -- faster. Keep the fences if this statement is ever rewritten.
+        WITH pairs AS MATERIALIZED (
+            SELECT
+                b.scrape_date,
+                b.neighborhood,
+                b.building_uid,
+                l.lot_uid,
+                l.lot_number,
+                ST_Area(geography(b.geom)) AS building_area_m2,
+                ST_Intersection(b.geom, l.geom) AS clipped_geom
+            FROM rag.buildings b
+            JOIN rag.lots l
+              ON l.neighborhood = b.neighborhood
+             AND l.scrape_date = b.scrape_date
+             AND ST_Intersects(b.geom, l.geom)
+            WHERE b.neighborhood = %(neighborhood)s
+              AND b.scrape_date = %(scrape_date)s::date
+        ),
+        measured AS MATERIALIZED (
+            SELECT
+                scrape_date,
+                neighborhood,
+                building_uid,
+                lot_uid,
+                lot_number,
+                building_area_m2,
+                clipped_geom,
+                ST_Area(geography(clipped_geom)) AS intersection_area_m2
+            FROM pairs
+            -- A shared edge or corner intersects but clips to a line or point,
+            -- which is not a "building on this lot" - only a 2D clip is.
+            WHERE NOT ST_IsEmpty(clipped_geom)
+              AND ST_Dimension(clipped_geom) = 2
+        )
         SELECT
-            b.scrape_date,
-            b.neighborhood,
-            b.building_uid,
-            l.lot_uid,
-            l.lot_number,
-            ST_Area(geography(b.geom)),
-            ST_Area(geography(clipped.geom)),
-            CASE WHEN ST_Area(geography(b.geom)) > 0
-                 THEN 100.0 * ST_Area(geography(clipped.geom)) / ST_Area(geography(b.geom))
+            scrape_date,
+            neighborhood,
+            building_uid,
+            lot_uid,
+            lot_number,
+            building_area_m2,
+            intersection_area_m2,
+            CASE WHEN building_area_m2 > 0
+                 THEN 100.0 * intersection_area_m2 / building_area_m2
                  ELSE 0.0
             END,
-            clipped.geom
-        FROM rag.buildings b
-        JOIN rag.lots l
-          ON l.neighborhood = b.neighborhood
-         AND l.scrape_date = b.scrape_date
-         AND ST_Intersects(b.geom, l.geom)
-        -- Computed once via LATERAL rather than three times inline: a
-        -- polygon clip is the expensive part of this query, ST_Area is not.
-        CROSS JOIN LATERAL (SELECT ST_Intersection(b.geom, l.geom) AS geom) AS clipped
-        WHERE b.neighborhood = %(neighborhood)s
-          AND b.scrape_date = %(scrape_date)s::date
-          -- A shared edge or corner intersects but clips to a line or point,
-          -- which is not a "building on this lot" - only a 2D clip is.
-          AND NOT ST_IsEmpty(clipped.geom)
-          AND ST_Dimension(clipped.geom) = 2
-          -- And a 2D clip is not enough either: two surveys disagreeing along
-          -- a lot line give the neighbour's house a few square metres on this
-          -- side of it, which has area and is still not a building here. Kept
-          -- only if the slice is large enough to be one, *or* is enough of its
-          -- footprint to be one - see the two constants for why that is an or.
-          AND (
-                ST_Area(geography(clipped.geom)) >= %(min_overlap_m2)s
-             OR (ST_Area(geography(b.geom)) > 0
-                 AND 100.0 * ST_Area(geography(clipped.geom))
-                           / ST_Area(geography(b.geom)) >= %(min_pct_of_building)s)
-          )
+            clipped_geom
+        FROM measured
+        -- A 2D clip is not enough either: two surveys disagreeing along a lot
+        -- line give the neighbour's house a few square metres on this side of
+        -- it, which has area and is still not a building here. Kept only if
+        -- the slice is large enough to be one, *or* is enough of its footprint
+        -- to be one - see the two constants for why that is an or.
+        WHERE intersection_area_m2 >= %(min_overlap_m2)s
+           OR (building_area_m2 > 0
+               AND 100.0 * intersection_area_m2
+                         / building_area_m2 >= %(min_pct_of_building)s)
         """,
         {
             "neighborhood": neighborhood,
@@ -1730,16 +1765,28 @@ WITH parcels AS (
 -- and takes *Avant secondaire*. `all_geom` is every rank, and is what gets
 -- subtracted from the boundary below - a lot facing three streets must not
 -- have its third edge come back as a side.
+-- Scoped to the batch, and transformed once.
+--
+-- This used to select every frontage row in the borough and call
+-- `ST_Transform` three times over each of them - once per FILTER. Both were
+-- waste. `street` is only ever reached as `JOIN street s ON s.lot_uid =
+-- <a parcels lot>`, and `parcels` is one batch, so the rows outside the batch
+-- were aggregated and thrown away: with 2,000-lot slices over a borough of
+-- ~25,000, that is the whole frontage table re-transformed a dozen times.
+-- Measured on VSMPE's first batch: 12.16s -> 4.46s, 2.73x, with the same 1,844
+-- rows and the same total rear+side edge length to the millimetre.
 street AS (
     SELECT lot_uid,
-           ST_Union(ST_Transform(geom, %(srid)s))
-               FILTER (WHERE frontage_rank = 1) AS front_geom,
-           ST_Union(ST_Transform(geom, %(srid)s))
-               FILTER (WHERE frontage_rank = 2) AS secondary_geom,
-           ST_Union(ST_Transform(geom, %(srid)s)) AS all_geom
-      FROM silver.lot_frontage
-     WHERE neighborhood = %(neighborhood)s
-       AND scrape_date = %(scrape_date)s::date
+           ST_Union(geom_m) FILTER (WHERE frontage_rank = 1) AS front_geom,
+           ST_Union(geom_m) FILTER (WHERE frontage_rank = 2) AS secondary_geom,
+           ST_Union(geom_m) AS all_geom
+      FROM (
+          SELECT lot_uid, frontage_rank, ST_Transform(geom, %(srid)s) AS geom_m
+            FROM silver.lot_frontage
+           WHERE neighborhood = %(neighborhood)s
+             AND scrape_date = %(scrape_date)s::date
+             AND lot_uid = ANY(%(lot_uids)s)
+      ) f
      GROUP BY lot_uid
 ),
 -- What is left of the boundary once the street edges are taken out of it,
