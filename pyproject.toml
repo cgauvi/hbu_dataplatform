@@ -36,6 +36,11 @@ dependencies = [
     # store is an asset, so the code location needs the driver even in the slim
     # image that has no encoder. Both are small; neither pulls torch.
     "pgvector>=0.3",
+    # Writes the map's tiles as PMTiles archives - one file per layer per
+    # partition, read by hbu_rag_map straight off S3 with HTTP range
+    # requests. Pure Python and a few hundred lines; the tiles themselves are
+    # rendered by PostGIS (`ST_AsMVT`), so no tippecanoe binary is needed.
+    "pmtiles>=3.5",
     "psycopg[binary]>=3.2",
     "pyarrow>=17",
     # geopandas already depends on this and uses it as its default I/O engine.

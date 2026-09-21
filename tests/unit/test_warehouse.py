@@ -209,15 +209,17 @@ def test_every_table_is_in_the_schema_its_asset_layer_names():
         assert table.qualified == f"{table.schema}.{table.name}"
 
 
-def test_the_registry_covers_every_silver_and_gold_asset_but_the_two_named():
-    """The two documented absences, and why neither one is a gap.
+def test_the_registry_covers_every_silver_and_gold_asset_but_the_three_named():
+    """The three documented absences, and why none of them is a gap.
 
     `document_embeddings` and `document_index` both publish to rag.chunks - the
     vectors are in Postgres, in the index every reader of the corpus queries,
     and a silver copy of them would be a second copy of the only thing in this
-    platform measured in gigabytes. Both are argued for in the comment above
-    `TABLES`, so this test is what keeps a *third* absence from arriving
-    quietly when an asset is added.
+    platform measured in gigabytes. `map_tiles` publishes nothing to Postgres
+    at all: its product is the PMTiles archives hbu_rag_map reads off S3, and
+    the tables it renders from are already published by their own assets. All
+    three are argued for in the comment above `TABLES`, so this test is what
+    keeps a *fourth* absence from arriving quietly when an asset is added.
 
     `assessment_units` used to be a third, on the grounds that the roll has no
     borough axis. It has a table now: the borough is the one whose boundary the
@@ -227,7 +229,7 @@ def test_the_registry_covers_every_silver_and_gold_asset_but_the_two_named():
     """
     published = {table.asset for table in warehouse.TABLES.values()}
     declared = set(assets_in(Layer.SILVER)) | set(assets_in(Layer.GOLD))
-    assert declared - published == {"document_embeddings", "document_index"}
+    assert declared - published == {"document_embeddings", "document_index", "map_tiles"}
 
 
 def test_the_conflict_target_is_the_partition_then_the_natural_key():

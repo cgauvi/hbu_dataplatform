@@ -139,7 +139,7 @@ class Table:
 #: `building_lot_intersections` writes both `building_lots.parquet` and
 #: `lot_features.parquet`, and they are two grains, so they are two tables.
 #:
-#: Two assets are deliberately absent, and neither is an oversight:
+#: Three assets are deliberately absent, and none is an oversight:
 #:
 #: * `document_embeddings` (silver) - its vectors' home is the pgvector index
 #:   `rag.chunks`, which `document_index` writes and every reader of the corpus
@@ -151,6 +151,11 @@ class Table:
 #:   `ON CONFLICT DO UPDATE` this module performs; repartitioning it would cut
 #:   one HNSW index into one index per borough-month, which changes what a
 #:   recall number from it means. See `PgVectorStore.load_partition`.
+#: * `map_tiles` (gold) - its product is not rows. It renders the map's layers
+#:   out of tables this registry already publishes and packs them into PMTiles
+#:   archives that hbu_rag_map reads off S3 with range requests; a table of
+#:   tile blobs would be a serving copy of a file whose whole point is to be
+#:   served as a file. See `urban_rag.tile_assets`.
 TABLES: dict[str, Table] = {
     # -- silver ------------------------------------------------------------
     "vacancy_rates": Table(

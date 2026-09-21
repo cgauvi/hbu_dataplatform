@@ -150,14 +150,17 @@ the problem: the window between a load finishing and the statistics catching up
 is exactly when somebody opens the map to look at what was loaded.
 
 What goes wrong in that window does not look like a statistics problem, which
-is why it is worth writing down. `hbu_rag_map` draws the cadastre, the
+is why it is worth writing down. `map_tiles` renders the cadastre, the
 footprints, the zoning layer, the utilisation shading and the proposed massing
-as **vector tiles** — one query per 256-pixel tile, several dozen per pan, each
-one a GiST lookup narrowed by `(neighborhood, scrape_date)`. Handed stale row
-counts the planner mis-estimates that filter's selectivity, drops the index
-scan for a sequential one, and every tile becomes a scan of the borough. The
-map does not fail. It stops answering, on precisely the partition that was most
-recently loaded.
+as **vector tiles** — one `ST_AsMVT` statement per band of 256-pixel tiles,
+thousands of tiles per borough, each a GiST lookup narrowed by
+`(neighborhood, scrape_date)`. Handed stale row counts the planner
+mis-estimates that filter's selectivity, drops the index scan for a sequential
+one, and every band becomes a scan of the borough. The run does not fail. It
+takes hours instead of minutes, on precisely the partition that was most
+recently loaded — and `hbu_rag_map`'s panes, which still read by viewport,
+meet the same plan. (The map's tiles themselves no longer touch the database
+at all: they are the PMTiles archives that asset writes, fetched off S3.)
 
 Two details of how it is done:
 
@@ -265,8 +268,13 @@ data/
     ├── lot_building_massing/2026-09-01/VSMPE/
     │   └── lot_building_massing.parquet   # two geometry columns:
     │                                      #   the building and its asphalt
-    └── map_cell_aggregates/2026-09-01/VSMPE/
-        └── map_cell_aggregates.parquet
+    ├── map_cell_aggregates/2026-09-01/VSMPE/
+    │   └── map_cell_aggregates.parquet
+    └── map_tiles/2026-09-01/VSMPE/      # not parquet: one PMTiles archive
+        ├── zones.pmtiles                 #   per map layer, read by hbu_rag_map
+        ├── lots.pmtiles                  #   straight off S3 with range requests
+        ├── ...
+        └── map_tiles.json                # which archives exist, and what each holds
 ```
 
 `<root>` is `data/` by default and `s3://$S3_BUCKET/` when that is set — see

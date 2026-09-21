@@ -198,6 +198,9 @@ RATIOS ?= [1.0,1.5,2.0,3.0]
 # the default and the only setting a scheduled run should use; naming
 # fewer is for rebuilding one layer's cells by hand.
 LAYERS ?= ["capacity","streets","lots","buildings","massing"]
+# The map layers `make map_tiles` renders - urban_rag.map_tiles.LAYERS, all
+# nine by default. Narrow it to rebuild one archive after its source re-ran.
+TILE_LAYERS ?= ["zones","land_use","capacity","opportunities","streets","lots","buildings","surface_parking","massing"]
 # Where the investment-thesis lines fall for `make opportunities`: the share
 # of proposed floor one class needs to own a lot outright, and what the
 # smaller of residential and commercial needs for it to be mixed-use instead.
@@ -508,6 +511,19 @@ massing: | $(UV_SYNC_STAMP) ## Draw DATE x NEIGHBORHOOD's HBU buildings as map p
 map_cells: | $(UV_SYNC_STAMP) ## Dissolve DATE x NEIGHBORHOOD's map layers onto the tile grid
 	$(DAGSTER) asset materialize --select gold/map_cell_aggregates --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE) \
 		--config-json '{"ops":{"gold__map_cell_aggregates":{"config":{"layers":$(LAYERS)}}}}'
+
+# The last step, and the one hbu_rag_map actually reads: every map layer
+# rendered as vector tiles in PostGIS (`ST_AsMVT`, the same SQL the map used
+# to run per request) and packed into one PMTiles archive per layer under
+# gold/map_tiles/<DATE>/<NEIGHBORHOOD>/ - on S3 when S3_BUCKET is set, which
+# is where the deployed map fetches them from with range requests. Runs after
+# `map_cells`, since below a layer's detail zoom the tiles hold those cells.
+# A source that has not been run yields no archive rather than a failure; the
+# manifest beside the archives says which. TILE_LAYERS narrows it to a subset
+# and leaves the other archives as they were.
+map_tiles: | $(UV_SYNC_STAMP) ## Render DATE x NEIGHBORHOOD's map layers into PMTiles archives
+	$(DAGSTER) asset materialize --select gold/map_tiles --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE) \
+		--config-json '{"ops":{"gold__map_tiles":{"config":{"layers":$(TILE_LAYERS)}}}}'
 
 # Bronze: one download for the whole province, so DATE only. Needs `quartiers`
 # first - the read is bounded by each city's outline, since the RQTT publishes

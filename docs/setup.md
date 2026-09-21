@@ -92,6 +92,14 @@ overridable:
 
 ### S3 output
 
+The one output that is not parquet lives in the same tree: `map_tiles` writes
+one PMTiles archive per map layer under `gold/map_tiles/<date>/<borough>/`,
+and hbu_rag_map reads those straight off the bucket with range requests. That
+needs two things of the bucket that this repository does not set —
+`s3:GetObject` for the map's task role under that prefix, and a CORS rule
+allowing cross-origin `Range` reads — and `hbu_infra/tiles.tf` sets both from
+the bucket name in its `app_tiles_bucket` variable.
+
 Set `S3_BUCKET` (in `.env` or the environment) to write every (geo)parquet
 output — the catalog, the Spectrum scrape, the open-data snapshot and the RAG
 corpus — under `s3://$S3_BUCKET/` instead of `/data`. The prefixes are the same

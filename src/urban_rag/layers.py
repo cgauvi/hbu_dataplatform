@@ -112,6 +112,7 @@ ASSET_LAYERS: dict[str, Layer] = {
     "lot_building_massing": Layer.GOLD,
     "lot_investment_opportunities": Layer.GOLD,
     "map_cell_aggregates": Layer.GOLD,
+    "map_tiles": Layer.GOLD,
     "document_index": Layer.GOLD,
 }
 

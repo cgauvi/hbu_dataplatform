@@ -101,6 +101,7 @@ from urban_rag.role_assets import (
 from urban_rag.setback_assets import lot_buildable_setbacks
 from urban_rag.storage import DATA_ROOT, output_root
 from urban_rag.street_assets import neighborhood_streets
+from urban_rag.tile_assets import map_tiles_asset
 
 TIMEZONE = "America/Toronto"
 
@@ -150,6 +151,7 @@ ASSETS = [
     lot_investment_opportunities,
     lot_building_massing,
     map_cell_aggregates,
+    map_tiles_asset,
     document_index,
 ]
 
@@ -480,6 +482,19 @@ lot_massing_job = define_asset_job(
 map_aggregates_job = define_asset_job(
     "map_aggregates_job",
     selection=AssetSelection.assets(map_cell_aggregates),
+    partitions_def=scrape_partitions,
+)
+
+# The very last job in the chain, and the one whose output is not a table:
+# every map layer rendered as vector tiles and packed into a PMTiles archive
+# per layer, which hbu_rag_map reads straight off S3. Kept apart from the
+# aggregates job it sits behind for the reason that job gives - re-rendering a
+# borough's tiles after a style-relevant column changed should not re-dissolve
+# it - and because this one is minutes of PostGIS per borough where the other
+# is one.
+map_tiles_job = define_asset_job(
+    "map_tiles_job",
+    selection=AssetSelection.assets(map_tiles_asset),
     partitions_def=scrape_partitions,
 )
 
@@ -990,6 +1005,7 @@ defs = Definitions(
         lot_massing_job,
         lot_opportunities_job,
         map_aggregates_job,
+        map_tiles_job,
         cmhc_survey_job,
         construction_costs_job,
         uniformized_property_wealth_job,

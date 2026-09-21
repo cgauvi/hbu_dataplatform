@@ -2369,7 +2369,22 @@ def compute_lot_buildable_setbacks(
                    AND scrape_date = %(scrape_date)s::date
                    AND lot_uid = ANY(%(lot_uids)s)
             ),
-            carved AS (
+            -- MATERIALIZED, and the fence is load-bearing.
+            --
+            -- `buildable_geom` is named three times downstream - `ST_Area` in
+            -- `measured`, the coverage test, and the column itself - and an
+            -- ordinary CTE is inlined, so the planner re-ran the whole chain
+            -- below (four ST_Buffer, an ST_UnaryUnion, an ST_Difference and an
+            -- ST_Intersection) once per mention. `EXPLAIN (ANALYZE, BUFFERS)`
+            -- on a VSMPE batch: 29.44s of which 29.34s was the projection and
+            -- 37ms the joins, every buffer cached, no I/O. Fenced, the same
+            -- 1,723 rows come back in 5.98s - **4.9x**.
+            --
+            -- This is `compute_intersections`' bug in another statement, and
+            -- it is worth stating the general rule once: in this module a CTE
+            -- whose output geometry is read more than once must say
+            -- MATERIALIZED, or it is computed more than once.
+            carved AS MATERIALIZED (
                 -- One ST_Difference against the union of the four buffers, rather
                 -- than four nested differences: the cuts overlap at every corner
                 -- of the parcel, and unioning them first is what keeps that from

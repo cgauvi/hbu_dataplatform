@@ -69,7 +69,7 @@ tree: [docs/architecture.md](docs/architecture.md).
 | --- | --- |
 | **bronze** | `spectrum_table_catalog` `neighborhood_features` `reference_neighborhoods` `neighborhood_lots` `neighborhood_buildings` `cmhc_vacancy_survey` `cmhc_rent_survey` `street_network` `neighborhood_addresses` `linked_documents` `montreal_residential_costs` `montreal_nonresidential_costs` `property_assessment_roll` `cubf_use_codes` `uniformized_property_wealth` `montreal_commercial_rents` `commercial_rent_index` |
 | **silver** | `assessment_units` `lot_assessed_values` `lot_assessment_comparables` `commercial_rents` `vacancy_rates` `average_rents` `building_lot_intersections` `neighborhood_streets` `lot_addresses` `lot_frontage` `document_chunks` `document_embeddings` `zoning_grid_columns` `lot_zone_pieces` `lot_zoning_envelopes` `lot_buildable_setbacks` `lot_development_programs` |
-| **gold** | `lot_profiles` `lot_highest_best_use` `lot_redevelopment_gap` `lot_building_massing` `lot_investment_opportunities` `map_cell_aggregates` `document_index` |
+| **gold** | `lot_profiles` `lot_highest_best_use` `lot_redevelopment_gap` `lot_building_massing` `lot_investment_opportunities` `map_cell_aggregates` `map_tiles` `document_index` |
 
 They read eight publishers: Spectrum and the open-data portal (Ville de
 Montréal), Infolot, the assessment roll and Adresses Québec (Québec), BDOI,
@@ -133,13 +133,13 @@ under a WMS endpoint, which renders pictures and cannot answer this; the REST
 face of the same server can. `make addresses`, and
 [docs/addresses.md](docs/addresses.md).
 
-### Eleven assets are blocked
+### Twelve assets are blocked
 
 `lot_frontage`, `lot_zone_pieces`, `lot_addresses`, `lot_buildable_setbacks`,
 `lot_profiles`, `lot_development_programs`, `lot_highest_best_use`,
 `lot_redevelopment_gap`, `lot_building_massing`,
-`lot_investment_opportunities` and `map_cell_aggregates` are registered and
-have jobs,
+`lot_investment_opportunities`, `map_cell_aggregates` and `map_tiles` are
+registered and have jobs,
 but **no schedule**: each reads a relation hbu_infra creates. The SQL files all exist; what is
 outstanding is `db.py init` against the target database — twice for
 `lot_profiles`, since `sql/006_lot_documents.sql` carries a

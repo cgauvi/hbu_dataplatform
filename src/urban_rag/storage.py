@@ -133,10 +133,49 @@ def clear_parquet(output_dir: str) -> list[str]:
     replaces the directory's contents instead of adding to them - otherwise a
     table that disappears upstream lingers in the partition forever.
     """
+    return clear_files(output_dir, "*.parquet")
+
+
+def clear_files(output_dir: str, *patterns: str) -> list[str]:
+    """Delete what matches ``patterns`` in ``output_dir``, returning what was removed.
+
+    `clear_parquet` for the assets whose output is not parquet - the map's
+    tile archives and their manifest - and the same rule: a partition is a
+    snapshot, so a re-run replaces it rather than adding to it.
+    """
     fs = filesystem(output_dir)
     if not fs.exists(output_dir):
         return []
-    stale = fs.glob(join(output_dir, "*.parquet"))
+    stale: list[str] = []
+    for pattern in patterns:
+        stale.extend(fs.glob(join(output_dir, pattern)))
     for path in stale:
         fs.rm(path)
     return stale
+
+
+def write_bytes(path: str, source) -> int:
+    """Copy the readable binary ``source`` to ``path``, creating its directory.
+
+    The counterpart of `urban_rag.frames.write_frame` for an output that is
+    not a frame. Returns the bytes written. Works for a local path and an
+    ``s3://`` URI alike, through the same fsspec filesystem every other write
+    goes through.
+    """
+    import shutil  # noqa: PLC0415
+
+    fs = filesystem(path)
+    if not is_s3_uri(path):
+        fs.makedirs(dirname(path), exist_ok=True)
+    with fs.open(path, "wb") as target:
+        shutil.copyfileobj(source, target)
+        return target.tell()
+
+
+def read_text(path: str) -> str | None:
+    """The text at ``path``, or None when nothing is there."""
+    fs = filesystem(path)
+    if not fs.exists(path):
+        return None
+    with fs.open(path, "rb") as source:
+        return source.read().decode("utf-8")
