@@ -69,6 +69,7 @@ believes they are being shown.
 from __future__ import annotations
 
 import math
+from collections.abc import Collection
 from dataclasses import dataclass
 
 #: How many zoom levels finer than the display zoom a cell is. Four, so a
@@ -402,3 +403,157 @@ def parent_of(x: int, y: int, levels: int = 1) -> tuple[int, int]:
 def _lat_of(y: int, span: int) -> float:
     """The northern latitude of tile row ``y`` on a grid ``span`` rows tall."""
     return math.degrees(math.atan(math.sinh(math.pi * (1.0 - 2.0 * y / span))))
+
+
+# ---------------------------------------------------------------------------
+# A cell's address, as a string
+#
+# `cell_of` gives a cell as three numbers, which is what the rollup needs and
+# what `gold.map_cell_aggregates` stores. A **quadkey** is the same cell as one
+# string: one character per level, each the two bits of `(x, y)` at that level.
+#
+#     z=3  (x, y) = (3, 5)   ->   "032"
+#
+# Three properties, and everything below is one of them:
+#
+# * **a prefix is an ancestor.** `"03"` is the parent of `"032"`, exactly, and
+#   `parent_of(x, y, 1)` is the same operation spelled in bits. So containment
+#   is a string comparison, with no geometry and no join.
+# * **lexicographic order is Z-order.** Sorted quadkeys walk contiguous ground,
+#   which is what makes a range over them a spatial range - and what makes an
+#   index on one cluster the way a reader of a map actually reads it.
+# * **the depth is in the string.** `len(q)` is the zoom, so a variable-depth
+#   set of cells needs no second column to say which level each one is at.
+#
+# Digits are `0-3` only, which is worth knowing at the edges: they survive
+# `warehouse.partition_name`'s `[^a-z0-9_]` fold untouched, and `"4"` sorts
+# above every quadkey there can ever be, which is how `quadkey_bounds` spells
+# the end of the last cell.
+# ---------------------------------------------------------------------------
+
+#: Sorts above every quadkey, because a quadkey has no digit above `3`. The
+#: upper bound of a range that runs to the end of the grid.
+ABOVE_ALL_QUADKEYS = "4"
+
+
+def quadkey(z: int, x: int, y: int) -> str:
+    """Tile ``z/x/y`` as a quadkey.
+
+    The string form of `cell_of`'s output, and the inverse of `cell_of_quadkey`.
+    """
+    if z < 0:
+        raise ValueError(f"zoom must not be negative, got {z}")
+    digits = []
+    for level in range(z, 0, -1):
+        mask = 1 << (level - 1)
+        digits.append(str((1 if x & mask else 0) + (2 if y & mask else 0)))
+    return "".join(digits)
+
+
+def cell_of_quadkey(key: str) -> tuple[int, int, int]:
+    """``(z, x, y)`` of a quadkey. The inverse of `quadkey`."""
+    x = y = 0
+    for level, digit in enumerate(key, start=1):
+        if digit not in ("0", "1", "2", "3"):
+            raise ValueError(f"{key!r} is not a quadkey: {digit!r} is not 0-3")
+        mask = 1 << (len(key) - level)
+        if digit in ("1", "3"):
+            x |= mask
+        if digit in ("2", "3"):
+            y |= mask
+    return len(key), x, y
+
+
+def quadkey_of(lon: float, lat: float, z: int = BASE_CELL_ZOOM) -> str:
+    """The quadkey of the zoom-``z`` cell containing ``lon``/``lat``.
+
+    What a row's permanent spatial address is made of: taken once, at
+    `BASE_CELL_ZOOM`, from a representative point of its geometry. Every
+    coarser address it will ever need is a prefix of the answer, so a row
+    stored at full depth never has to be recomputed when the depth something
+    groups it at changes.
+    """
+    return quadkey(z, *cell_of(lon, lat, z))
+
+
+def quadkey_bounds(
+    prefix: str, depth: int = BASE_CELL_ZOOM
+) -> tuple[str, str]:
+    """``[lo, hi)`` over depth-``depth`` quadkeys, for everything under ``prefix``.
+
+    The half-open range a `WHERE cell_key >= lo AND cell_key < hi` uses, which
+    is how a cell's rows are selected without `LIKE` and without a function on
+    the column - both of which cost the index.
+
+    ``hi`` is the prefix incremented as a base-4 number and padded, so it is the
+    first key *not* covered. The last cell of the grid has no such successor
+    and gets `ABOVE_ALL_QUADKEYS` instead.
+
+    The comparison this feeds must be byte-ordered - ``COLLATE "C"`` on the
+    column - or a locale that sorts digits some other way silently returns the
+    wrong ground.
+    """
+    if len(prefix) > depth:
+        raise ValueError(
+            f"{prefix!r} is deeper than depth {depth}; a prefix cannot be "
+            "longer than the keys it bounds"
+        )
+    lo = prefix.ljust(depth, "0")
+
+    digits = list(prefix)
+    index = len(digits) - 1
+    while index >= 0 and digits[index] == "3":
+        digits[index] = "0"
+        index -= 1
+    if index < 0:
+        # Every digit was a 3: the last cell at its level, with nothing above
+        # it on the grid to be the exclusive end.
+        return lo, ABOVE_ALL_QUADKEYS
+    digits[index] = str(int(digits[index]) + 1)
+    return lo, "".join(digits).ljust(depth, "0")
+
+
+def cut_cell_of(key: str, cut: Collection[str]) -> str:
+    """The member of ``cut`` that contains ``key``.
+
+    ``cut`` is a **complete** quadtree cut - every leaf of the grid has exactly
+    one ancestor in it - so walking `key`'s prefixes shortest-first and taking
+    the first hit is both correct and unambiguous. At most `BASE_CELL_ZOOM`
+    membership tests, no database, no geometry.
+
+    Shortest-first rather than longest-first because a complete cut cannot
+    contain both a cell and one of its ancestors; `validate_cut` is what makes
+    that true, and is worth running whenever the cut changes.
+    """
+    for end in range(1, len(key) + 1):
+        candidate = key[:end]
+        if candidate in cut:
+            return candidate
+    raise KeyError(
+        f"no cell of the cut contains {key!r}; the cut covers "
+        f"{len(cut)} cell(s) and is not complete over this key"
+    )
+
+
+def validate_cut(cut: Collection[str]) -> None:
+    """Raise unless ``cut`` is a set of quadkeys no two of which nest.
+
+    Does **not** check that the cut covers the world - it deliberately does
+    not, because a cut is only ever built over ground that has lots on it, and
+    a cell with no lots is a cell nothing needs. What it does check is the
+    property `cut_cell_of` relies on: that no key in the cut is a prefix of
+    another, so "the first prefix that is a member" names exactly one cell.
+    """
+    if not cut:
+        raise ValueError("the cut is empty")
+    members = set(cut)
+    for key in members:
+        if not key:
+            raise ValueError("the cut contains the empty quadkey (the root)")
+        cell_of_quadkey(key)  # raises unless every character is a digit 0-3
+        for end in range(1, len(key)):
+            if key[:end] in members:
+                raise ValueError(
+                    f"the cut contains both {key[:end]!r} and {key!r}, so "
+                    "which one holds a lot beneath them is ambiguous"
+                )

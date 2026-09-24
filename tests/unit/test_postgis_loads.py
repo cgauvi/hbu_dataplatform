@@ -123,6 +123,7 @@ def test_loading_features_refreshes_their_statistics(cursor):
         FakeConnection(cursor), zones(),
         neighborhood=NEIGHBORHOOD, scrape_date=DATE,
         source_table="Reglement_urbanisme__VSP_REG_ZONE",
+        source_namespace="19_VSMPE",
         feature_id_column="NUMERO_COMPLET",
     )
     assert cursor.analyzed() == ["ANALYZE rag.features"]
@@ -165,6 +166,7 @@ def test_an_empty_feature_layer_is_analyzed_too(cursor):
         FakeConnection(cursor), empty,
         neighborhood=NEIGHBORHOOD, scrape_date=DATE,
         source_table="Reglement_urbanisme__VSP_REG_ZONE",
+        source_namespace="19_VSMPE",
         feature_id_column="NUMERO_COMPLET",
     )
     assert written == 0

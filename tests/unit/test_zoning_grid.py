@@ -64,6 +64,7 @@ def grid_pdf(
     commerce: tuple[str, ...] = ("C.4", ""),
     all_levels: tuple[str, ...] = ("X", ""),
     except_ground: tuple[str, ...] = ("", "X"),
+    height: tuple[str, ...] = ("0/23", "0/23"),
     floors: tuple[str, ...] = ("2/6", "2/6"),
     lot_width: tuple[str, ...] = ("-", "-"),
     coverage: tuple[str, ...] = ("50/70", "50/70"),
@@ -107,7 +108,7 @@ def grid_pdf(
     line("Tous les niveaux", "", *all_levels)
     line("Nombre de logements maximal", "", *dwellings)
     line("CADRE BÂTI")
-    line("En mètre", "min/max (m)", "0/23", "0/23")
+    line("En mètre", "min/max (m)", *height)
     line("En étage", "min/max", *floors)
     line("Largeur du terrain", "min (m)", *lot_width)
     line("Mode d’implantation", "(I-J-C)", "I-J", "I-J")
@@ -330,10 +331,35 @@ def test_to_zone_column_hands_the_solver_its_input():
     assert zone_column.zone == "C01-001"
 
 
-def test_to_zone_column_refuses_a_column_with_no_storey_ceiling():
-    """An envelope with no cap on storeys is unbounded, not generous."""
+def test_a_column_printing_no_storeys_is_bounded_by_the_height_it_does_print():
+    """*En etage* blank and *En metre* filled is a ceiling, not an absence.
+
+    The column is still reported as the grid prints it - `floors_max` stays
+    `None`, because inventing a storey count is what this parser must not do -
+    and the solver's input takes its ceiling from the 23 m instead, at the
+    shortest storey the platform builds. Montreal prints this on 15 of
+    Villeray's 1 555 columns and Quebec City on nine tenths of La
+    Cite-Limoilou, which is what made it worth reading rather than dropping.
+    """
     habitation = column_of(grid_pdf(floors=("2/6", "-")), 1)
     assert habitation.floors_max is None
+    assert habitation.height_max_m == 23.0
+    assert habitation.to_zone_column().floors_max == 7
+    # And the height still travels, so `solve_program` charges a commercial
+    # storey four metres against the 23 rather than taking the seven on trust.
+    assert habitation.to_zone_column().height_max_m == 23.0
+
+
+def test_to_zone_column_refuses_a_column_bounded_in_neither_way():
+    """An envelope with no cap on storeys *and* no height is unbounded.
+
+    Not generous - unbounded. The density and coverage caps are multiplied by
+    the storey count, so a column with no ceiling on it at all is one the
+    solver cannot be handed.
+    """
+    habitation = column_of(grid_pdf(floors=("2/6", "-"), height=("0/23", "-")), 1)
+    assert habitation.floors_max is None
+    assert habitation.height_max_m is None
     with pytest.raises(GridParseError, match="storey maximum"):
         habitation.to_zone_column()
 

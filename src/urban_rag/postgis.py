@@ -321,6 +321,7 @@ def load_features(
     neighborhood: str,
     scrape_date: str,
     source_table: str,
+    source_namespace: str,
     feature_id_column: str,
 ) -> int:
     """Replace one source table's rows in `rag.features` for this partition.
@@ -341,6 +342,14 @@ def load_features(
     dropped rather than kept in `attributes` for the same reason - one row
     carrying two different meanings of the name is the confusion this docstring
     exists to prevent.
+
+    ``source_namespace`` is the unit the publisher files the layer under, from
+    `partitions.source_namespace_for` - passed in for the same reason
+    ``source_table`` is, because the registry that knows it lives on the
+    Dagster side of the line this module stays clear of. It is what makes
+    `C01-001` in one borough a different row from `C01-001` in the next, and it
+    is stored rather than derived so the uniqueness of this table stops
+    depending on `neighborhood` being 1:1 with it.
 
     ``feature_id_column`` is the column holding the id the corpus cites -
     `NUMERO_COMPLET` for the zoning layers. A layer with no such column has no
@@ -372,12 +381,21 @@ def load_features(
     cursor.execute(f"DROP TABLE IF EXISTS {staging}")
     cursor.execute(
         f"CREATE TEMP TABLE {staging} "
-        "(feature_id text, source_table text, neighborhood text, scrape_date date, "
-        "attributes jsonb, geom bytea) ON COMMIT DROP"
+        "(feature_id text, source_table text, source_namespace text, "
+        "neighborhood text, scrape_date date, attributes jsonb, geom bytea) "
+        "ON COMMIT DROP"
     )
 
     geometry_name = frame.geometry.name
-    exclude = set(_ALWAYS_EXCLUDED) | {geometry_name, feature_id_column, "source_table"}
+    exclude = set(_ALWAYS_EXCLUDED) | {
+        geometry_name,
+        feature_id_column,
+        "source_table",
+        # Provenance, and now a column of its own - so it must not also be
+        # packed into `attributes`, where a second copy could disagree with
+        # the first.
+        "source_namespace",
+    }
     attribute_columns = [c for c in frame.columns if c not in exclude]
     attrs = (
         json.loads(frame[attribute_columns].to_json(orient="records", date_format="iso"))
@@ -388,11 +406,11 @@ def load_features(
     inserted = 0
     partition_date = _as_date(scrape_date)
     statement = (
-        f"COPY {staging} (feature_id, source_table, neighborhood, scrape_date, "
-        "attributes, geom) FROM STDIN (FORMAT BINARY)"
+        f"COPY {staging} (feature_id, source_table, source_namespace, "
+        "neighborhood, scrape_date, attributes, geom) FROM STDIN (FORMAT BINARY)"
     )
     with cursor.copy(statement) as copy:
-        copy.set_types(["text", "text", "text", "date", "jsonb", "bytea"])
+        copy.set_types(["text", "text", "text", "text", "date", "jsonb", "bytea"])
         for index, row in enumerate(frame.itertuples(index=False)):
             geometry = getattr(row, geometry_name)
             if geometry is None or geometry.is_empty:
@@ -404,6 +422,7 @@ def load_features(
                 [
                     str(feature_id),
                     source_table,
+                    source_namespace,
                     neighborhood,
                     partition_date,
                     Jsonb(attrs[index]),
@@ -418,11 +437,17 @@ def load_features(
     cursor.execute(
         f"""
         INSERT INTO rag.features (
-            feature_id, source_table, neighborhood, scrape_date, attributes, geom
+            feature_id, source_table, source_namespace, neighborhood,
+            scrape_date, attributes, geom
         )
-        SELECT feature_id, source_table, neighborhood, scrape_date, attributes,
+        SELECT feature_id, source_table, source_namespace, neighborhood,
+               scrape_date, attributes,
                ST_SetSRID(ST_GeomFromWKB(geom), 4326)
         FROM {staging}
+        -- Still on `neighborhood`, not on `source_namespace`: this phase adds
+        -- the column and populates it, and the constraint swap waits until
+        -- `neighborhood` actually leaves the key. The two are 1:1 today, so
+        -- conflicting on either resolves the same rows.
         ON CONFLICT (source_table, feature_id, neighborhood, scrape_date) DO NOTHING
         """
     )
@@ -1311,7 +1336,12 @@ def compute_lot_frontage(
     # handed this an autocommit connection. Session scope survives that, a
     # rollback still takes them with it because DDL is transactional here, and
     # this makes a second call on one connection work either way.
-    for table in ("_frontage_sides", "_frontage_lots", "_frontage_road_sides"):
+    for table in (
+        "_frontage_sides",
+        "_frontage_lots",
+        "_frontage_road_sides",
+        "_frontage_road_geoms",
+    ):
         cursor.execute(f"DROP TABLE IF EXISTS {table}")
 
     cursor.execute(
@@ -1576,26 +1606,46 @@ def compute_lot_frontage(
     # is a survey gap, `ST_Intersects` drops it from the join, and the lot ends
     # up looking exactly like an interior parcel. This is that band, and on a
     # topologically clean cadastre it is empty. See `_SLIVER_GAP_M`.
+    # Materialised with a GiST index rather than left as a CTE. The two
+    # predicates below are correlated subqueries evaluated once per lot, and a
+    # CTE carries no index - so against one the planner has nothing but a scan
+    # of every road lot per lot, and neither `ST_DWithin` nor `ST_Intersects`
+    # brings a `&&` of its own to cut that down the way the shared-edge join
+    # above does. A dense borough hides it, because almost every lot abuts a
+    # road lot and the outer set is nearly empty; a municipality with rural
+    # parcels does not. On SAG (71,995 lots) this counter ran for **2h08m**
+    # and had not finished, holding the step's write lock on
+    # `silver.lot_frontage` against every reader for its whole duration, while
+    # the frontage it reports on had been computed in about two and a half
+    # minutes.
     cursor.execute(
         """
-        WITH roads AS (
-            SELECT DISTINCT l.lot_uid, l.geom
-            FROM _frontage_road_sides r
-            JOIN _frontage_lots l ON l.lot_uid = r.road_lot_uid
-        )
+        CREATE TEMP TABLE _frontage_road_geoms AS
+        SELECT DISTINCT l.lot_uid, l.geom
+        FROM _frontage_road_sides r
+        JOIN _frontage_lots l ON l.lot_uid = r.road_lot_uid
+        """
+    )
+    cursor.execute("CREATE INDEX ON _frontage_road_geoms USING gist (geom)")
+    cursor.execute("CREATE INDEX ON _frontage_road_geoms (lot_uid)")
+    cursor.execute("ANALYZE _frontage_road_geoms")
+    cursor.execute(
+        """
         SELECT count(*)
         FROM _frontage_lots l
-        WHERE NOT EXISTS (SELECT 1 FROM roads s WHERE s.lot_uid = l.lot_uid)
+        WHERE NOT EXISTS (
+            SELECT 1 FROM _frontage_road_geoms s WHERE s.lot_uid = l.lot_uid
+        )
           -- Near one ...
           AND EXISTS (
-              SELECT 1 FROM roads road
+              SELECT 1 FROM _frontage_road_geoms road
               WHERE ST_DWithin(road.geom, l.geom, %(gap_m)s::double precision)
           )
           -- ... but abutting none. A corner parcel touching one road lot and
           -- lying a little off a second is not a sliver, which is why this is
           -- "intersects nothing" rather than "some road lot it misses".
           AND NOT EXISTS (
-              SELECT 1 FROM roads road
+              SELECT 1 FROM _frontage_road_geoms road
               WHERE ST_Intersects(road.geom, l.geom)
           )
         """,

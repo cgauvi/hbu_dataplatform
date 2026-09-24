@@ -105,9 +105,15 @@ class VectorStore:
                 FROM {source}
                 {where}
                 -- The same resolution is re-embedded on every scrape date it is
-                -- still cited on. Keep the newest copy so chunk_id stays unique.
+                -- still cited on. Keep the newest copy per borough, which is
+                -- the grain the pgvector store's primary key uses and for the
+                -- same reason: `chunk_id` comes off the document's URL, so two
+                -- boroughs citing one sheet mint the same one. Collapsing on
+                -- `chunk_id` alone filed a zone on the CIL/SSC line under
+                -- whichever arrondissement sorted first and dropped it for the
+                -- other, which is what `rag.lot_documents` joins on.
                 QUALIFY row_number() OVER (
-                    PARTITION BY chunk_id ORDER BY scrape_date DESC
+                    PARTITION BY neighborhood, chunk_id ORDER BY scrape_date DESC
                 ) = 1
                 """,
                 [pattern, *parameters],

@@ -825,6 +825,41 @@ def yard_of(lot: BaseGeometry | None, building: BaseGeometry | None):
     return lot.difference(building)
 
 
+def _clip_to_yard(opened: BaseGeometry, yard: BaseGeometry) -> BaseGeometry:
+    """``opened & yard``, with the dilation's own self-intersection repaired.
+
+    The mitred dilation does not always come back valid: where two arms of
+    the opening meet, the ring pinches and touches itself, and GEOS refuses
+    the overlay outright with *found non-noded intersection* - raised before
+    it computes anything, so the whole borough's `programs` step dies on one
+    yard. Repairing the ring is what the pair needs, and it is `make_valid`
+    that does it, the same way `_largest_part` repairs a pinched buildable.
+
+    Noding it onto a grid is *not* the answer, which is worth saying because
+    it is the reflex for a GEOS topology exception: `grid_size` refuses the
+    same pair at every scale from a micron to a decimetre. The input is
+    invalid, not merely awkward to node.
+
+    Only the areal parts of the repair survive it: `make_valid` returns the
+    pinch as a line beside the polygon, and a line has no ground to park on.
+
+    A valid opening - every one but a handful per borough - takes the exact
+    overlay untouched, so a yard measured before this change and after it is
+    the same yard. First seen on SSC lot 5 749 100, whose plate subtraction
+    left the opening pinched at a single point.
+    """
+    if opened.is_valid:
+        return opened.intersection(yard)
+    parts = [
+        part
+        for part in shapely.get_parts(shapely.normalize(shapely.make_valid(opened)))
+        if isinstance(part, Polygon) and not part.is_empty
+    ]
+    if not parts:
+        return Polygon()
+    return shapely.union_all(parts).intersection(yard)
+
+
 def parkable_ground(
     yard: BaseGeometry | None,
     *,
@@ -883,7 +918,7 @@ def parkable_ground(
     # Clipped back to the yard because the dilation is not the exact inverse of
     # the erosion at a mitred corner: it can push a whisker past the lot line,
     # and parking outside the parcel is the one answer this must never give.
-    opened = opened.intersection(yard)
+    opened = _clip_to_yard(opened, yard)
     if opened.is_empty:
         return opened
     floor = _surface_stall_area_m2() if min_area_m2 is None else min_area_m2

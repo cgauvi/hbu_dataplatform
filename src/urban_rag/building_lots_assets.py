@@ -82,7 +82,7 @@ from urban_rag.bdoi_assets import BUILDINGS_FILE, neighborhood_buildings
 from urban_rag.frames import count_invalid_geometries, write_frame
 from urban_rag.infolot_assets import LOTS_FILE, neighborhood_lots
 from urban_rag.layers import key_prefix
-from urban_rag.partitions import scrape_partitions
+from urban_rag.partitions import scrape_partitions, source_namespace_for
 from urban_rag.postgis import (
     MissingRelation,
     compute_intersections,
@@ -123,8 +123,12 @@ LOT_NUMBER_COLUMN = "NO_LOT"
 #: Named here rather than imported from there because the dependency runs the
 #: wrong way: `rag_assets` builds the corpus, this builds the geometry it is
 #: about, and neither is downstream of the other. ``IGDS_TEXT_STRING`` is the
-#: zone code on Quebec City's zoning layer - see `urban_rag.quebec`.
-FEATURE_ID_COLUMNS = ("NUMERO_COMPLET", "ID", "IGDS_TEXT_STRING")
+#: zone code on Quebec City's zoning layer - see `urban_rag.quebec`;
+#: ``no_zone`` is Saguenay's - see `urban_rag.saguenay`. It precedes ``ID``
+#: because Saguenay's layer carries both, and the zone code is the one a grid
+#: is keyed on; its ``id`` is the reporting service's own primary key, which
+#: no document cites. `test_building_lots` pins this tuple to the other.
+FEATURE_ID_COLUMNS = ("NUMERO_COMPLET", "no_zone", "ID", "IGDS_TEXT_STRING")
 
 
 @asset(
@@ -240,6 +244,11 @@ def building_lot_intersections(
                     neighborhood=neighborhood,
                     scrape_date=scrape_date,
                     source_table=slug,
+                    # From the registry rather than from the frame's own
+                    # column: parquet written before this change carries no
+                    # such column, and the registry is the definition either
+                    # way.
+                    source_namespace=source_namespace_for(neighborhood),
                     feature_id_column=_id_column(frame),
                 )
             # Inside the transaction on purpose: raising here rolls the loaded

@@ -401,6 +401,216 @@ def test_the_geometry_seed_extracts_the_layer_dimension(layer):
     assert f"{tile_grid.BASE_CELL_ZOOM}," in statement
 
 
+# -- the quadkey: a cell's address as a string --------------------------------
+
+
+@pytest.mark.parametrize("seed", [1, 7, 13])
+def test_a_prefix_is_exactly_the_ancestor_parent_of_computes(seed):
+    """The property the whole addressing scheme rests on.
+
+    `parent_of` halves the two indices; chopping a character off a quadkey is
+    supposed to be the same operation. If these two ever disagree, a row's
+    stored address stops naming the cell it is grouped under, and every rollup
+    keyed on a prefix quietly reads the wrong ground. This is the test to keep
+    if all the others in this section go.
+    """
+    random = __import__("random").Random(seed)
+    for _ in range(2_000):
+        zoom = random.randint(1, tile_grid.BASE_CELL_ZOOM)
+        lon = random.uniform(-179.9, 179.9)
+        lat = random.uniform(-84.0, 84.0)
+        x, y = tile_grid.cell_of(lon, lat, zoom)
+        key = tile_grid.quadkey(zoom, x, y)
+
+        assert tile_grid.cell_of_quadkey(key) == (zoom, x, y)
+        assert tile_grid.quadkey_of(lon, lat, zoom) == key
+
+        for levels in range(1, zoom):
+            assert tile_grid.cell_of_quadkey(key[:-levels]) == (
+                zoom - levels,
+                *tile_grid.parent_of(x, y, levels),
+            )
+
+
+def test_quadkey_bounds_is_the_half_open_range_of_what_it_covers():
+    """`cell_key >= lo AND cell_key < hi` has to select a cell's rows exactly.
+
+    Half-open rather than `LIKE 'prefix%'` because a range over a plain text
+    column is what an index answers; the equivalence is what this checks.
+    """
+    random = __import__("random").Random(11)
+    for _ in range(2_000):
+        depth = random.randint(1, tile_grid.BASE_CELL_ZOOM - 1)
+        full = tile_grid.quadkey_of(
+            random.uniform(-179.9, 179.9), random.uniform(-84.0, 84.0)
+        )
+        prefix = full[:depth]
+        low, high = tile_grid.quadkey_bounds(prefix)
+
+        assert low <= full < high
+        assert full.startswith(prefix) == (low <= full < high)
+
+        # A sibling's ground is outside the range, which is the half that
+        # `LIKE` gets right by luck and a hand-rolled range gets wrong.
+        sibling = prefix[:-1] + str((int(prefix[-1]) + 1) % 4)
+        if sibling != prefix:
+            assert not low <= sibling + full[depth:] < high
+
+
+def test_the_last_cell_of_the_grid_has_an_upper_bound_at_all():
+    """`"333..."` has no successor to be the exclusive end, so one is invented.
+
+    `"4"` is not a quadkey and sorts above every string of `0-3`, which is the
+    only thing the bound has to do. Getting this wrong loses the south-east
+    corner of the world rather than erroring.
+    """
+    low, high = tile_grid.quadkey_bounds("333")
+    assert high == tile_grid.ABOVE_ALL_QUADKEYS
+    assert low <= "3" * tile_grid.BASE_CELL_ZOOM < high
+
+
+def test_a_prefix_cannot_be_deeper_than_the_keys_it_bounds():
+    with pytest.raises(ValueError, match="deeper than depth"):
+        tile_grid.quadkey_bounds("0" * (tile_grid.BASE_CELL_ZOOM + 1))
+
+
+# -- the third copy of the grid: hbu_infra's SQL function ----------------------
+
+#: Where hbu_infra's `sql/` tree is, when it is not beside this checkout. The
+#: same switch `tests/integration/conftest.py` uses.
+INFRA_ENV = "URBAN_RAG_INFRA_SQL"
+
+
+def _infra_sql_dir():
+    import os
+    import pathlib
+
+    configured = os.environ.get(INFRA_ENV)
+    if configured:
+        return pathlib.Path(configured)
+    return pathlib.Path(__file__).resolve().parents[2].parent / "hbu_infra" / "sql"
+
+
+def _quadkey_sql_expressions():
+    """The `x` and `y` expressions out of `warehouse.quadkey`, as written.
+
+    Read from the file that will actually be applied rather than copied into
+    this test, for the reason the `_cell_x_sql` tests above give: a grid
+    written twice is a grid that will disagree with itself, and this is now the
+    *third* spelling of it - `tile_grid.cell_of`, `postgis._cell_x_sql`, and
+    hbu_infra's function.
+    """
+    import re
+
+    path = _infra_sql_dir() / "028_cell_key.sql"
+    if not path.is_file():
+        pytest.skip(f"hbu_infra sql/ not found at {path.parent} - set {INFRA_ENV}")
+    body = path.read_text(encoding="utf-8")
+
+    match = re.search(
+        r"greatest\(0, least\(\(1 << z\) - 1,\s*(.+?)\s*\)\) AS x.*?"
+        r"greatest\(0, least\(\(1 << z\) - 1,\s*(.+?)\s*\)\) AS y",
+        body,
+        re.DOTALL,
+    )
+    assert match, "028_cell_key.sql no longer has the two clamped expressions"
+    return match.group(1), match.group(2)
+
+
+def test_the_sql_function_addresses_the_same_cell_as_the_python(monkeypatch):
+    """hbu_infra's `warehouse.quadkey` and `tile_grid.quadkey_of`, side by side.
+
+    The arithmetic is evaluated rather than re-implemented - `greatest`/`least`
+    for `max`/`min`, `pi()` as a call, the casts dropped - so this checks the
+    expression that will be sent to Postgres. What it cannot check is a
+    function Postgres spells differently; `tests/integration` is where that is
+    caught, against a real database.
+    """
+    x_sql, y_sql = _quadkey_sql_expressions()
+
+    def sql_cell(lon, lat, zoom):
+        namespace = dict(_SQL_NAMESPACE, lon=lon, lat=lat, z=zoom)
+        x = eval(_as_python(x_sql).replace("::bigint", ""), {}, namespace)  # noqa: S307
+        y = eval(_as_python(y_sql).replace("::bigint", ""), {}, namespace)  # noqa: S307
+        # The clamp the regex left outside the captured expressions.
+        span = 1 << zoom
+        return max(0, min(span - 1, int(x))), max(0, min(span - 1, int(y)))
+
+    for lon, lat in POINTS:
+        for zoom in (6, 11, 15, tile_grid.BASE_CELL_ZOOM):
+            assert sql_cell(lon, lat, zoom) == tile_grid.cell_of(lon, lat, zoom)
+
+    # And the string the function builds from those two, digit for digit.
+    for lon, lat in POINTS:
+        zoom = tile_grid.BASE_CELL_ZOOM
+        x, y = sql_cell(lon, lat, zoom)
+        digits = "".join(
+            str(
+                (1 if (x >> (level - 1)) & 1 else 0)
+                + (2 if (y >> (level - 1)) & 1 else 0)
+            )
+            for level in range(zoom, 0, -1)  # the SQL's ORDER BY lvl DESC
+        )
+        assert digits == tile_grid.quadkey_of(lon, lat, zoom)
+
+
+def test_the_sql_stores_the_address_at_the_zoom_the_pyramid_is_seeded_at():
+    """19 in the file has to be `BASE_CELL_ZOOM`, or every coarser address a
+    prefix of it would name the wrong cell."""
+    path = _infra_sql_dir() / "028_cell_key.sql"
+    if not path.is_file():
+        pytest.skip(f"hbu_infra sql/ not found at {path.parent} - set {INFRA_ENV}")
+    body = path.read_text(encoding="utf-8")
+
+    assert body.count(f"ST_Y(ST_PointOnSurface(geom)), {tile_grid.BASE_CELL_ZOOM}") == 3
+
+    # Centroid is the bug this column exists to avoid, so it must not be
+    # *called* - though the file is expected to name it, since explaining why
+    # it is not used is half of what that comment block is for.
+    statements = "\n".join(
+        line for line in body.splitlines() if not line.lstrip().startswith("--")
+    )
+    assert "ST_Centroid" not in statements
+
+
+# -- the cut: variable depth over the same grid --------------------------------
+
+
+def test_cut_cell_of_resolves_a_ragged_cut_without_geometry():
+    """A cut is deliberately not uniform: dense ground is cut finer.
+
+    So the lookup cannot assume a depth, and walks prefixes shortest-first.
+    """
+    cut = {"0", "10", "11", "120", "121", "122", "123", "13", "2", "3"}
+    tile_grid.validate_cut(cut)
+
+    assert tile_grid.cut_cell_of("0333", cut) == "0"
+    assert tile_grid.cut_cell_of("1012", cut) == "10"
+    assert tile_grid.cut_cell_of("1213", cut) == "121"
+    assert tile_grid.cut_cell_of("31", cut) == "3"
+
+    with pytest.raises(KeyError, match="no cell of the cut"):
+        tile_grid.cut_cell_of("9", cut)
+
+
+def test_a_cut_that_contains_a_cell_and_its_ancestor_is_refused():
+    """Which of the two a lot belongs to would be a coin toss.
+
+    `cut_cell_of` returns the shortest match, so a nested cut would not error -
+    it would silently assign every lot under `"12"` to `"1"` instead. The check
+    belongs where the cut is built, not where it is read.
+    """
+    with pytest.raises(ValueError, match="contains both"):
+        tile_grid.validate_cut({"0", "1", "12", "2", "3"})
+
+    with pytest.raises(ValueError, match="empty"):
+        tile_grid.validate_cut(set())
+    with pytest.raises(ValueError, match="root"):
+        tile_grid.validate_cut({""})
+    with pytest.raises(ValueError, match="not 0-3"):
+        tile_grid.validate_cut({"1", "5"})
+
+
 class _FakeCursor:
     """Records statements instead of running them - the shape `test_postgis_loads`
     uses, kept local because this file needs nothing else from a cursor."""

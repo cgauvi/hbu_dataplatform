@@ -118,14 +118,6 @@ DEFAULT_BATCH_SIZE = 200
 
 WGS84 = 4326
 
-#: Metres of building per storey where the grid states a height in metres and
-#: no storey count. Read off the grid itself: of the 1,640 zones stating both,
-#: the city pairs 9 m with 2 storeys, 12-13 m with 3, 15-16 m with 4, 21-22 m
-#: with 6 and 26 m with 8, and ``floor(height / 3.5)`` reproduces every one
-#: of those but the last (7 for 8). A third of the residential zones in La
-#: Cité-Limoilou state no storey count, so without this they would have no
-#: ceiling and no envelope.
-STOREY_HEIGHT_M = 3.5
 
 #: Where a usage may go in the building, as the grid's *Localisation* codes
 #: spell it: ``S`` the basement, ``R`` the ground floor, ``R+`` the ground
@@ -487,9 +479,13 @@ def grid_columns(row: Mapping[str, Any]) -> list[GridColumn]:
       not map onto Montreal's numbered classes, so no class ceiling applies
       and the dwelling cap comes from the grid's own *nb max. logement par
       bâtiment*, the largest of the isolé / jumelé / rangée figures.
-    * **Storeys.** *Nombre d'étages max.* where stated; otherwise
-      ``floor(height_max_m / STOREY_HEIGHT_M)``, noted on the column. The
-      height itself is carried as printed.
+    * **Storeys.** *Nombre d'étages max.* where stated, and **left unset
+      where it is not** - 693 of La Cité-Limoilou's 761 zones state none, and
+      a count invented here is one a reader comparing this against the city's
+      own sheet finds printed where the sheet is blank. The height is carried
+      as printed, and is what bounds those zones' envelopes:
+      `GridColumn.to_zone_column` turns it into the storey domain the solver
+      needs, and `solve_program` enforces the metric cap itself.
     * **Levels.** From the family's *Localisation* codes - see `_LEVEL_CODES`
       for the one approximation.
     * **Site coverage.** *POS min.* is the minimum. The grid states no
@@ -500,10 +496,19 @@ def grid_columns(row: Mapping[str, Any]) -> list[GridColumn]:
       lot's *Largeur min.* under *Dimensions générales*; the implantation
       mode read off which H1 types (isolé / jumelé / rangée) are given a
       dwelling count, in the ``I-J-C`` letters `postgis` already parses.
-    * **Not translated.** The dwelling density (*log/ha*) - a per-hectare
-      figure, not a floor-area ratio, so it does not go in ``density_max``;
-      the particular dimensions and norms stated per building type; the
-      PDAD code. Each is noted where present.
+    * **Dwelling density.** *Nb de log. à l'hectare min/max*, carried in
+      ``dwelling_density_min_per_ha`` / ``..._max_per_ha`` and **not** in
+      ``density_min``/``density_max``: those are a floor-area ratio and this
+      is a unit count per hectare of lot, so the two bound different
+      variables. A stated ``0`` is a stated zero, not a blank.
+    * **Commercial floor area.** *Superficie maximale de plancher*, printed
+      once for *Vente au détail* and once for *Administration*; the tighter of
+      the two becomes ``commercial_floor_max_m2``, the cap on the one
+      ``commerce`` quantity this platform prices - see
+      `_commercial_floor_cap`. The grid states **no minimum** floor area for
+      commerce, so there is no field for one.
+    * **Not translated.** The particular dimensions and norms stated per
+      building type, and the PDAD code. Each is noted where present.
     """
     lookup = _Lookup(row)
     zone = lookup.text("zone a modifier") or lookup.text(GRID_ZONE_COLUMN)
@@ -584,10 +589,17 @@ def _norms(lookup: _Lookup, notes: list[str]) -> dict:
     floors_min = lookup.number("dimension du batiment principal - dimensions generales: nombre d'etages min.", "nombre d'etages min.")
     floors_max = lookup.number("dimension du batiment principal - dimensions generales: nombre d'etages max.", "nombre d'etages max.")
     if floors_max is None and height_max:
-        floors_max = float(max(1, math.floor(height_max / STOREY_HEIGHT_M)))
+        # Left unset on purpose. The grid states a height and no storey count
+        # on 693 of La Cite-Limoilou's 761 zones, and filling that in here
+        # would print a ceiling against *Nombre d'etages max.* that the sheet
+        # leaves blank - which is what a reader checking the grid against this
+        # platform sees first. `GridColumn.to_zone_column` derives the bound
+        # the solver needs from `height_max_m`, where it is a domain bound
+        # rather than a norm and where `solve_program` enforces the height
+        # itself at the storey heights it actually builds.
         notes.append(
-            f"floors_max: derived from Hauteur max. {height_max:g} m at "
-            f"{STOREY_HEIGHT_M} m per storey"
+            f"floors_max: not stated; the envelope is bounded by Hauteur max. "
+            f"{height_max:g} m instead"
         )
 
     coverage_min = lookup.number("normes d'implantation generales: pos min. (%)", "pos min. (%)")
@@ -597,9 +609,15 @@ def _norms(lookup: _Lookup, notes: list[str]) -> dict:
         coverage_max = 100.0 - green_min
         notes.append(f"site_coverage_max_pct: 100 - aire verte min. {green_min:g}%")
 
-    density_max = lookup.number("nb de log. a l'hectare max. (log/ha)")
-    if density_max:
-        notes.append(f"dwelling density: {density_max:g} log/ha max, not carried (per hectare, not a floor-area ratio)")
+    # *Normes de densite*, the dwellings-per-hectare pair. Carried as itself
+    # rather than folded into `density_min`/`density_max`, which are a
+    # floor-area ratio: one bounds the floor area and this bounds the unit
+    # count, and the two are multiplied by the lot to reach different
+    # variables. A stated ``0`` is kept as ``0`` - 883 zones print ``0/0`` and
+    # all but four of them authorise no dwelling group, so it is the by-law
+    # saying "no dwellings here" and not a blank.
+    dwelling_density_min = lookup.number("nb de log. a l'hectare min. (log/ha)")
+    dwelling_density_max = lookup.number("nb de log. a l'hectare max. (log/ha)")
     if lookup.text("dimension du batiment principal - dimensions particulieres: groupe + type + log. ou ch. min. + log. ou ch. max."):
         notes.append("particular building dimensions stated per type: not carried")
     if lookup.text("normes d'implantation particulieres: groupe + type + log. ou ch. min. + log. ou ch. max."):
@@ -630,11 +648,14 @@ def _norms(lookup: _Lookup, notes: list[str]) -> dict:
         "site_coverage_max_pct": coverage_max,
         "density_min": None,
         "density_max": None,
+        "dwelling_density_min_per_ha": dwelling_density_min,
+        "dwelling_density_max_per_ha": dwelling_density_max,
         "max_dwellings": max_dwellings,
         "specific_use_area_max_m2": lookup.number(
             "sup. max. de plancher vente au detail par batiment (m²)",
             "sup. max. de plancher vente au detail par batiment (m2)",
         ),
+        "commercial_floor_max_m2": _commercial_floor_cap(lookup),
         "front_margin_min_m": lookup.number("normes d'implantation generales: marge avant (m)", "marge avant (m)"),
         "front_margin_max_m": None,
         "secondary_front_margin_min_m": None,
@@ -644,6 +665,49 @@ def _norms(lookup: _Lookup, notes: list[str]) -> dict:
         "only_permitted_usages": lookup.text("usage specifiquement autorise"),
         "excluded_usages": lookup.text("usage specifiquement exclu"),
     }
+
+
+def _commercial_floor_cap(lookup: _Lookup) -> float | None:
+    """The commerce family's floor ceiling, per building, in square metres.
+
+    The grid prints *Superficie maximale de plancher* twice under *Normes de
+    densite* - once for *Vente au detail* and once for *Administration* - and
+    this platform prices one undifferentiated ``commerce``. **The tighter of
+    the two is taken**, so no split of that one quantity can breach either
+    stated cap. It is the conservative reading and it does cost something: the
+    grid lets an all-retail building reach the retail figure, and where the
+    two differ - 316 of La Cite-Limoilou's 525 zones stating both, typically
+    2 200 against 1 100 - this refuses the larger half of that. The permissive
+    readings are the other cap and their sum, and neither is safe against a
+    program that turns out to be the other use.
+
+    *Par batiment* rather than *par etablissement*: the solver sizes a
+    building, and a building may hold several establishments, so the
+    per-establishment figure bounds nothing it decides. A zone printing only
+    the per-establishment cap - 162 of the borough's - therefore states no
+    building cap here, and gets ``None``.
+
+    Note the city's own header spells it ``Adminstration``. That is the
+    workbook's text and matching it is deliberate; a corrected spelling
+    matches no column and silently reads as "no cap".
+    """
+    caps = [
+        lookup.number(*labels)
+        for labels in (
+            (
+                "sup. max. de plancher vente au detail par batiment (m²)",
+                "sup. max. de plancher vente au detail par batiment (m2)",
+            ),
+            (
+                "sup. max. de plancher adminstration par batiment (m²)",
+                "sup. max. de plancher adminstration par batiment (m2)",
+                "sup. max. de plancher administration par batiment (m²)",
+                "sup. max. de plancher administration par batiment (m2)",
+            ),
+        )
+    ]
+    stated = [cap for cap in caps if cap is not None]
+    return min(stated) if stated else None
 
 
 def _type_permitted(lookup: _Lookup, kind: str) -> bool:

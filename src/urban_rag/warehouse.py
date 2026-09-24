@@ -692,6 +692,167 @@ def published_metadata(results: Mapping[str, dict[str, int]]) -> dict[str, int]:
     return metadata
 
 
+# ---------------------------------------------------------------------------
+# Versions: whether a partition changed at all
+#
+# `urban_rag.digest` decides what a dataset's content hashes to. This is where
+# the answer is kept and compared, in `warehouse.dataset_versions`
+# (029_dataset_versions.sql).
+#
+# The shape a caller uses:
+#
+#     seen = warehouse.record_version(cursor, "neighborhood_lots", ...)
+#     if not seen["changed"]:
+#         return  # nothing to write, and nothing downstream to run
+#
+# `record_version` returns the `scrape_date` the version *first* appeared under,
+# which is the date the data tables should be keyed on. That is the whole
+# separation: the tick's own date says when the pipeline looked, and this says
+# which version it is looking at.
+# ---------------------------------------------------------------------------
+
+#: The table the two functions below read and write. Not a `Table` in `TABLES`:
+#: it is metadata about datasets rather than one of them, it is not
+#: partitioned, and `upsert_frame` would have nothing to do with it.
+VERSIONS_TABLE = "warehouse.dataset_versions"
+
+
+def current_version(
+    cursor: "Cursor", dataset: str, partition_key: str
+) -> dict[str, Any] | None:
+    """The newest observed version of one dataset partition, or None.
+
+    The cheap pre-check: a caller that can compute a digest without doing the
+    expensive work - hashing a publisher's response rather than the frame it
+    parses into - can compare against this and stop before parsing at all.
+    """
+    cursor.execute(
+        f"""
+        SELECT content_digest, scrape_date, first_observed, last_observed,
+               row_count
+          FROM {VERSIONS_TABLE}
+         WHERE dataset = %s AND partition_key = %s
+         ORDER BY last_observed DESC, scrape_date DESC
+         LIMIT 1
+        """,
+        [dataset, partition_key],
+    )
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    digest, scrape_date, first_observed, last_observed, row_count = row
+    return {
+        "content_digest": bytes(digest),
+        "scrape_date": scrape_date,
+        "first_observed": first_observed,
+        "last_observed": last_observed,
+        "row_count": row_count,
+    }
+
+
+def record_version(
+    cursor: "Cursor",
+    dataset: str,
+    *,
+    partition_key: str,
+    content_digest: bytes,
+    observed_on: str,
+    row_count: int | None = None,
+    attributes: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Record that ``dataset`` was observed with this content, and say if it is new.
+
+    Returns ``changed`` - whether this content had never been seen in this
+    partition - along with the ``scrape_date`` the version is filed under.
+
+    **``changed`` is False for content that was seen, superseded, and has come
+    back.** A by-law amendment that is repealed returns the layer to a version
+    this table already holds, and collapsing onto it is the right answer: the
+    rows for that version are still in the warehouse under their original
+    date, so there is nothing to write. What it costs is that `last_observed`
+    on a revived version jumps over the interval when something else was
+    current; `first_observed` still says when it was first seen, and the two
+    together are the honest record of a layer that flip-flopped.
+
+    ``observed_on`` is the tick's own date - when the pipeline looked. It
+    becomes `scrape_date` only for content that is new, which is what makes an
+    unchanged month cost one UPDATE.
+    """
+    from psycopg.types.json import Jsonb
+
+    if len(content_digest) != 32:
+        raise ValueError(
+            f"{dataset}: a content digest is 32 bytes of SHA-256, got "
+            f"{len(content_digest)}"
+        )
+
+    cursor.execute(
+        f"""
+        INSERT INTO {VERSIONS_TABLE} (
+            dataset, partition_key, content_digest, scrape_date,
+            first_observed, last_observed, row_count, attributes
+        )
+        VALUES (%s, %s, %s, %s::date, %s::date, %s::date, %s, %s)
+        ON CONFLICT (dataset, partition_key, content_digest) DO UPDATE
+           SET last_observed = greatest(
+                   {VERSIONS_TABLE}.last_observed, EXCLUDED.last_observed
+               ),
+               row_count = COALESCE(EXCLUDED.row_count, {VERSIONS_TABLE}.row_count),
+               attributes = EXCLUDED.attributes
+        -- `xmax = 0` is true only on the INSERT arm of an upsert, which is how
+        -- this distinguishes "content nobody has seen" from "the same content
+        -- again" without a second round trip.
+        RETURNING scrape_date, first_observed, last_observed,
+                  (xmax = 0) AS inserted
+        """,
+        [
+            dataset,
+            partition_key,
+            content_digest,
+            observed_on,
+            observed_on,
+            observed_on,
+            row_count,
+            Jsonb(dict(attributes or {})),
+        ],
+    )
+    row = cursor.fetchone()
+    if row is None:  # pragma: no cover - the upsert always returns its row
+        raise RuntimeError(
+            f"{dataset}: recording a version returned nothing, which an "
+            "INSERT ... ON CONFLICT DO UPDATE ... RETURNING cannot do. The "
+            f"row is not in {VERSIONS_TABLE} and the caller must not treat "
+            "this partition as unchanged."
+        )
+    scrape_date, first_observed, last_observed, inserted = row
+    return {
+        "changed": bool(inserted),
+        "scrape_date": scrape_date,
+        "first_observed": first_observed,
+        "last_observed": last_observed,
+        "content_digest": content_digest,
+    }
+
+
+def version_metadata(seen: Mapping[str, Any]) -> dict[str, Any]:
+    """`record_version`'s answer, as the metadata an asset reports.
+
+    `days_unchanged` is the number worth watching: a large one is a dataset the
+    pipeline has correctly stopped rewriting, and a zero on something that has
+    not been amended in a year is a canonicalisation bug announcing itself.
+    """
+    first = seen.get("first_observed")
+    last = seen.get("last_observed")
+    metadata: dict[str, Any] = {
+        "content_changed": bool(seen["changed"]),
+        "content_digest": bytes(seen["content_digest"]).hex(),
+        "version_scrape_date": str(seen["scrape_date"]),
+    }
+    if first is not None and last is not None:
+        metadata["days_unchanged"] = (last - first).days
+    return metadata
+
+
 def require_table(cursor: "Cursor", table: Table) -> None:
     """Raise `MissingRelation` naming the file to apply, if it is not there."""
     cursor.execute("SELECT to_regclass(%s)", [table.qualified])

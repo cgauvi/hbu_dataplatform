@@ -205,6 +205,8 @@ CMHC_CENTRES: dict[City, str] = {
 #: Vieux-Québec and Saint-Jean-Baptiste, Montcalm, Saint-Sacrement, the
 #: Vieux-Port, Saint-Roch, Saint-Sauveur and Limoilou. Vanier, Duberger and
 #: Les Saules sit in the same two zones and belong to Les Rivières.
+#: Sainte-Foy-Sillery-Cap-Rouge is the survey's `Sainte-Foy-Sillery` zone
+#: whole, plus one half of `Saint-Augustin-Cap-Rouge`.
 CMHC_QUARTIERS: dict[str, tuple[str, ...]] = {
     "AC": ("Ahuntsic", "Cartierville"),
     "Anjou": ("Anjou",),
@@ -235,6 +237,18 @@ CMHC_QUARTIERS: dict[str, tuple[str, ...]] = {
         "Saint-Roch",
         "Saint-Sauveur",
         "Limoilou",
+    ),
+    # Sainte-Foy-Sillery-Cap-Rouge, from two of the survey's Québec zones.
+    # `Sainte-Foy-Sillery` is the borough's and nothing else's, so all three
+    # of its quartiers are taken. `Saint-Augustin-Cap-Rouge` is not: it pairs
+    # Cap-Rouge, which is in the borough, with Saint-Augustin-de-Desmaures,
+    # which is a separate municipality - and unlike Senneville in `PR` the
+    # survey publishes the two apart, so only Cap-Rouge is claimed.
+    "SSC": (
+        "Haut de Sainte-Foy",
+        "Pointe-de-Sainte-Foy",
+        "Sillery",
+        "Cap-Rouge",
     ),
     # Saguenay is one partition, so it takes every quartier the `Saguenay`
     # centre publishes - the survey's four zones (Secteur Nord, Chicoutimi-Sud,
@@ -452,6 +466,33 @@ def namespace_for(neighborhood: str) -> str:
             f"Unknown neighborhood {neighborhood!r}; "
             f"known keys: {sorted(NEIGHBORHOOD_NAMESPACES)}"
         ) from None
+
+
+def source_namespace_for(neighborhood: str) -> str:
+    """The unit the *publisher* files this key's layers under.
+
+    Not a spatial fact, and that is the point. `rag.features` is unique on
+    ``(source_table, feature_id, ...)`` plus something, because `source_table`
+    is the file slug - `Reglement_urbanisme__VSP_REG_ZONE` - and Montreal
+    restarts its zone numbers at C01-001 in every borough. The something has
+    been `neighborhood` since 005_silver_lot_features.sql widened the
+    constraint, and `neighborhood` happens to work only because it is 1:1 with
+    the Spectrum namespace that actually distinguishes the two rows. This names
+    the real qualifier, so the constraint stops depending on that coincidence.
+
+    Montreal's is its Spectrum namespace, `19_VSMPE`. Quebec City and Saguenay
+    publish **one** zoning layer for the whole municipality and no namespace at
+    all, so theirs is the city: their zone codes are already unique city-wide -
+    Quebec's leading digit *is* the arrondissement (`quebec.py:22-25`) and
+    Saguenay is one key by construction (`:120-134`). Returning ``""`` for them
+    would be a qualifier that qualifies nothing, and a constraint that is
+    strong for one city and vacuous for the other two is the asymmetry this
+    avoids.
+    """
+    city = city_of(neighborhood)
+    if city is City.MONTREAL:
+        return namespace_for(neighborhood)
+    return str(city)
 
 
 def borough_code_for(neighborhood: str) -> str:

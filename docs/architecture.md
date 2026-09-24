@@ -298,9 +298,17 @@ import geopandas as gpd
 
 zones = gpd.read_parquet("data/neighborhood_features/2026-09-01/VSMPE/Reglement_urbanisme__VSP_REG_ZONE.parquet")
 zones.crs        # EPSG:4326
-zones.columns    # source table attributes + source_table + neighborhood
-                 #   + scrape_date + scraped_at
+zones.columns    # source table attributes + source_table + source_namespace
+                 #   + neighborhood + scrape_date + scraped_at
 ```
+
+`source_namespace` is the unit the *publisher* files the layer under — Montreal's
+Spectrum namespace `19_VSMPE`, and the city for Quebec and Saguenay, which each
+publish one zoning layer and no namespace at all. It is what makes `C01-001` in
+one borough a different feature from `C01-001` in the next, now that
+`source_table` is the slug and the slug drops it. See
+`urban_rag.partitions.source_namespace_for` and
+hbu_infra's `027_features_source_namespace.sql`.
 
 The whole history still reads back as one dataset — `read_parquet` over
 `data/neighborhood_features/**/*.parquet`, then group by those two columns.

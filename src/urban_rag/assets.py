@@ -42,6 +42,7 @@ from urban_rag.partitions import (
     municipality_code_for,
     namespace_for,
     scrape_partitions,
+    source_namespace_for,
 )
 from urban_rag import saguenay
 from urban_rag.saguenay import SaguenayZoningError
@@ -228,6 +229,11 @@ def neighborhood_features(
                 # one file still knows which snapshot it belongs to.
                 extra_columns={
                     "source_table": table,
+                    # The borough namespace the path carries and `table_slug`
+                    # drops - what makes C01-001 here a different zone from
+                    # C01-001 in the next borough. See
+                    # `partitions.source_namespace_for`.
+                    "source_namespace": source_namespace_for(neighborhood),
                     "neighborhood": neighborhood,
                     "scrape_date": scrape_date,
                     "scraped_at": scraped_at,
@@ -330,6 +336,7 @@ def _quebec_features(
     _clear_partition(context, output_dir)
     scraped_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     provenance = {
+        "source_namespace": source_namespace_for(neighborhood),
         "neighborhood": neighborhood,
         "scrape_date": scrape_date,
         "scraped_at": scraped_at,
@@ -457,6 +464,7 @@ def _saguenay_features(
     scraped_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     provenance = {
         "source_table": saguenay.ZONING_SLUG,
+        "source_namespace": source_namespace_for(neighborhood),
         "neighborhood": neighborhood,
         "scrape_date": scrape_date,
         "scraped_at": scraped_at,

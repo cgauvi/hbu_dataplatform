@@ -442,6 +442,7 @@ class PgVectorStore:
         self._check_compatible(cursor, dimension, model)
         self._ensure_schema(cursor)
         self._create_table(cursor, dimension)
+        self._widen_primary_key(cursor)
         self._create_meta_table(cursor)
 
     def _ensure_schema(self, cursor: "Cursor") -> None:
@@ -496,7 +497,7 @@ class PgVectorStore:
         cursor.execute(
             f"""
             CREATE TABLE IF NOT EXISTS {self.table} (
-                chunk_id     text        PRIMARY KEY,
+                chunk_id     text        NOT NULL,
                 doc_id       text        NOT NULL,
                 url          text        NOT NULL,
                 title        text,
@@ -512,9 +513,79 @@ class PgVectorStore:
                 model        text        NOT NULL,
                 text         text        NOT NULL,
                 embedding    vector({int(dimension)}) NOT NULL,
-                indexed_at   timestamptz NOT NULL DEFAULT now()
+                indexed_at   timestamptz NOT NULL DEFAULT now(),
+                -- The borough is in the key, and that is not redundancy.
+                --
+                -- `chunk_id` is derived from the document's URL, so two
+                -- partitions that link the *same sheet* mint the same one. In
+                -- Montreal that never happens: a zone code is borough-local,
+                -- so `C01-001` in two boroughs is two zones citing two
+                -- different PDFs. In Quebec City it happens on every
+                -- arrondissement boundary - an outline-bounded fetch picks up
+                -- the neighbours on the line, so 33 zones are in both CIL and
+                -- SSC, one zone with one sheet, legitimately claimed twice.
+                --
+                -- Keyed on `chunk_id` alone, the second borough to publish
+                -- overwrote the first's row in place and `rag.lot_documents`
+                -- - which joins `d.neighborhood = lf.neighborhood`, because
+                -- Montreal's codes need it to - then dropped the document for
+                -- whoever lost. Publishing SSC cost CIL 33 documents and 219
+                -- lots, and re-publishing CIL would only have reversed it.
+                --
+                -- So a shared sheet is stored once per borough that cites it.
+                -- The duplicate is the point: it is what lets each partition
+                -- own its own row. It costs one extra vector per shared
+                -- document, which over both Quebec City arrondissements is 33.
+                PRIMARY KEY (neighborhood, chunk_id)
             )
             """
+        )
+
+    def _widen_primary_key(self, cursor: "Cursor") -> None:
+        """Move an existing table's key from ``(chunk_id)`` to include the borough.
+
+        `_create_table` cannot do this. ``CREATE TABLE IF NOT EXISTS`` does not
+        read its own body when the table is already there, so a database built
+        before the key was widened keeps the narrow one silently and goes on
+        letting one borough overwrite another's rows - which is the bug, not a
+        stale comment. See the key's own note in `_create_table` for why the
+        borough belongs in it.
+
+        Idempotent and keyed on what is actually there rather than on a version
+        number: it asks Postgres for the current primary key and returns unless
+        it is exactly ``(chunk_id)``. A database already widened, or one created
+        fresh by `_create_table` above, does nothing here.
+
+        The rows do not move. Widening a key only ever *splits* groups that
+        were previously collapsed, so no existing row can violate the new
+        constraint - what was unique on ``chunk_id`` alone is still unique on
+        the pair. The documents an earlier overwrite already took from one
+        borough are not restored by this; they come back when that borough is
+        published again, which is now safe to do.
+        """
+        current = cursor.execute(
+            """
+            SELECT array_agg(a.attname ORDER BY k.ord)
+              FROM pg_constraint c
+              JOIN pg_class t ON t.oid = c.conrelid
+              JOIN pg_namespace n ON n.oid = t.relnamespace
+              CROSS JOIN LATERAL unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord)
+              JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum
+             WHERE n.nspname = %s AND t.relname = %s AND c.contype = 'p'
+             GROUP BY c.oid
+            """,
+            (self.settings.db_schema, self.settings.table),
+        ).fetchone()
+        if not current or list(current[0]) != ["chunk_id"]:
+            return
+
+        # One statement, so a failure leaves the old key in place rather than
+        # the table with none: DROP CONSTRAINT and ADD PRIMARY KEY in the same
+        # ALTER are applied together.
+        cursor.execute(
+            f"ALTER TABLE {self.table} "
+            f"DROP CONSTRAINT {self.settings.table}_pkey, "
+            f"ADD PRIMARY KEY (neighborhood, chunk_id)"
         )
 
     def _create_meta_table(self, cursor: "Cursor") -> None:
@@ -769,23 +840,27 @@ class PgVectorStore:
         if upsert:
             assignments = ", ".join(f"{c} = EXCLUDED.{c}" for c in _UPDATED_COLUMNS)
             conflict = (
-                f"ON CONFLICT (chunk_id) DO UPDATE SET {assignments}, "
-                "indexed_at = now() "
+                f"ON CONFLICT (neighborhood, chunk_id) DO UPDATE SET "
+                f"{assignments}, indexed_at = now() "
                 # The same resolution is re-embedded on every scrape date it is
                 # still cited on. Newest wins, as in the DuckDB store.
                 "WHERE EXCLUDED.scrape_date >= target.scrape_date"
             )
         else:
-            conflict = "ON CONFLICT (chunk_id) DO NOTHING"
+            conflict = "ON CONFLICT (neighborhood, chunk_id) DO NOTHING"
         cursor.execute(
             f"""
             INSERT INTO {self.table} AS target ({columns})
             -- Two source tables can link the same PDF, so one partition can
             -- carry a chunk_id twice; ON CONFLICT refuses to touch a row twice
             -- in one statement, so the duplicate is resolved here instead.
-            SELECT DISTINCT ON (chunk_id) {columns}
+            -- Deduplicated *within* the borough, matching the key: the same
+            -- chunk_id under two boroughs is two rows on purpose, and
+            -- collapsing them here would re-create the overwrite the key was
+            -- widened to stop.
+            SELECT DISTINCT ON (neighborhood, chunk_id) {columns}
             FROM {staging}
-            ORDER BY chunk_id, scrape_date DESC
+            ORDER BY neighborhood, chunk_id, scrape_date DESC
             {conflict}
             """
         )

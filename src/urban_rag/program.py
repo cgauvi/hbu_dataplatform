@@ -386,6 +386,11 @@ SOLVER_RANDOM_SEED = 20260917
 #: ratios are metric; the unit schedule below is in square feet.
 M2_PER_SQFT = 0.09290304
 
+#: Square metres in a hectare, which is the unit Quebec City states its
+#: dwelling density in - *Nb de log. à l'hectare*. See
+#: `ZoneColumn.dwelling_density_min_per_ha`.
+M2_PER_HECTARE = 10_000.0
+
 #: Rentable area per dwelling, in square feet, keyed by CMHC's bedroom class.
 #:
 #: Keyed that way rather than to "studio/1br/2br/3br" so a rent or vacancy
@@ -806,6 +811,35 @@ MAX_UNDERGROUND_LEVELS = 6
 RESIDENTIAL_STOREY_HEIGHT_M = 3.0
 COMMERCIAL_STOREY_HEIGHT_M = 4.0
 INDUSTRIAL_STOREY_HEIGHT_M = 4.0
+
+
+def storey_ceiling_from_height(height_max_m: float | None) -> int | None:
+    """The storey domain a metric ceiling implies, where no storey row states one.
+
+    Quebec City's grid states *Hauteur max.* far more often than *Nombre
+    d'étages max.* - 693 of La Cité-Limoilou's 761 zones print no storey count
+    and 607 of those print a height - so an envelope is bounded by the height
+    or by nothing at all. `solve_program` needs *some* finite storey count to
+    size its variables, and this is that number.
+
+    It is a **domain bound, not a norm**, and the distinction is the whole
+    reason it is computed here rather than written into the column as though
+    the grid had printed it. Taken at the shortest storey this platform builds,
+    it is the most storeys the height could possibly hold - six under 20 m -
+    and `solve_program` then enforces `height_max_m` itself, charging four
+    metres to a commercial plate against three to a dwelling. The metric cap is
+    what actually stops the building; this only keeps the search finite. A
+    tighter number here would invent a ceiling the by-law never stated and
+    would cost a storey of housing on every zone that states a height and
+    nothing else.
+
+    Both callers - `zoning_grid.GridColumn.to_zone_column`, reading a grid, and
+    `hbu.column_of`, reading the envelope table back - go through here, because
+    two copies of this rule would be two answers to "is this column solvable".
+    """
+    if height_max_m is None:
+        return None
+    return max(1, math.floor(height_max_m / RESIDENTIAL_STOREY_HEIGHT_M))
 
 #: What an underground level adds to the building's height: nothing. Not an
 #: approximation but the definition - *hauteur en metre* is measured from grade
@@ -1288,6 +1322,25 @@ class ZoneColumn:
     #: *Densité min/max* - gross floor area over lot area.
     density_min: float | None = None
     density_max: float | None = None
+    #: *Nombre de logements à l'hectare min/max* - dwellings per hectare of
+    #: lot, which Quebec City's grid states and Montreal's does not.
+    #:
+    #: Emphatically **not** `density_min`/`density_max`: those are a floor-area
+    #: ratio and this is a unit count, so the two are multiplied by the lot to
+    #: bound different variables - the ratio bounds `density_area` and this
+    #: bounds the dwellings. A zone stating 65 log/ha and no ceiling is the
+    #: common case, and the minimum is owed only by a building that houses
+    #: anyone: it is conditioned on the residential family being built, the
+    #: same way `density_min` is, because a pure commercial program on a
+    #: residential-capable zone owes no dwellings at all.
+    dwelling_density_min_per_ha: float | None = None
+    dwelling_density_max_per_ha: float | None = None
+    #: *Superficie maximale de plancher* for the commerce family, per building.
+    #: Quebec City's grid prints it twice - once for *Vente au détail* and once
+    #: for *Administration* - and this is the tighter of the two, so no split
+    #: of the one commerce quantity this model carries can breach either. The
+    #: grid states no minimum, and there is no field for one here.
+    commercial_floor_max_m2: float | None = None
     #: *Taux d'implantation au sol min/max (%)* - footprint over lot area.
     site_coverage_min_pct: float | None = None
     site_coverage_max_pct: float | None = None
@@ -1299,7 +1352,15 @@ class ZoneColumn:
             raise ProgramError(f"{self!r}: floors_max must not be negative")
         if self.floors_min < 0:
             raise ProgramError(f"{self!r}: floors_min must not be negative")
-        for name in ("density_min", "density_max", "height_min_m", "height_max_m"):
+        for name in (
+            "density_min",
+            "density_max",
+            "height_min_m",
+            "height_max_m",
+            "dwelling_density_min_per_ha",
+            "dwelling_density_max_per_ha",
+            "commercial_floor_max_m2",
+        ):
             value = getattr(self, name)
             if value is not None and value < 0:
                 raise ProgramError(f"{self!r}: {name} must not be negative")
@@ -3395,6 +3456,35 @@ class ZoneEnvelope:
             return None
         return self.residential.effective_max_dwellings
 
+    @property
+    def dwelling_density_min_per_ha(self) -> float | None:
+        """*Nb de log. à l'hectare min*, from the Habitation column alone.
+
+        Read off the same column as `max_dwellings` and for the same reason: a
+        commerce column states no dwelling density, and an absent one there
+        must not be read as relieving the H column of its own.
+        """
+        if self.residential is None:
+            return None
+        return self.residential.dwelling_density_min_per_ha
+
+    @property
+    def dwelling_density_max_per_ha(self) -> float | None:
+        if self.residential is None:
+            return None
+        return self.residential.dwelling_density_max_per_ha
+
+    @property
+    def commercial_floor_max_m2(self) -> float | None:
+        """*Superficie maximale de plancher*, from the Commerce column alone.
+
+        The mirror of `max_dwellings`: a norm printed against one family, owed
+        by that family, and silent on a zone that authorises no commerce.
+        """
+        if self.commercial is None:
+            return None
+        return self.commercial.commercial_floor_max_m2
+
 
 def _loosest_max(values: Iterable[float | None]) -> float | None:
     """The weakest of several maxima: the largest, or ``None`` if any is absent.
@@ -4103,6 +4193,15 @@ def solve_program(
     )
     if column.max_dwellings is not None:
         dwellings_hi = min(dwellings_hi, column.max_dwellings)
+    # *Nb de log. à l'hectare max*, as a count on this particular lot. Applied
+    # to the domain as well as as a constraint below, for the reason every
+    # other ceiling here is: a bound the solver cannot exceed is cheaper than
+    # one it has to be told about at every node.
+    density_dwellings_hi = _dwellings_per_hectare(
+        lot.area_m2, column.dwelling_density_max_per_ha, bound="max"
+    )
+    if density_dwellings_hi is not None:
+        dwellings_hi = min(dwellings_hi, density_dwellings_hi)
 
     # The two ratios, each expressed against the thing it is charged on: one
     # per dwelling, one per hundredth of a square metre of non-residential
@@ -4634,6 +4733,33 @@ def solve_program(
     )
     if column.max_dwellings is not None:
         model.Add(dwellings + retained_dwellings <= column.max_dwellings)
+
+    # *Nb de log. à l'hectare*, the other way the by-law counts dwellings. The
+    # ceiling binds whatever is built, exactly as `max_dwellings` does; the
+    # floor is owed only by a building that houses anyone, which is what the
+    # literal is for. A zone printing a minimum and no maximum is the common
+    # case in La Cité-Limoilou - 1 702 of the city's zones state one bound
+    # only - so the two are applied apart rather than as a range.
+    if density_dwellings_hi is not None:
+        model.Add(dwellings + retained_dwellings <= density_dwellings_hi)
+    density_dwellings_lo = _dwellings_per_hectare(
+        lot.area_m2, column.dwelling_density_min_per_ha, bound="min"
+    )
+    if density_dwellings_lo and "residential" in used:
+        model.Add(dwellings + retained_dwellings >= density_dwellings_lo).OnlyEnforceIf(
+            used["residential"]
+        )
+
+    # *Superficie maximale de plancher* for the commerce family, over every
+    # plate it stands on including the cellar's: the norm is stated per
+    # *building*, and a shop in the basement is floor area of that building.
+    # Unconditional, because a program that builds no commerce has both areas
+    # at zero and satisfies it without being told.
+    if column.commercial_floor_max_m2 is not None:
+        model.Add(
+            commercial_area + basement_commercial_area
+            <= _floor_scaled(column.commercial_floor_max_m2)
+        )
 
     # Bounded by the hole before the solver starts: however many stalls the
     # program could owe, no more fit than `max_underground_levels` of the
@@ -5575,6 +5701,25 @@ def _binding_caps(
     binding: list[str] = []
     if column.max_dwellings is not None and total_dwellings >= column.max_dwellings:
         binding.append("max_dwellings")
+    # The same ceiling stated the other way, and named separately because a
+    # reader who lifts one will not have lifted the other: a zone can print
+    # both, and whichever is reached first is what stopped the dwellings.
+    density_dwellings_hi = _dwellings_per_hectare(
+        lot.area_m2, column.dwelling_density_max_per_ha, bound="max"
+    )
+    if density_dwellings_hi is not None and total_dwellings >= density_dwellings_hi:
+        binding.append("dwelling_density_max_per_ha")
+    # Not a ceiling on the dwellings at all - it is a ceiling on the commerce,
+    # reported here for the same reason `commercial_floor_area` below is: a
+    # reader asking why the retail is this size is owed the norm that says so.
+    # Both sides in the hundredths of a square metre the model counts in, the
+    # way `density_cap` above already is, so the test is exact rather than a
+    # float comparison needing a tolerance.
+    if column.commercial_floor_max_m2 is not None and (
+        commercial_area + basement_commercial_area
+        >= _floor_scaled(column.commercial_floor_max_m2)
+    ):
+        binding.append("commercial_floor_max_m2")
 
     # The plates the dwellings could stand on **above grade**. The cellar is
     # deliberately not added in: this branch answers "could one more dwelling
@@ -5753,6 +5898,35 @@ def _ceil_scaled(m2: float) -> int:
 
 def _unscale(scaled: int) -> float:
     return scaled / AREA_SCALE
+
+
+def _dwellings_per_hectare(
+    area_m2: float, per_ha: float | None, *, bound: str
+) -> int | None:
+    """A *log/ha* norm as a whole dwelling count on a lot of this size.
+
+    Rounded the way each bound wants to be read, which is the rule
+    `height_cap_cm` states for the metric caps and matters far more here: a
+    maximum floors so a lot entitled to 5.9 dwellings may not take six, and a
+    minimum ceils so a lot owing 3.25 may not discharge it with three. The
+    rounding is a whole dwelling rather than a hundredth of a square metre, so
+    picking the convenient direction for both would be worth up to one unit
+    either way - on a small lot, the whole norm.
+
+    ``None`` where the grid states no such norm, which is the common case
+    outside Quebec City: Montreal's grid prints no density in these units at
+    all.
+
+    Note what the caller passes: `Lot.area_m2` is the piece being solved, not
+    always the whole parcel. A density is stated per hectare of *lot*, and a
+    lot split between two zones is two pieces answering to two grids - so this
+    is multiplied by the same area the coverage and `density_max` caps already
+    are, and not by a larger one.
+    """
+    if per_ha is None:
+        return None
+    exact = area_m2 / M2_PER_HECTARE * per_ha
+    return math.floor(exact) if bound == "max" else math.ceil(exact)
 
 
 def _scale_height(m: float) -> int:

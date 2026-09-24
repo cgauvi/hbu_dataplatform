@@ -46,8 +46,9 @@ harmless rather than something to strip by name.
 and `ZoneColumn` is built to hold that distinction: an absent minimum is
 ``None`` and not ``0``, because reading ``Densite min/max -`` as ``0/0``
 forbids building at all. Every field here is therefore optional, and
-`GridColumn.to_zone_column` refuses on the one the solver cannot do without -
-the storey maximum, which is what bounds the envelope.
+`GridColumn.to_zone_column` refuses only where the grid bounds the envelope in
+neither of the two ways it can - no storey maximum *and* no height. Where it
+prints one of the two, that one is the ceiling.
 
 **This module reads; it does not judge.** A cell it cannot make a number of is
 recorded in `GridColumn.notes` with the text that produced it, and the column
@@ -65,7 +66,12 @@ from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from urban_rag.program import BuildingLevel, ZoneColumn, is_residential_usage
+from urban_rag.program import (
+    BuildingLevel,
+    ZoneColumn,
+    is_residential_usage,
+    storey_ceiling_from_height,
+)
 
 if TYPE_CHECKING:
     from pypdf._page import PageObject
@@ -270,8 +276,25 @@ class GridColumn:
     site_coverage_max_pct: float | None = None
     density_min: float | None = None
     density_max: float | None = None
+    #: *Nb de log. a l'hectare min/max*, which Quebec City's grid prints under
+    #: *Normes de densite* and the other two publishers do not print at all.
+    #: A dwelling count per hectare of lot, and so not `density_min`/
+    #: `density_max` above, which are a floor-area ratio - see
+    #: `ZoneColumn.dwelling_density_min_per_ha`. ``0`` is a stated zero and not
+    #: a blank: 883 of the city's zones print ``0/0``, and all but four of them
+    #: authorise no dwelling group at all.
+    dwelling_density_min_per_ha: float | None = None
+    dwelling_density_max_per_ha: float | None = None
     max_dwellings: int | None = None
     specific_use_area_max_m2: float | None = None
+    #: *Superficie maximale de plancher* for the commerce family, per building.
+    #: Quebec City's grid prints it twice - *Vente au detail* and
+    #: *Administration* - and this is the tighter of the two; see
+    #: `quebec._commercial_floor_cap` for why the two lump that way. Distinct
+    #: from `specific_use_area_max_m2`, which is Montreal's *Superficie des
+    #: usages specifiques* and is a cap on a named use rather than on the
+    #: family.
+    commercial_floor_max_m2: float | None = None
     front_margin_min_m: float | None = None
     front_margin_max_m: float | None = None
     secondary_front_margin_min_m: float | None = None
@@ -328,18 +351,39 @@ class GridColumn:
         """This column as the solver's input.
 
         Raises on the one field `solve_program` cannot be run without. A grid
-        printing ``-`` for *En etage* states no storey ceiling, and an envelope
-        with no ceiling on the one dimension the density and coverage caps are
-        multiplied by is unbounded rather than generous.
+        stating neither *En etage* nor *Hauteur* states no ceiling at all, and
+        an envelope with no ceiling on the one dimension the density and
+        coverage caps are multiplied by is unbounded rather than generous.
+
+        **Where only the height is printed, the storey count is derived from
+        it** rather than the column being dropped. Quebec City's grid states a
+        height far more often than a storey count - 693 of La Cite-Limoilou's
+        761 zones print no *Nombre d'etages max.*, and 607 of those do print a
+        *Hauteur max.* - so refusing them would leave nine tenths of the
+        borough with no envelope over a number the by-law never claimed to
+        state.
+
+        What is derived is a *domain* bound and not a norm, which is why it is
+        taken at the shortest storey this platform builds
+        (`RESIDENTIAL_STOREY_HEIGHT_M`) and so is the loosest count the height
+        can hold. `solve_program` enforces `height_max_m` itself, charging four
+        metres to a commercial storey against three to a dwelling, and that is
+        what actually stops the building - so a looser storey count here costs
+        nothing and a tighter one would quietly invent a ceiling. A column
+        carrying a derived count says so in `notes`.
         """
-        if self.floors_max is None:
+        floors_max = self.floors_max
+        if floors_max is None:
+            floors_max = storey_ceiling_from_height(self.height_max_m)
+        if floors_max is None:
             raise GridParseError(
                 f"zone {self.zone} column {self.column_index}: no storey "
-                "maximum (En etage), so the envelope has no ceiling"
+                "maximum (En etage) and no height (Hauteur), so the envelope "
+                "has no ceiling"
             )
         return ZoneColumn(
             usages=self.usages,
-            floors_max=self.floors_max,
+            floors_max=floors_max,
             levels=self.levels,
             floors_min=self.floors_min or 0,
             height_min_m=self.height_min_m,
@@ -348,6 +392,9 @@ class GridColumn:
             max_dwellings=self.max_dwellings,
             density_min=self.density_min,
             density_max=self.density_max,
+            dwelling_density_min_per_ha=self.dwelling_density_min_per_ha,
+            dwelling_density_max_per_ha=self.dwelling_density_max_per_ha,
+            commercial_floor_max_m2=self.commercial_floor_max_m2,
             site_coverage_min_pct=self.site_coverage_min_pct,
             site_coverage_max_pct=self.site_coverage_max_pct,
             zone=self.zone,

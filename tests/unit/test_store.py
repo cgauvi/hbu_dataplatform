@@ -235,3 +235,44 @@ def test_querying_a_database_we_did_not_write_is_a_clear_error(store, source, tm
 
     with pytest.raises(IndexMismatch, match="not written by"):
         VectorStore(foreign).stats()
+
+
+def test_one_sheet_cited_by_two_boroughs_is_kept_for_both(store, tmp_path):
+    """A zone on an arrondissement boundary belongs to both partitions.
+
+    `chunk_id` is derived from the document's URL, so two boroughs citing the
+    same sheet mint the same one. In Montreal that never happens - a zone code
+    is borough-local, so the same code in two boroughs is two different PDFs -
+    but Quebec City's outline-bounded fetch picks up the neighbours on the
+    line, and 33 zones are in both CIL and SSC: one zone, one sheet, two
+    partitions that each legitimately cite it.
+
+    Collapsing on `chunk_id` alone kept whichever sorted first and dropped the
+    sheet for the other borough, which is what `rag.lot_documents` joins on -
+    it matches the chunk's neighborhood against the lot's. The row is stored
+    once per borough so each partition owns its own.
+    """
+    shared = [("shared:0000", "la grille", 10, unit(1, 0, 0))]
+    write_embeddings(tmp_path, shared, neighborhood="CIL")
+    pattern = write_embeddings(tmp_path, shared, neighborhood="SSC")
+
+    assert store.build(pattern)["chunks"] == 2
+    assert store.build(pattern, neighborhood="CIL")["chunks"] == 1
+    assert store.build(pattern, neighborhood="SSC")["chunks"] == 1
+
+
+def test_the_same_sheet_in_one_borough_still_collapses_to_its_newest(
+    store, tmp_path
+):
+    """The dedup that was there is not lost by widening the grain.
+
+    A document still cited on a later scrape is re-embedded under the same
+    chunk_id, and only the newest copy should survive - within the borough.
+    """
+    rows = [("doc1:0000", "a", 10, unit(1, 0, 0))]
+    write_embeddings(tmp_path, rows, neighborhood="CIL", scrape_date="2026-08-18")
+    pattern = write_embeddings(
+        tmp_path, rows, neighborhood="CIL", scrape_date="2026-09-01"
+    )
+
+    assert store.build(pattern)["chunks"] == 1

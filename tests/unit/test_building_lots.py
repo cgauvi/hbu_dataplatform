@@ -171,9 +171,18 @@ def stub_postgis(
         return len(frame)
 
     def load_features(
-        connection, frame, *, neighborhood, scrape_date, source_table, feature_id_column
+        connection,
+        frame,
+        *,
+        neighborhood,
+        scrape_date,
+        source_table,
+        source_namespace,
+        feature_id_column,
     ):
-        calls["features"].append((source_table, feature_id_column, len(frame)))
+        calls["features"].append(
+            (source_table, source_namespace, feature_id_column, len(frame))
+        )
         return len(frame)
 
     def compute_intersections(connection, *, neighborhood, scrape_date):
@@ -281,7 +290,7 @@ def test_loads_all_three_partitions_then_computes_both_joins(store, monkeypatch)
     # Loaded before the joins were computed, and with this partition's own key.
     assert calls["lots"] == (NEIGHBORHOOD, DATE, 2)
     assert calls["buildings"] == (NEIGHBORHOOD, DATE, 1)
-    assert calls["features"] == [(ZONE_SLUG, "NUMERO_COMPLET", 2)]
+    assert calls["features"] == [(ZONE_SLUG, "19_VSMPE", "NUMERO_COMPLET", 2)]
     assert calls["intersections"] == (NEIGHBORHOOD, DATE)
     assert calls["join"] == (NEIGHBORHOOD, DATE)
     # Read back out of the same transaction that computed them.
@@ -381,7 +390,7 @@ def test_features_are_loaded_under_the_slug_not_the_spectrum_path(store, monkeyp
 
     run(store)
 
-    assert calls["features"] == [(ZONE_SLUG, "NUMERO_COMPLET", 2)]
+    assert calls["features"] == [(ZONE_SLUG, "19_VSMPE", "NUMERO_COMPLET", 2)]
 
 
 def test_layers_without_an_id_or_geometry_are_skipped_not_loaded(store, monkeypatch):
@@ -392,7 +401,7 @@ def test_layers_without_an_id_or_geometry_are_skipped_not_loaded(store, monkeypa
 
     result = run(store)
 
-    assert [slug for slug, _, _ in calls["features"]] == [ZONE_SLUG]
+    assert [slug for slug, _, _, _ in calls["features"]] == [ZONE_SLUG]
     metadata = materialization_metadata(result, building_lot_intersections)
     assert metadata["num_layers_loaded"].value == 1
     assert metadata["num_layers_skipped"].value == 2
@@ -527,3 +536,93 @@ def test_a_duplicated_lot_number_fails_rather_than_multiplying_the_joins(
 
     with pytest.raises(Failure, match="appear more than once"):
         run(store)
+
+
+def write_saguenay_zones(store, *, slug="Zonage__ZONAGE_SAGUENAY"):
+    """Saguenay's zoning layer, in the shape `neighborhood_features` writes it.
+
+    The columns are the published ones: a lowercase ``id`` that is the
+    reporting service's own primary key, and ``no_zone``, the number printed
+    on the grid. Neither is ``ID``, so a tuple that lists only Montreal's and
+    Quebec City's columns matches nothing here - which is how the whole
+    partition came to be unloadable.
+    """
+    frame = gpd.GeoDataFrame(
+        {
+            "id": [2468, 2069],
+            "municipalite": ["Saguenay"] * 2,
+            "no_zone": ["1000", "1002"],
+            "LIEN_GRILLE": [
+                "https://zonage.saguenay.ca/rapports/v1/zonages/grille/pdf/2468",
+                "https://zonage.saguenay.ca/rapports/v1/zonages/grille/pdf/2069",
+            ],
+            "source_table": ["Zonage/ZONAGE_SAGUENAY"] * 2,
+        },
+        geometry=[box(0, 0, 1.5, 1), box(1.5, 0, 2, 1)],
+        crs="EPSG:4326",
+    )
+    write_frame(frame, join(features_dir(store), f"{slug}.parquet"))
+
+
+def test_saguenays_zoning_layer_is_keyed_on_no_zone_not_skipped(store, monkeypatch):
+    """The regression that blocked SAG's whole chain at its first silver step.
+
+    `FEATURE_ID_COLUMNS` knew Montreal's `NUMERO_COMPLET` and Quebec City's
+    `IGDS_TEXT_STRING` but not Saguenay's `no_zone`, so its one zoning layer
+    was skipped as having no id column - and with nothing else to load, the
+    asset failed the partition outright rather than landing a borough with no
+    features. Matching is exact, so the layer's lowercase `id` is not `ID`.
+    """
+    write_lots(store)
+    write_buildings(store)
+    write_saguenay_zones(store)
+    calls = stub_postgis(monkeypatch)
+
+    result = run(store)
+
+    assert [(slug, column) for slug, _, column, _ in calls["features"]] == [
+        ("Zonage__ZONAGE_SAGUENAY", "no_zone")
+    ]
+    metadata = materialization_metadata(result, building_lot_intersections)
+    assert metadata["num_layers_loaded"].value == 1
+    assert metadata["num_layers_skipped"].value == 0
+
+
+def test_the_zone_code_wins_over_the_services_own_primary_key(store, monkeypatch):
+    """`no_zone` precedes `ID`, because a document cites the zone number.
+
+    Saguenay's layer carries both an internal key and the printed zone number;
+    only the latter is what a grid is served under and what a chunk cites, so
+    a layer carrying an upper-case `ID` as well must still key on `no_zone`.
+    """
+    frame = gpd.GeoDataFrame(
+        {
+            "ID": [2468],
+            "no_zone": ["1000"],
+            "source_table": ["Zonage/ZONAGE_SAGUENAY"],
+        },
+        geometry=[box(0, 0, 1, 1)],
+        crs="EPSG:4326",
+    )
+    write_lots(store)
+    write_buildings(store)
+    write_frame(frame, join(features_dir(store), "Zonage__ZONAGE_SAGUENAY.parquet"))
+    calls = stub_postgis(monkeypatch)
+
+    run(store)
+
+    assert [column for _, _, column, _ in calls["features"]] == ["no_zone"]
+
+
+def test_the_two_id_column_tuples_agree():
+    """The invariant `FEATURE_ID_COLUMNS`' own docstring states.
+
+    `rag_assets._ID_COLUMNS` writes `feature_ids` onto a chunk and this one
+    keys the geometry those chunks are about; they are deliberately not
+    imported from each other, so nothing but this test keeps them equal. They
+    drifted once - `no_zone` was added to one and not the other - and the
+    symptom was a whole city that could not be loaded.
+    """
+    from urban_rag.rag_assets import _ID_COLUMNS
+
+    assert building_lots_assets.FEATURE_ID_COLUMNS == _ID_COLUMNS

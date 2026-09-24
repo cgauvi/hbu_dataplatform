@@ -102,11 +102,21 @@ do not, and every approximation is written on the column's `parse_notes`:
   so no class ceiling applies and `max_dwellings` is the grid's own
   *nb max. logement par bâtiment*, the largest of the isolé / jumelé /
   rangée figures.
-* **Storeys.** *Nombre d'étages max.* where stated. Two thirds of the
-  residential zones in La Cité-Limoilou state a height in metres and no
-  storey count; those get `floor(height / 3.5)`, the pairing the grid itself
-  makes wherever it states both (9 m ↔ 2, 12-13 m ↔ 3, 15-16 m ↔ 4,
-  21-22 m ↔ 6). The height is carried as printed.
+* **Storeys.** *Nombre d'étages max.* where stated, and **left blank where it
+  is not** — which is most of the borough: 693 of La Cité-Limoilou's 761
+  zones print no storey count, 607 of them stating a height in metres
+  instead. `floors_max` is NULL on those columns, exactly as the published
+  sheet leaves the row empty. The envelope is bounded by the height, which is
+  carried as printed: `GridColumn.to_zone_column` turns it into the storey
+  *domain* CP-SAT needs, at the shortest storey the platform builds, and
+  `solve_program` then enforces the metre cap itself — charging four metres
+  to a commercial plate against three to a dwelling, which is the ranking a
+  single storey count cannot express.
+
+  Until 2026-09-22 this filled the blank with `floor(height / 3.5)`. That
+  printed a ceiling against *Nombre d'étages max.* on 91% of the borough
+  where the by-law states none, and it was also tight: 20 m became five
+  storeys where the by-law allows six of housing.
 * **Levels.** *Localisation* codes map onto `BuildingLevel`: `S` below
   ground, `R` the ground floor, `R+` everything, `1` the floor above the
   ground floor, `1+` that and up. `2+` and higher have no exact row and are
@@ -117,10 +127,36 @@ do not, and every approximation is written on the column's `parse_notes`:
 * **Margins and lot width** as printed; the implantation mode is read off
   which H1 building types are given a dwelling count, in the `I-J-C`
   letters `postgis` already parses for VSMPE.
-* **Not carried:** the dwelling density in *logements à l'hectare* (a
-  per-hectare figure, not the floor-area ratio `density_max` holds), the
-  particular dimensions and norms the grid states per building type, and
-  the PDAD code.
+* **Dwelling density.** *Nb de log. à l'hectare min/max*, in
+  `dwelling_density_min_per_ha` and `dwelling_density_max_per_ha`. Kept apart
+  from `density_min`/`density_max`, which are a floor-area ratio: one bounds
+  floor area and the other bounds a unit count, so they are multiplied by the
+  lot to reach different variables and folding either into the other would be
+  a category error. 2 592 of the city's zones state the minimum and 985 the
+  maximum; 1 702 state one bound and not the other, which is why they are
+  carried as two fields rather than a range. A stated `0` is a stated zero —
+  883 zones print `0/0` and all but four of them authorise no dwelling group
+  at all — and is **not** to be read as "unstated".
+* **Commercial floor area.** *Superficie maximale de plancher*, which the
+  grid prints once for *Vente au détail* and once for *Administration*, both
+  per building. The platform prices one undifferentiated `commerce`, so the
+  **tighter of the two** becomes `commercial_floor_max_m2` and no split of
+  that one quantity can breach either stated cap. It is the conservative
+  reading and it costs something: the two differ on 2 845 zones city-wide
+  (316 in CIL, typically 2 200 against 1 100), and where they do, this
+  refuses the all-retail building the grid would allow. *Par bâtiment* and
+  not *par établissement*, because the solver sizes a building and a building
+  may hold several establishments — a zone printing only the
+  per-establishment figure states no building cap here at all. The grid
+  states **no minimum** commercial floor area, so there is no field for one.
+* **Not carried:** the particular dimensions and norms the grid states per
+  building type, and the PDAD code.
+
+All three of the norms above **bind the solve**, not just the table:
+`solve_program` bounds the dwelling count by `lot_ha × the log/ha range` (the
+minimum owed only where housing is actually built, the way `density_min` is)
+and the commerce floor by the lumped ceiling. A lot stopped by either says so
+in `binding`, as `dwelling_density_max_per_ha` and `commercial_floor_max_m2`.
 
 On La Cité-Limoilou's 761 zones this yields 539 residential columns, 538 of
 them solver-ready (the one that is not states neither storeys nor height).
@@ -156,8 +192,11 @@ are Montreal's, and each says so where it lands:
   national and the bronze snapshot now keeps its `Québec` centre beside
   `Montréal`; the average-rent page is fetched once per centre (HMIP
   geography 1400 for the Québec CMA, 1060 for Montréal), and
-  `CMHC_QUARTIERS["CIL"]` names the seven quartiers that make up La
-  Cité-Limoilou. Silver picks the borough's centre before matching quartiers.
+  `CMHC_QUARTIERS` names the quartiers that make up each borough: seven
+  for La Cité-Limoilou, and four for Sainte-Foy–Sillery–Cap-Rouge - the
+  survey's whole `Sainte-Foy-Sillery` zone plus Cap-Rouge, whose zone pairs
+  it with Saint-Augustin-de-Desmaures, a separate municipality. Silver picks
+  the borough's centre before matching quartiers.
 * **Commercial rents are a proxy.** Cushman & Wakefield publishes no Quebec
   City MarketBeat, so `commercial_rents` prices a Quebec City borough at the
   Montreal whole-market row. The row's `submarket` reads `... (Montreal

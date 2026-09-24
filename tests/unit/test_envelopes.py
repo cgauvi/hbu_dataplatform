@@ -336,10 +336,30 @@ def test_every_grid_failing_fails_the_partition(store, cache, stub_pdfs):
         run_columns(store, cache)
 
 
-def test_a_column_with_no_storey_ceiling_lands_but_is_not_solver_ready(
+def test_a_column_with_no_storey_ceiling_lands_bounded_by_its_height(
     store, cache, stub_pdfs
 ):
+    """Blank *En etage* is reported blank and does not cost the column its row.
+
+    The table carries `floors_max` NULL because that is what the grid prints,
+    and `solver_ready` is still true because the 23 m the grid does print is a
+    ceiling. The two used to be the same fact and are not: a reader comparing
+    this table against the published sheet should find the same blanks.
+    """
     stub_pdfs[GRID_URL] = grid_pdf(floors=("2/6", "-"))
+    write_documents(store)
+    run_columns(store, cache)
+
+    habitation = read_envelope_column(read_columns(store))
+    assert habitation["solver_ready"]
+    assert pd.isna(habitation["floors_max"])
+    assert habitation["height_max_m"] == 23.0
+
+
+def test_a_column_bounded_in_neither_way_is_not_solver_ready(
+    store, cache, stub_pdfs
+):
+    stub_pdfs[GRID_URL] = grid_pdf(floors=("2/6", "-"), height=("0/23", "-"))
     write_documents(store)
     run_columns(store, cache)
 
@@ -347,6 +367,7 @@ def test_a_column_with_no_storey_ceiling_lands_but_is_not_solver_ready(
     assert not habitation["solver_ready"]
     assert "storey maximum" in habitation["solver_error"]
     assert pd.isna(habitation["floors_max"])
+    assert pd.isna(habitation["height_max_m"])
 
 
 # -- lot_zoning_envelopes ---------------------------------------------------

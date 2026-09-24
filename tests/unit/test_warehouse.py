@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 from contextlib import contextmanager
+from datetime import date
 
 import geopandas as gpd
 import numpy as np
@@ -912,3 +913,188 @@ def test_a_computed_partition_is_analyzed_too():
     )
 
     assert cursor.one("ANALYZE").startswith("ANALYZE ")
+
+
+# ---------------------------------------------------------------------------
+# versions: whether a partition changed at all
+#
+# The upsert into `warehouse.dataset_versions` is small and its semantics are
+# the whole feature, so it gets a cursor that actually models the table rather
+# than one that records statements. What matters is not which SQL was issued -
+# it is that the same content twice is one version, and different content is
+# two.
+# ---------------------------------------------------------------------------
+
+
+class VersionsCursor:
+    """A `dataset_versions` table, as a dict, with the upsert's semantics.
+
+    Small enough to be obviously right, which is the point: a fake that got the
+    `xmax = 0` arm wrong would make `changed` a coin toss and every test below
+    would still pass.
+    """
+
+    def __init__(self):
+        self.rows: dict[tuple, dict] = {}
+        self._result = None
+
+    def execute(self, statement, params=None):
+        text = " ".join(statement.split())
+        if text.startswith("SELECT content_digest"):
+            dataset, partition_key = params
+            matches = [
+                row
+                for (d, p, _), row in self.rows.items()
+                if (d, p) == (dataset, partition_key)
+            ]
+            latest = max(matches, key=lambda r: r["last_observed"], default=None)
+            self._result = (
+                None
+                if latest is None
+                else (
+                    latest["content_digest"],
+                    latest["scrape_date"],
+                    latest["first_observed"],
+                    latest["last_observed"],
+                    latest["row_count"],
+                )
+            )
+            return self
+
+        assert text.startswith("INSERT INTO warehouse.dataset_versions"), text
+        dataset, partition_key, digest, observed, _f, _l, row_count, attrs = params
+        key = (dataset, partition_key, bytes(digest))
+        existing = self.rows.get(key)
+        if existing is None:
+            self.rows[key] = {
+                "content_digest": bytes(digest),
+                "scrape_date": observed,
+                "first_observed": observed,
+                "last_observed": observed,
+                "row_count": row_count,
+                "attributes": attrs,
+            }
+            inserted = True
+        else:
+            existing["last_observed"] = max(existing["last_observed"], observed)
+            if row_count is not None:
+                existing["row_count"] = row_count
+            existing["attributes"] = attrs
+            inserted = False
+        row = self.rows[key]
+        self._result = (
+            row["scrape_date"],
+            row["first_observed"],
+            row["last_observed"],
+            inserted,
+        )
+        return self
+
+    def fetchone(self):
+        return self._result
+
+
+DIGEST_A = bytes(range(32))
+DIGEST_B = bytes(reversed(range(32)))
+
+
+def record(cursor, digest, observed, **kwargs):
+    return warehouse.record_version(
+        cursor,
+        "neighborhood_lots",
+        partition_key=NEIGHBORHOOD,
+        content_digest=digest,
+        observed_on=observed,
+        **kwargs,
+    )
+
+
+def test_content_nobody_has_seen_is_a_new_version():
+    cursor = VersionsCursor()
+    seen = record(cursor, DIGEST_A, date(2026, 9, 1), row_count=24_953)
+
+    assert seen["changed"] is True
+    assert seen["scrape_date"] == date(2026, 9, 1)
+    assert len(cursor.rows) == 1
+
+
+def test_the_same_content_again_is_not_a_change_and_writes_no_version():
+    """The whole feature, as one assertion.
+
+    October finds the roll byte-identical to September's. `changed` is False,
+    so nothing is written and nothing downstream runs - and the date handed
+    back is September's, because that is when this content appeared.
+    """
+    cursor = VersionsCursor()
+    record(cursor, DIGEST_A, date(2026, 9, 1))
+    seen = record(cursor, DIGEST_A, date(2026, 10, 1))
+
+    assert seen["changed"] is False
+    assert seen["scrape_date"] == date(2026, 9, 1)
+    assert seen["first_observed"] == date(2026, 9, 1)
+    assert seen["last_observed"] == date(2026, 10, 1)
+    assert len(cursor.rows) == 1, "an unchanged month must not mint a version"
+
+
+def test_different_content_is_a_second_version_beside_the_first():
+    cursor = VersionsCursor()
+    record(cursor, DIGEST_A, date(2026, 9, 1))
+    seen = record(cursor, DIGEST_B, date(2026, 10, 1))
+
+    assert seen["changed"] is True
+    assert seen["scrape_date"] == date(2026, 10, 1)
+    assert len(cursor.rows) == 2, "the old version is history, not garbage"
+
+
+def test_content_that_comes_back_collapses_onto_the_version_it_reverts_to():
+    """A by-law amendment that is repealed is not a third version.
+
+    The rows for that content are still in the warehouse under their original
+    date, so there is nothing to write - which is why `changed` is False here
+    even though last month was different.
+    """
+    cursor = VersionsCursor()
+    record(cursor, DIGEST_A, date(2026, 9, 1))
+    record(cursor, DIGEST_B, date(2026, 10, 1))
+    seen = record(cursor, DIGEST_A, date(2026, 11, 1))
+
+    assert seen["changed"] is False
+    assert seen["scrape_date"] == date(2026, 9, 1)
+    assert seen["first_observed"] == date(2026, 9, 1)
+    assert seen["last_observed"] == date(2026, 11, 1)
+    assert len(cursor.rows) == 2
+
+
+def test_current_version_reads_back_what_was_recorded():
+    cursor = VersionsCursor()
+    assert warehouse.current_version(cursor, "neighborhood_lots", NEIGHBORHOOD) is None
+
+    record(cursor, DIGEST_A, date(2026, 9, 1), row_count=7)
+    current = warehouse.current_version(cursor, "neighborhood_lots", NEIGHBORHOOD)
+
+    assert current is not None
+    assert current["content_digest"] == DIGEST_A
+    assert current["scrape_date"] == date(2026, 9, 1)
+    assert current["row_count"] == 7
+
+
+def test_a_digest_that_is_not_a_sha256_is_refused():
+    """Better to fail on the write than to store something no comparison can
+    trust - a truncated digest would silently collide."""
+    cursor = VersionsCursor()
+    with pytest.raises(ValueError, match="32 bytes"):
+        record(cursor, b"too short", date(2026, 9, 1))
+
+
+def test_version_metadata_reports_how_long_a_version_has_stood():
+    """`days_unchanged` is the number that says the feature is working - and a
+    zero on something amended once a year is a canonicalisation bug."""
+    cursor = VersionsCursor()
+    record(cursor, DIGEST_A, date(2026, 9, 1))
+    seen = record(cursor, DIGEST_A, date(2026, 12, 1))
+
+    metadata = warehouse.version_metadata(seen)
+    assert metadata["content_changed"] is False
+    assert metadata["days_unchanged"] == 91
+    assert metadata["version_scrape_date"] == "2026-09-01"
+    assert metadata["content_digest"] == DIGEST_A.hex()

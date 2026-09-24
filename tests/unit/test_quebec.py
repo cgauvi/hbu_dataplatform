@@ -22,6 +22,7 @@ from urban_rag.partitions import (
     metric_crs_for,
     metric_srid_for,
     register_neighborhoods,
+    source_namespace_for,
     unregister_neighborhoods,
 )
 from urban_rag.program import BuildingLevel
@@ -29,7 +30,6 @@ from urban_rag.quebec import (
     DEFAULT_SHEET_URL_TEMPLATE,
     GRID_URL_COLUMN,
     GRID_ZONE_COLUMN,
-    STOREY_HEIGHT_M,
     QuebecZoningClient,
     QuebecZoningError,
     borough_prefix,
@@ -47,6 +47,67 @@ def test_every_key_belongs_to_one_city():
     assert set(known_neighborhoods()) >= {"VSMPE", "CIL", "RIV", "SSC", "CHA", "BEA", "HSC"}
     with pytest.raises(KeyError, match="Unknown neighborhood"):
         city_of("Nowhere")
+
+
+def test_the_collision_source_namespace_exists_to_resolve_is_real():
+    """Two Montreal boroughs publish the same zone number under the same slug.
+
+    This is what 005_silver_lot_features.sql widened the uniqueness of
+    `rag.features` for, and it is the whole reason a fourth column is in that
+    key at all. `frames.table_slug` drops the namespace deliberately - the slug
+    has to match `rag.chunks.source_table` - so the slug alone cannot tell the
+    two rows apart, and neither can the zone number.
+    """
+    from urban_rag.frames import table_slug
+
+    vsmpe = "/19_VSMPE/Reglement_urbanisme/VSP_REG_ZONE"
+    rpp = "/16_RPP/Reglement_urbanisme/VSP_REG_ZONE"
+
+    # Same slug, and a zone number that restarts in every borough.
+    assert table_slug(vsmpe) == table_slug(rpp) == "Reglement_urbanisme__VSP_REG_ZONE"
+
+    # So (source_table, feature_id) is ambiguous across boroughs...
+    assert (table_slug(vsmpe), "C01-001") == (table_slug(rpp), "C01-001")
+
+    # ...and source_namespace is what resolves it.
+    assert source_namespace_for("VSMPE") != source_namespace_for("RPP")
+
+
+def test_source_namespace_is_the_publishers_unit_not_the_borough():
+    """Montreal's is the Spectrum namespace; the other two cities have none.
+
+    Quebec City and Saguenay each publish one zoning layer for the whole
+    municipality, so the city is the honest answer. The empty string would not
+    be: a qualifier that is the same for every row qualifies nothing, and the
+    day this column joins the uniqueness key that would be the difference
+    between a constraint and a decoration.
+    """
+    assert source_namespace_for("VSMPE") == "19_VSMPE"
+    assert source_namespace_for("AC") == "01_AC"
+
+    assert source_namespace_for("CIL") == "quebec"
+    assert source_namespace_for("RIV") == "quebec"
+    assert source_namespace_for("SAG") == "saguenay"
+
+    # Never empty, for any key the axis will accept.
+    for key in known_neighborhoods():
+        assert source_namespace_for(key)
+
+    with pytest.raises(KeyError, match="Unknown neighborhood"):
+        source_namespace_for("Nowhere")
+
+
+def test_quebec_zone_codes_are_unique_city_wide_so_one_namespace_is_enough():
+    """Why collapsing six arrondissements onto `quebec` is safe.
+
+    The leading digit of a Quebec City zone code *is* the arrondissement, so
+    two arrondissements cannot publish the same code. That is the property that
+    lets `source_namespace` be the city here and still be a real qualifier -
+    and if it ever stopped holding, this test is what would say so.
+    """
+    assert borough_prefix("11005Mb") == "1"
+    assert borough_prefix("21005Mb") == "2"
+    assert borough_prefix("11005Mb") != borough_prefix("21005Mb")
 
 
 def test_the_metric_projection_follows_the_city():
@@ -131,7 +192,10 @@ def workbook(rows: list[dict]) -> bytes:
         ("", "", "Marge arrière (m)"),
         ("", "", "POS min. (%)"),
         ("", "", "Aire verte min. (%)"),
-        ("Normes de densité", "", "Nb de log. à l'hectare max. (log/ha)"),
+        ("Normes de densité", "", "Nb de log. à l'hectare min. (log/ha)"),
+        ("", "", "Nb de log. à l'hectare max. (log/ha)"),
+        ("", "", "Sup. max. de plancher Vente au détail par bâtiment (m²)"),
+        ("", "", "Sup. max. de plancher Adminstration par bâtiment (m²)"),
         ("Dispositions particulières", "", "PIIA"),
         ("", "", "Arrondissement historique"),
     ]
@@ -172,7 +236,12 @@ MIXED = {
     "Marge arrière (m)": "7.5",
     "POS min. (%)": "35",
     "Aire verte min. (%)": "10",
+    "Nb de log. à l'hectare min. (log/ha)": "40",
     "Nb de log. à l'hectare max. (log/ha)": "100",
+    # Retail and administration, differing, the way 316 of the borough's zones
+    # print them. The tighter of the two is the commerce family's ceiling.
+    "Sup. max. de plancher Vente au détail par bâtiment (m²)": "2200",
+    "Sup. max. de plancher Adminstration par bâtiment (m²)": "1100",
     "PIIA": "PIIA",
 }
 
@@ -243,9 +312,11 @@ def test_the_norms_are_the_zones_and_shared_by_every_column():
         assert column.zone == "11017Md"
         assert column.height_min_m == 7.0
         assert column.height_max_m == 20.0
-        # No storey count stated: derived from the height, and noted.
-        assert column.floors_max == int(20 // STOREY_HEIGHT_M) == 5
-        assert any(note.startswith("floors_max: derived") for note in column.notes)
+        # No storey count stated, so none is reported: the sheet prints the
+        # *Nombre d'étages* row blank and so does this. The height is what
+        # bounds the envelope, and the note says so.
+        assert column.floors_max is None
+        assert any(note.startswith("floors_max: not stated") for note in column.notes)
         assert column.min_lot_width_m == 9.0
         assert column.front_margin_min_m == 6.0
         assert column.side_margin_min_m == 1.5
@@ -257,12 +328,22 @@ def test_the_norms_are_the_zones_and_shared_by_every_column():
         # The largest of the three type ceilings; isolé's 0 is a refusal.
         assert column.max_dwellings == 12
         assert column.implantation_mode == "J-C"
+        # *Densité* is a floor-area ratio and the grid prints none; the
+        # dwellings-per-hectare pair is its own norm and is carried as one.
         assert column.density_max is None
-        assert any("log/ha" in note for note in column.notes)
+        assert column.dwelling_density_min_per_ha == 40.0
+        assert column.dwelling_density_max_per_ha == 100.0
+        # The tighter of the retail and administration ceilings.
+        assert column.commercial_floor_max_m2 == 1100.0
         assert column.excluded_usages.startswith("La location")
         assert column.piia_sector == "PIIA"
         assert column.heritage_sector is None
-        assert column.to_zone_column().floors_max == 5
+        # The solver still gets a ceiling: 20 m at the shortest storey this
+        # platform builds. Six, not the five a 3.5 m storey used to invent -
+        # and `solve_program` enforces the 20 m itself, so a commercial stack
+        # is still stopped at five by the metric cap rather than by this.
+        assert column.to_zone_column().floors_max == 6
+        assert column.to_zone_column().height_max_m == 20.0
 
 
 def test_a_stated_storey_count_wins_over_the_height():

@@ -300,11 +300,29 @@ def test_storeys_come_off_the_min_max_cell():
     assert (second.floors_min, second.floors_max) == (2, 8)
 
 
-def test_a_grid_with_no_storey_ceiling_is_read_and_is_not_solver_ready():
-    """The one field the solver cannot do without, and it is often blank."""
+def test_a_grid_with_no_storey_ceiling_falls_back_to_its_height_sentence():
+    """Saguenay states the height in prose, and that is a ceiling too.
+
+    The storey cell is blank and the column reports it blank; the sentence
+    under the grid says 12,5 metres, and four storeys at the shortest storey
+    this platform builds is what the solver gets. Nothing here is invented -
+    `floors_max` on the parsed column stays `None`.
+    """
     (only,) = parse_grid_pdf(grid_pdf(codes=("c4a",), storeys=("",)))
 
     assert only.floors_max is None
+    assert only.height_max_m == 12.5
+    assert only.to_zone_column().floors_max == 4
+
+
+def test_a_grid_with_neither_a_storey_ceiling_nor_a_height_is_not_solver_ready():
+    """The one field the solver cannot do without, in either of its two forms."""
+    (only,) = parse_grid_pdf(
+        grid_pdf(codes=("c4a",), storeys=("",), height_sentence=None)
+    )
+
+    assert only.floors_max is None
+    assert only.height_max_m is None
     with pytest.raises(GridParseError, match="no storey"):
         only.to_zone_column()
 

@@ -313,6 +313,7 @@ from urban_rag.program import (
     is_residential_usage,
     select_governing_column,
     solve_program,
+    storey_ceiling_from_height,
 )
 
 #: The CMHC bedroom classes the solver prices a dwelling in, in the order a
@@ -805,10 +806,18 @@ def zone_column_of(row: Mapping) -> ZoneColumn:
     `solver_ready` already promises will not happen, and is caught per row
     anyway, so a promise broken by a stale parquet costs one lot.
     """
+    height_max_m = _float_or_none(row.get("height_max_m"))
     floors_max = _int_or_none(row.get("floors_max"))
     if floors_max is None:
+        # The same rule `GridColumn.to_zone_column` applies when it reads the
+        # grid, and through the same function so the two cannot drift: a
+        # Quebec City row carries a height and no storey count on nine tenths
+        # of the borough, and the height is its ceiling.
+        floors_max = storey_ceiling_from_height(height_max_m)
+    if floors_max is None:
         raise ProgramError(
-            "no storey maximum (En etage), so the envelope has no ceiling"
+            "no storey maximum (En etage) and no height (Hauteur), so the "
+            "envelope has no ceiling"
         )
     return ZoneColumn(
         usages=tuple(str(usage) for usage in _json_list(row.get("usages"))),
@@ -818,11 +827,18 @@ def zone_column_of(row: Mapping) -> ZoneColumn:
         ),
         floors_min=_int_or_none(row.get("floors_min")) or 0,
         height_min_m=_float_or_none(row.get("height_min_m")),
-        height_max_m=_float_or_none(row.get("height_max_m")),
+        height_max_m=height_max_m,
         min_lot_width_m=_float_or_none(row.get("min_lot_width_m")),
         max_dwellings=_int_or_none(row.get("max_dwellings")),
         density_min=_float_or_none(row.get("density_min")),
         density_max=_float_or_none(row.get("density_max")),
+        dwelling_density_min_per_ha=_float_or_none(
+            row.get("dwelling_density_min_per_ha")
+        ),
+        dwelling_density_max_per_ha=_float_or_none(
+            row.get("dwelling_density_max_per_ha")
+        ),
+        commercial_floor_max_m2=_float_or_none(row.get("commercial_floor_max_m2")),
         site_coverage_min_pct=_float_or_none(row.get("site_coverage_min_pct")),
         site_coverage_max_pct=_float_or_none(row.get("site_coverage_max_pct")),
         zone=_text_or_none(row.get("feature_id")),
@@ -1368,12 +1384,19 @@ def _governing_column_of(row: pd.Series) -> ZoneColumn:
     """The two fields `select_governing_column` reads, as a `ZoneColumn`.
 
     The private counterpart of `envelope_assets._as_zone_column`, here so an
-    older parquet can be read without that asset re-running. `floors_max`
-    falls back to 0 on a row that never parsed - such a row is not
+    older parquet can be read without that asset re-running. `floors_max` is
+    read, then derived from the height the way the other two rebuilds derive
+    it, then falls back to 0 on a row that states neither - such a row is not
     `solver_ready` and is filtered before this is called, but a hand-built
     test frame should not have to state a ceiling to ask about governance.
+    The ceiling plays no part in the choice either way; it is required on a
+    `ZoneColumn` and this is what satisfies that.
     """
-    floors_max = _int_or_none(row.get("floors_max")) or 0
+    floors_max = (
+        _int_or_none(row.get("floors_max"))
+        or storey_ceiling_from_height(_float_or_none(row.get("height_max_m")))
+        or 0
+    )
     return ZoneColumn(
         usages=tuple(str(usage) for usage in _json_list(row.get("usages"))),
         floors_max=floors_max,

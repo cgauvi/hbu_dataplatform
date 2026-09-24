@@ -140,6 +140,7 @@ from urban_rag.program import (
     select_commercial_column,
     select_residential_column,
     solve_program,
+    storey_ceiling_from_height,
 )
 
 #: Rents and vacancies in the shape `average_rents` / `vacancy_rates` write
@@ -4581,3 +4582,201 @@ def test_an_empty_program_is_re_solved_without_its_parking():
     )
     assert poor.binding == ("nothing_pencils",)
     assert not poor.parking_waived
+
+
+# -- the norms Quebec City states and Montreal does not -----------------------
+#
+# *Nb de log. à l'hectare* and *Superficie maximale de plancher*. Both are
+# `None` on every Montreal column, so these are the only tests that exercise
+# them, and both are held apart from the norms they are easily confused with:
+# the dwelling density is not `density_max` (a floor-area ratio) and not
+# `max_dwellings` (a count with no lot in it), and the commercial floor cap is
+# not `specific_use_area_max_m2`.
+
+
+def test_the_dwelling_density_ceiling_is_a_count_scaled_by_the_lot():
+    # 40 log/ha on a quarter-hectare lot is ten dwellings, and the lot is
+    # roomy enough for far more - so the density is what stops it, by a rule
+    # that would not exist on a lot of another size.
+    program = solve_program(
+        column(dwelling_density_max_per_ha=40.0, density_max=None),
+        Lot(area_m2=2500.0, frontage_m=30.0),
+        ECONOMICS,
+        investment=UNDISCOUNTED,
+    )
+    assert program.solved
+    assert program.total_dwellings == 10
+    assert "dwelling_density_max_per_ha" in program.binding
+
+    # Half the lot, half the dwellings: the same norm, and the count follows
+    # the area rather than being a property of the zone.
+    half = solve_program(
+        column(dwelling_density_max_per_ha=40.0, density_max=None),
+        Lot(area_m2=1250.0, frontage_m=30.0),
+        ECONOMICS,
+        investment=UNDISCOUNTED,
+    )
+    assert half.total_dwellings == 5
+
+
+def test_a_partial_dwelling_of_density_is_floored_not_granted():
+    # 40 log/ha on 2 400 m2 is 9.6 dwellings. The building holds whole ones,
+    # and rounding up would put the lot over the density it is held to.
+    program = solve_program(
+        column(dwelling_density_max_per_ha=40.0, density_max=None),
+        Lot(area_m2=2400.0, frontage_m=30.0),
+        ECONOMICS,
+        investment=UNDISCOUNTED,
+    )
+    assert program.total_dwellings == 9
+
+
+def test_the_dwelling_density_floor_is_owed_only_where_housing_is_built():
+    """A minimum density binds the housing and does not conjure any.
+
+    The distinction `density_min` already draws, and it matters more here:
+    2 592 of Quebec City's zones state a minimum and 985 a maximum, so on most
+    of the city this is the only dwelling-density norm printed. Read
+    unconditionally it would oblige every commercial programme in La
+    Cité-Limoilou to carry dwellings it was never asked for.
+    """
+    # A commerce column on a zone whose *housing* column states the minimum:
+    # the commerce is solved on its own norms and owes no dwellings.
+    commerce = ZoneEnvelope(
+        commercial=column(
+            usages=("C",),
+            density_max=None,
+            dwelling_density_min_per_ha=65.0,
+        )
+    )
+    program = solve_program(
+        commerce,
+        Lot(area_m2=1000.0, frontage_m=20.0),
+        ECONOMICS,
+        parking=NO_PARKING,
+        investment=UNDISCOUNTED,
+    )
+    assert program.solved
+    assert program.total_dwellings == 0
+
+
+def test_the_dwelling_density_floor_rounds_up_so_the_lot_does_not_fall_short():
+    # 65 log/ha on 1 000 m2 is 6.5 dwellings. Six would be 60 log/ha, under
+    # the minimum the by-law states, so seven is what discharges it - the
+    # opposite rounding from the ceiling above, and deliberately so.
+    program = solve_program(
+        column(dwelling_density_min_per_ha=65.0, density_max=None),
+        Lot(area_m2=1000.0, frontage_m=20.0),
+        ECONOMICS,
+        investment=UNDISCOUNTED,
+    )
+    assert program.solved
+    assert program.total_dwellings >= 7
+
+
+def test_the_commercial_floor_ceiling_binds_the_commerce_and_not_the_housing():
+    # 300 m2 of commerce allowed on a lot that would otherwise take far more.
+    lot = Lot(area_m2=1200.0, frontage_m=25.0)
+    capped = ZoneEnvelope(
+        residential=column(density_max=None),
+        commercial=column(
+            usages=("C",), density_max=None, commercial_floor_max_m2=300.0
+        ),
+    )
+    program = solve_program(
+        capped, lot, ECONOMICS, parking=NO_PARKING, investment=UNDISCOUNTED
+    )
+    assert program.solved
+    assert program.commercial_area_m2 + program.basement_commercial_area_m2 <= 300.0
+
+    # The same zone with the cap lifted builds more commerce, which is what
+    # says the cap was doing the work rather than the economics.
+    uncapped = ZoneEnvelope(
+        residential=column(density_max=None),
+        commercial=column(usages=("C",), density_max=None),
+    )
+    free = solve_program(
+        uncapped, lot, ECONOMICS, parking=NO_PARKING, investment=UNDISCOUNTED
+    )
+    assert (
+        free.commercial_area_m2 + free.basement_commercial_area_m2
+        > program.commercial_area_m2 + program.basement_commercial_area_m2
+    )
+
+
+def test_a_stated_zero_dwelling_density_is_a_refusal_and_not_a_blank():
+    """``0`` in the log/ha row means no dwellings, and is read that way.
+
+    883 of Quebec City's zones print ``0/0`` and all but four of them
+    authorise no dwelling group at all, so the zero is the by-law agreeing
+    with itself rather than a cell nobody filled in. A reader that treated it
+    as "unstated" would put housing on land zoned for none.
+    """
+    program = solve_program(
+        column(dwelling_density_max_per_ha=0.0, density_max=None),
+        Lot(area_m2=2000.0, frontage_m=25.0),
+        ECONOMICS,
+        investment=UNDISCOUNTED,
+    )
+    assert program.total_dwellings == 0
+
+
+def test_the_three_dwelling_norms_are_not_each_other():
+    """`max_dwellings`, `density_max` and the per-hectare pair all bind apart.
+
+    A zone can print all three and they are three different sentences: a count,
+    a floor-area ratio, and a count per hectare. The tightest wins, and which
+    one it is depends on the lot - which is the whole reason they cannot be
+    collapsed into one field on the way in.
+    """
+    lot = Lot(area_m2=1000.0, frontage_m=20.0)
+    by_count = solve_program(
+        column(max_dwellings=4, dwelling_density_max_per_ha=100.0, density_max=None),
+        lot,
+        ECONOMICS,
+        investment=UNDISCOUNTED,
+    )
+    assert by_count.total_dwellings == 4
+    assert "max_dwellings" in by_count.binding
+
+    # Same zone, same lot, the per-hectare norm tightened below the count:
+    # 20 log/ha on a tenth of a hectare is two.
+    by_density = solve_program(
+        column(max_dwellings=4, dwelling_density_max_per_ha=20.0, density_max=None),
+        lot,
+        ECONOMICS,
+        investment=UNDISCOUNTED,
+    )
+    assert by_density.total_dwellings == 2
+    assert "dwelling_density_max_per_ha" in by_density.binding
+    assert "max_dwellings" not in by_density.binding
+
+
+def test_a_negative_density_or_floor_cap_is_refused():
+    for field in (
+        "dwelling_density_min_per_ha",
+        "dwelling_density_max_per_ha",
+        "commercial_floor_max_m2",
+    ):
+        with pytest.raises(ProgramError, match=field):
+            column(**{field: -1.0})
+
+
+# -- a height with no storey row --------------------------------------------
+
+
+def test_a_height_with_no_storey_count_is_a_ceiling_at_the_shortest_storey():
+    """What Quebec City's grid states on nine tenths of La Cité-Limoilou.
+
+    The derived count is the *loosest* the height can hold - the shortest
+    storey this platform builds - because `solve_program` enforces the metric
+    cap itself and a tighter count here would be a ceiling the by-law never
+    printed. 20 m is six dwelling storeys at three metres and five commercial
+    ones at four, and the model is what tells them apart.
+    """
+    assert storey_ceiling_from_height(20.0) == 6
+    assert storey_ceiling_from_height(9.0) == 3
+    # Never zero: a building under one storey is not what a 2 m height means,
+    # and an empty domain would be reported as an unsolvable column.
+    assert storey_ceiling_from_height(2.0) == 1
+    assert storey_ceiling_from_height(None) is None

@@ -108,6 +108,8 @@ Three derived areas sit on top:
 | *Densité* | `density_area` within `density_min` and `density_max` × lot area |
 | *Taux d'implantation au sol* | `footprint` within min and max × lot area; the dug plate is **not** in it — article 43 excludes *une partie du bâtiment qui est entièrement sous terre* |
 | *Nombre de logements maximal* | `sum(dwellings) <= max_dwellings` — the printed row **∧** the ceiling the `H.n` class carries |
+| *Nb de log. à l'hectare* (Quebec City) | `sum(dwellings)` within `dwelling_density_{min,max}_per_ha × lot hectares`. A **count**, not the floor-area ratio *Densité* holds, so it bounds the units and not `density_area`; the maximum floors and the minimum ceils, because the rounding is a whole dwelling. The minimum is owed only while housing is built, the way `density_min` is — a pure commercial programme on a housing-capable zone owes no dwellings |
+| *Superficie maximale de plancher* (Quebec City) | `commercial_area + basement_commercial_area <= commercial_floor_max_m2` — the cellar included, because the norm is stated per *building*. The grid prints it once for *Vente au détail* and once for *Administration* and the tighter of the two is carried, so no split of the one commerce quantity can breach either |
 | *Largeur du terrain min* | not a constraint at all: it decides *which column governs*, in `select_governing_column`, before the model is built |
 
 **The class is a norm, not a label.** `RESIDENTIAL_CLASS_MAX_DWELLINGS` reads
@@ -633,6 +635,8 @@ return. More than one name can appear at once.
 | `nothing_pencils` | the solve was optimal and the optimum was to build nothing. **Not** the same as a zoning column that permits nothing — the envelope is whatever the grid prints, and what is zero is the best program inside it |
 | `max_dwellings` | the printed row, or the class ceiling, is reached |
 | `density_max` | no further dwelling fits in what *Densité* leaves — the garage bays counted beside the dwellings, being floor out of the same plates |
+| `dwelling_density_max_per_ha` | *Nb de log. à l'hectare* is reached. Named apart from `max_dwellings` because a zone can print both and a reader who lifts one has not lifted the other |
+| `commercial_floor_max_m2` | the commerce is at *Superficie maximale de plancher*. Not a ceiling on the dwellings at all — it answers "why is the retail this size", the way `commercial_floor_area` answers the opposite question |
 | `site_coverage_max` | the plate is at *Taux d'implantation* |
 | `setbacks` | the plate is at what the zone's margins leave — a borough reporting this is one where the margins, not the coverage, decide what gets built |
 | `placement` | the plate is at the largest rectangle those margins hold. Neither printed norm decided it; the *shape* of the ground did, and the fix is a different building rather than a variance |

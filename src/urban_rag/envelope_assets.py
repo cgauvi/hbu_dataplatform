@@ -80,6 +80,7 @@ from urban_rag.program import (
     is_industrial_usage,
     permitted_floors,
     select_governing_column,
+    storey_ceiling_from_height,
 )
 from urban_rag.quebec import GRID_SLUG, GRID_ZONE_COLUMN, ZONING_SLUG, grid_columns
 from urban_rag.rag.documents import DOCUMENT_SOURCES
@@ -163,8 +164,16 @@ NORM_FIELDS = (
     "site_coverage_max_pct",
     "density_min",
     "density_max",
+    # Quebec City's only, and NULL on the other two cities' columns: a
+    # dwelling count per hectare of lot, which is not the floor-area ratio
+    # above. See `program.ZoneColumn.dwelling_density_min_per_ha`.
+    "dwelling_density_min_per_ha",
+    "dwelling_density_max_per_ha",
     "max_dwellings",
     "specific_use_area_max_m2",
+    # Also Quebec City's: the tighter of the grid's retail and administration
+    # floor ceilings, per building. See `quebec._commercial_floor_cap`.
+    "commercial_floor_max_m2",
     "front_margin_min_m",
     "front_margin_max_m",
     "secondary_front_margin_min_m",
@@ -795,10 +804,25 @@ def _as_zone_column(row: pd.Series) -> ZoneColumn:
     to `_governing` and not the table's public inverse. A row is turned back
     into a full `ZoneColumn` by whoever solves it, from the columns this asset
     wrote.
+
+    `floors_max` is the one field that has to be *derived* rather than read:
+    it is required on a `ZoneColumn` and a Quebec City grid leaves it blank on
+    nine tenths of La Cite-Limoilou, stating a height instead. Through
+    `storey_ceiling_from_height` so this agrees with the two other places that
+    rebuild a column - a disagreement here would pick a different governing
+    column than the one that gets solved.
     """
+    floors_max = (
+        None if pd.isna(row["floors_max"]) else int(row["floors_max"])
+    )
+    if floors_max is None:
+        height_max_m = (
+            None if pd.isna(row["height_max_m"]) else float(row["height_max_m"])
+        )
+        floors_max = storey_ceiling_from_height(height_max_m)
     return ZoneColumn(
         usages=tuple(json.loads(row["usages"])),
-        floors_max=int(row["floors_max"]),
+        floors_max=floors_max,
         min_lot_width_m=(
             None if pd.isna(row["min_lot_width_m"]) else float(row["min_lot_width_m"])
         ),

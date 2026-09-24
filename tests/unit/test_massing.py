@@ -605,6 +605,60 @@ def test_a_narrow_strip_is_not_parkable():
     assert loose.area == pytest.approx(PARCELS["driveway"].area, rel=1e-6)
 
 
+def test_a_pinched_opening_is_repaired_rather_than_raised():
+    """The failure that cost a borough its `programs` step.
+
+    A mitred dilation can come back pinched - a ring that touches itself at
+    one point - and GEOS refuses to overlay it at all, raising *found
+    non-noded intersection* before it computes anything. On SSC that killed
+    the step after 409 s with 24,000 lots already solved, on lot 5 749 100.
+
+    The pinch is reproduced here rather than the borough's own geometry:
+    self-intersection is invalid on any GEOS build, so this fails for the
+    same reason everywhere, while the real pair's refusal is that build's
+    arithmetic. What is asserted is what the clip owes its caller - areal,
+    valid, and nowhere outside the yard.
+    """
+    # Two squares joined through a single shared vertex, written as one
+    # ring: the shape the opening takes where two arms of a yard meet.
+    pinched = Polygon(
+        [
+            (0, 0),
+            (10, 0),
+            (10, 10),
+            (20, 20),
+            (30, 20),
+            (30, 10),
+            (20, 10),
+            (10, 10),
+            (0, 10),
+        ]
+    )
+    assert not pinched.is_valid
+    yard = box(-5, -5, 40, 40)
+
+    clipped = massing._clip_to_yard(pinched, yard)
+
+    assert clipped.is_valid
+    assert clipped.geom_type in ("Polygon", "MultiPolygon")
+    assert clipped.area > 0.0
+    assert clipped.difference(yard).area == pytest.approx(0.0, abs=1e-9)
+
+
+def test_a_valid_opening_is_clipped_exactly():
+    """The repair is a repair, not a rounding: a valid pair is untouched.
+
+    Worth pinning, because the first attempt at the pinch above ran every
+    clip through a precision grid and would have moved every yard in every
+    borough by a hair - enough to make two boroughs measured either side of
+    it incomparable, for a fault that affects a handful of lots.
+    """
+    opened = box(0, 0, 30, 30)
+    yard = box(5, 5, 40, 40)
+
+    assert massing._clip_to_yard(opened, yard).equals(opened.intersection(yard))
+
+
 def test_a_rectangular_parcel_is_its_own_capacity():
     """A rectangle's largest inscribed rectangle is the rectangle.
 
