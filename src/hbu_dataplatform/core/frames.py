@@ -13,7 +13,6 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from shapely.geometry import shape
 
-from hbu_dataplatform.cities.montreal.spectrum import STYLE_COLUMN
 from hbu_dataplatform.core.storage import dirname, filesystem
 
 Frame = pd.DataFrame | gpd.GeoDataFrame
@@ -36,17 +35,21 @@ def features_to_frame(
     features: list[dict],
     *,
     extra_columns: dict[str, Any] | None = None,
+    drop_properties: tuple[str, ...] = (),
 ) -> Frame:
     """GeoJSON features -> GeoDataFrame (EPSG:4326) or plain DataFrame.
 
     Geometry has already been reprojected server side by ``MI_Transform``, so
-    the CRS is asserted rather than converted here.
+    the CRS is asserted rather than converted here. ``drop_properties`` names
+    properties to leave out - a publisher's rendering instructions, say
+    (`spectrum.STYLE_COLUMN`), which carry no analytical value.
     """
     records: list[dict] = []
     geometries: list[Any] = []
     for feature in features:
         properties = dict(feature.get("properties") or {})
-        properties.pop(STYLE_COLUMN, None)
+        for name in drop_properties:
+            properties.pop(name, None)
         records.append(properties)
         raw_geometry = feature.get("geometry")
         geometries.append(shape(raw_geometry) if raw_geometry else None)

@@ -67,7 +67,7 @@ from hbu_dataplatform.sources.donnees_quebec import QuebecOpenDataResource
 from hbu_dataplatform.cities.quebec_city.resources import QuebecZoningResource
 from hbu_dataplatform.cities.saguenay.resources import SaguenayZoningResource
 from hbu_dataplatform.cities.montreal.resources import SpectrumResource
-from hbu_dataplatform.cities.montreal.spectrum import SpectrumError
+from hbu_dataplatform.cities.montreal.spectrum import STYLE_COLUMN, SpectrumError
 from hbu_dataplatform.core.storage import (
     basename,
     clear_parquet,
@@ -231,6 +231,7 @@ def neighborhood_features(
 
             frame = features_to_frame(
                 features,
+                drop_properties=(STYLE_COLUMN,),
                 # Written as columns because the output path holds bare keys
                 # rather than hive `key=value` pairs, so a reader that opens
                 # one file still knows which snapshot it belongs to.

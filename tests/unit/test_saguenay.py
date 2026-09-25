@@ -10,7 +10,7 @@ and their wording differ.
 Two things here are Saguenay's own and are what most of these tests are about.
 
 **The rows run up the page.** The city's reporting service lays its content
-out in an inverted text space, so a published grid hands `_page_rows` its
+out in an inverted text space, so a published grid hands `page_rows` its
 amendment table first and its letterhead last. `_reading_order` is what sorts
 that out, and `test_a_grid_reads_the_same_either_way_up` builds the same grid
 both ways and asserts the parse does not change.
@@ -351,10 +351,10 @@ def test_the_published_star_is_a_mark_and_a_norm_is_not():
     is pinned, alongside the cells that must *not* read as marks: a number is a
     norm, a unit caption is furniture, and a dash is an absent norm.
     """
-    from hbu_dataplatform.cities.saguenay.zoning import _Cell, _is_mark
+    from hbu_dataplatform.cities.saguenay.zoning import Cell, _is_mark
 
-    def cell(text: str) -> _Cell:
-        return _Cell(start=310.0, end=322.0, text=text)
+    def cell(text: str) -> Cell:
+        return Cell(start=310.0, end=322.0, text=text)
 
     assert _is_mark(cell("★"))
     assert _is_mark(cell(MARK))

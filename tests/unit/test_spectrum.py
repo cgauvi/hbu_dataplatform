@@ -119,7 +119,11 @@ def test_features_become_a_geodataframe_without_the_style_column():
         }
     ]
 
-    frame = features_to_frame(features, extra_columns={"source_table": "/a/b/c"})
+    frame = features_to_frame(
+        features,
+        extra_columns={"source_table": "/a/b/c"},
+        drop_properties=("MI_Style",),
+    )
 
     assert "MI_Style" not in frame.columns
     assert frame.loc[0, "NUMERO"] == "01-001"

@@ -402,7 +402,7 @@ class GridColumn:
 
 
 @dataclass(frozen=True)
-class _Cell:
+class Cell:
     """One cell of a row, and the span of the page it covers, in points.
 
     ``center`` is what identifies the column: the grid centres its values in
@@ -435,7 +435,7 @@ def parse_grid_pdf(content: bytes, *, url: str | None = None) -> list[GridColumn
     where = url or "<bytes>"
     try:
         reader = PdfReader(io.BytesIO(content))
-        pages = [_page_rows(page) for page in reader.pages]
+        pages = [page_rows(page) for page in reader.pages]
     except (PdfReadError, ValueError, OSError) as exc:
         raise GridParseError(f"{where}: unreadable PDF ({exc})") from exc
 
@@ -450,7 +450,7 @@ def parse_grid_pdf(content: bytes, *, url: str | None = None) -> list[GridColumn
     return columns
 
 
-def is_grid_page(rows: Sequence[Sequence[_Cell]]) -> bool:
+def is_grid_page(rows: Sequence[Sequence[Cell]]) -> bool:
     """Whether a page is a grid rather than prose that mentions one.
 
     The title is looked for in the first few rows only. A P.P.C.M.O.I.
@@ -461,12 +461,12 @@ def is_grid_page(rows: Sequence[Sequence[_Cell]]) -> bool:
     return any(GRID_TITLE in _normalize(_line(row)) for row in rows[:4])
 
 
-def _line(row: Iterable[_Cell]) -> str:
+def _line(row: Iterable[Cell]) -> str:
     """A row as the one string it would read as, cells and all."""
     return " ".join(cell.text for cell in row)
 
 
-def parse_grid_page(rows: Sequence[Sequence[_Cell]]) -> list[GridColumn]:
+def parse_grid_page(rows: Sequence[Sequence[Cell]]) -> list[GridColumn]:
     """The columns of one grid page, from its rows of positioned cells.
 
     Returns an empty list where the page has a title but no column band: a
@@ -537,7 +537,7 @@ def parse_grid_page(rows: Sequence[Sequence[_Cell]]) -> list[GridColumn]:
     ]
 
 
-def _page_rows(page: PageObject) -> list[list[_Cell]]:
+def page_rows(page: PageObject) -> list[list[Cell]]:
     """A page as rows of cells, top to bottom and each row left to right."""
     shown = [fragment for fragment in _fragments(page) if fragment.text.strip()]
     shown.sort(key=lambda fragment: (-fragment.ty, fragment.tx))
@@ -558,7 +558,7 @@ def _page_rows(page: PageObject) -> list[list[_Cell]]:
     return [cells for line in lines if (cells := _cells(line))]
 
 
-def _cells(line: Iterable[TextStateParams]) -> list[_Cell]:
+def _cells(line: Iterable[TextStateParams]) -> list[Cell]:
     """One row's strings joined back into the cells they were printed as.
 
     A content stream shows as much or as little of a line at a time as its
@@ -566,7 +566,7 @@ def _cells(line: Iterable[TextStateParams]) -> list[_Cell]:
     ``Densite`` arrives as ``Densit`` and ``e``. So a cell is not a string but
     a run of them, and where one ends is a question about the gap to the next.
     """
-    cells: list[_Cell] = []
+    cells: list[Cell] = []
     for fragment in sorted(line, key=lambda fragment: fragment.tx):
         start, end, text = _span(fragment)
         if not text:
@@ -579,9 +579,9 @@ def _cells(line: Iterable[TextStateParams]) -> list[_Cell]:
         em = fragment.font_height or fragment.font_size
         gap = start - cells[-1].end if cells else 0.0
         if not cells or gap > em * CELL_GAP_EM:
-            cells.append(_Cell(start, end, text))
+            cells.append(Cell(start, end, text))
             continue
-        cells[-1] = _Cell(
+        cells[-1] = Cell(
             cells[-1].start,
             max(cells[-1].end, end),
             cells[-1].text + (" " if gap > em * WORD_GAP_EM else "") + text,
@@ -664,7 +664,7 @@ def _fragments(page: PageObject) -> list[TextStateParams]:
     return shown
 
 
-def _zone(rows: Sequence[Sequence[_Cell]]) -> str | None:
+def _zone(rows: Sequence[Sequence[Cell]]) -> str | None:
     """The zone number printed beside ``ZONE :``.
 
     It is the id the map joins on - ``NUMERO_COMPLET`` in the feature table,
@@ -678,7 +678,7 @@ def _zone(rows: Sequence[Sequence[_Cell]]) -> str | None:
     return None
 
 
-def _grid_block(rows: Iterable[Sequence[_Cell]]) -> Iterator[Sequence[_Cell]]:
+def _grid_block(rows: Iterable[Sequence[Cell]]) -> Iterator[Sequence[Cell]]:
     """The rows above *Patrimoine* - see `_END_LABEL`."""
     for row in rows:
         if _normalize(row[0].text) == _END_LABEL:
@@ -686,7 +686,7 @@ def _grid_block(rows: Iterable[Sequence[_Cell]]) -> Iterator[Sequence[_Cell]]:
         yield row
 
 
-def _zone_fields(rows: Sequence[Sequence[_Cell]]) -> dict[str, str | None]:
+def _zone_fields(rows: Sequence[Sequence[Cell]]) -> dict[str, str | None]:
     """The zone-level rows below *Patrimoine*, as the fields of `_ZONE_LABELS`.
 
     Each of these rows is a label and one value printed somewhere of its own,
@@ -722,7 +722,7 @@ def _zone_fields(rows: Sequence[Sequence[_Cell]]) -> dict[str, str | None]:
     return fields
 
 
-def _column_centers(rows: Sequence[Sequence[_Cell]]) -> list[float]:
+def _column_centers(rows: Sequence[Sequence[Cell]]) -> list[float]:
     """The midpoint of each column, left to right.
 
     Built from `_ANCHOR_LABELS` only. Every other row on the page is attributed
@@ -752,7 +752,7 @@ def _column_centers(rows: Sequence[Sequence[_Cell]]) -> list[float]:
     ]
 
 
-def _by_column(cells: Iterable[_Cell], centers: Sequence[float]) -> dict[int, _Cell]:
+def _by_column(cells: Iterable[Cell], centers: Sequence[float]) -> dict[int, Cell]:
     """Attribute cells to columns by midpoint; drop what lands in none.
 
     The last cell wins a collision, which happens only on a row whose unit
@@ -760,7 +760,7 @@ def _by_column(cells: Iterable[_Cell], centers: Sequence[float]) -> dict[int, _C
     value and a value can, so preferring the later of the two is preferring the
     one printed further right - the value.
     """
-    placed: dict[int, _Cell] = {}
+    placed: dict[int, Cell] = {}
     for cell in cells:
         distances = [abs(cell.center - center) for center in centers]
         nearest = min(range(len(centers)), key=distances.__getitem__)
