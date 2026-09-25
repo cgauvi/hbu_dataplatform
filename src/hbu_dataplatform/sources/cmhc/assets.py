@@ -70,7 +70,7 @@ from hbu_dataplatform.partitions.axes import (
     quartiers_for,
     scrape_partitions,
 )
-from hbu_dataplatform.rag.pgvector import PostgresUnavailable
+from hbu_dataplatform.core.pg import PostgresUnavailable
 from hbu_dataplatform.core.resources import CmhcResource, ParquetStore, PostgisResource
 from hbu_dataplatform.core.storage import (
     clear_parquet,

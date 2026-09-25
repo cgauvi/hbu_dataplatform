@@ -103,7 +103,7 @@ import geopandas as gpd
 import pandas as pd
 
 from hbu_dataplatform.core import tile_cut, tile_grid, warehouse
-from hbu_dataplatform.rag.pgvector import PgSettings, PostgresUnavailable
+from hbu_dataplatform.core.pg import PgSettings, PostgresUnavailable
 from hbu_dataplatform.core.warehouse import MissingRelation
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, psycopg is imported lazily

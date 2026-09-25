@@ -144,7 +144,7 @@ from hbu_dataplatform.partitions.axes import (
     tile_partition_of,
     tile_scrape_partitions,
 )
-from hbu_dataplatform.rag.pgvector import PostgresUnavailable
+from hbu_dataplatform.core.pg import PostgresUnavailable
 from hbu_dataplatform.core.resources import ParquetStore, PostgisResource
 from hbu_dataplatform.sources.roll.assets import (
     ASSESSMENT_UNITS_FILE,

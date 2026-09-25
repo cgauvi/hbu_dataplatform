@@ -111,7 +111,7 @@ from hbu_dataplatform.partitions.axes import (
     scrape_partitions,
     submarket_for,
 )
-from hbu_dataplatform.rag.pgvector import PostgresUnavailable
+from hbu_dataplatform.core.pg import PostgresUnavailable
 from hbu_dataplatform.core.resources import (
     CrspiResource,
     MarketBeatResource,

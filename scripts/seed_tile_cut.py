@@ -42,7 +42,7 @@ load_dotenv()
 from hbu_dataplatform.core import tile_cut, tile_grid  # noqa: E402
 from hbu_dataplatform.partitions.axes import city_of  # noqa: E402
 from hbu_dataplatform.core.postgis import connect  # noqa: E402
-from hbu_dataplatform.rag.pgvector import PgSettings  # noqa: E402
+from hbu_dataplatform.core.pg import PgSettings  # noqa: E402
 
 #: How many rows the agreement check reads. A few thousand is plenty - a
 #: disagreement is systematic, not occasional.

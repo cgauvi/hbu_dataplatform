@@ -92,7 +92,7 @@ from hbu_dataplatform.core.postgis import (
     load_addresses,
     neighborhoods_of_tile,
 )
-from hbu_dataplatform.rag.pgvector import PostgresUnavailable
+from hbu_dataplatform.core.pg import PostgresUnavailable
 from hbu_dataplatform.core.resources import (
     AdressesQuebecResource,
     ParquetStore,

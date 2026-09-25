@@ -54,7 +54,7 @@ from hbu_dataplatform.hbu.massing_assets import lot_building_massing
 from hbu_dataplatform.hbu.opportunity_assets import lot_investment_opportunities
 from hbu_dataplatform.partitions.axes import borough_partition_of, scrape_partitions
 from hbu_dataplatform.map.pmtiles_archive import ArchiveSummary, write_archive
-from hbu_dataplatform.rag.pgvector import PostgresUnavailable
+from hbu_dataplatform.core.pg import PostgresUnavailable
 from hbu_dataplatform.core.resources import ParquetStore, PostgisResource
 from hbu_dataplatform.core.storage import clear_files, join, write_bytes
 from hbu_dataplatform.sources.rqtt.assets import neighborhood_streets

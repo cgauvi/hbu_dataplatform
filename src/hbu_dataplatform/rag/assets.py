@@ -52,7 +52,7 @@ from hbu_dataplatform.rag.documents import (
 from hbu_dataplatform.core.frames import write_vectors
 from hbu_dataplatform.core.layers import key_prefix
 from hbu_dataplatform.partitions.axes import borough_partition_of, scrape_partitions
-from hbu_dataplatform.rag.pgvector import PostgresUnavailable
+from hbu_dataplatform.core.pg import PostgresUnavailable
 from hbu_dataplatform.rag.results import IndexMismatch
 from hbu_dataplatform.core.resources import (
     EmbeddingModel,

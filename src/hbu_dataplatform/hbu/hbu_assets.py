@@ -143,7 +143,7 @@ from hbu_dataplatform.cities.montreal.rents.assets import (
     COMMERCIAL_RENTS_FILE,
     commercial_rents,
 )
-from hbu_dataplatform.rag.pgvector import PostgresUnavailable
+from hbu_dataplatform.core.pg import PostgresUnavailable
 from hbu_dataplatform.core.resources import ParquetStore, PostgisResource
 from hbu_dataplatform.zoning.setback_assets import (
     LOT_SETBACKS_FILE,

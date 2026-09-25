@@ -16,7 +16,8 @@ from hbu_dataplatform.rag.embeddings import (
     ModelTokenRuler,
     cached_embeddings,
 )
-from hbu_dataplatform.rag.pgvector import PgSettings, PgVectorStore
+from hbu_dataplatform.core.pg import PgSettings
+from hbu_dataplatform.rag.pgvector import PgVectorStore
 from hbu_dataplatform.core.postgis import connect as postgis_connect
 from hbu_dataplatform.sources.bdoi.client import (
     DEFAULT_BASE_URL as BDOI_BASE_URL,
@@ -945,7 +946,7 @@ class PgVectorResource(ConfigurableResource):
     """The shared vector store: Postgres on RDS with the pgvector extension.
 
     Every field defaults to `None`, which means "whatever the corresponding
-    `URBAN_RAG_PG_*` variable says" - see `rag.pgvector.PgSettings.from_env`.
+    `URBAN_RAG_PG_*` variable says" - see `core.pg.PgSettings.from_env`.
     Configuring it that way rather than in `definitions.py` keeps one endpoint
     for the code location, the `urban-rag` CLI and anything else that opens the
     store, and keeps the endpoint out of the repository.
@@ -1034,7 +1035,7 @@ class PostgisResource(ConfigurableResource):
     class's `table`/`ef_search`/`prune_superseded` fields are about the vector
     index and mean nothing here - but every connection field means the same
     thing, resolved the same way: an explicit value, else the corresponding
-    `URBAN_RAG_PG_*` variable. See `rag.pgvector.PgSettings.from_env`.
+    `URBAN_RAG_PG_*` variable. See `core.pg.PgSettings.from_env`.
     """
 
     host: str | None = None

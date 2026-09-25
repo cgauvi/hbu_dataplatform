@@ -62,7 +62,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     from hbu_dataplatform.core.postgis import connect, tiles_of_neighborhood
-    from hbu_dataplatform.rag.pgvector import PgSettings
+    from hbu_dataplatform.core.pg import PgSettings
 
     with connect(PgSettings.from_env()) as connection:
         tiles = tiles_of_neighborhood(
@@ -84,7 +84,7 @@ def _ensure_leaves(scrape_date: str) -> int:
     """Every (tile table, cell) leaf for ``scrape_date``, each committed alone."""
     from hbu_dataplatform.core import warehouse
     from hbu_dataplatform.core.postgis import connect
-    from hbu_dataplatform.rag.pgvector import PgSettings
+    from hbu_dataplatform.core.pg import PgSettings
 
     tables = [t for t in warehouse.TABLES.values() if t.axis is warehouse.Axis.TILE]
     month = scrape_date[:7].replace("-", "")

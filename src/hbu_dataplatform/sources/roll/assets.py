@@ -158,7 +158,7 @@ from hbu_dataplatform.partitions.axes import (
     tile_scrape_partitions,
 )
 from hbu_dataplatform.core.postgis import fetch_lots
-from hbu_dataplatform.rag.pgvector import PostgresUnavailable
+from hbu_dataplatform.core.pg import PostgresUnavailable
 from hbu_dataplatform.core.resources import ParquetStore, PostgisResource, RoleResource
 from hbu_dataplatform.sources.roll.client import (
     CADASTRE_LAYER,

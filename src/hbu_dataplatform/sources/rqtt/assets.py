@@ -83,7 +83,7 @@ from hbu_dataplatform.partitions.axes import (
 )
 from hbu_dataplatform.sources.rqtt.client import STREET_ID_FIELD, STREET_NAME_FIELD
 from hbu_dataplatform.core.postgis import load_streets
-from hbu_dataplatform.rag.pgvector import PostgresUnavailable
+from hbu_dataplatform.core.pg import PostgresUnavailable
 from hbu_dataplatform.core.resources import ParquetStore, PostgisResource
 from hbu_dataplatform.core.storage import clear_parquet, join, storage_options
 from hbu_dataplatform.core.warehouse import MissingRelation, published_metadata

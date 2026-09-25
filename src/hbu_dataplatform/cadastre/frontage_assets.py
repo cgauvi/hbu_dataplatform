@@ -146,7 +146,7 @@ from hbu_dataplatform.core.postgis import (
     compute_lot_frontage,
     fetch_lot_frontage,
 )
-from hbu_dataplatform.rag.pgvector import PostgresUnavailable
+from hbu_dataplatform.core.pg import PostgresUnavailable
 from hbu_dataplatform.core.resources import ParquetStore, PostgisResource
 from hbu_dataplatform.core.storage import clear_parquet, join, storage_options
 from hbu_dataplatform.sources.rqtt.assets import STREETS_FILE_OUT, neighborhood_streets

@@ -126,7 +126,7 @@ from hbu_dataplatform.hbu.opportunities import (
 )
 from hbu_dataplatform.partitions.axes import tile_partition_of, tile_scrape_partitions
 from hbu_dataplatform.hbu.proforma import ProformaAssumptions, Timing
-from hbu_dataplatform.rag.pgvector import PostgresUnavailable
+from hbu_dataplatform.core.pg import PostgresUnavailable
 from hbu_dataplatform.core.resources import ParquetStore, PostgisResource
 from hbu_dataplatform.core.storage import (
     clear_parquet,

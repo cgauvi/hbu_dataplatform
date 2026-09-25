@@ -95,7 +95,7 @@ from hbu_dataplatform.core.postgis import (
     fetch_lot_zone_pieces,
 )
 from hbu_dataplatform.rag.documents import ZONING_SOURCES
-from hbu_dataplatform.rag.pgvector import PostgresUnavailable
+from hbu_dataplatform.core.pg import PostgresUnavailable
 from hbu_dataplatform.core.resources import ParquetStore, PostgisResource
 from hbu_dataplatform.core.storage import clear_parquet, join
 

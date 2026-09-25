@@ -84,7 +84,7 @@ from hbu_dataplatform.core.postgis import (
     compute_lot_buildable_setbacks,
     fetch_lot_buildable_setbacks,
 )
-from hbu_dataplatform.rag.pgvector import PostgresUnavailable
+from hbu_dataplatform.core.pg import PostgresUnavailable
 from hbu_dataplatform.core.resources import ParquetStore, PostgisResource
 from hbu_dataplatform.core.storage import clear_parquet, join
 

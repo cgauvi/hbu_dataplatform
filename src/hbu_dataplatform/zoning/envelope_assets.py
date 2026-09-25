@@ -112,7 +112,7 @@ from hbu_dataplatform.cities.quebec_city.zoning import (
     grid_columns,
 )
 from hbu_dataplatform.rag.documents import DOCUMENT_SOURCES
-from hbu_dataplatform.rag.pgvector import PostgresUnavailable
+from hbu_dataplatform.core.pg import PostgresUnavailable
 from hbu_dataplatform.rag.assets import DOCUMENTS_FILE, linked_documents
 from hbu_dataplatform.core.resources import ParquetStore, PdfCache, PostgisResource
 from hbu_dataplatform.core.storage import (

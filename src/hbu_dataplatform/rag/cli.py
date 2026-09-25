@@ -21,7 +21,8 @@ import time
 from pathlib import Path
 
 from hbu_dataplatform.core.layers import layer_of
-from hbu_dataplatform.rag.pgvector import PgSettings, PgVectorStore, PostgresUnavailable
+from hbu_dataplatform.core.pg import PgSettings, PostgresUnavailable
+from hbu_dataplatform.rag.pgvector import PgVectorStore
 from hbu_dataplatform.rag.store import IndexMismatch, VectorStore
 from hbu_dataplatform.rag.vss import StoreLocked, VSSUnavailable
 from hbu_dataplatform.core.storage import DATA_ROOT, join, output_root

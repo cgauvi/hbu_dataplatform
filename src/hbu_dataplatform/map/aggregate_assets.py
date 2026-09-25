@@ -61,7 +61,7 @@ from hbu_dataplatform.core.postgis import (
     compute_map_cell_aggregates,
     fetch_map_cell_aggregates,
 )
-from hbu_dataplatform.rag.pgvector import PostgresUnavailable
+from hbu_dataplatform.core.pg import PostgresUnavailable
 from hbu_dataplatform.core.resources import ParquetStore, PostgisResource
 from hbu_dataplatform.core.storage import clear_parquet, join
 from hbu_dataplatform.sources.rqtt.assets import neighborhood_streets
