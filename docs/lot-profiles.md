@@ -42,7 +42,7 @@ answering a question it did not ask.
 answer; whether $900,000 is a lot of money for a given lot is a cap rate on one
 side and a comparable on the other, and `silver.lot_assessment_comparables` is
 both. `cap_rate_pct` is the roll's dwellings and floor area priced at CMHC's
-borough rent and at `hbu_dataplatform.program`'s stated non-residential rates, over
+borough rent and at `hbu_dataplatform.hbu.program`'s stated non-residential rates, over
 what the lot is assessed at. `estimated_value_cad` is what the k most similar
 lots in the borough imply instead, and `assessed_to_estimated_ratio` is the two
 side by side — the screen a highest-and-best-use question actually starts from:
@@ -178,7 +178,7 @@ no corpus for that partition, not that the borough is unzoned.
 ## The zoning envelopes
 
 `silver/lot_zoning_envelopes` is one row per (lot, grid column) — the grain
-[`hbu_dataplatform.program`](../src/hbu_dataplatform/program.py) solves at — and
+[`hbu_dataplatform.hbu.program`](../src/hbu_dataplatform/hbu/program.py) solves at — and
 `zoning_envelopes` is that lot's rows, the zone covering most of it first:
 
 ```json
@@ -279,7 +279,7 @@ disagree. The parking pair is the choice a building actually makes — stalls du
 out underneath (`parkade_ug`) or a garage integrated into it at grade
 (`parkade_ag`); underground is dearer per stall *and* larger per stall, while
 above grade burns floor area the envelope would rather spend on dwellings,
-which is what makes it a choice at all. `hbu_dataplatform.program` hardcodes the
+which is what makes it a choice at all. `hbu_dataplatform.hbu.program` hardcodes the
 midpoints of exactly these two pairs today; these columns are where it can read
 them from instead. The guide's third parking type, `surface_lot`, is
 deliberately not carried: an asphalt lot is not a parking structure.

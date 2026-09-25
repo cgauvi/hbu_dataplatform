@@ -30,8 +30,8 @@ import pytest
 
 from conftest import NEIGHBORHOOD, STREET_PARCEL_SCRAPE_DATE
 
-from hbu_dataplatform.hbu import cadastral_road_lots
-from hbu_dataplatform.postgis import (
+from hbu_dataplatform.hbu.hbu import cadastral_road_lots
+from hbu_dataplatform.core.postgis import (
     DEFAULT_ROAD_LOT_MIN_STREET_M,
     ROAD_LOT_COLUMNS,
     compute_lot_frontage,

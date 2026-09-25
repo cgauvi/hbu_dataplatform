@@ -17,7 +17,7 @@
 # the lot chain, DATE x TILE, one run per cell of the cut the borough's lots
 # fall in: `cadastre` lands the borough in rag.lots with each lot's cell, and
 # every tile step after it asks Postgres which cells those were
-# (`python -m hbu_dataplatform.tiles of`) and runs once per cell. That is also why a
+# (`python -m hbu_dataplatform.partitions.tiles of`) and runs once per cell. That is also why a
 # reload of a borough re-runs the whole chain for every cell it touches - a
 # reload remints lot_uid and cascades into all of them.
 #
@@ -105,7 +105,7 @@ if [ ${#ORDER[@]} -eq 0 ]; then ORDER=("${DEFAULT_ORDER[@]}"); fi
 TILES=()
 tiles_of_borough() {
   if [ ${#TILES[@]} -eq 0 ]; then
-    mapfile -t TILES < <($PY python -m hbu_dataplatform.tiles of "$NEIGHBORHOOD" "$DATE")
+    mapfile -t TILES < <($PY python -m hbu_dataplatform.partitions.tiles of "$NEIGHBORHOOD" "$DATE")
     echo "$(date '+%H:%M:%S')  $NEIGHBORHOOD holds ${#TILES[@]} cell(s): ${TILES[*]}"
   fi
 }
@@ -125,7 +125,7 @@ for step in "${ORDER[@]}"; do
   echo "$(date '+%H:%M:%S')  $step  -> $log"
   status=0
   case "$kind" in
-    -)  $PY python -m hbu_dataplatform.neighborhoods add "$NEIGHBORHOOD" > "$log" 2>&1 || status=$? ;;
+    -)  $PY python -m hbu_dataplatform.partitions.neighborhoods add "$NEIGHBORHOOD" > "$log" 2>&1 || status=$? ;;
     date)
         # shellcheck disable=SC2086
         run_step "$log" "$DATE" "$selection" $extra || status=$? ;;

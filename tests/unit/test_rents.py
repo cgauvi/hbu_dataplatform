@@ -24,8 +24,12 @@ import pytest
 from dagster import Failure, MultiPartitionKey, materialize
 
 from asset_helpers import materialization_metadata, stub_publish
-from hbu_dataplatform import crspi, marketbeat, rent_assets
-from hbu_dataplatform.crspi import (
+from hbu_dataplatform.cities.montreal.rents import (
+    crspi,
+    marketbeat,
+    assets as rent_assets,
+)
+from hbu_dataplatform.cities.montreal.rents.crspi import (
     BUILDING_TYPES,
     CrspiError,
     escalate,
@@ -33,7 +37,7 @@ from hbu_dataplatform.crspi import (
     latest_period,
     read_montreal,
 )
-from hbu_dataplatform.marketbeat import (
+from hbu_dataplatform.cities.montreal.rents.marketbeat import (
     INDUSTRIAL,
     OFFICE,
     MarketBeatError,
@@ -43,8 +47,8 @@ from hbu_dataplatform.marketbeat import (
     market_total,
     parse_submarkets,
 )
-from hbu_dataplatform.partitions import submarket_for
-from hbu_dataplatform.rent_assets import (
+from hbu_dataplatform.partitions.axes import submarket_for
+from hbu_dataplatform.cities.montreal.rents.assets import (
     COMMERCIAL_RENTS_FILE,
     MARKETBEAT_FILE,
     RENT_INDEX_FILE,
@@ -52,13 +56,13 @@ from hbu_dataplatform.rent_assets import (
     commercial_rents,
     montreal_commercial_rents,
 )
-from hbu_dataplatform.resources import (
+from hbu_dataplatform.core.resources import (
     CrspiResource,
     MarketBeatResource,
     ParquetStore,
     PostgisResource,
 )
-from hbu_dataplatform.storage import join
+from hbu_dataplatform.core.storage import join
 
 DATE = "2026-08-01"
 NEIGHBORHOOD = "VSMPE"

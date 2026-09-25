@@ -42,7 +42,7 @@ https://servicescarto.mrnf.gouv.qc.ca/pes/rest/services/Territoire/AQ_ADRESSES_W
 
 Its own metadata declares `capabilities: Map,Query,Data`,
 `supportsSpatialFilter: true` and `supportedQueryFormats: JSON, geoJSON, PBF`.
-So the WMS URL is recorded in `hbu_dataplatform.adresses_quebec.DEFAULT_WMS_URL` and in
+So the WMS URL is recorded in `hbu_dataplatform.sources.addresses.client.DEFAULT_WMS_URL` and in
 the bronze asset's metadata as the product's front door, and the REST sibling is
 what is actually read.
 

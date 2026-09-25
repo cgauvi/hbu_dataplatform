@@ -28,7 +28,7 @@ import pytest
 
 from conftest import NEIGHBORHOOD, SCRAPE_DATE
 
-from hbu_dataplatform.postgis import (
+from hbu_dataplatform.core.postgis import (
     DEFAULT_FRONTAGE_FALLBACK_BUFFERS_M,
     DEFAULT_ROAD_LOT_MIN_STREET_M,
     compute_lot_frontage,

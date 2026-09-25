@@ -27,7 +27,7 @@ from __future__ import annotations
 import pytest
 from psycopg._queries import _query2pg_nocache
 
-from hbu_dataplatform.postgis import (
+from hbu_dataplatform.core.postgis import (
     DEFAULT_SETBACK_EDGE_TOLERANCE_M,
     SETBACK_MAX_SIN,
     SETBACK_SEGMENT_M,

@@ -2,7 +2,7 @@
 
 `gold.lot_building_massing` is one rectangle per **(lot, zone)**, fitted inside
 that piece's setback envelope, in EPSG:4326 and ready to put on a map. It
-exists because `hbu_dataplatform.program` answers in numbers and numbers are what
+exists because `hbu_dataplatform.hbu.program` answers in numbers and numbers are what
 nobody can sanity-check: *a 287 m² footprint under five storeys* is not
 something you can look at and call wrong.
 
@@ -13,7 +13,7 @@ not overlap. The surface parking below follows the same ground — it is fitted
 into the piece rather than the parcel, so neither program is offered a yard the
 other has already built on.
 
-Written by the `lot_building_massing` asset over `hbu_dataplatform.massing`; the table
+Written by the `lot_building_massing` asset over `hbu_dataplatform.hbu.massing`; the table
 is hbu_infra's [sql/022](../../hbu_infra/sql/022_gold_lot_building_massing.sql).
 
 That asset draws a **second** polygon beside it — the surface parking, on the
@@ -212,7 +212,7 @@ rectangle without a join back to `gold.lot_highest_best_use`.
 because a lot can perfectly well have a building that fits and parking that
 does not — one status cannot say both.
 
-The last three have no polygon, and `hbu_dataplatform.warehouse` skips a row with no
+The last three have no polygon, and `hbu_dataplatform.core.warehouse` skips a row with no
 geometry on the way into a spatial table — so they are in the tree and not in
 `gold.lot_building_massing`. Nothing is lost by it: a reader who wants them in
 SQL anti-joins `gold.lot_highest_best_use`, which has every lot and an

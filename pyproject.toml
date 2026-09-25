@@ -10,10 +10,10 @@ dependencies = [
     "dagster-webserver>=1.11",
     "duckdb>=1.4",
     "geopandas>=1.0",
-    # Reads the CMHC survey workbook (hbu_dataplatform.cmhc); pandas needs it as the
+    # Reads the CMHC survey workbook (hbu_dataplatform.sources.cmhc.client); pandas needs it as the
     # xlsx engine and does not pull it in itself.
     "openpyxl>=3.1",
-    # CP-SAT, for the development program in hbu_dataplatform.program. Gross floor
+    # CP-SAT, for the development program in hbu_dataplatform.hbu.program. Gross floor
     # area is a footprint the model chooses times a storey count it also
     # chooses, so the one constraint that matters is a product of two decision
     # variables and an LP cannot express it. ~30 MB, no transitive weight.
@@ -22,7 +22,7 @@ dependencies = [
     # Reads linked zoning PDFs for the document corpus. Kept in the base install
     # because it is small and the asset can fetch PDFs without the encoder stack.
     #
-    # Capped below 7 because `hbu_dataplatform.zoning_grid` reaches into the layout
+    # Capped below 7 because `hbu_dataplatform.zoning.zoning_grid` reaches into the layout
     # mode's internals - `_text_extraction._layout_mode` and `_font` - for the
     # user-space coordinates of each string, which `extract_text` computes and
     # then spends on a fixed-width character grid rather than returning. The
@@ -44,7 +44,7 @@ dependencies = [
     "psycopg[binary]>=3.2",
     "pyarrow>=17",
     # geopandas already depends on this and uses it as its default I/O engine.
-    # Named here because `hbu_dataplatform.role_foncier` calls it directly rather than
+    # Named here because `hbu_dataplatform.sources.roll.client` calls it directly rather than
     # through geopandas: the assessment roll is a 2.8 GB GeoPackage of five
     # layers, and `list_layers` (to resolve the year-stamped layer names) and
     # `read_dataframe(..., where=...)` (to filter to Montreal in OGR rather

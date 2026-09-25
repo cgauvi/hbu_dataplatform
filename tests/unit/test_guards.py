@@ -31,15 +31,19 @@ from dagster import (
     materialize,
 )
 
-from hbu_dataplatform import guards
-from hbu_dataplatform.guards import (
+from hbu_dataplatform.partitions import guards
+from hbu_dataplatform.partitions.guards import (
     ALLOW_STALE_SCRAPE_TAG,
     current_scrape_month,
     guard_current_scrape_month,
     guards_scrape_month,
     scrape_date_of,
 )
-from hbu_dataplatform.partitions import SCRAPE_TIMEZONE, date_partitions, scrape_partitions
+from hbu_dataplatform.partitions.axes import (
+    SCRAPE_TIMEZONE,
+    date_partitions,
+    scrape_partitions,
+)
 
 pytestmark = pytest.mark.scrape_month_guard
 

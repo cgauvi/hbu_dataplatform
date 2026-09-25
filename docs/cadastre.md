@@ -64,7 +64,7 @@ boroughs — the query keeps whatever intersects, rather than cutting geometry.
 ### Why it is read the way it is
 
 Infolot is an ArcGIS `MapServer` behind a GeoCortex security module, and three
-things about it decide the shape of `hbu_dataplatform.infolot`:
+things about it decide the shape of `hbu_dataplatform.sources.infolot.client`:
 
 - **Not every service answers.** `Infolot` is open; its sibling
   `Infolot_Anonyme` returns HTTP 500 from the security module to everything,

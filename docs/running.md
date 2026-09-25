@@ -7,7 +7,7 @@ Every command below has a Makefile target on Linux (`make dagster_run`,
 the variables they read. Raw:
 
 `--select` takes an asset's full `<layer>/<asset>` key — the prefix
-`hbu_dataplatform.layers` gives it. A bare name selects nothing and dagster answers
+`hbu_dataplatform.core.layers` gives it. A bare name selects nothing and dagster answers
 `DagsterInvalidSubsetError`, naming the prefixed key it meant.
 
 Raw invocations skip the `hbu_dataplatform.dagster_home` entrypoint the Makefile and
@@ -149,7 +149,7 @@ make neighborhood-add NEIGHBORHOOD=CIL      # `make neighborhoods` lists them
 ```
 
 which refuses anything `known_neighborhoods()` in
-[partitions.py](../src/hbu_dataplatform/partitions.py) cannot resolve into its
+[partitions.py](../src/hbu_dataplatform/partitions/axes.py) cannot resolve into its
 sources. All 17 Montreal borough namespaces, Quebec City's six
 arrondissements and Saguenay's single `SAG` key are mapped there; a fresh
 instance is seeded with `DEFAULT_NEIGHBORHOODS` (`VSMPE` and `CIL`) the first
@@ -177,7 +177,7 @@ The lot chain — everything from `building_lot_intersections` to
 `lot_building_massing` — is not partitioned by borough but by **cell of the
 tile cut**: a Web Mercator tile named by its quadkey, `0302303330102` for the
 Villeray cell, at whatever depth holds about 20,000 lots. The axis is static,
-every cell of `hbu_dataplatform.tile_cut.CUT`, so there is nothing to register;
+every cell of `hbu_dataplatform.core.tile_cut.CUT`, so there is nothing to register;
 `make tiles` lists them with their city, and a partition key reads
 `2026-09-01|0302303330102`. Why the chain runs this way is in
 [architecture.md](architecture.md#two-spatial-axes).
@@ -235,14 +235,14 @@ The one legitimate reason to write a past month is recovery — a scrape that ra
 on the 1st, failed on the write, and was noticed in the following month. Launch
 that run with the tag `urban_rag/allow_stale_scrape=true`, set in the Launchpad
 or with `--tag`. It is logged as a warning and stays visible in the run's tags.
-See [guards.py](../src/hbu_dataplatform/guards.py).
+See [guards.py](../src/hbu_dataplatform/partitions/guards.py).
 
 ## Talking to the service
 
 The proxy in front of the Feature Service has two quirks that dictate how every
 request is built — a mandatory `url` parameter, and the fact that it is the
 *only* parameter forwarded. Both are documented at the top of
-[spectrum.py](../src/hbu_dataplatform/spectrum.py), with the behaviors verified against
+[spectrum.py](../src/hbu_dataplatform/cities/montreal/spectrum.py), with the behaviors verified against
 the live service:
 
 - `pageLength` is honoured only when `page` is also present.

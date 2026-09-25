@@ -1,8 +1,8 @@
 """The three `rag` working-set loaders, and the statistics they leave behind.
 
 `rag.lots`, `rag.buildings` and `rag.features` are loaded by the raw
-DELETE/COPY/INSERT in `hbu_dataplatform.postgis` rather than through
-`hbu_dataplatform.warehouse`, so the ANALYZE that closes a warehouse write had to be
+DELETE/COPY/INSERT in `hbu_dataplatform.core.postgis` rather than through
+`hbu_dataplatform.core.warehouse`, so the ANALYZE that closes a warehouse write had to be
 added to them separately - and separately is exactly how it would go missing
 again. These tests hold it.
 
@@ -25,7 +25,7 @@ import geopandas as gpd
 import pytest
 from shapely.geometry import Point, box
 
-from hbu_dataplatform import postgis
+from hbu_dataplatform.core import postgis
 
 NEIGHBORHOOD = "VSMPE"
 DATE = "2026-08-26"

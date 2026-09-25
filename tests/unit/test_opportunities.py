@@ -1,6 +1,6 @@
 """Which under-built lots to look at first, and under which thesis.
 
-Two halves. `hbu_dataplatform.opportunities` is arithmetic over a frame and is tested
+Two halves. `hbu_dataplatform.hbu.opportunities` is arithmetic over a frame and is tested
 directly - where the thesis lines fall, what the yield divides by, and what the
 ranking prefers. `lot_investment_opportunities` is tested by materializing it
 over a hand-written `lot_redevelopment_gap` partition, the same way
@@ -23,19 +23,19 @@ import pytest
 from dagster import Failure, MultiPartitionKey, materialize
 
 from asset_helpers import materialization_metadata, stub_publish
-from hbu_dataplatform import opportunity_assets
-from hbu_dataplatform.comparables_assets import (
+from hbu_dataplatform.hbu import opportunity_assets
+from hbu_dataplatform.hbu.comparables_assets import (
     LOT_COMPARABLES_FILE,
     lot_assessment_comparables,
 )
-from hbu_dataplatform.hbu_assets import (
+from hbu_dataplatform.hbu.hbu_assets import (
     LOT_GAP_FILE,
     LOT_HBU_FILE,
     lot_highest_best_use,
     lot_redevelopment_gap,
 )
-from hbu_dataplatform.frames import write_frame
-from hbu_dataplatform.opportunities import (
+from hbu_dataplatform.core.frames import write_frame
+from hbu_dataplatform.hbu.opportunities import (
     COMMERCIAL,
     INDUSTRIAL,
     INVESTMENT_THESES,
@@ -48,12 +48,12 @@ from hbu_dataplatform.opportunities import (
     thesis_summary,
     yield_on_cost_pct,
 )
-from hbu_dataplatform.opportunity_assets import (
+from hbu_dataplatform.hbu.opportunity_assets import (
     LOT_OPPORTUNITIES_FILE,
     lot_investment_opportunities,
 )
-from hbu_dataplatform.resources import ParquetStore, PostgisResource
-from hbu_dataplatform.storage import join
+from hbu_dataplatform.core.resources import ParquetStore, PostgisResource
+from hbu_dataplatform.core.storage import join
 
 DATE = "2026-08-01"
 NEIGHBORHOOD = "VSMPE"
@@ -377,7 +377,7 @@ def store(tmp_path):
 @pytest.fixture(autouse=True)
 def published(monkeypatch):
     # The tile's boroughs, which decide whose zone grids are read: one here.
-    from hbu_dataplatform import postgis
+    from hbu_dataplatform.core import postgis
 
     monkeypatch.setattr(
         postgis,

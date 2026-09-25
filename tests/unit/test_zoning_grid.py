@@ -1,4 +1,4 @@
-"""What `hbu_dataplatform.zoning_grid` reads off a grid, and what it refuses to guess.
+"""What `hbu_dataplatform.zoning.zoning_grid` reads off a grid, and what it refuses to guess.
 
 The parser's whole subject is horizontal position, so the fixtures here are
 real PDFs rather than text: `grid_pdf` types a page the way a grille is
@@ -16,18 +16,15 @@ The offsets and the wording are copied from the published grids for zones
 C01-001 and C01-002 (Villeray-Saint-Michel-Parc-Extension, by-law 01-283), so
 the two-column case is a real one: a *Commerce* column authorised on every
 level and a bare *Habitation* column authorised on every level but the ground
-floor, which is the example `hbu_dataplatform.program` names in its own docstring.
+floor, which is the example `hbu_dataplatform.hbu.program` names in its own docstring.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from hbu_dataplatform.program import BuildingLevel
-from hbu_dataplatform.zoning_grid import (
-    GridParseError,
-    parse_grid_pdf,
-)
+from hbu_dataplatform.hbu.program import BuildingLevel
+from hbu_dataplatform.zoning.zoning_grid import GridParseError, parse_grid_pdf
 
 #: Point size every fixture page is set at, and the width of one Courier glyph
 #: at it. Courier is metrically fixed - every glyph is six tenths of an em -

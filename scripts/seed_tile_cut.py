@@ -3,7 +3,7 @@
 Two jobs, in this order, because the second is worthless if the first fails.
 
 **Does the SQL address the same cell as the Python?** `warehouse.quadkey`
-(hbu_infra/sql/028_cell_key.sql), `hbu_dataplatform.tile_grid.quadkey_of` and
+(hbu_infra/sql/028_cell_key.sql), `hbu_dataplatform.core.tile_grid.quadkey_of` and
 `postgis._cell_x_sql` are three spellings of one grid. The unit tests compare
 the first two as arithmetic; this compares them on the rows actually in the
 database, which is the only place a difference between Postgres's `asinh` and
@@ -11,7 +11,7 @@ Python's would show up.
 
 **What cut does this cadastre want?** Reads every `cell_key` with the borough
 it was loaded for, subdivides to `tile_cut.DEFAULT_BUDGET`, names each cell's
-city, and prints the literal to paste into `hbu_dataplatform.tile_cut`. It does
+city, and prints the literal to paste into `hbu_dataplatform.core.tile_cut`. It does
 **not** write anything - the cut is a checked-in constant on purpose, because
 a cut that re-derived itself would re-key the Dagster axis every time a lot
 was subdivided. See that module's docstring.
@@ -39,9 +39,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from hbu_dataplatform import tile_cut, tile_grid  # noqa: E402
-from hbu_dataplatform.partitions import city_of  # noqa: E402
-from hbu_dataplatform.postgis import connect  # noqa: E402
+from hbu_dataplatform.core import tile_cut, tile_grid  # noqa: E402
+from hbu_dataplatform.partitions.axes import city_of  # noqa: E402
+from hbu_dataplatform.core.postgis import connect  # noqa: E402
 from hbu_dataplatform.rag.pgvector import PgSettings  # noqa: E402
 
 #: How many rows the agreement check reads. A few thousand is plenty - a
@@ -111,7 +111,7 @@ def main() -> int:
             )
             return 2
 
-        print(f"\nchecking {args.sample} row(s) against hbu_dataplatform.tile_grid")
+        print(f"\nchecking {args.sample} row(s) against hbu_dataplatform.core.tile_grid")
         if check_agreement(cursor, args.sample):
             print(
                 "  !! the SQL and the Python disagree. Do NOT seed a cut from "
@@ -168,14 +168,14 @@ def main() -> int:
         print(
             "  !! this cut drops or splits live cell(s) - a re-cut, not an "
             "addition. Every partition under them would be re-keyed; see "
-            "hbu_dataplatform.tile_cut on what that costs. Re-run with --allow-recut "
+            "hbu_dataplatform.core.tile_cut on what that costs. Re-run with --allow-recut "
             "if that is the intent:"
         )
         for cell in dropped:
             print(f"     {cell}")
         return 2
 
-    print("\n--- paste into src/hbu_dataplatform/tile_cut.py ---")
+    print("\n--- paste into src/hbu_dataplatform/core/tile_cut.py ---")
     print(f"CUT_VERSION = {tile_cut.CUT_VERSION + 1 if added or dropped else tile_cut.CUT_VERSION}")
     print("TILE_CITIES: dict[str, str] = {")
     by_city: dict[str, list[str]] = defaultdict(list)

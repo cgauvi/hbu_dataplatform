@@ -68,7 +68,7 @@ import pytest
 
 from dataclasses import replace
 
-from hbu_dataplatform.program import (
+from hbu_dataplatform.hbu.program import (
     BASEMENT_LEVELS,
     BASEMENT_LEVELS_ALLOWED,
     BASEMENT_STACK_ORDER,
@@ -1049,7 +1049,7 @@ def test_the_parking_constants_are_the_ones_the_program_was_specified_with():
     assert STALLS_PER_DWELLING == 0.5
     assert UNDERGROUND_STALL_AREA_SQFT == 400.0
     assert GARAGE_STALL_AREA_SQFT == 300.0
-    # The Altus Group guide's Montreal midpoint, as `hbu_dataplatform.estimator`
+    # The Altus Group guide's Montreal midpoint, as `hbu_dataplatform.cities.montreal.costs.estimator`
     # publishes it: `parkade_ug` [51 925, 68 675], flagged `perStall`.
     assert UNDERGROUND_STALL_COST_CAD == pytest.approx((51_925 + 68_675) / 2)
     # Underground is worse on both counts than a bay. Only the by-law makes it
@@ -1275,7 +1275,7 @@ def test_a_parking_rule_that_cannot_be_priced_is_refused(overrides):
 
 def test_the_surface_stall_is_the_guides_third_montreal_midpoint():
     # Read the same way as the dug one: `surface_lot`'s mtl [3 960, 8 250],
-    # flagged `perStall`, from the Altus Group guide `hbu_dataplatform.estimator`
+    # flagged `perStall`, from the Altus Group guide `hbu_dataplatform.cities.montreal.costs.estimator`
     # ingests. Ten times under the parkade, which is the whole reason a house
     # can afford the stall it owes itself.
     assert SURFACE_STALL_COST_CAD == pytest.approx((3_960 + 8_250) / 2)

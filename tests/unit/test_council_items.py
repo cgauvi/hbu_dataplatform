@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from hbu_dataplatform.council_items import (
+from hbu_dataplatform.cities.quebec_city.council.items import (
     PLANNING_KINDS,
     addresses,
     agenda_items,

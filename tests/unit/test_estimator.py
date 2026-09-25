@@ -17,7 +17,7 @@ import pandas as pd
 import pytest
 from dagster import Failure, materialize
 
-from hbu_dataplatform.estimator import (
+from hbu_dataplatform.cities.montreal.costs.estimator import (
     MONTREAL_CITY_ID,
     NON_RESIDENTIAL_CATEGORIES,
     RESIDENTIAL_CATEGORIES,
@@ -26,14 +26,14 @@ from hbu_dataplatform.estimator import (
     parse_catalog,
     rates_frame,
 )
-from hbu_dataplatform.estimator_assets import (
+from hbu_dataplatform.cities.montreal.costs.assets import (
     NON_RESIDENTIAL_FILE,
     RESIDENTIAL_FILE,
     montreal_nonresidential_costs,
     montreal_residential_costs,
 )
-from hbu_dataplatform.resources import EstimatorResource, ParquetStore
-from hbu_dataplatform.storage import join
+from hbu_dataplatform.core.resources import EstimatorResource, ParquetStore
+from hbu_dataplatform.core.storage import join
 
 from asset_helpers import materialization_metadata
 

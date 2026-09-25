@@ -29,7 +29,7 @@ CMHC surveys the Montreal **census metropolitan area** and cuts it into its own
 neighborhoods, which do not line up with the boroughs everything else here is
 partitioned on. `VSMPE` is three of them, `Outremont` is one, and `PR` is the
 borough *plus* Senneville, which CMHC will not split out. The crosswalk is
-`CMHC_QUARTIERS` in [partitions.py](../src/hbu_dataplatform/partitions.py), a third map
+`CMHC_QUARTIERS` in [partitions.py](../src/hbu_dataplatform/partitions/axes.py), a third map
 alongside the Spectrum namespaces and the borough codes.
 
 It holds one canonical name per quartier, not one per publication: CMHC

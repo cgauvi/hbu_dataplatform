@@ -1,7 +1,7 @@
 """Code location for the hbu_dataplatform pipeline.
 
 Assets are grouped and keyed by medallion layer - `bronze/`, `silver/`,
-`gold/` - declared once in `hbu_dataplatform.layers` and used for both the Dagster
+`gold/` - declared once in `hbu_dataplatform.core.layers` and used for both the Dagster
 asset key and the prefix each asset writes under. `_assert_layers_declared`
 below checks the two sets against each other at import time, so an asset
 registered without a layer is a code-location load error rather than a
@@ -21,45 +21,54 @@ from dagster import (
     schedule,
 )
 
-from hbu_dataplatform.address_assets import lot_addresses, neighborhood_addresses
-from hbu_dataplatform.aggregate_assets import map_cell_aggregates
-from hbu_dataplatform.assets import neighborhood_features, spectrum_table_catalog
-from hbu_dataplatform.bdoi_assets import neighborhood_buildings
-from hbu_dataplatform.building_lots_assets import building_lot_intersections
-from hbu_dataplatform.cadastre_assets import neighborhood_cadastre
-from hbu_dataplatform.cmhc_assets import (
+from hbu_dataplatform.sources.addresses.assets import (
+    lot_addresses,
+    neighborhood_addresses,
+)
+from hbu_dataplatform.map.aggregate_assets import map_cell_aggregates
+from hbu_dataplatform.zoning.features_assets import (
+    neighborhood_features,
+    spectrum_table_catalog,
+)
+from hbu_dataplatform.sources.bdoi.assets import neighborhood_buildings
+from hbu_dataplatform.cadastre.building_lots_assets import building_lot_intersections
+from hbu_dataplatform.cadastre.cadastre_assets import neighborhood_cadastre
+from hbu_dataplatform.sources.cmhc.assets import (
     average_rents,
     cmhc_rent_survey,
     cmhc_vacancy_survey,
     vacancy_rates,
 )
-from hbu_dataplatform.comparables_assets import lot_assessment_comparables
-from hbu_dataplatform.cubf_assets import cubf_use_codes
-from hbu_dataplatform.rent_assets import (
+from hbu_dataplatform.hbu.comparables_assets import lot_assessment_comparables
+from hbu_dataplatform.sources.cubf.assets import cubf_use_codes
+from hbu_dataplatform.cities.montreal.rents.assets import (
     commercial_rent_index,
     commercial_rents,
     montreal_commercial_rents,
 )
-from hbu_dataplatform.envelope_assets import lot_zoning_envelopes, zoning_grid_columns
-from hbu_dataplatform.zone_piece_assets import lot_zone_pieces
-from hbu_dataplatform.estimator_assets import (
+from hbu_dataplatform.zoning.envelope_assets import (
+    lot_zoning_envelopes,
+    zoning_grid_columns,
+)
+from hbu_dataplatform.zoning.zone_piece_assets import lot_zone_pieces
+from hbu_dataplatform.cities.montreal.costs.assets import (
     montreal_nonresidential_costs,
     montreal_residential_costs,
 )
-from hbu_dataplatform.frontage_assets import lot_frontage
-from hbu_dataplatform.opportunity_assets import lot_investment_opportunities
-from hbu_dataplatform.hbu_assets import (
+from hbu_dataplatform.cadastre.frontage_assets import lot_frontage
+from hbu_dataplatform.hbu.opportunity_assets import lot_investment_opportunities
+from hbu_dataplatform.hbu.hbu_assets import (
     lot_development_programs,
     lot_highest_best_use,
     lot_redevelopment_gap,
 )
-from hbu_dataplatform.infolot_assets import neighborhood_lots
-from hbu_dataplatform.guards import guards_scrape_month
-from hbu_dataplatform.layers import ASSET_LAYERS, Layer, layer_of
-from hbu_dataplatform.lot_profiles_assets import lot_profiles
-from hbu_dataplatform.massing_assets import lot_building_massing
-from hbu_dataplatform.open_data_assets import reference_neighborhoods, street_network
-from hbu_dataplatform.partitions import (
+from hbu_dataplatform.sources.infolot.assets import neighborhood_lots
+from hbu_dataplatform.partitions.guards import guards_scrape_month
+from hbu_dataplatform.core.layers import ASSET_LAYERS, Layer, layer_of
+from hbu_dataplatform.hbu.lot_profiles_assets import lot_profiles
+from hbu_dataplatform.hbu.massing_assets import lot_building_massing
+from hbu_dataplatform.boundaries.assets import reference_neighborhoods, street_network
+from hbu_dataplatform.partitions.axes import (
     TILE_DIMENSION,
     date_partitions,
     enabled_neighborhoods,
@@ -67,18 +76,18 @@ from hbu_dataplatform.partitions import (
     tile_partitions,
     tile_scrape_partitions,
 )
-from hbu_dataplatform.council_assets import (
+from hbu_dataplatform.cities.quebec_city.council.assets import (
     council_minutes,
     council_minutes_documents,
     council_planning_items,
 )
-from hbu_dataplatform.rag_assets import (
+from hbu_dataplatform.rag.assets import (
     document_chunks,
     document_embeddings,
     document_index,
     linked_documents,
 )
-from hbu_dataplatform.resources import (
+from hbu_dataplatform.core.resources import (
     AdressesQuebecResource,
     BdoiResource,
     CmhcResource,
@@ -102,16 +111,16 @@ from hbu_dataplatform.resources import (
     SaguenayZoningResource,
     SpectrumResource,
 )
-from hbu_dataplatform.rfu_assets import uniformized_property_wealth
-from hbu_dataplatform.role_assets import (
+from hbu_dataplatform.sources.rfu.assets import uniformized_property_wealth
+from hbu_dataplatform.sources.roll.assets import (
     assessment_units,
     lot_assessed_values,
     property_assessment_roll,
 )
-from hbu_dataplatform.setback_assets import lot_buildable_setbacks
-from hbu_dataplatform.storage import DATA_ROOT, output_root
-from hbu_dataplatform.street_assets import neighborhood_streets
-from hbu_dataplatform.tile_assets import map_tiles_asset
+from hbu_dataplatform.zoning.setback_assets import lot_buildable_setbacks
+from hbu_dataplatform.core.storage import DATA_ROOT, output_root
+from hbu_dataplatform.sources.rqtt.assets import neighborhood_streets
+from hbu_dataplatform.map.tile_assets import map_tiles_asset
 
 TIMEZONE = "America/Toronto"
 
@@ -182,12 +191,12 @@ def _assert_layers_declared() -> None:
     declared = set(ASSET_LAYERS)
     if undeclared := sorted(registered - declared):
         raise ValueError(
-            f"Registered asset(s) with no layer in hbu_dataplatform.layers: "
+            f"Registered asset(s) with no layer in hbu_dataplatform.core.layers: "
             f"{', '.join(undeclared)}"
         )
     if unregistered := sorted(declared - registered):
         raise ValueError(
-            f"hbu_dataplatform.layers declares layer(s) for asset(s) this code "
+            f"hbu_dataplatform.core.layers declares layer(s) for asset(s) this code "
             f"location does not register: {', '.join(unregistered)}"
         )
 
@@ -205,7 +214,7 @@ def _assert_bronze_assets_guarded() -> None:
     than a fabricated snapshot noticed a quarter later.
 
     Silver and gold are skipped on purpose: they recompute from bronze parquet
-    already on disk, so backfilling them is a feature. See `hbu_dataplatform.guards`.
+    already on disk, so backfilling them is a feature. See `hbu_dataplatform.partitions.guards`.
     """
     unguarded = sorted(
         definition.key.path[-1]
@@ -217,7 +226,7 @@ def _assert_bronze_assets_guarded() -> None:
         raise ValueError(
             f"Bronze asset(s) registered without @guard_current_scrape_month: "
             f"{', '.join(unguarded)}. Bronze records what a publisher returned "
-            f"now, so it must refuse a past partition - see hbu_dataplatform.guards."
+            f"now, so it must refuse a past partition - see hbu_dataplatform.partitions.guards."
         )
 
 
@@ -590,7 +599,7 @@ def _scrape_month(context: ScheduleEvaluationContext) -> str:
 def _tile_requests(prefix: str, scrape_date: str):
     """One `RunRequest` per cell of the cut, for a job on the tile axis.
 
-    The tile axis is static - every cell of `hbu_dataplatform.tile_cut.CUT` - so
+    The tile axis is static - every cell of `hbu_dataplatform.core.tile_cut.CUT` - so
     there is no instance to ask, unlike `enabled_neighborhoods`. A cell no
     borough has been loaded into yet runs and computes over nothing, which is
     a cheap run rather than a wrong one; the cut only ever holds cells that

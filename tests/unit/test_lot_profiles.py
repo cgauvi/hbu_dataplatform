@@ -27,7 +27,7 @@ files, and a missing one names a date rather than a borough.
 The asset cannot run for real yet: `rag.lot_profiles` and the
 `rag.lot_documents` view are hbu_infra's, and sql/006 only lands on a `db.py
 init` run after a corpus has been indexed. See the module docstring of
-`hbu_dataplatform.lot_profiles_assets`.
+`hbu_dataplatform.hbu.lot_profiles_assets`.
 """
 
 from __future__ import annotations
@@ -43,25 +43,28 @@ from shapely.geometry import box
 
 from asset_helpers import materialization_metadata
 
-from hbu_dataplatform import lot_profiles_assets
-from hbu_dataplatform.cmhc_assets import (
+from hbu_dataplatform.hbu import lot_profiles_assets
+from hbu_dataplatform.sources.cmhc.assets import (
     AVERAGE_RENTS_FILE,
     VACANCY_FILE,
     average_rents,
     vacancy_rates,
 )
-from hbu_dataplatform.envelope_assets import LOT_ENVELOPES_FILE, lot_zoning_envelopes
-from hbu_dataplatform.estimator_assets import (
+from hbu_dataplatform.zoning.envelope_assets import (
+    LOT_ENVELOPES_FILE,
+    lot_zoning_envelopes,
+)
+from hbu_dataplatform.cities.montreal.costs.assets import (
     NON_RESIDENTIAL_FILE,
     RESIDENTIAL_FILE,
     montreal_nonresidential_costs,
     montreal_residential_costs,
 )
-from hbu_dataplatform.frames import write_frame
-from hbu_dataplatform.lot_profiles_assets import LOT_PROFILES_FILE, lot_profiles
-from hbu_dataplatform.postgis import DEFAULT_MAX_BUILT_AREA_M2, MissingRelation
-from hbu_dataplatform.resources import ParquetStore, PostgisResource
-from hbu_dataplatform.storage import join
+from hbu_dataplatform.core.frames import write_frame
+from hbu_dataplatform.hbu.lot_profiles_assets import LOT_PROFILES_FILE, lot_profiles
+from hbu_dataplatform.core.postgis import DEFAULT_MAX_BUILT_AREA_M2, MissingRelation
+from hbu_dataplatform.core.resources import ParquetStore, PostgisResource
+from hbu_dataplatform.core.storage import join
 
 DATE = "2026-08-01"
 NEIGHBORHOOD = "VSMPE"
@@ -169,7 +172,7 @@ def write_rents(store, *, overall=1_275.0):
     )
 
 
-#: The Montreal column of the Altus guide, as `hbu_dataplatform.estimator` publishes
+#: The Montreal column of the Altus guide, as `hbu_dataplatform.cities.montreal.costs.estimator` publishes
 #: it, for the types a lot profile carries a rate for. Real figures rather than
 #: round ones, so a test that asserts a number is asserting the guide's number:
 #: `parkade_ug` and `parkade_ag` are the two the parking columns come from, and

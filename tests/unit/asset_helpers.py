@@ -8,11 +8,11 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 
-from hbu_dataplatform.resources import PostgisResource
+from hbu_dataplatform.core.resources import PostgisResource
 
 
 def stub_publish(monkeypatch, module, *, pruned: int = 0) -> dict[str, object]:
-    """Patch out one asset module's `hbu_dataplatform.warehouse.publish`.
+    """Patch out one asset module's `hbu_dataplatform.core.warehouse.publish`.
 
     Every silver and gold asset writes its parquet and then upserts the same
     frames into `silver.*`/`gold.*`, which needs a database. What is worth
@@ -51,7 +51,7 @@ def stub_publish(monkeypatch, module, *, pruned: int = 0) -> dict[str, object]:
 
 
 def stub_publish_by_neighborhood(monkeypatch, module) -> dict[str, object]:
-    """Patch out `hbu_dataplatform.warehouse.publish_by_neighborhood` for one module.
+    """Patch out `hbu_dataplatform.core.warehouse.publish_by_neighborhood` for one module.
 
     The sibling of `stub_publish`, for the one asset that publishes several
     borough partitions out of a single date partition: `assessment_units`
@@ -98,7 +98,7 @@ def node_name(asset_def) -> str:
     """The op name Dagster gives ``asset_def``, for looking its events up by.
 
     Every asset in this project carries a medallion key prefix (see
-    `hbu_dataplatform.layers`), so `building_lot_intersections` is the node
+    `hbu_dataplatform.core.layers`), so `building_lot_intersections` is the node
     `silver__building_lot_intersections`. Derived from the definition rather than
     written out, so moving an asset between layers does not mean editing the
     same string in every test that asserts on its metadata.

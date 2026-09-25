@@ -9,17 +9,22 @@ import pandas as pd
 import pytest
 from dagster import MultiPartitionKey, materialize
 
-from tests.unit.asset_helpers import stub_publish
-from tests.unit.test_quebec_council import FakeResponse, make_pdf
-from hbu_dataplatform import council_assets
-from hbu_dataplatform.council_assets import (
+from asset_helpers import stub_publish
+from test_quebec_council import FakeResponse, make_pdf
+from hbu_dataplatform.cities.quebec_city.council import assets as council_assets
+from hbu_dataplatform.cities.quebec_city.council.assets import (
     council_minutes,
     council_minutes_documents,
     council_planning_items,
 )
 from hbu_dataplatform.rag.documents import PdfFetcher
-from hbu_dataplatform.quebec_council import CouncilFetcher
-from hbu_dataplatform.resources import CouncilMinutesResource, ParquetStore, PdfCache, PostgisResource
+from hbu_dataplatform.cities.quebec_city.council.councils import CouncilFetcher
+from hbu_dataplatform.core.resources import (
+    CouncilMinutesResource,
+    ParquetStore,
+    PdfCache,
+    PostgisResource,
+)
 
 DATE = "2026-08-01"
 

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from hbu_dataplatform.rqtt import (
+from hbu_dataplatform.sources.rqtt.client import (
     ROAD_CLASS_FIELD,
     ROAD_LAYER,
     STREET_ID_FIELD,

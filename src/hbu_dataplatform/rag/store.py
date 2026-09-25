@@ -13,9 +13,14 @@ from pathlib import Path
 
 import duckdb
 
-from hbu_dataplatform.rag.results import COLUMNS as _COLUMNS, SCHEMA_VERSION, Hit, IndexMismatch
+from hbu_dataplatform.rag.results import (
+    COLUMNS as _COLUMNS,
+    SCHEMA_VERSION,
+    Hit,
+    IndexMismatch,
+)
 from hbu_dataplatform.rag.vss import connect
-from hbu_dataplatform.storage import configure_duckdb_s3, is_s3_uri
+from hbu_dataplatform.core.storage import configure_duckdb_s3, is_s3_uri
 
 #: Re-exported so `from hbu_dataplatform.rag.store import Hit, IndexMismatch` keeps
 #: working: both are shared with the Postgres store, see `rag.results`.

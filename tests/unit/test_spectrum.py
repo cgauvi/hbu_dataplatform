@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from hbu_dataplatform.frames import features_to_frame, table_slug
-from hbu_dataplatform.spectrum import (
+from hbu_dataplatform.core.frames import features_to_frame, table_slug
+from hbu_dataplatform.cities.montreal.spectrum import (
     Column,
     SpectrumAccessDenied,
     SpectrumClient,

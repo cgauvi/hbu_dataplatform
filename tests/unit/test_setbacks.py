@@ -28,12 +28,15 @@ from shapely.geometry import Polygon
 
 from asset_helpers import materialization_metadata
 
-from hbu_dataplatform.postgis import (
+from hbu_dataplatform.core.postgis import (
     DEFAULT_SETBACK_BATCH_LOTS,
     DEFAULT_SETBACK_EDGE_TOLERANCE_M,
 )
-from hbu_dataplatform.resources import ParquetStore, PostgisResource
-from hbu_dataplatform.setback_assets import LOT_SETBACKS_FILE, lot_buildable_setbacks
+from hbu_dataplatform.core.resources import ParquetStore, PostgisResource
+from hbu_dataplatform.zoning.setback_assets import (
+    LOT_SETBACKS_FILE,
+    lot_buildable_setbacks,
+)
 
 DATE = "2026-08-01"
 TILE = "0302303330102"
@@ -142,7 +145,7 @@ def stub_postgis(
         "compute_lot_buildable_setbacks": compute_lot_buildable_setbacks,
         "fetch_lot_buildable_setbacks": fetch_lot_buildable_setbacks,
     }.items():
-        monkeypatch.setattr(f"hbu_dataplatform.setback_assets.{name}", value)
+        monkeypatch.setattr(f"hbu_dataplatform.zoning.setback_assets.{name}", value)
     return calls
 
 

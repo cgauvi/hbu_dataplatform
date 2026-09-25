@@ -3,7 +3,7 @@
 CMHC prices a dwelling. The Altus cost guide prices a building to *put up*.
 Neither says what a square foot of retail, office or warehouse **rents for** —
 and until these three assets, that figure was two constants in
-[`hbu_dataplatform.program`](../src/hbu_dataplatform/program.py):
+[`hbu_dataplatform.hbu.program`](../src/hbu_dataplatform/hbu/program.py):
 
 ```python
 COMMERCIAL_REVENUE_PER_SQFT_CAD = 80.0

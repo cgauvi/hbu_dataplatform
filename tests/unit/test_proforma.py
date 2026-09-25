@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from hbu_dataplatform.proforma import (
+from hbu_dataplatform.hbu.proforma import (
     M2_PER_SQFT,
     ProformaAssumptions,
     Timing,

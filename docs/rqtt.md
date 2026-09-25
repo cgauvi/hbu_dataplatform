@@ -38,8 +38,8 @@ read as a roadway.
 
 The GeoPackage is **unpacked before it is read**, never opened through `zip://`
 — SQLite reads by seeking, and a seek inside a deflate stream decompresses from
-the start of the member every time. `hbu_dataplatform.role_foncier` makes the same
-choice for the same reason, and `hbu_dataplatform.rqtt` is deliberately its twin.
+the start of the member every time. `hbu_dataplatform.sources.roll.client` makes the same
+choice for the same reason, and `hbu_dataplatform.sources.rqtt.client` is deliberately its twin.
 
 ## The vintage problem
 

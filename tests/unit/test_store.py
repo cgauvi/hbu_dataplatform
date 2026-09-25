@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from hbu_dataplatform.frames import write_vectors
+from hbu_dataplatform.core.frames import write_vectors
 from hbu_dataplatform.rag.store import IndexMismatch, VectorStore
 
 

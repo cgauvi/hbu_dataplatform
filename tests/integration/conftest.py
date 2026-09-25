@@ -221,7 +221,7 @@ def ensure_partition(connection, table: str, neighborhood: str = NEIGHBORHOOD) -
 
     Every table here is `PARTITION BY LIST (neighborhood)` and a partitioned
     table rejects an insert with no partition to take it. The real pipeline
-    creates these through `hbu_dataplatform.warehouse.ensure_partition`; these tests
+    creates these through `hbu_dataplatform.core.warehouse.ensure_partition`; these tests
     write straight into the tables, so they have to make their own.
     """
     connection.cursor().execute(

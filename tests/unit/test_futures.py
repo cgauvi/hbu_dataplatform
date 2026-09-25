@@ -17,8 +17,8 @@ from dataclasses import replace
 import pandas as pd
 import pytest
 
-from hbu_dataplatform import hbu
-from hbu_dataplatform.hbu import (
+from hbu_dataplatform.hbu import hbu
+from hbu_dataplatform.hbu.hbu import (
     ENHANCEMENT_COLUMNS,
     EnhancementRules,
     ProgramAssumptions,
@@ -27,7 +27,7 @@ from hbu_dataplatform.hbu import (
     solve_enhancements,
     three_futures,
 )
-from hbu_dataplatform.program import (
+from hbu_dataplatform.hbu.program import (
     BuildingLevel,
     ConstructionCosts,
     DevelopmentProgram,

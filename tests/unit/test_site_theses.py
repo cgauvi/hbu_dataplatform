@@ -1,6 +1,6 @@
 """The second axis of `lot_investment_opportunities`: why a site is acquirable.
 
-`hbu_dataplatform.opportunities`'s site functions are arithmetic over a frame and are
+`hbu_dataplatform.hbu.opportunities`'s site functions are arithmetic over a frame and are
 tested directly - which thesis fires on what, what the heritage rows screen,
 what each thesis's denominator carries, and how the improvement is sized. The
 asset is then materialized over hand-written gap, HBU, comparables and zone
@@ -22,20 +22,23 @@ import pytest
 from dagster import MultiPartitionKey, materialize
 
 from asset_helpers import materialization_metadata, stub_publish
-from hbu_dataplatform import opportunity_assets
-from hbu_dataplatform.comparables_assets import (
+from hbu_dataplatform.hbu import opportunity_assets
+from hbu_dataplatform.hbu.comparables_assets import (
     LOT_COMPARABLES_FILE,
     lot_assessment_comparables,
 )
-from hbu_dataplatform.envelope_assets import ZONE_COLUMNS_FILE, zoning_grid_columns
-from hbu_dataplatform.frames import write_frame
-from hbu_dataplatform.hbu_assets import (
+from hbu_dataplatform.zoning.envelope_assets import (
+    ZONE_COLUMNS_FILE,
+    zoning_grid_columns,
+)
+from hbu_dataplatform.core.frames import write_frame
+from hbu_dataplatform.hbu.hbu_assets import (
     LOT_GAP_FILE,
     LOT_HBU_FILE,
     lot_highest_best_use,
     lot_redevelopment_gap,
 )
-from hbu_dataplatform.opportunities import (
+from hbu_dataplatform.hbu.opportunities import (
     BROWNFIELD,
     IMPROVEMENT,
     INFILL,
@@ -50,12 +53,12 @@ from hbu_dataplatform.opportunities import (
     site_thesis_summary,
     site_yield_on_cost_pct,
 )
-from hbu_dataplatform.opportunity_assets import (
+from hbu_dataplatform.hbu.opportunity_assets import (
     LOT_OPPORTUNITIES_FILE,
     lot_investment_opportunities,
 )
-from hbu_dataplatform.resources import ParquetStore, PostgisResource
-from hbu_dataplatform.storage import join
+from hbu_dataplatform.core.resources import ParquetStore, PostgisResource
+from hbu_dataplatform.core.storage import join
 
 DATE = "2026-09-01"
 NEIGHBORHOOD = "VSMPE"
@@ -646,7 +649,7 @@ def store(tmp_path):
 def published(monkeypatch):
     # The tile's boroughs, which decide whose zone grids are read: one here,
     # and the zone file below is written under it.
-    from hbu_dataplatform import postgis
+    from hbu_dataplatform.core import postgis
 
     monkeypatch.setattr(
         postgis,
@@ -935,7 +938,10 @@ def test_a_zone_file_without_the_heritage_rows_screens_nothing_and_says_so(store
 # -- the three futures, for the owner and for a buyer ---------------------------
 
 
-from hbu_dataplatform.opportunities import futures_economics, site_costs  # noqa: E402
+from hbu_dataplatform.hbu.opportunities import (
+    futures_economics,
+    site_costs,
+)  # noqa: E402
 
 
 def _with_futures(**overrides) -> pd.DataFrame:

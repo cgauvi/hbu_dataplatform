@@ -17,9 +17,9 @@ from dagster import materialize
 
 from asset_helpers import materialization_metadata
 
-from hbu_dataplatform.open_data import CkanClient
-from hbu_dataplatform.resources import ParquetStore, RfuResource
-from hbu_dataplatform.rfu import (
+from hbu_dataplatform.core.open_data import CkanClient
+from hbu_dataplatform.core.resources import ParquetStore, RfuResource
+from hbu_dataplatform.sources.rfu.client import (
     COMPARATIVE_FACTOR_COLUMN,
     RFU_YEAR_VAR,
     RfuError,
@@ -28,7 +28,11 @@ from hbu_dataplatform.rfu import (
     pick_postes_file,
     published_years,
 )
-from hbu_dataplatform.rfu_assets import POSTES_FILE, RFU_FILE, uniformized_property_wealth
+from hbu_dataplatform.sources.rfu.assets import (
+    POSTES_FILE,
+    RFU_FILE,
+    uniformized_property_wealth,
+)
 
 DOWNLOAD_BASE = "https://www.donneesquebec.ca/recherche/dataset/abc/resource/def/download"
 

@@ -20,18 +20,18 @@ import textwrap
 import time
 from pathlib import Path
 
-from hbu_dataplatform.layers import layer_of
+from hbu_dataplatform.core.layers import layer_of
 from hbu_dataplatform.rag.pgvector import PgSettings, PgVectorStore, PostgresUnavailable
 from hbu_dataplatform.rag.store import IndexMismatch, VectorStore
 from hbu_dataplatform.rag.vss import StoreLocked, VSSUnavailable
-from hbu_dataplatform.storage import DATA_ROOT, join, output_root
+from hbu_dataplatform.core.storage import DATA_ROOT, join, output_root
 
 #: Every partition `document_embeddings` has written: the glob spans
 #: `<date>/<neighborhood>/`, and each file carries those two as columns.
 #: `output_root()` is an `s3://` URI when `S3_BUCKET` is set - DuckDB's httpfs
 #: reads that glob directly, authenticated through `AWS_PROFILE`.
 #:
-#: The layer comes from `hbu_dataplatform.layers` rather than being spelled `silver`
+#: The layer comes from `hbu_dataplatform.core.layers` rather than being spelled `silver`
 #: here, for the same reason `ParquetStore.partition_dir` looks it up: this is
 #: a reader of an asset's output, and a reader that hard-codes the layer is
 #: the thing that breaks when the asset moves between them.

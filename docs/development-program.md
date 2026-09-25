@@ -1,6 +1,6 @@
 # The development program — a lot's envelope, solved with CP-SAT
 
-`hbu_dataplatform.program` answers one question: given what the *grille des usages et
+`hbu_dataplatform.hbu.program` answers one question: given what the *grille des usages et
 des normes* lets you build on this parcel, and what CMHC says the
 neighbourhood pays, **what is the most valuable thing to build?** Everything
 upstream of it — the cadastre, the roll, the frontage, the setbacks, the rent
@@ -8,15 +8,15 @@ and vacancy grids — exists to fill in that one question's inputs.
 
 The answer is an integer program, solved by Google OR-Tools' CP-SAT
 (`ortools>=9.10`), and the module is
-[`src/hbu_dataplatform/program.py`](../src/hbu_dataplatform/program.py). One call to
+[`src/hbu_dataplatform/hbu/program.py`](../src/hbu_dataplatform/hbu/program.py). One call to
 `solve_program` is one row of `silver.lot_development_programs` — hbu_infra's
 [sql/017](../../hbu_infra/sql/017_silver_lot_development_programs.sql).
 
 | | |
 | --- | --- |
-| module | [`hbu_dataplatform.program`](../src/hbu_dataplatform/program.py) — no Dagster imports and no I/O, the same posture `comparables` and `role_foncier` take |
-| caller | [`hbu_dataplatform.hbu`](../src/hbu_dataplatform/hbu.py) `solve_envelopes`, one call per candidate envelope row |
-| asset | `lot_development_programs` in [`hbu_dataplatform.hbu_assets`](../src/hbu_dataplatform/hbu_assets.py), `make programs` |
+| module | [`hbu_dataplatform.hbu.program`](../src/hbu_dataplatform/hbu/program.py) — no Dagster imports and no I/O, the same posture `comparables` and `role_foncier` take |
+| caller | [`hbu_dataplatform.hbu.hbu`](../src/hbu_dataplatform/hbu/hbu.py) `solve_envelopes`, one call per candidate envelope row |
+| asset | `lot_development_programs` in [`hbu_dataplatform.hbu.hbu_assets`](../src/hbu_dataplatform/hbu/hbu_assets.py), `make programs` |
 | entry point | `solve_program(column_or_envelope, lot, economics, **assumptions) -> DevelopmentProgram` |
 | tests | [`tests/unit/test_program.py`](../tests/unit/test_program.py), against hand-written envelopes rather than municipal PDFs |
 
@@ -39,7 +39,7 @@ whole numbers and CP-SAT is the tool that fits the shape of the problem rather
 than the one that happens to be installed.
 
 **What it is handed, and what it is not.** A `ZoneColumn` already parsed out of
-a grid, never a PDF. [`hbu_dataplatform.zoning_grid`](../src/hbu_dataplatform/zoning_grid.py)
+a grid, never a PDF. [`hbu_dataplatform.zoning.zoning_grid`](../src/hbu_dataplatform/zoning/zoning_grid.py)
 produces one, and it is a separate module for a reason: `linked_documents`
 flattens a grid to text for the embedding corpus and `pypdf`'s default
 extraction drops the column alignment that says *which* column an `X` belongs
@@ -520,7 +520,7 @@ nearly half the rent. The cellar plates compound it — they are rented at
 `commercial_area_m2` entirely — so no arithmetic on the area columns
 reconstructs the split.
 
-What reads it is [`hbu_dataplatform.proforma`](site-theses.md): a lease-up and an
+What reads it is [`hbu_dataplatform.hbu.proforma`](site-theses.md): a lease-up and an
 exit cap rate are both weighted by which family earns the income, and a mixed
 building priced on the dwelling side of either is being priced as a building
 it is not.

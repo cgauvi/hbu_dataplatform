@@ -1,0 +1,556 @@
+"""How much street each lot faces, longest first.
+
+Frontage is the measurement a highest-and-best-use question turns on after
+area. Two lots of 400 m2 side by side are not the same site if one has 30 m on
+a boulevard and the other 6 m on a lane: the width of the street edge decides
+what can be built, how it is entered, and what it is worth. Neither publisher
+records it, but between them they draw it - and the drawing is simpler than it
+looks, because **in Quebec's renewed cadastre the street is a lot**. Infolot
+publishes avenue Chabot as parcels 3 946 199, 3 946 200 and their neighbours,
+some 13.5 m wide, exactly as it publishes the houses along it. So a lot's
+frontage is the length of the boundary it shares with one of those, and the
+whole measure is one intersection of two parcel boundaries - no buffer, no
+tolerance, nothing to tune. See `postgis.compute_lot_frontage`.
+
+That replaces a measure that could not be made to hold still. The street was
+taken as the geobase double's *line*, the lot boundary was matched to it within
+`buffer_m`, and the pieces running within 45 degrees of parallel were kept.
+Every part of that was compensation for a line standing in for a polygon: a lot
+line does not sit on the roadway, so the reach had to widen until it reached
+the lots - at 3 m it missed 90 % of Villeray, and the default ended at 10 m -
+and a reach that wide then caught the lot's own side boundaries, which the
+angle test had to throw back out. A road lot has none of those problems, and
+lot 3 790 556 measures 15.24 m against it, which is what the polygon says.
+
+**The assessment roll is the obvious way to find a road lot and it does not
+work here.** The roll files the public way under CUBF 45xx, but Montreal does
+not enter its roadways on the roll at all: of the fourteen road lots in the
+Villeray fixture, none appears in the roll's cadastre crosswalk, and the city
+states 859 CUBF-45 units in 437,192. So the street network identifies the
+street, which is what it is for - a geobase double side is drawn along the
+roadway and so runs *inside* the parcel that is the roadway. Over the fixture
+that picks out all fourteen with no false positive and no false negative. See
+`postgis.DEFAULT_ROAD_LOT_MIN_STREET_M`, which is the guard on that test rather
+than a threshold anything sits near.
+
+`silver.neighborhood_streets` earns its dependency twice over, then: it says
+which parcels are the roadway, and it *names* them, since a cadastral parcel
+carries no street name. Naming is all it does to the numbers - a label landing
+on the wrong side of a corner costs a name, never a metre.
+
+`FrontageConfig.min_street_m` is what is left to configure, and it decides
+which parcels count as road rather than what any lot then measures. The measure
+itself has no setting at all, which is the point of the change.
+
+**The road lots are published, not just used.** They go out as `road_lots.parquet`
+beside the frontages, because identifying them is the more valuable half of
+this asset and it used to be thrown away. Nothing else in the platform can name
+a Montreal street parcel: `hbu.road_parcel_lots` asks the assessment roll and
+gets 48 of this borough's roadways where the geobase double finds some fourteen
+hundred, so `lot_highest_best_use` was handing avenue Querbes to a CP-SAT solver
+and getting back a plausible apartment block on it. A road lot gets no frontage
+row - it fronts on nothing - so the set cannot travel as a column of the table
+beside it, and "no row here" cannot stand in for it either: that says roadway
+*or* landlocked parcel, and those two want opposite treatment. Hence a file of
+its own. See `ROAD_LOTS_FILE`, and `hbu.select_highest_best_use` for the gate.
+
+**A lot that shares no boundary with any road lot is measured a second time,
+with a reach.** The exact measure answers only where the cadastre lets it, and
+in Villeray it often does not: a road-widening strip between the parcel and the
+roadway is a parcel of its own, carries no geobase side inside it, and is
+therefore not a road lot - so lot 6 291 714 abuts nothing and comes back with
+no frontage though it faces 19 m of boulevard Pie-IX. On 2026-09-01 that left
+560 lots the solver still prices with none, and downstream a missing frontage
+is not a null: `envelope_assets` reads it as 0 m and holds the parcel to the
+narrowest column its zone prints.
+
+So step two spends the reach the exact measure refuses - on those lots only.
+The boundary segments running within 45 degrees of parallel to a street side
+and lying wholly within the reach are the frontage, tried at 8 m and then at
+16 m, stopping at whichever first places the lot. Nothing a road lot already
+answered is touched, so the argument for measuring the shared edge exactly is
+untouched too: no parcel with a real edge pays a tolerance. `buffer_m` on the
+row says which step answered - 0 for the edge, 8 or 16 for a reach - and
+`FrontageConfig.fallback_buffers_m` is where the ladder is set or turned off.
+See `postgis.DEFAULT_FRONTAGE_FALLBACK_BUFFERS_M`.
+
+A lot with no row after both steps abuts no road lot *and* faces no street line
+within 16 m: a true interior parcel, one reached only by a lane, or a street
+snapshot that stopped short. A road lot gets no row from either step - a street
+does not front on itself - and is left out of the coverage denominator rather
+than reported as landlocked. The count, the share and a sample of the lot
+numbers are logged as a warning and published as metadata rather than left to
+be noticed; see `num_lots_without_frontage`.
+
+**This asset loads nothing.** Both sides of the join are already in Postgres
+when it runs: `rag.lots` because `neighborhood_cadastre` put it there, and
+`silver.neighborhood_streets` because that asset owns its own table. Each of
+those is loaded in exactly one place, which is not tidiness but the fix for a
+real race - see `building_lots_assets` on why loading the cadastre from two
+assets means whoever commits second replaces the rows the first just computed
+against. So the dependencies here are on `building_lot_intersections` and
+`neighborhood_streets`, the guards below are on their partitions being
+populated, and the only table this one writes is its own.
+
+**A run is one tile, and the pool is the snapshot.** The lots measured are the
+ones a cut cell owns - `rag.lots.cell_partition` - and the road lots and street
+sides they are measured against are every one in the snapshot, with no borough
+and no tile predicate on them. That is what the tile axis buys this measure: a
+parcel on a borough line shares its edge with the road lot on the other side
+of it, and a borough-wide run could not see that lot at all. See
+`hbu_dataplatform.partitions.axes.tile_partitions` for the axis and `postgis.compute_lot_frontage`
+for the read.
+
+**`silver.lot_frontage` is owned by hbu_infra**, like every other table this
+repo writes into - sql/008_silver_lot_frontage.sql. Until it is applied to the
+database, a run fails naming the file to apply, which is why this asset is
+registered and given a job but left off the daily schedules. See
+`hbu_dataplatform.definitions`, and `lot_profiles` for the same posture.
+
+The `buffer_m` column that table carries says which of the two steps produced
+the row. **0** is the exact measure and the great majority of the table:
+nothing was allowed between the lot line and the street, because the boundary
+*is* the road lot's edge. **8** or **16** is a step-two estimate, and the
+number is how far the reach had to go to find a street side. It still dates a
+partition too - rows saying 3.0 or 10.0 predate all of this and were measured
+the old way, borough-wide, which is a different quantity from either.
+"""
+
+import geopandas as gpd
+import pandas as pd
+from dagster import (
+    AssetExecutionContext,
+    Config,
+    Failure,
+    MaterializeResult,
+    MetadataValue,
+    asset,
+)
+from pydantic import Field
+
+from hbu_dataplatform.cadastre.building_lots_assets import building_lot_intersections
+from hbu_dataplatform.core.frames import write_frame
+from hbu_dataplatform.core.layers import key_prefix
+from hbu_dataplatform.partitions.axes import (
+    city_of_tile,
+    metric_srid_for_city,
+    tile_partition_of,
+    tile_scrape_partitions,
+)
+from hbu_dataplatform.hbu.hbu import ROAD_LOT_FLAG_COLUMN
+from hbu_dataplatform.core.postgis import (
+    DEFAULT_FRONTAGE_FALLBACK_BUFFERS_M,
+    DEFAULT_ROAD_LOT_MIN_STREET_M,
+    ROAD_LOT_COLUMNS,
+    MissingRelation,
+    compute_lot_frontage,
+    fetch_lot_frontage,
+)
+from hbu_dataplatform.rag.pgvector import PostgresUnavailable
+from hbu_dataplatform.core.resources import ParquetStore, PostgisResource
+from hbu_dataplatform.core.storage import clear_parquet, join, storage_options
+from hbu_dataplatform.sources.rqtt.assets import STREETS_FILE_OUT, neighborhood_streets
+
+GROUP = "silver_streets"
+
+#: The frontages themselves, under
+#: `silver/lot_frontage/<YYYY-MM-DD>/<tile>/`.
+LOT_FRONTAGE_FILE = "lot_frontage.parquet"
+
+#: The parcels that *are* the street, beside them - one row per road lot, with
+#: how much geobase double street line runs inside it.
+#:
+#: A second file rather than a column on the first, because a road lot has no
+#: frontage row to carry one: it fronts on nothing, which is the definition.
+#: The absence is what made this set unreadable downstream - "no row in
+#: lot_frontage" says *either* roadway *or* landlocked parcel, and the two want
+#: opposite treatment - so it is written out rather than left to be inferred.
+#: `lot_highest_best_use` is the reader; see `hbu.select_highest_best_use`.
+ROAD_LOTS_FILE = "road_lots.parquet"
+
+
+class FrontageConfig(Config):
+    """How a parcel is recognised as a road, and how far step two may reach.
+
+    Config rather than constants for the reason `lot_profiles` makes its shed
+    cutoff config: both are judgements about how far the two publishers may
+    disagree, and neither is a fact the data settles.
+
+    `min_street_m` is not the old `buffer_m` under a new name, and the
+    difference is the whole point of the change. `buffer_m` decided what every
+    lot in the borough *measured*, so the table moved when it moved. This
+    decides only which parcels are the roadway, and the fixture separates those
+    from everything else by two orders of magnitude - road lots carry 105 to
+    325 m of street line, every other parcel carries none - so no real parcel
+    sits near it and the frontages do not move with it.
+
+    `fallback_buffers_m` is a reach, and it is one on purpose - but it is
+    spent only where the exact measure came back with nothing, so it still
+    cannot move a frontage the cadastre already answered. Empty turns step two
+    off entirely and gives back the one-step table.
+    """
+
+    min_street_m: float = Field(
+        default=DEFAULT_ROAD_LOT_MIN_STREET_M,
+        gt=0,
+        description=(
+            "How much geobase double street line must run inside a parcel for "
+            "that parcel to count as the roadway, in metres."
+        ),
+    )
+    fallback_buffers_m: list[float] = Field(
+        default=list(DEFAULT_FRONTAGE_FALLBACK_BUFFERS_M),
+        description=(
+            "How far step two reaches for a street on the lots that share no "
+            "boundary with a road lot, in metres, tried in order and stopping "
+            "at the first that places the lot. Empty disables step two."
+        ),
+    )
+
+
+@asset(
+    key_prefix=key_prefix("lot_frontage"),
+    partitions_def=tile_scrape_partitions,
+    deps=[building_lot_intersections, neighborhood_streets],
+    group_name=GROUP,
+    kinds={"postgres", "geoparquet"},
+    description=(
+        "How much of each lot's boundary faces each street side, in metres, "
+        "longest frontage first. The street is a cadastral lot in its own "
+        "right, so this is the boundary a parcel shares with one - an exact "
+        "intersection, with no buffer and no tolerance. Road lots are the "
+        "parcels a silver.neighborhood_streets side runs inside, and that side "
+        "also names the street; frontage_rank is 1 for the street a lot mostly "
+        "fronts on, so a corner lot has two rows and an interior lot none. "
+        "Computed for the lots one tile owns against every road lot and street "
+        "side in the snapshot - no borough line bounds the pool - upserted "
+        "into silver.lot_frontage on (scrape_date, cell_partition, lot_uid, "
+        f"cote_rue_id) and written to silver/lot_frontage/<YYYY-MM-DD>/"
+        f"<tile>/{LOT_FRONTAGE_FILE}. The road lots themselves are "
+        f"written beside it as {ROAD_LOTS_FILE} - one row per parcel that is "
+        "the street, which is a set no other input to this platform holds, "
+        "since the assessment roll does not reach Montreal's roadways. "
+        "lot_highest_best_use reads it to keep the solver off them."
+    ),
+)
+def lot_frontage(
+    context: AssetExecutionContext,
+    config: FrontageConfig,
+    store: ParquetStore,
+    postgis: PostgisResource,
+) -> MaterializeResult:
+    tile, scrape_date = tile_partition_of(context)
+
+    streets_path = join(
+        store.partition_dir(neighborhood_streets.key.path[-1], scrape_date, tile),
+        STREETS_FILE_OUT,
+    )
+    # Read only to check the partition is there and to report the denominator:
+    # the sides that identify and name the road lots are the ones
+    # `neighborhood_streets` already upserted into `silver.neighborhood_streets`.
+    # That asset used to write only parquet and this one loaded the table on its
+    # way past, which left a table whose writer was not the asset it is named
+    # for.
+    streets = _read_streets(streets_path, tile=tile, scrape_date=scrape_date)
+    if streets.empty:
+        raise Failure(f"{streets_path} holds no street side to measure against.")
+
+    try:
+        with postgis.connect() as connection:
+            result = compute_lot_frontage(
+                connection,
+                tile=tile,
+                scrape_date=scrape_date,
+                metric_srid=metric_srid_for_city(city_of_tile(tile)),
+                min_street_m=config.min_street_m,
+                fallback_buffers_m=tuple(config.fallback_buffers_m),
+            )
+            num_streets = int(result["num_streets"])
+            if num_streets == 0:
+                raise Failure(
+                    f"silver.neighborhood_streets holds no street side for "
+                    f"{scrape_date}, though {streets_path} has {len(streets)} "
+                    "- re-materialize neighborhood_streets for this tile."
+                )
+            num_lots = int(result["num_lots"])
+            if num_lots == 0:
+                # Not "no lot faces a street": no lots at all, which means the
+                # cadastre was never loaded rather than that the tile is
+                # landlocked. Raised inside the transaction so the frontage it
+                # just computed rolls back with it rather than sitting in
+                # silver.lot_frontage against a cadastre that is not there.
+                raise Failure(
+                    f"rag.lots holds no lot for tile {tile} {scrape_date} - "
+                    "materialize neighborhood_cadastre for the boroughs this "
+                    "tile covers, then building_lot_intersections for it, "
+                    "first."
+                )
+            # Inside the transaction that computed it, so the file is that
+            # answer rather than whatever a concurrent run leaves behind after
+            # the commit. Written outside it, below, so an S3 upload does not
+            # hold a write transaction open for its duration.
+            frame = fetch_lot_frontage(connection, tile=tile, scrape_date=scrape_date)
+    except PostgresUnavailable as exc:
+        raise Failure(f"Postgres unreachable for tile {tile} {scrape_date}: {exc}")
+    except MissingRelation as exc:
+        raise Failure(str(exc))
+
+    output_dir = store.partition_dir(context.asset_key.path[-1], scrape_date, tile)
+    removed = clear_parquet(output_dir)
+    if removed:
+        context.log.info("Removed %d file(s) from a previous run", len(removed))
+    path = write_frame(frame, join(output_dir, LOT_FRONTAGE_FILE))
+    # Beside the frontages, and in the same partition, because it is the same
+    # answer read the other way round: these are the parcels the measure
+    # identified as the street and therefore measured nothing for. Written
+    # unconditionally - a tile with no road lot writes an empty file rather
+    # than none, so a reader can tell "no roadway here" from "this asset has
+    # not run".
+    road_lots_path = write_frame(
+        _road_lot_frame(
+            result["road_lots"],
+            tile=tile,
+            scrape_date=scrape_date,
+            min_street_m=config.min_street_m,
+        ),
+        join(output_dir, ROAD_LOTS_FILE),
+    )
+
+    lots_matched = int(result["lots_matched"])
+    num_road_lots = int(result["num_road_lots"])
+    # The lots that could have had frontage. A road lot is not one of them - it
+    # is the street - so it is out of the denominator rather than counted as a
+    # parcel that failed to find one.
+    num_candidates = num_lots - num_road_lots
+    context.log.info(
+        "%s %s: %d street side(s) identifying %d road lot(s) -> %d frontage(s) "
+        "across %d of %d non-road lot(s), %.1f km in total, longest %.1f m "
+        "-> %s",
+        tile,
+        scrape_date,
+        num_streets,
+        num_road_lots,
+        int(result["frontages"]),
+        lots_matched,
+        num_candidates,
+        result["total_frontage_m"] / 1000.0,
+        result["max_frontage_m"],
+        path,
+    )
+    if int(result["lots_from_buffer"]):
+        # Said out loud rather than left in metadata, because these are the
+        # rows a reader should treat differently: an estimate from a reach, on
+        # a parcel the cadastre could not answer for exactly.
+        context.log.info(
+            "%s %s: %d lot(s) shared no boundary with a road lot and were "
+            "measured against a buffered street side instead (%s) - their "
+            "rows carry that reach in buffer_m",
+            tile,
+            scrape_date,
+            int(result["lots_from_buffer"]),
+            ", ".join(
+                f"{count} at {buffer_m} m"
+                for buffer_m, count in result["lots_by_buffer"].items()
+            ),
+        )
+
+    # Every lot that is not itself a road is expected to face a street. The
+    # ones that do not are named rather than only counted: a handful are
+    # genuine interior parcels or parcels reached only by a lane, but a run
+    # where the share jumps is a street snapshot that stopped short - and the
+    # lot numbers are what turns that from a percentage into something to go
+    # and look at. A warning rather than a Failure - see
+    # `test_no_lot_matching_is_not_a_failure`: a tile measuring badly is a
+    # number to read, not a partition to refuse.
+    # The measure is an exact shared boundary, which is right because the
+    # cadastre is a topological survey - abutting parcels reference the same
+    # points rather than coming close. This is the count that says so is still
+    # true: parcels lying a sliver's width off a road lot and touching none.
+    # On a clean partition it is 0. Anything else is frontage being lost to a
+    # survey gap, and it is called out separately from the interior parcels
+    # because it is a different problem with a different fix.
+    slivers = int(result.get("num_lots_near_road_without_frontage", 0))
+    if slivers:
+        context.log.warning(
+            "%s %s: %d parcel(s) lie within a sliver of a road lot without "
+            "touching one - the cadastre is not topologically clean here and "
+            "their frontage is being dropped, not measured as zero",
+            tile,
+            scrape_date,
+            slivers,
+        )
+
+    unmatched = num_candidates - lots_matched
+    sample = [str(number) for number in result.get("lots_without_frontage", [])]
+    if unmatched > 0:
+        context.log.warning(
+            "%s %s: %d of %d non-road lot(s) (%.1f %%) share no boundary with "
+            "any road lot and are flagged as potentially problematic%s",
+            tile,
+            scrape_date,
+            unmatched,
+            num_candidates,
+            100.0 * unmatched / num_candidates if num_candidates else 0.0,
+            f" - e.g. {', '.join(sample)}" if sample else "",
+        )
+
+    return MaterializeResult(
+        metadata={
+            "dagster/row_count": int(result["frontages"]),
+            "tile": tile,
+            "num_frontages": int(result["frontages"]),
+            "num_streets": num_streets,
+            "num_lots": num_lots,
+            # The parcels that *are* the street, and so the gap between
+            # `num_lots` and the denominator the two counts below are read
+            # against. A tile where this collapses to near zero is a street
+            # snapshot that did not land, not a tile without roads.
+            "num_road_lots": num_road_lots,
+            "num_lots_with_frontage": lots_matched,
+            # The symptom worth seeing: a lot facing nothing is a true interior
+            # parcel, one reached only by a lane, or a partition whose street
+            # snapshot stops short of it. Under a few percent is the first two;
+            # a third of the tile is the last.
+            "num_lots_without_frontage": max(unmatched, 0),
+            # Of those, the ones that are a survey gap rather than an interior
+            # parcel: within a sliver of a road lot and abutting none, so the
+            # exact intersection drops them instead of measuring them. 0 says
+            # the cadastre is still the topological survey this measure
+            # assumes; see postgis._SLIVER_GAP_M.
+            "num_lots_near_road_without_frontage": slivers,
+            # Which ones, up to a sample's worth - the count says how bad, this
+            # says where to start. Empty when every lot faced a street.
+            "lots_without_frontage": MetadataValue.text(", ".join(sample)),
+            "pct_lots_without_frontage": round(
+                100.0 * unmatched / num_candidates, 2
+            )
+            if num_candidates > 0
+            else 0.0,
+            "num_streets_matched": int(result["streets_matched"]),
+            "num_rows_pruned": int(result["pruned"]),
+            # The two steps, told apart. The exact count is the measure; the
+            # buffered one is the rescue, and it is the number to watch rather
+            # than to admire - a partition where thousands of lots need a
+            # reach is one whose road lots are not being identified, and the
+            # fix for that is upstream, not a wider ladder.
+            "num_frontages_exact": int(result["frontages_exact"]),
+            "num_frontages_from_buffer": int(result["frontages_from_buffer"]),
+            "num_lots_from_buffer": int(result["lots_from_buffer"]),
+            # Which reach placed them, tier by tier. "how many needed 16 m" is
+            # what says whether the ladder is the right shape for a tile:
+            # a tail piling up on the last rung means the parcels beyond it
+            # are being lost, and one that never fires means it is decoration.
+            "lots_by_buffer_m": MetadataValue.json(result["lots_by_buffer"]),
+            "fallback_buffers_m": MetadataValue.json(
+                list(config.fallback_buffers_m)
+            ),
+            "total_frontage_km": round(result["total_frontage_m"] / 1000.0, 2),
+            "max_frontage_m": round(result["max_frontage_m"], 1),
+            "mean_frontage_m": round(result["total_frontage_m"] / lots_matched, 1)
+            if lots_matched
+            else 0.0,
+            # Which parcels counted as road, which is the only judgement in the
+            # run - the frontages themselves are exact and have no setting. It
+            # travels with the numbers rather than living only in the run's
+            # config, the way `buffer_m` used to.
+            "min_street_m": config.min_street_m,
+            # How far the nearest road lot sits above the cutoff. The cutoff
+            # is the run's only judgement, and this is what says whether it is
+            # a guard or a knife edge: on a real borough the parcels that are
+            # the roadway carry hundreds of metres of street line, so a
+            # minimum in the single digits means the identification does not
+            # turn on where `min_street_m` was set.
+            "min_road_lot_street_m": _min_street_m_inside(result["road_lots"]),
+            # How many of them are anywhere near it. A parcel that is the
+            # roadway carries hundreds of metres of street line; one that
+            # carries a few is a geobase side clipping a corner where the two
+            # publishers disagree, and calling it a road costs a real
+            # development site downstream. On the 2026 VSMPE partition this is
+            # 61 of 1,405 - small, and the number to watch rather than assume,
+            # because the lever for it is `min_street_m` and nothing else.
+            "num_road_lots_near_the_cutoff": _near_the_cutoff(
+                result["road_lots"], config.min_street_m
+            ),
+            "output_path": MetadataValue.path(str(path)),
+            # The parcels nothing else can name - see `ROAD_LOTS_FILE`.
+            "road_lots_path": MetadataValue.path(str(road_lots_path)),
+        }
+    )
+
+
+def _road_lot_frame(
+    road_lots: pd.DataFrame,
+    *,
+    tile: str,
+    scrape_date: str,
+    min_street_m: float,
+) -> pd.DataFrame:
+    """`compute_lot_frontage`'s road lots, ready to be written.
+
+    The partition travels as columns rather than in the path, because the path
+    carries bare keys rather than hive `key=value` pairs - the same reason
+    `neighborhood_streets` writes them onto its own frame. The tile and the
+    date are the partition and are stamped; a borough is not, because a tile
+    can span two and the lot's own `neighborhood` is the compute's to report
+    when it does. `lot_number` is what the reader joins on: `lot_uid` is a
+    bigserial that means nothing outside the load that minted it, and `hbu`
+    speaks lot numbers for exactly that reason.
+
+    `near_cutoff` is computed here rather than downstream because this is the
+    only place `min_street_m` is known - the reader has a file, not the config
+    that produced it. See `postgis.ROAD_LOT_FLAG_COLUMN` for what it is for.
+    """
+    frame = road_lots.copy()
+    frame[ROAD_LOT_FLAG_COLUMN] = (
+        frame["street_m_inside"] < _CUTOFF_MARGIN * float(min_street_m)
+        if not frame.empty
+        else pd.Series(dtype="bool")
+    )
+    frame["tile"] = tile
+    frame["scrape_date"] = scrape_date
+    return frame
+
+
+def _min_street_m_inside(road_lots: pd.DataFrame) -> float:
+    """The least street line any parcel had to carry to be called the roadway.
+
+    0.0 when nothing was - which is a tile whose street snapshot did not
+    land, and is already reported as `num_road_lots` being zero.
+    """
+    if road_lots.empty or "street_m_inside" not in road_lots.columns:
+        return 0.0
+    return round(float(road_lots["street_m_inside"].min()), 1)
+
+
+#: How many multiples of `min_street_m` a road lot has to clear to be out of
+#: the band worth watching. Twenty metres at the shipped cutoff of 1 m, which
+#: is well under the shortest real street parcel in the boroughs measured so
+#: far - the shortest in the Querbes fixture holds 126 m - and well over what a
+#: corner clip produces, which is under a metre.
+_CUTOFF_MARGIN = 20.0
+
+
+def _near_the_cutoff(road_lots: pd.DataFrame, min_street_m: float) -> int:
+    """Road lots identified by barely more street line than the cutoff asks.
+
+    Not an error and not filtered out: a short street stub is a real parcel of
+    roadway and belongs here. But so is a side clipping the corner of an
+    ordinary lot, and the two are indistinguishable at this end of the range -
+    so the count is published, because gating a parcel as road removes it from
+    the development inventory and that should never happen silently.
+    """
+    if road_lots.empty or "street_m_inside" not in road_lots.columns:
+        return 0
+    return int(
+        (road_lots["street_m_inside"] < _CUTOFF_MARGIN * float(min_street_m)).sum()
+    )
+
+
+def _read_streets(path: str, *, tile: str, scrape_date: str) -> gpd.GeoDataFrame:
+    try:
+        return gpd.read_parquet(path, storage_options=storage_options(path))
+    except FileNotFoundError as exc:
+        raise Failure(
+            f"{path} does not exist - materialize neighborhood_streets for "
+            f"tile {tile} {scrape_date} first."
+        ) from exc

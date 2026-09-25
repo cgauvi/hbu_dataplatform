@@ -29,11 +29,11 @@ make opportunities DATE=2026-09-01 NEIGHBORHOOD=VSMPE TEARDOWN_MAX_YEAR=1945 SIT
 make opportunities DATE=2026-09-01 NEIGHBORHOOD=VSMPE REQUIRE_POSITIVE_NPV=false
 ```
 
-The arithmetic is in [`hbu_dataplatform.opportunities`](../src/hbu_dataplatform/opportunities.py)
+The arithmetic is in [`hbu_dataplatform.hbu.opportunities`](../src/hbu_dataplatform/hbu/opportunities.py)
 (`SiteRules`, `assign_site_thesis`, `rank_site_opportunities`); the joins are in
-[`hbu_dataplatform.opportunity_assets`](../src/hbu_dataplatform/opportunity_assets.py); the
+[`hbu_dataplatform.hbu.opportunity_assets`](../src/hbu_dataplatform/hbu/opportunity_assets.py); the
 columns are hbu_infra's `sql/021`; the grid rows are read by
-[`hbu_dataplatform.zoning_grid`](../src/hbu_dataplatform/zoning_grid.py) and carried by
+[`hbu_dataplatform.zoning.zoning_grid`](../src/hbu_dataplatform/zoning/zoning_grid.py) and carried by
 `silver.zoning_grid_columns`.
 
 ## The fact that shapes every thesis
@@ -580,7 +580,7 @@ sentence each.
 ## Yield on cost and IRR
 
 A present value is one number and a decision needs two. Every future on the
-shortlist now carries the proforma around it — `hbu_dataplatform.proforma` — and
+shortlist now carries the proforma around it — `hbu_dataplatform.hbu.proforma` — and
 the two returns a screen is read on:
 
 - **yield on all-in cost**: the future's stabilised NOI over everything a

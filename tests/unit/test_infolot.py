@@ -15,18 +15,18 @@ import shapely
 from dagster import Failure, MultiPartitionKey, materialize
 from shapely.geometry import Polygon, box
 
-from hbu_dataplatform.infolot import (
+from hbu_dataplatform.sources.infolot.client import (
     OBJECT_ID_FIELD,
     InfolotClient,
     InfolotError,
     esri_polygon,
     normalize_dates,
 )
-from hbu_dataplatform.frames import write_frame
-from hbu_dataplatform.infolot_assets import LOTS_FILE, neighborhood_lots
-from hbu_dataplatform.open_data_assets import QUARTIERS_FILE, reference_neighborhoods
-from hbu_dataplatform.resources import InfolotResource, ParquetStore
-from hbu_dataplatform.storage import join
+from hbu_dataplatform.core.frames import write_frame
+from hbu_dataplatform.sources.infolot.assets import LOTS_FILE, neighborhood_lots
+from hbu_dataplatform.boundaries.assets import QUARTIERS_FILE, reference_neighborhoods
+from hbu_dataplatform.core.resources import InfolotResource, ParquetStore
+from hbu_dataplatform.core.storage import join
 
 DATE = "2026-08-01"
 NEIGHBORHOOD = "VSMPE"
@@ -153,7 +153,7 @@ def test_service_errors_arrive_with_http_200():
 @pytest.fixture(autouse=True)
 def no_backoff(monkeypatch):
     """Retry pauses are 1.5s upward; no test should wait them out."""
-    monkeypatch.setattr("hbu_dataplatform.infolot.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("hbu_dataplatform.sources.infolot.client.time.sleep", lambda _seconds: None)
 
 
 def dropped_connection():

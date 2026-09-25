@@ -41,7 +41,7 @@ buildings by geography and industry, and CMHC publishes rents and vacancies,
 but **neither breaks maintenance out by age of building** — so there is no
 series to read the curve off, and giving it a measured-looking provenance would
 be worse than saying which it is. The three parameters are therefore stated,
-they live in one place (`hbu_dataplatform.program`), and every row carries them in
+they live in one place (`hbu_dataplatform.hbu.program`), and every row carries them in
 `income_assumptions` so a rate can be read back against the curve that produced
 it. 0.43 is a 1955 building on the default curve and a 1990 one on a steeper
 one; the ratio alone does not say which.

@@ -42,7 +42,7 @@ itself is `RoleResource.roll_year`, defaulting to `$URBAN_RAG_ROLL_YEAR`.
 
 ## Two things the archive forces
 
-**It is unpacked to disk.** `hbu_dataplatform.bdoi` hands its zipped shapefiles
+**It is unpacked to disk.** `hbu_dataplatform.sources.bdoi.client` hands its zipped shapefiles
 straight to GDAL through `zip://` and never writes them out. That cannot work
 here: a GeoPackage is a SQLite database, and SQLite reads it by *seeking* —
 inside a deflate stream, every seek means decompressing from the start of the
@@ -136,7 +136,7 @@ would hand the *Logement* heading's name to whatever unit collided with it.
 **The category is not always one digit.** `2-3` is a single row spanning both
 leading digits: manufacturing is numbered 2000 through 3999. That is why the
 column is read as text and why this pipeline maps a leading digit to an income
-class in `hbu_dataplatform.comparables` rather than here — see the note on
+class in `hbu_dataplatform.hbu.comparables` rather than here — see the note on
 `CUBF_CLASSES` in that module.
 
 **The lookup is a left join, and eight rows say why.** The 2025 edition
@@ -265,7 +265,7 @@ same reason and made visible the same way.
 (`sql/013_silver_lot_assessed_values.sql`), like every other borough-scoped
 silver asset — one row per `(scrape_date, neighborhood, lot_number)`, the
 cadastre's other columns in the jsonb catch-all, upserted then pruned by
-`hbu_dataplatform.warehouse` like all the rest. That file has no `-- requires:`
+`hbu_dataplatform.core.warehouse` like all the rest. That file has no `-- requires:`
 header, so it lands on the first `db.py init` and the asset is scheduled
 normally.
 

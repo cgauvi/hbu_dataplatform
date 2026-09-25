@@ -34,7 +34,7 @@ from pathlib import Path
 import duckdb
 import requests
 
-from hbu_dataplatform.spectrum import default_ca_bundle
+from hbu_dataplatform.cities.montreal.spectrum import default_ca_bundle
 
 #: DuckDB will not persist an HNSW index to disk unless this is set: a crash
 #: partway through a write can leave the index inconsistent with the table it

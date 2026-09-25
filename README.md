@@ -42,7 +42,7 @@ schedules, and adding a borough are in [docs/running.md](docs/running.md).
 ## The shape of it
 
 A medallion in three layers, declared once in
-[layers.py](src/hbu_dataplatform/layers.py) so the asset key and the prefix it writes
+[layers.py](src/hbu_dataplatform/core/layers.py) so the asset key and the prefix it writes
 under cannot drift apart:
 
 | Layer | What it promises a reader |
@@ -97,7 +97,7 @@ Why each is read the way it is, and what each one gets wrong, is a page per
 source under [docs/](docs/README.md#the-data).
 
 `lot_development_programs` is where the highest-and-best-use question
-actually gets solved — one `hbu_dataplatform.program.solve_program` CP-SAT run per
+actually gets solved — one `hbu_dataplatform.hbu.program.solve_program` CP-SAT run per
 candidate envelope, maximising discounted net profit (`npv_cad`) over the mix
 of dwellings, commerce, industry and parking. The model itself — its caps, the
 three places a stall can go, and the `binding` vocabulary that says why an

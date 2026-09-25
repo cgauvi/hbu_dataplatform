@@ -20,12 +20,12 @@ import pytest
 from dagster import Failure, MultiPartitionKey, materialize
 from shapely.geometry import Point, box
 
-from hbu_dataplatform.address_assets import (
+from hbu_dataplatform.sources.addresses.assets import (
     ADDRESSES_FILE,
     neighborhood_addresses,
     parse_address_frame,
 )
-from hbu_dataplatform.adresses_quebec import (
+from hbu_dataplatform.sources.addresses.client import (
     ADDRESS_FIELDS,
     MAX_FILTER_VERTICES,
     AdressesQuebecClient,
@@ -36,10 +36,10 @@ from hbu_dataplatform.adresses_quebec import (
     parse_addresses,
     parse_formatted_address,
 )
-from hbu_dataplatform.frames import write_frame
-from hbu_dataplatform.open_data_assets import QUARTIERS_FILE, reference_neighborhoods
-from hbu_dataplatform.resources import AdressesQuebecResource, ParquetStore
-from hbu_dataplatform.storage import join
+from hbu_dataplatform.core.frames import write_frame
+from hbu_dataplatform.boundaries.assets import QUARTIERS_FILE, reference_neighborhoods
+from hbu_dataplatform.core.resources import AdressesQuebecResource, ParquetStore
+from hbu_dataplatform.core.storage import join
 
 DATE = "2026-08-01"
 NEIGHBORHOOD = "VSMPE"
@@ -418,7 +418,7 @@ def test_addresses_land_under_date_then_neighborhood(store, monkeypatch):
     frame = gpd.read_parquet(path)
     assert len(frame) == 1
     assert frame["IdAdr"].tolist() == ["id-1"]
-    # Bronze keeps the publisher's string unparsed - see hbu_dataplatform.layers.
+    # Bronze keeps the publisher's string unparsed - see hbu_dataplatform.core.layers.
     assert frame["AdresseFormatee"].tolist() == ["7430 Rue Lajeunesse, Montréal H2R2H8"]
     assert frame["Version"].tolist() == ["AQ20260901"]
     # The partition keys travel as columns, since the path holds bare values.
@@ -583,8 +583,8 @@ def stub_join(monkeypatch, *, boroughs=(NEIGHBORHOOD,), num_addresses=2):
     """Patch the four Postgres calls `lot_addresses` makes, recording each."""
     from contextlib import contextmanager
 
-    from hbu_dataplatform import address_assets
-    from hbu_dataplatform.resources import PostgisResource
+    from hbu_dataplatform.sources.addresses import assets as address_assets
+    from hbu_dataplatform.core.resources import PostgisResource
 
     calls: dict[str, list] = {"loaded": [], "compute": [], "fetch": [], "boroughs": []}
 
@@ -628,8 +628,8 @@ def stub_join(monkeypatch, *, boroughs=(NEIGHBORHOOD,), num_addresses=2):
 
 
 def run_join(store):
-    from hbu_dataplatform.address_assets import lot_addresses
-    from hbu_dataplatform.resources import PostgisResource
+    from hbu_dataplatform.sources.addresses.assets import lot_addresses
+    from hbu_dataplatform.core.resources import PostgisResource
 
     return materialize(
         [lot_addresses],

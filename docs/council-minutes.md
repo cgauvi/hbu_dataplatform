@@ -93,7 +93,7 @@ on it with their dates.
 
 ## The reading
 
-`hbu_dataplatform.council_items` turns text into a `PlanningItem`, and
+`hbu_dataplatform.cities.quebec_city.council.items` turns text into a `PlanningItem`, and
 `council_planning_items` writes one row per item. Two grains meet:
 
 * **a minute is cut into its agenda items** — the numbered headings the

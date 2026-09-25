@@ -41,7 +41,7 @@ from conftest import (
     whole_lot_clips,
 )
 
-from hbu_dataplatform.postgis import (
+from hbu_dataplatform.core.postgis import (
     DEFAULT_ROAD_LOT_MIN_STREET_M,
     MIN_ZONE_PIECE_AREA_M2,
     compute_lot_frontage,
@@ -78,7 +78,7 @@ REAR_ZONE = "H01-999"
 TOLERANCE_M2 = 0.5
 
 #: Where the clips are cut. The same MTM zone 8 every metric operation in
-#: `hbu_dataplatform.postgis` uses, so a metre here is the metre the function measures.
+#: `hbu_dataplatform.core.postgis` uses, so a metre here is the metre the function measures.
 METRIC_SRID = 32188
 
 

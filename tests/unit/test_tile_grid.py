@@ -26,7 +26,7 @@ import math
 
 import pytest
 
-from hbu_dataplatform import postgis, tile_grid
+from hbu_dataplatform.core import postgis, tile_grid
 
 #: Real coordinates, because the grid is only interesting where the data is.
 #: Villeray, the southern tip of the island, and a point out in the river that

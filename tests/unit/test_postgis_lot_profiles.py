@@ -21,8 +21,8 @@ from __future__ import annotations
 import pytest
 from psycopg._queries import _query2pg_nocache
 
-from hbu_dataplatform import postgis
-from hbu_dataplatform.postgis import (
+from hbu_dataplatform.core import postgis
+from hbu_dataplatform.core.postgis import (
     DEFAULT_MAX_BUILT_AREA_M2,
     LOT_CATEGORIES,
     MissingRelation,
@@ -115,7 +115,7 @@ class FakeCursor:
         elif text.startswith("CREATE TEMP TABLE") or text.startswith("DROP TABLE"):
             pass
         elif "INSERT INTO gold_lot_profiles_load" in text:
-            # The staging table `hbu_dataplatform.warehouse.upsert_select` lands the
+            # The staging table `hbu_dataplatform.core.warehouse.upsert_select` lands the
             # computed rows in, before the upsert and the prune below.
             self.rowcount = 10
         elif "INSERT INTO gold.lot_profiles" in text:

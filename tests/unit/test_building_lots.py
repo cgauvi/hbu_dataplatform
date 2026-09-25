@@ -1,6 +1,6 @@
 """Offline test for `building_lot_intersections`, both joins it computes.
 
-`hbu_dataplatform.postgis`'s compute functions are Postgres-only in substance - they
+`hbu_dataplatform.core.postgis`'s compute functions are Postgres-only in substance - they
 issue INSERT ... ST_Intersection statements - so nothing here touches a real
 database. What is worth testing without one is the asset's own logic: which
 tile it computes for, what it hands to the two compute functions and the two
@@ -34,12 +34,12 @@ from shapely.geometry import box
 
 from asset_helpers import materialization_metadata
 
-from hbu_dataplatform import building_lots_assets
-from hbu_dataplatform.building_lots_assets import building_lot_intersections
-from hbu_dataplatform.cadastre_assets import neighborhood_cadastre
-from hbu_dataplatform.partitions import tile_scrape_partitions
-from hbu_dataplatform.resources import ParquetStore, PostgisResource
-from hbu_dataplatform.storage import join
+from hbu_dataplatform.cadastre import building_lots_assets
+from hbu_dataplatform.cadastre.building_lots_assets import building_lot_intersections
+from hbu_dataplatform.cadastre.cadastre_assets import neighborhood_cadastre
+from hbu_dataplatform.partitions.axes import tile_scrape_partitions
+from hbu_dataplatform.core.resources import ParquetStore, PostgisResource
+from hbu_dataplatform.core.storage import join
 
 DATE = "2026-08-01"
 TILE = "0302303330102"

@@ -32,14 +32,14 @@ from asset_helpers import (
     stub_publish_by_neighborhood,
 )
 
-from hbu_dataplatform import role_assets
-from hbu_dataplatform.cubf import USE_DESCRIPTION_COLUMN
-from hbu_dataplatform.cubf_assets import CUBF_FILE, cubf_use_codes
-from hbu_dataplatform.frames import write_frame
-from hbu_dataplatform.open_data_assets import QUARTIERS_FILE, reference_neighborhoods
-from hbu_dataplatform.partitions import borough_code_for
-from hbu_dataplatform.resources import ParquetStore, PostgisResource, RoleResource
-from hbu_dataplatform.role_assets import (
+from hbu_dataplatform.sources.roll import assets as role_assets
+from hbu_dataplatform.sources.cubf.client import USE_DESCRIPTION_COLUMN
+from hbu_dataplatform.sources.cubf.assets import CUBF_FILE, cubf_use_codes
+from hbu_dataplatform.core.frames import write_frame
+from hbu_dataplatform.boundaries.assets import QUARTIERS_FILE, reference_neighborhoods
+from hbu_dataplatform.partitions.axes import borough_code_for
+from hbu_dataplatform.core.resources import ParquetStore, PostgisResource, RoleResource
+from hbu_dataplatform.sources.roll.assets import (
     ARROND_PREFIX,
     ASSESSMENT_UNITS_FILE,
     CADASTRE_FILE,
@@ -51,7 +51,7 @@ from hbu_dataplatform.role_assets import (
     lot_key,
     property_assessment_roll,
 )
-from hbu_dataplatform.role_foncier import (
+from hbu_dataplatform.sources.roll.client import (
     CADASTRE_LAYER,
     JOIN_KEY,
     MONTREAL_CODE_MUN,
@@ -68,7 +68,7 @@ from hbu_dataplatform.role_foncier import (
     municipality_filter,
     read_layer,
 )
-from hbu_dataplatform.storage import join
+from hbu_dataplatform.core.storage import join
 
 DATE = "2026-08-01"
 NEIGHBORHOOD = "VSMPE"

@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from hbu_dataplatform.partitions import city_of, known_neighborhoods
-from hbu_dataplatform.quebec_council import (
+from hbu_dataplatform.partitions.axes import city_of, known_neighborhoods
+from hbu_dataplatform.cities.quebec_city.council.councils import (
     KIND_CONSULTATION_FILE,
     KIND_COUNCIL_FILE,
     KIND_FICHE,

@@ -1,7 +1,7 @@
 """Offline tests for `neighborhood_cadastre`, the load half of what used to
 be `building_lot_intersections`.
 
-`hbu_dataplatform.postgis`'s loaders are Postgres-only in substance - they issue
+`hbu_dataplatform.core.postgis`'s loaders are Postgres-only in substance - they issue
 DELETE and COPY - so nothing here touches a real database. What is worth
 testing without one is the asset's own logic: which partitions it reads,
 what it hands to `postgis.load_lots`/`load_buildings`/`load_features`, what
@@ -33,16 +33,19 @@ from shapely.geometry import Point, Polygon, box
 
 from asset_helpers import materialization_metadata
 
-from hbu_dataplatform import cadastre_assets
-from hbu_dataplatform.assets import neighborhood_features
-from hbu_dataplatform.bdoi_assets import BUILDINGS_FILE, neighborhood_buildings
-from hbu_dataplatform.cadastre_assets import CADASTRE_FILE, neighborhood_cadastre
-from hbu_dataplatform.frames import write_frame
-from hbu_dataplatform.infolot_assets import LOTS_FILE, neighborhood_lots
-from hbu_dataplatform.partitions import scrape_partitions
-from hbu_dataplatform.postgis import GroundOutsideCut
-from hbu_dataplatform.resources import ParquetStore, PostgisResource
-from hbu_dataplatform.storage import join
+from hbu_dataplatform.cadastre import cadastre_assets
+from hbu_dataplatform.zoning.features_assets import neighborhood_features
+from hbu_dataplatform.sources.bdoi.assets import BUILDINGS_FILE, neighborhood_buildings
+from hbu_dataplatform.cadastre.cadastre_assets import (
+    CADASTRE_FILE,
+    neighborhood_cadastre,
+)
+from hbu_dataplatform.core.frames import write_frame
+from hbu_dataplatform.sources.infolot.assets import LOTS_FILE, neighborhood_lots
+from hbu_dataplatform.partitions.axes import scrape_partitions
+from hbu_dataplatform.core.postgis import GroundOutsideCut
+from hbu_dataplatform.core.resources import ParquetStore, PostgisResource
+from hbu_dataplatform.core.storage import join
 
 DATE = "2026-08-01"
 NEIGHBORHOOD = "VSMPE"
@@ -239,7 +242,7 @@ def test_loads_all_three_partitions_then_asks_which_tiles_they_fell_in(
 def test_a_missing_rag_working_set_names_the_file_to_apply(store, monkeypatch):
     """The three `rag` tables are hbu_infra's, and nothing else checks them.
 
-    Every silver and gold write goes through `hbu_dataplatform.warehouse`, which
+    Every silver and gold write goes through `hbu_dataplatform.core.warehouse`, which
     checks its own target; `rag.lots`/`rag.buildings`/`rag.features` are loaded
     by raw DELETE/COPY/INSERT, so without the preflight a database that has
     never had sql/002 applied fails as `relation "rag.lots" does not exist` -
@@ -572,6 +575,6 @@ def test_the_two_id_column_tuples_agree():
     drifted once - `no_zone` was added to one and not the other - and the
     symptom was a whole city that could not be loaded.
     """
-    from hbu_dataplatform.rag_assets import _ID_COLUMNS
+    from hbu_dataplatform.rag.assets import _ID_COLUMNS
 
     assert cadastre_assets.FEATURE_ID_COLUMNS == _ID_COLUMNS
