@@ -31,7 +31,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from hbu_dataplatform.cities.montreal.spectrum import USER_AGENT, default_ca_bundle
+from hbu_dataplatform.core.http import USER_AGENT, default_ca_bundle
 
 #: Where the workbooks the landing page links to actually live. The page
 #: itself is `cmhc_assets.SOURCE_URL`; these are on the asset CDN, which

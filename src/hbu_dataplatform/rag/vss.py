@@ -17,7 +17,7 @@ So there are three routes, tried in this order:
 2. **`INSTALL vss`**, DuckDB's own downloader, for a machine with clean egress
    and no dev extra.
 3. **A download through `requests`**, which honours the corporate CA bundle
-   (see `spectrum.default_ca_bundle`), cached on disk and handed to DuckDB as a
+   (see `core.http.default_ca_bundle`), cached on disk and handed to DuckDB as a
    local file. This is what covers a proxy that inspects TLS but does *not*
    truncate.
 
@@ -34,7 +34,7 @@ from pathlib import Path
 import duckdb
 import requests
 
-from hbu_dataplatform.cities.montreal.spectrum import default_ca_bundle
+from hbu_dataplatform.core.http import default_ca_bundle
 
 #: DuckDB will not persist an HNSW index to disk unless this is set: a crash
 #: partway through a write can leave the index inconsistent with the table it

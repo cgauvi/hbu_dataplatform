@@ -62,7 +62,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from hbu_dataplatform.rag.documents import DocumentError, PdfFetcher
-from hbu_dataplatform.cities.montreal.spectrum import USER_AGENT, default_ca_bundle
+from hbu_dataplatform.core.http import USER_AGENT, default_ca_bundle
 
 #: The iframe the city's minutes page embeds, per council id.
 DEFAULT_LISTING_URL_TEMPLATE = (

@@ -27,7 +27,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from hbu_dataplatform.cities.montreal.spectrum import default_ca_bundle
+from hbu_dataplatform.core.http import default_ca_bundle
 
 #: Tables whose URL column points at a document worth indexing, keyed by the
 #: file slug written by ``neighborhood_features``. The zoning grids are the

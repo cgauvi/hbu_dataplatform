@@ -25,26 +25,20 @@ inside the SQL string.
 
 from __future__ import annotations
 
-import os
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
-from pathlib import Path
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from hbu_dataplatform.core.http import USER_AGENT, default_ca_bundle
+
 DEFAULT_BASE_URL = (
     "https://spectrum.montreal.ca/connect/analyst/controller/connectProxy"
     "/rest/Spatial/FeatureService"
 )
-
-#: Sent by every client in the project. Not decoration: donnees.montreal.ca
-#: answers 403 to the `python-requests/x.y` default that `requests` would
-#: otherwise send, and naming the caller is the polite thing to do on three
-#: public servers that owe this pipeline nothing.
-USER_AGENT = "urban-rag/0.1.0 (Dagster pipeline)"
 
 #: Geometry is stored in each table's native CRS (usually epsg:42104, an
 #: MTM-zone-8 variant). MI_Transform is the only way to get lon/lat out, as the
@@ -232,22 +226,6 @@ class SpectrumClient:
             f"{metadata.table}: stopped after {max_pages} pages of {page_length}; "
             "raise max_pages if the table is really that large"
         )
-
-
-def default_ca_bundle() -> str | None:
-    """CA bundle to trust, for laptops behind a TLS-inspecting proxy.
-
-    ``requests`` verifies against ``certifi`` and reads only
-    ``REQUESTS_CA_BUNDLE``/``CURL_CA_BUNDLE``, while managed machines usually
-    advertise their corporate root through ``SSL_CERT_FILE`` instead. Without
-    this, every call fails with a certificate-verify error.
-    """
-    for variable in ("REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "SSL_CERT_FILE"):
-        value = os.environ.get(variable)
-        if value and Path(value).exists():
-            return value
-    return None
-
 
 def _raise_for_service_exception(payload: object, path: str, url_param: str) -> None:
     if not isinstance(payload, dict):

@@ -52,7 +52,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from hbu_dataplatform.cities.montreal.spectrum import USER_AGENT, default_ca_bundle
+from hbu_dataplatform.core.http import USER_AGENT, default_ca_bundle
 
 #: The endpoint the product is published under, kept for the record. It is a
 #: WMS connector on the MapServer below and cannot answer a feature query —

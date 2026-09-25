@@ -60,7 +60,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from hbu_dataplatform.cities.montreal.spectrum import USER_AGENT, default_ca_bundle
+from hbu_dataplatform.core.http import USER_AGENT, default_ca_bundle
 
 #: Where the workbook is served from. The landing page is `SOURCE_URL` below;
 #: this is the CDN path it links to, which carries no year and no revision in
