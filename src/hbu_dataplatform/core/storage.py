@@ -20,6 +20,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+#: The repository root: core/storage.py -> core -> hbu_dataplatform -> src -> here.
+#: tests/unit/test_storage.py checks that, so moving this file fails loudly.
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 #: Local root for state that never moves to S3: the PDF cache, the Dagster IO

@@ -1094,6 +1094,7 @@ defs = Definitions(
         vacancy_rates_job,
         average_rents_job,
         rag_corpus_job,
+        council_minutes_job,
         document_index_job,
     ],
     schedules=[

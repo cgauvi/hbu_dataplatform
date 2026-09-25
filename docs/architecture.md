@@ -36,6 +36,58 @@ is a silver or gold dataset's own table.
 The tree is the record — losing the database costs a reload rather than a
 re-scrape, which for a live municipal source no later run can undo.
 
+## Package layout
+
+`src/hbu_dataplatform/` is grouped by what a module is about, not by which
+medallion layer it writes. Each subpackage owns the pure logic (clients,
+parsers, the solver) *and* the Dagster assets and resources that wrap it, so
+`definitions.py` is the only module that has to know about every package.
+Every `__init__.py` is empty on purpose: packages depend on each other's
+modules, never on a package object, which is what keeps the graph free of
+import cycles.
+
+```
+hbu_dataplatform/
+  definitions.py        the code location: the ASSETS list, jobs, schedules, resources
+  dagster_home.py       writes dagster.yaml from the environment, then execs the command
+  core/                 generic plumbing, imports nothing outside itself
+    storage  warehouse  layers  frames  postgis  digest  tile_grid  tile_cut
+    open_data           a CKAN client with no portal baked in
+    http                USER_AGENT and the CA bundle every client sends and trusts
+    pg                  PgSettings: where Postgres is and how to authenticate
+    resources           ParquetStore, PostgisResource, CkanResource
+  partitions/
+    axes                the date, neighborhood and tile axes and their helpers
+    cities              City, and the switch from a key to the city it is in
+    guards              the bronze scrape-month guard
+    neighborhoods, tiles   the two CLIs
+  cities/               one package per publisher city
+    montreal/           registry (boroughs, Spectrum namespaces, CMHC quartiers,
+                        MarketBeat submarkets), spectrum, costs/, rents/
+    quebec_city/        registry (arrondissements, quartiers), zoning, council/
+    saguenay/           registry (the one key, the limit layer), zoning
+  sources/              province- or nation-wide publishers, one package each:
+                        infolot, bdoi, addresses, roll, cubf, rfu, rqtt, cmhc
+                        (client, assets, resources), plus donnees_quebec
+  boundaries/           reference_neighborhoods and the borough/city outlines
+  zoning/               the grid parser, the zoning features, envelopes, pieces, setbacks
+  cadastre/             the lot chain's joins: cadastre, building intersections, frontage
+  hbu/                  program (CP-SAT), hbu, massing, proforma, opportunities,
+                        comparables, and their assets
+  map/                  layer specs, the MVT render, PMTiles, the two map assets
+  rag/                  documents, chunks, embeddings, the DuckDB and pgvector stores,
+                        the corpus assets and resources, the `urban-rag` CLI
+```
+
+Three edges are worth knowing. `partitions.cities` reads the three city
+registries, which import nothing, so adding a city is a registry module plus
+a line in `cities.py`. The zoning parsers (`zoning.zoning_grid`,
+`cities.*.zoning`) import `hbu.program` for the zone-column vocabulary while
+`hbu`'s assets import `zoning`'s; that is a package-level loop but not a
+module-level one, because `program.py` imports nothing from the package.
+And `partitions.guards` lives beside the axes rather than in `core` because
+it reads the scrape timezone the date axis is cut in.
+
 ## Two spatial axes
 
 Every partitioned table has `scrape_date` as one key. Which spatial column is
@@ -394,4 +446,3 @@ handful with self-intersecting rings that shapely rejects (5 of 3,135 rows in
 the first VSMPE snapshot). They are counted in the `num_invalid_geometries`
 materialization metadata and logged per table; repair with
 `gdf.geometry.make_valid()` downstream if a consumer needs it.
-

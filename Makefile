@@ -298,7 +298,8 @@ DOCKER_RUN := docker run --rm -it \
 	neighborhoods neighborhood-add neighborhood-remove lots buildings building-lots \
 	quartiers cmhc costs vacancy rents zone-pieces addresses envelopes setbacks \
 	lot-profiles programs hbu opportunities massing map_cells map_tiles \
-	streets borough-streets roll lot-values comparables \
+	streets tile-streets roll lot-values comparables cadastre grid-columns \
+	lot-addresses council-minutes tiles tiles-of tiles-ensure \
 	rent-sources commercial-rents \
 	frontage corpus publish index search ask status \
 	require-q validate_defs clean clean-data clean-silver \
