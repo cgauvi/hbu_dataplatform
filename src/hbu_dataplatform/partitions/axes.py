@@ -8,7 +8,7 @@ tuple frozen into this module. Adding a borough is therefore a registration
 (`make neighborhood-add NEIGHBORHOOD=CIL`, or `register_neighborhoods`) and
 not a deploy, and the UI, the schedules and every `materialize` call read the
 same list. What *may* be registered is declared beside it: a key has to be
-one `hbu_dataplatform.partitions.axes.cities` can resolve into its city, and each
+one `hbu_dataplatform.partitions.cities` can resolve into its city, and each
 city's own registry (`hbu_dataplatform.cities.<city>.registry`) says what its
 publishers file that key under.
 """

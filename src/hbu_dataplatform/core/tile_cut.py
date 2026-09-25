@@ -92,7 +92,7 @@ CUT_VERSION = 2
 #: `warehouse.dataset_versions` that comes with it.
 #:
 #: Each cell names the city whose publishers its ground belongs to, as the
-#: plain value of `hbu_dataplatform.partitions.axes.cities.City` (a string here rather than the
+#: plain value of `hbu_dataplatform.partitions.cities.City` (a string here rather than the
 #: enum, because `partitions` imports this module and not the other way
 #: round). A cell has exactly one city by construction: the cut is built per
 #: city's lots and two cities' ground diverges high in the tree - Montreal

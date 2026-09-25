@@ -4,7 +4,7 @@ CMHC surveys the Montreal *census metropolitan area* and cuts it into its own
 neighborhoods, which do not line up with the boroughs this pipeline is
 partitioned on: `VSMPE` is three CMHC quartiers, `Outremont` is one, and `PR`
 is the borough plus a neighbouring municipality CMHC will not split out. The
-crosswalk is `hbu_dataplatform.partitions.axes.cities.CMHC_QUARTIERS`.
+crosswalk is `hbu_dataplatform.partitions.cities.CMHC_QUARTIERS`.
 
 That crosswalk is exactly where the bronze/silver line falls here.
 

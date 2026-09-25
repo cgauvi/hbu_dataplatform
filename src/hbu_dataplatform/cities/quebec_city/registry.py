@@ -4,7 +4,7 @@ city's publishers.
 A key here is one of the six arrondissements. It resolves into the
 arrondissement layer on Données Québec (by its ``ABREVIATION``), the city's
 ArcGIS zoning service and its published specification grid, and CMHC's
-Québec quartiers. `hbu_dataplatform.partitions.axes.cities` composes this with the
+Québec quartiers. `hbu_dataplatform.partitions.cities` composes this with the
 other cities' registries.
 """
 

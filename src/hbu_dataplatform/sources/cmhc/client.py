@@ -187,7 +187,7 @@ def normalize_quartier(name: str) -> str:
     ``Sud-Ouest`` is published as ``South West ~ Sud-Ouest`` in one year and
     bare in the next, and Pierrefonds' quartier swaps a slash for a hyphen.
     Punctuation, case and accents are therefore collapsed before matching
-    against `hbu_dataplatform.partitions.axes.cities.CMHC_QUARTIERS`, so the crosswalk holds one
+    against `hbu_dataplatform.partitions.cities.CMHC_QUARTIERS`, so the crosswalk holds one
     canonical name per quartier instead of one per publication.
 
     Deliberately *not* fuzzy: two names that differ by a letter still differ,
