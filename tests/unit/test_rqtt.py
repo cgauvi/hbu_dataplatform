@@ -19,7 +19,7 @@ import pytest
 import requests
 from shapely.geometry import LineString
 
-from urban_rag.rqtt import (
+from hbu_dataplatform.rqtt import (
     CACHE_NAME_TEMPLATE,
     PUBLISHED_CRS,
     ROAD_LAYER,

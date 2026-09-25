@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from urban_rag.proforma import (
+from hbu_dataplatform.proforma import (
     M2_PER_SQFT,
     ProformaAssumptions,
     Timing,

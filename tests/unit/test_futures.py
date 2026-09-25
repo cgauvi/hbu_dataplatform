@@ -17,8 +17,8 @@ from dataclasses import replace
 import pandas as pd
 import pytest
 
-from urban_rag import hbu
-from urban_rag.hbu import (
+from hbu_dataplatform import hbu
+from hbu_dataplatform.hbu import (
     ENHANCEMENT_COLUMNS,
     EnhancementRules,
     ProgramAssumptions,
@@ -27,7 +27,7 @@ from urban_rag.hbu import (
     solve_enhancements,
     three_futures,
 )
-from urban_rag.program import (
+from hbu_dataplatform.program import (
     BuildingLevel,
     ConstructionCosts,
     DevelopmentProgram,

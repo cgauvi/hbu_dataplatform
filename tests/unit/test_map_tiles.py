@@ -19,9 +19,9 @@ from pathlib import Path
 import pytest
 from dagster import MultiPartitionKey, materialize
 
-from urban_rag import map_tiles, pmtiles_archive, tile_assets, tile_grid, tile_render
-from urban_rag.rag.documents import DOCUMENT_SOURCES
-from urban_rag.resources import ParquetStore, PostgisResource
+from hbu_dataplatform import map_tiles, pmtiles_archive, tile_assets, tile_grid, tile_render
+from hbu_dataplatform.rag.documents import DOCUMENT_SOURCES
+from hbu_dataplatform.resources import ParquetStore, PostgisResource
 
 DATE = "2026-08-01"
 NEIGHBORHOOD = "VSMPE"

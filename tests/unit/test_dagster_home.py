@@ -1,7 +1,7 @@
 from urllib.parse import parse_qs, unquote, urlsplit
 
-import urban_rag.dagster_home as dagster_home
-from urban_rag.dagster_home import configure_dagster_home, main, postgres_url_from_env
+import hbu_dataplatform.dagster_home as dagster_home
+from hbu_dataplatform.dagster_home import configure_dagster_home, main, postgres_url_from_env
 
 
 def test_dagster_home_defaults_to_local_storage(tmp_path):

@@ -41,7 +41,7 @@ endif
 # `rm -rf .venv` also arms the next re-sync.
 UV_SYNC_STAMP := $(CURDIR)/.venv/.uv-sync-stamp
 
-# Every dagster invocation goes through urban_rag.dagster_home, which writes
+# Every dagster invocation goes through hbu_dataplatform.dagster_home, which writes
 # $(DAGSTER_HOME)/dagster.yaml from the environment and then execs the command
 # it was handed - the same entrypoint the image uses, so a laptop run and a
 # container run configure the instance identically.
@@ -56,17 +56,17 @@ UV_SYNC_STAMP := $(CURDIR)/.venv/.uv-sync-stamp
 # and then ignore an environment that had changed underneath it. It also does
 # its own mkdir -p, which is why these targets no longer take $(DAGSTER_HOME)
 # as a prerequisite - only the docker ones, which bind-mount it, still do.
-DAGSTER := uv run python -m urban_rag.dagster_home dagster
-DAGSTER_DAEMON := uv run python -m urban_rag.dagster_home dagster-daemon
+DAGSTER := uv run python -m hbu_dataplatform.dagster_home dagster
+DAGSTER_DAEMON := uv run python -m hbu_dataplatform.dagster_home dagster-daemon
 # The same instance config, for a command of this package's own.
-URBAN_RAG_PYTHON := uv run python -m urban_rag.dagster_home python
+URBAN_RAG_PYTHON := uv run python -m hbu_dataplatform.dagster_home python
 
 # Assets are selected by their full `<layer>/<asset>` key, which is what
-# `key_prefix` in urban_rag.layers gives them. A bare name resolves to no
+# `key_prefix` in hbu_dataplatform.layers gives them. A bare name resolves to no
 # AssetsDefinition and dagster answers DagsterInvalidSubsetError, so adding a
 # target means looking the asset's layer up rather than copying its name.
-MODULE := urban_rag.definitions
-# The scrape partition is monthly (see urban_rag.partitions), so the key is
+MODULE := hbu_dataplatform.definitions
+# The scrape partition is monthly (see hbu_dataplatform.partitions), so the key is
 # the first of the current month rather than today. Override to re-derive an
 # earlier month from bronze already on disk: `make hbu DATE=2026-08-01`.
 #
@@ -74,10 +74,10 @@ MODULE := urban_rag.definitions
 # reach a bronze asset - `addresses`, `buildings`, `catalog`, `cmhc`, `corpus`,
 # `costs`, `features`, `lots`, `quartiers`, `rent-sources`, `roll`, `streets`
 # - fetch from a live publisher, so an earlier DATE would write today's data
-# under an earlier month's key. They refuse it; see urban_rag.guards and
+# under an earlier month's key. They refuse it; see hbu_dataplatform.guards and
 # docs/running.md.
 DATE ?= $(shell date +%Y-%m-01)
-# A key from urban_rag.partitions.known_neighborhoods(): a Montreal borough
+# A key from hbu_dataplatform.partitions.known_neighborhoods(): a Montreal borough
 # (VSMPE, RPP, ...) or a Quebec City arrondissement (CIL, RIV, ...). It has to
 # be registered on the partition axis first - `make neighborhood-add` - since
 # the axis is dynamic and lives in the Dagster instance, not in code.
@@ -115,7 +115,7 @@ TOLERANCE_M ?= 0.05
 # exists for - the session is rebuilt periodically, a transaction spanning that
 # rolls back whole, and unbatched runs could therefore fail to finish at all.
 # SETBACK_BATCH=0 does the partition in one transaction, which is only safe on
-# a stable link. See urban_rag.postgis.DEFAULT_SETBACK_BATCH_LOTS.
+# a stable link. See hbu_dataplatform.postgis.DEFAULT_SETBACK_BATCH_LOTS.
 SETBACK_BATCH ?= 2000
 SETBACK_RESUME ?= true
 # How far off a parcel an address point may sit and still be that parcel's,
@@ -124,13 +124,13 @@ SETBACK_RESUME ?= true
 # ground, and a point digitised against a building face lands just outside the
 # lot line. 0 disables the fallback and drops those addresses instead; the
 # rows record which basis they matched on either way. See
-# urban_rag.postgis.DEFAULT_ADDRESS_SNAP_M.
+# hbu_dataplatform.postgis.DEFAULT_ADDRESS_SNAP_M.
 ADDRESS_SNAP_M ?= 2.0
 # Which municipalities' assessment rolls `make roll` keeps out of the
 # province-wide archive, as a JSON list of five-digit `code_mun` values.
 # Defaults to Ville de Montréal, Ville de Québec and Ville de Saguenay, the
 # three cities this pipeline has keys in
-# (urban_rag.partitions.MUNICIPALITY_CODES); `[]` keeps the province. See
+# (hbu_dataplatform.partitions.MUNICIPALITY_CODES); `[]` keeps the province. See
 # docs/assessment-roll.md.
 CODE_MUN ?= ["66023","23027","94068"]
 # Whether `make lot-values` falls back to the assessment point for the units
@@ -177,12 +177,12 @@ RETAIL_BASE ?= 26.0
 RETAIL_BASE_PERIOD ?= 2025-01
 # Stalls each dwelling owes, for `make programs`. Villeray abolished
 # residential parking minima, so this is what the building offers rather than
-# what a by-law demands - urban_rag.program's own default. 0 removes the
+# what a by-law demands - hbu_dataplatform.program's own default. 0 removes the
 # residential half of the parking demand.
 STALLS_PER_DWELLING ?= 0.5
 # Dollars per square foot of dwelling, for `make programs`. The default is the
 # Altus wood-frame condo midpoint, which under-costs a lot zoned for a tower -
-# see urban_rag.hbu_assets.ProgramConfig.
+# see hbu_dataplatform.hbu_assets.ProgramConfig.
 RES_COST_SQFT ?= 257.5
 # The proforma `make programs` optimises: discounted net profit. DISCOUNT_PCT
 # discounts each year of stabilised NOI, TERMINAL_CAP_PCT prices the sale that
@@ -190,7 +190,7 @@ RES_COST_SQFT ?= 257.5
 # for over the stock average CMHC surveys - dwellings only, the commercial
 # rents are already market quotes. OPEX above is shared with `comparables` so
 # both sides of the redevelopment gap stay netted with one number. All stated
-# assumptions - see urban_rag.program.InvestmentAssumptions.
+# assumptions - see hbu_dataplatform.program.InvestmentAssumptions.
 DISCOUNT_PCT ?= 5.0
 HOLD_YEARS ?= 25
 TERMINAL_CAP_PCT ?= 4.5
@@ -206,7 +206,7 @@ RATIOS ?= [1.0,1.5,2.0,3.0]
 # the default and the only setting a scheduled run should use; naming
 # fewer is for rebuilding one layer's cells by hand.
 LAYERS ?= ["capacity","streets","lots","buildings","massing"]
-# The map layers `make map_tiles` renders - urban_rag.map_tiles.LAYERS, all
+# The map layers `make map_tiles` renders - hbu_dataplatform.map_tiles.LAYERS, all
 # nine by default. Narrow it to rebuild one archive after its source re-ran.
 TILE_LAYERS ?= ["zones","land_use","capacity","opportunities","streets","lots","buildings","surface_parking","massing"]
 # Where the investment-thesis lines fall for `make opportunities`: the share
@@ -363,15 +363,15 @@ quartiers: | $(UV_SYNC_STAMP) ## Materialize reference_neighborhoods for DATE (e
 # The neighborhood axis is a DynamicPartitionsDefinition: its keys are held in
 # the Dagster instance (the `dagster` schema on Postgres, or the local home)
 # rather than in code, so a borough is switched on by registering it. `add`
-# refuses a key urban_rag.partitions cannot resolve into its sources.
+# refuses a key hbu_dataplatform.partitions cannot resolve into its sources.
 neighborhoods: | $(UV_SYNC_STAMP) ## List the boroughs registered on the partition axis, and the ones that could be
-	$(URBAN_RAG_PYTHON) -m urban_rag.neighborhoods list
+	$(URBAN_RAG_PYTHON) -m hbu_dataplatform.neighborhoods list
 
 neighborhood-add: | $(UV_SYNC_STAMP) ## Register NEIGHBORHOOD on the partition axis (e.g. NEIGHBORHOOD=CIL)
-	$(URBAN_RAG_PYTHON) -m urban_rag.neighborhoods add $(NEIGHBORHOOD)
+	$(URBAN_RAG_PYTHON) -m hbu_dataplatform.neighborhoods add $(NEIGHBORHOOD)
 
 neighborhood-remove: | $(UV_SYNC_STAMP) ## Take NEIGHBORHOOD off the axis; its partitions stay on disk
-	$(URBAN_RAG_PYTHON) -m urban_rag.neighborhoods remove $(NEIGHBORHOOD)
+	$(URBAN_RAG_PYTHON) -m hbu_dataplatform.neighborhoods remove $(NEIGHBORHOOD)
 
 # The two borough-scoped loads beside `features`, and the hop to the tile axis.
 # Each needs `quartiers` for the same DATE; `lots` and `buildings` read
@@ -390,21 +390,21 @@ buildings: | $(UV_SYNC_STAMP) ## Materialize neighborhood_buildings (BDOI footpr
 cadastre: | $(UV_SYNC_STAMP) ## Land NEIGHBORHOOD's lots/buildings/features in rag.* for DATE, addressed to the cut
 	$(DAGSTER) asset materialize --select silver/neighborhood_cadastre --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
 
-# The tile axis is static - every cell of urban_rag.tile_cut.CUT, checked in
+# The tile axis is static - every cell of hbu_dataplatform.tile_cut.CUT, checked in
 # with its city - so there is nothing to register. `tiles` lists them;
 # `tiles-of` asks Postgres which cells a borough's loaded lots fall in, which
 # is the list to run after that borough is reloaded.
 tiles: | $(UV_SYNC_STAMP) ## List the cells of the tile cut, by city
-	$(URBAN_RAG_PYTHON) -m urban_rag.tiles list
+	$(URBAN_RAG_PYTHON) -m hbu_dataplatform.tiles list
 
 tiles-of: | $(UV_SYNC_STAMP) ## The cells NEIGHBORHOOD's loaded lots fall in for DATE (needs the database)
-	$(URBAN_RAG_PYTHON) -m urban_rag.tiles of $(NEIGHBORHOOD) $(DATE)
+	$(URBAN_RAG_PYTHON) -m hbu_dataplatform.tiles of $(NEIGHBORHOOD) $(DATE)
 
 # Before running cells side by side: creating a partition mid-run takes an
 # exclusive lock on the parent, which deadlocks two cells or stalls every
-# other one behind the first. See urban_rag.tiles.
+# other one behind the first. See hbu_dataplatform.tiles.
 tiles-ensure: | $(UV_SYNC_STAMP) ## Create every tile table's partition for every cell of DATE
-	$(URBAN_RAG_PYTHON) -m urban_rag.tiles ensure $(DATE)
+	$(URBAN_RAG_PYTHON) -m hbu_dataplatform.tiles ensure $(DATE)
 
 building-lots: | $(UV_SYNC_STAMP) ## Materialize building_lot_intersections for DATE x TILE
 	$(DAGSTER) asset materialize --select silver/building_lot_intersections --partition "$(DATE)|$(TILE)" -m $(MODULE)
@@ -480,7 +480,7 @@ setbacks: | $(UV_SYNC_STAMP) ## Materialize lot_buildable_setbacks for DATE x TI
 
 # Needs gold.lot_profiles and the rag.lot_documents view (hbu_infra sql/009,
 # sql/006) applied, and 006 only lands on a db.py init run *after* a corpus has
-# been indexed - see urban_rag.lot_profiles_assets. Also reads three silver
+# been indexed - see hbu_dataplatform.lot_profiles_assets. Also reads three silver
 # parquet partitions the database knows nothing about: `envelopes`, `vacancy`
 # and `rents` for the same DATE x NEIGHBORHOOD.
 lot-profiles: | $(UV_SYNC_STAMP) ## Materialize lot_profiles for DATE x TILE
@@ -488,15 +488,15 @@ lot-profiles: | $(UV_SYNC_STAMP) ## Materialize lot_profiles for DATE x TILE
 
 # Needs silver.lot_development_programs (hbu_infra sql/017) applied, and
 # `envelopes` run first for the same partition - the CP-SAT model in
-# urban_rag.program is run once per candidate row it wrote. `setbacks` is
+# hbu_dataplatform.program is run once per candidate row it wrote. `setbacks` is
 # read too if it has run, and is optional: without it the footprint is capped
 # on Taux d'implantation alone. `commercial-rents` likewise: with it the
 # commerce and industry are priced at the borough's surveyed rents, without
-# it at urban_rag.program's stated constants, which flatter retail badly.
+# it at hbu_dataplatform.program's stated constants, which flatter retail badly.
 # The objective is discounted net profit - DISCOUNT_PCT / HOLD_YEARS /
 # TERMINAL_CAP_PCT / OPEX / RENT_PREMIUM_PCT above are its levers, and
 # STALLS_PER_DWELLING and RES_COST_SQFT remain the heaviest two on the cost
-# side; see urban_rag.hbu_assets.ProgramConfig for the rest.
+# side; see hbu_dataplatform.hbu_assets.ProgramConfig for the rest.
 programs: | $(UV_SYNC_STAMP) ## Materialize lot_development_programs for DATE x TILE
 	$(DAGSTER) asset materialize --select silver/lot_development_programs --partition "$(DATE)|$(TILE)" -m $(MODULE) \
 		--config-json '{"ops":{"silver__lot_development_programs":{"config":{"stalls_per_dwelling":$(STALLS_PER_DWELLING),"residential_cost_per_sqft_cad":$(RES_COST_SQFT),"operating_expense_ratio":$(OPEX),"discount_rate_pct":$(DISCOUNT_PCT),"hold_years":$(HOLD_YEARS),"terminal_cap_rate_pct":$(TERMINAL_CAP_PCT),"new_build_rent_premium_pct":$(RENT_PREMIUM_PCT),"construction_months":$(CONSTRUCTION_MONTHS),"lease_up_months":$(LEASE_UP_MONTHS)}}}}'
@@ -712,7 +712,7 @@ status: | $(UV_SYNC_STAMP) ## What is in the vector store
 # Only the two bind-mounting targets below need this: docker creates a missing
 # mount source itself, but as root, and then nothing on the host can write to
 # it. The targets that run dagster directly get the directory from
-# urban_rag.dagster_home instead.
+# hbu_dataplatform.dagster_home instead.
 $(DAGSTER_HOME):
 	@mkdir -p $(DAGSTER_HOME)
 

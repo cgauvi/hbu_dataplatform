@@ -14,10 +14,10 @@ construction the real one passes - that is what a load error means.
 import pytest
 from dagster import AssetExecutionContext, MaterializeResult, asset
 
-from urban_rag import definitions
-from urban_rag.guards import guard_current_scrape_month, guards_scrape_month
-from urban_rag.layers import ASSET_LAYERS, Layer, layer_of
-from urban_rag.partitions import date_partitions
+from hbu_dataplatform import definitions
+from hbu_dataplatform.guards import guard_current_scrape_month, guards_scrape_month
+from hbu_dataplatform.layers import ASSET_LAYERS, Layer, layer_of
+from hbu_dataplatform.partitions import date_partitions
 
 
 def test_every_registered_bronze_asset_carries_the_guard():

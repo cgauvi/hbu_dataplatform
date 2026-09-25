@@ -36,7 +36,7 @@ from conftest import (
     load_zone_clips,
 )
 
-from urban_rag.postgis import (
+from hbu_dataplatform.postgis import (
     DEFAULT_ADDRESS_SNAP_M,
     compute_lot_addresses,
     compute_lot_zone_pieces,
@@ -141,7 +141,7 @@ def split_lot(connection):
         [(LOT_NUMBER, FRONT_ZONE, front), (LOT_NUMBER, REAR_ZONE, rear)],
     )
     # No `ensure_partition` for either of the two tables below: both are
-    # written through `urban_rag.warehouse`, which calls hbu_infra's own
+    # written through `hbu_dataplatform.warehouse`, which calls hbu_infra's own
     # `warehouse.ensure_partition` and builds *two* levels - a borough leaf
     # that is itself partitioned by month. Creating a flat leaf for the same
     # borough here would claim the LIST value and make the real one fail, and
@@ -164,7 +164,7 @@ def split_lot(connection):
 
 def address_row(address_id, civic, unit, street, point, *, suffix=None):
     """One row shaped the way `address_assets.parse_address_frame` shapes it."""
-    from urban_rag.adresses_quebec import civic_address
+    from hbu_dataplatform.adresses_quebec import civic_address
 
     return {
         "address_id": address_id,

@@ -1,4 +1,4 @@
-from urban_rag.rag.pgvector import PgSettings
+from hbu_dataplatform.rag.pgvector import PgSettings
 
 
 def test_connection_kwargs_can_use_a_tunnel_without_renaming_the_server(tmp_path):

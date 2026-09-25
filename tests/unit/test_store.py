@@ -13,8 +13,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from urban_rag.frames import write_vectors
-from urban_rag.rag.store import IndexMismatch, VectorStore
+from hbu_dataplatform.frames import write_vectors
+from hbu_dataplatform.rag.store import IndexMismatch, VectorStore
 
 
 def unit(*components: float) -> list[float]:

@@ -15,8 +15,8 @@ from __future__ import annotations
 import pytest
 from psycopg._queries import _query2pg_nocache
 
-from urban_rag import postgis
-from urban_rag.postgis import (
+from hbu_dataplatform import postgis
+from hbu_dataplatform.postgis import (
     MIN_BUILDING_OVERLAP_M2,
     MIN_BUILDING_PCT_OF_BUILDING,
     compute_intersections,

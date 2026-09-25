@@ -10,10 +10,10 @@ dependencies = [
     "dagster-webserver>=1.11",
     "duckdb>=1.4",
     "geopandas>=1.0",
-    # Reads the CMHC survey workbook (urban_rag.cmhc); pandas needs it as the
+    # Reads the CMHC survey workbook (hbu_dataplatform.cmhc); pandas needs it as the
     # xlsx engine and does not pull it in itself.
     "openpyxl>=3.1",
-    # CP-SAT, for the development program in urban_rag.program. Gross floor
+    # CP-SAT, for the development program in hbu_dataplatform.program. Gross floor
     # area is a footprint the model chooses times a storey count it also
     # chooses, so the one constraint that matters is a product of two decision
     # variables and an LP cannot express it. ~30 MB, no transitive weight.
@@ -22,7 +22,7 @@ dependencies = [
     # Reads linked zoning PDFs for the document corpus. Kept in the base install
     # because it is small and the asset can fetch PDFs without the encoder stack.
     #
-    # Capped below 7 because `urban_rag.zoning_grid` reaches into the layout
+    # Capped below 7 because `hbu_dataplatform.zoning_grid` reaches into the layout
     # mode's internals - `_text_extraction._layout_mode` and `_font` - for the
     # user-space coordinates of each string, which `extract_text` computes and
     # then spends on a fixed-width character grid rather than returning. The
@@ -44,7 +44,7 @@ dependencies = [
     "psycopg[binary]>=3.2",
     "pyarrow>=17",
     # geopandas already depends on this and uses it as its default I/O engine.
-    # Named here because `urban_rag.role_foncier` calls it directly rather than
+    # Named here because `hbu_dataplatform.role_foncier` calls it directly rather than
     # through geopandas: the assessment roll is a 2.8 GB GeoPackage of five
     # layers, and `list_layers` (to resolve the year-stamped layer names) and
     # `read_dataframe(..., where=...)` (to filter to Montreal in OGR rather
@@ -72,7 +72,7 @@ dev = [
     # extension repository.
     #
     # In `dev` rather than the base install: it is the *test suite* that needs
-    # vss present without a network, and `urban_rag.rag.vss` still installs it
+    # vss present without a network, and `hbu_dataplatform.rag.vss` still installs it
     # by its own routes at runtime when this is absent.
     #
     # Both packages come from https://github.com/santosh-d3vpl3x/duckdb_extensions,
@@ -94,24 +94,24 @@ rag = [
 ]
 
 [project.scripts]
-urban-rag = "urban_rag.rag.cli:main"
+urban-rag = "hbu_dataplatform.rag.cli:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/urban_rag"]
+packages = ["src/hbu_dataplatform"]
 
 [tool.dagster]
-module_name = "urban_rag.definitions"
-code_location_name = "urban_rag"
+module_name = "hbu_dataplatform.definitions"
+code_location_name = "hbu_dataplatform"
 
 [tool.dg]
 directory_type = "project"
 
 [tool.dg.project]
-root_module = "urban_rag"
+root_module = "hbu_dataplatform"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

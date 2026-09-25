@@ -10,7 +10,7 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from urban_rag.rag.documents import (
+from hbu_dataplatform.rag.documents import (
     DOCUMENT_SOURCES,
     ZONING_SOURCES,
     DocumentError,
@@ -223,7 +223,7 @@ def test_a_quebec_zone_row_is_cited_by_its_zone_code():
     "11004Mc" rather than nothing. It publishes no usage description either,
     so the title is null - the one field a Quebec document is missing.
     """
-    from urban_rag.rag_assets import _features_by_url
+    from hbu_dataplatform.rag_assets import _features_by_url
 
     frame = pd.DataFrame(
         {
@@ -248,7 +248,7 @@ def test_a_quebec_zone_row_is_cited_by_its_zone_code():
 
 def test_montreals_zone_number_still_wins_where_both_columns_exist():
     """`_ID_COLUMNS` is first-match-wins, so the order is load-bearing."""
-    from urban_rag.rag_assets import _features_by_url
+    from hbu_dataplatform.rag_assets import _features_by_url
 
     frame = pd.DataFrame(
         {

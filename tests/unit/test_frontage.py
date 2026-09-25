@@ -1,6 +1,6 @@
 """Offline test for `lot_frontage`.
 
-`urban_rag.postgis.load_streets`/`compute_lot_frontage` are Postgres-only in
+`hbu_dataplatform.postgis.load_streets`/`compute_lot_frontage` are Postgres-only in
 substance - they issue COPY and INSERT ... ST_Intersection statements over
 projected parcel boundaries - so nothing here touches a real database, the
 same posture `test_building_lots.py` takes for the two joins it covers.
@@ -29,22 +29,22 @@ from shapely.geometry import LineString
 
 from asset_helpers import materialization_metadata
 
-from urban_rag.frames import write_frame
-from urban_rag.hbu import ROAD_LOT_FLAG_COLUMN
-from urban_rag.frontage_assets import (
+from hbu_dataplatform.frames import write_frame
+from hbu_dataplatform.hbu import ROAD_LOT_FLAG_COLUMN
+from hbu_dataplatform.frontage_assets import (
     LOT_FRONTAGE_FILE,
     ROAD_LOTS_FILE,
     lot_frontage,
 )
-from urban_rag.postgis import (
+from hbu_dataplatform.postgis import (
     DEFAULT_FRONTAGE_FALLBACK_BUFFERS_M,
     DEFAULT_ROAD_LOT_MIN_STREET_M,
     FRONTAGE_NO_BUFFER,
     ROAD_LOT_COLUMNS,
 )
-from urban_rag.resources import ParquetStore, PostgisResource
-from urban_rag.storage import join
-from urban_rag.street_assets import STREETS_FILE_OUT, neighborhood_streets
+from hbu_dataplatform.resources import ParquetStore, PostgisResource
+from hbu_dataplatform.storage import join
+from hbu_dataplatform.street_assets import STREETS_FILE_OUT, neighborhood_streets
 
 DATE = "2026-08-01"
 TILE = "0302303330102"
@@ -214,7 +214,7 @@ def stub_postgis(
         "compute_lot_frontage": compute_lot_frontage,
         "fetch_lot_frontage": fetch_lot_frontage,
     }.items():
-        monkeypatch.setattr(f"urban_rag.frontage_assets.{name}", value)
+        monkeypatch.setattr(f"hbu_dataplatform.frontage_assets.{name}", value)
     return calls
 
 

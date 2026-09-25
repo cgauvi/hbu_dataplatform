@@ -29,7 +29,7 @@ CMHC surveys the Montreal **census metropolitan area** and cuts it into its own
 neighborhoods, which do not line up with the boroughs everything else here is
 partitioned on. `VSMPE` is three of them, `Outremont` is one, and `PR` is the
 borough *plus* Senneville, which CMHC will not split out. The crosswalk is
-`CMHC_QUARTIERS` in [partitions.py](../src/urban_rag/partitions.py), a third map
+`CMHC_QUARTIERS` in [partitions.py](../src/hbu_dataplatform/partitions.py), a third map
 alongside the Spectrum namespaces and the borough codes.
 
 It holds one canonical name per quartier, not one per publication: CMHC
@@ -99,7 +99,7 @@ to `URBAN_RAG_CMHC_SURVEY_YEAR`, so pointing a run at another year takes:
 
 ```powershell
 $env:URBAN_RAG_CMHC_SURVEY_YEAR = "2022"
-uv run dagster asset materialize --select silver/vacancy_rates --partition "2026-09-01|VSMPE" -m urban_rag.definitions
+uv run dagster asset materialize --select silver/vacancy_rates --partition "2026-09-01|VSMPE" -m hbu_dataplatform.definitions
 ```
 
 An env var rather than config alone because `--config-json` replaces a
@@ -119,7 +119,7 @@ final.
 same `CMHC_QUARTIERS` crosswalk as `vacancy_rates`:
 
 ```powershell
-uv run dagster asset materialize --select silver/average_rents --partition "2026-09-01|VSMPE" -m urban_rag.definitions
+uv run dagster asset materialize --select silver/average_rents --partition "2026-09-01|VSMPE" -m hbu_dataplatform.definitions
 ```
 
 It writes five borough rows, one per `bedroom_type`, plus the quartier cells

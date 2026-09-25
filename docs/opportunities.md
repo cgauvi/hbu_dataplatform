@@ -16,8 +16,8 @@ make opportunities DATE=2026-09-01 NEIGHBORHOOD=VSMPE MIXED_MIN_SHARE=0.10 TOP_N
 make opportunities DATE=2026-09-01 NEIGHBORHOOD=VSMPE LAND_FACTOR=1.3
 ```
 
-The arithmetic is in [`urban_rag.opportunities`](../src/urban_rag/opportunities.py);
-the asset is [`urban_rag.opportunity_assets`](../src/urban_rag/opportunity_assets.py);
+The arithmetic is in [`hbu_dataplatform.opportunities`](../src/hbu_dataplatform/opportunities.py);
+the asset is [`hbu_dataplatform.opportunity_assets`](../src/hbu_dataplatform/opportunity_assets.py);
 the table is hbu_infra's `sql/021`.
 
 ## The thesis is what you would build

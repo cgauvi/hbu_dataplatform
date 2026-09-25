@@ -1,12 +1,12 @@
 {
-  "name": "urban_rag",
+  "name": "hbu_dataplatform",
   "build": {
     "context": "..",
     "dockerfile": "../Dockerfile",
     "target": "dev"
   },
-  "workspaceFolder": "/workspaces/urban_rag",
-  "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/urban_rag,type=bind,consistency=cached",
+  "workspaceFolder": "/workspaces/hbu_dataplatform",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/hbu_dataplatform,type=bind,consistency=cached",
   "remoteUser": "app",
   "updateRemoteUserUID": true,
 
@@ -20,7 +20,7 @@
   ],
 
   "containerEnv": {
-    "DAGSTER_HOME": "/workspaces/urban_rag/.dagster_home",
+    "DAGSTER_HOME": "/workspaces/hbu_dataplatform/.dagster_home",
     "UV_PROJECT_ENVIRONMENT": "/opt/venv",
     "UV_LINK_MODE": "copy"
   },
@@ -50,7 +50,7 @@
           {
             "alias": "vect_db",
             "type": "file",
-            "path": "/workspaces/urban_rag/data/vect_db.duckdb",
+            "path": "/workspaces/hbu_dataplatform/data/vect_db.duckdb",
             "attached": true
           }
         ]

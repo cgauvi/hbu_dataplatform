@@ -1,6 +1,6 @@
 """What a lot yields, and which lots the roll says are like it.
 
-Two halves, matching the two modules. `urban_rag.comparables` is arithmetic
+Two halves, matching the two modules. `hbu_dataplatform.comparables` is arithmetic
 over frames and is tested directly - the CUBF classification, the per-lot
 aggregation, the income, the metric and the value bases. `lot_assessment_
 comparables` is tested by materializing it over a hand-built borough written
@@ -27,15 +27,15 @@ from dagster import Failure, MultiPartitionKey, materialize
 from shapely.geometry import Point, box
 
 from asset_helpers import materialization_metadata, stub_publish
-from urban_rag import comparables, comparables_assets
-from urban_rag.cubf import USE_DESCRIPTION_COLUMN
-from urban_rag.cmhc_assets import (
+from hbu_dataplatform import comparables, comparables_assets
+from hbu_dataplatform.cubf import USE_DESCRIPTION_COLUMN
+from hbu_dataplatform.cmhc_assets import (
     AVERAGE_RENTS_FILE,
     VACANCY_FILE,
     average_rents,
     vacancy_rates,
 )
-from urban_rag.comparables import (
+from hbu_dataplatform.comparables import (
     ComparableWeights,
     IncomeAssumptions,
     aggregate_units_by_lot,
@@ -47,21 +47,21 @@ from urban_rag.comparables import (
     summarise_comparables,
     use_class_of,
 )
-from urban_rag.comparables_assets import (
+from hbu_dataplatform.comparables_assets import (
     LOT_COMPARABLES_FILE,
     lot_assessment_comparables,
 )
-from urban_rag.rent_assets import COMMERCIAL_RENTS_FILE, commercial_rents
-from urban_rag.frames import write_frame
-from urban_rag.program import (
+from hbu_dataplatform.rent_assets import COMMERCIAL_RENTS_FILE, commercial_rents
+from hbu_dataplatform.frames import write_frame
+from hbu_dataplatform.program import (
     COMMERCIAL_REVENUE_PER_SQFT_CAD,
     COMMERCIAL_VACANCY_PCT,
     M2_PER_SQFT,
     MAX_MAINTENANCE_PREMIUM,
     MONTHS_PER_YEAR,
 )
-from urban_rag.resources import ParquetStore, PostgisResource
-from urban_rag.role_assets import (
+from hbu_dataplatform.resources import ParquetStore, PostgisResource
+from hbu_dataplatform.role_assets import (
     ASSESSMENT_UNITS_FILE,
     CADASTRE_FILE,
     LOT_VALUES_FILE,
@@ -69,7 +69,7 @@ from urban_rag.role_assets import (
     lot_assessed_values,
     property_assessment_roll,
 )
-from urban_rag.role_foncier import (
+from hbu_dataplatform.role_foncier import (
     DWELLINGS_COLUMN,
     FLOOR_AREA_COLUMN,
     JOIN_KEY,
@@ -83,7 +83,7 @@ from urban_rag.role_foncier import (
     VALUE_COLUMN,
     YEAR_BUILT_COLUMN,
 )
-from urban_rag.storage import join
+from hbu_dataplatform.storage import join
 
 DATE = "2026-08-01"
 NEIGHBORHOOD = "VSMPE"
@@ -1427,7 +1427,7 @@ def test_the_pool_read_is_bounded_by_the_search_radius(borough, halo):
 
 def test_the_tile_envelope_widened_by_the_radius_contains_the_reach():
     """At least the radius on every side, so no comparable can fall outside."""
-    from urban_rag import tile_grid
+    from hbu_dataplatform import tile_grid
 
     west, south, east, north = tile_grid.tile_bounds(
         *tile_grid.cell_of_quadkey(TILE)

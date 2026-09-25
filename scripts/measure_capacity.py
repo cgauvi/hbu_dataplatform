@@ -25,8 +25,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from urban_rag.postgis import connect  # noqa: E402
-from urban_rag.rag.pgvector import PgSettings  # noqa: E402
+from hbu_dataplatform.postgis import connect  # noqa: E402
+from hbu_dataplatform.rag.pgvector import PgSettings  # noqa: E402
 
 PROVINCE_LOTS = 3_900_000
 

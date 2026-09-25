@@ -32,14 +32,14 @@ from asset_helpers import (
     stub_publish_by_neighborhood,
 )
 
-from urban_rag import role_assets
-from urban_rag.cubf import USE_DESCRIPTION_COLUMN
-from urban_rag.cubf_assets import CUBF_FILE, cubf_use_codes
-from urban_rag.frames import write_frame
-from urban_rag.open_data_assets import QUARTIERS_FILE, reference_neighborhoods
-from urban_rag.partitions import borough_code_for
-from urban_rag.resources import ParquetStore, PostgisResource, RoleResource
-from urban_rag.role_assets import (
+from hbu_dataplatform import role_assets
+from hbu_dataplatform.cubf import USE_DESCRIPTION_COLUMN
+from hbu_dataplatform.cubf_assets import CUBF_FILE, cubf_use_codes
+from hbu_dataplatform.frames import write_frame
+from hbu_dataplatform.open_data_assets import QUARTIERS_FILE, reference_neighborhoods
+from hbu_dataplatform.partitions import borough_code_for
+from hbu_dataplatform.resources import ParquetStore, PostgisResource, RoleResource
+from hbu_dataplatform.role_assets import (
     ARROND_PREFIX,
     ASSESSMENT_UNITS_FILE,
     CADASTRE_FILE,
@@ -51,7 +51,7 @@ from urban_rag.role_assets import (
     lot_key,
     property_assessment_roll,
 )
-from urban_rag.role_foncier import (
+from hbu_dataplatform.role_foncier import (
     CADASTRE_LAYER,
     JOIN_KEY,
     MONTREAL_CODE_MUN,
@@ -68,7 +68,7 @@ from urban_rag.role_foncier import (
     municipality_filter,
     read_layer,
 )
-from urban_rag.storage import join
+from hbu_dataplatform.storage import join
 
 DATE = "2026-08-01"
 NEIGHBORHOOD = "VSMPE"

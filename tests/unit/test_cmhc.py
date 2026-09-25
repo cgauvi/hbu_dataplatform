@@ -22,7 +22,7 @@ import pytest
 from dagster import Failure, MultiPartitionKey, materialize
 from openpyxl import Workbook
 
-from urban_rag.cmhc import (
+from hbu_dataplatform.cmhc import (
     AVERAGE_RENTS_READING_MODE_URL,
     QUARTIER_SHEET,
     CmhcError,
@@ -35,7 +35,7 @@ from urban_rag.cmhc import (
     strip_bilingual,
     survey_period,
 )
-from urban_rag.cmhc_assets import (
+from hbu_dataplatform.cmhc_assets import (
     AVERAGE_RENTS_FILE,
     QUARTIER_AVERAGE_RENTS_FILE,
     QUARTIERS_FILE,
@@ -45,10 +45,10 @@ from urban_rag.cmhc_assets import (
     cmhc_vacancy_survey,
     vacancy_rates,
 )
-from urban_rag import cmhc_assets
-from urban_rag.partitions import CMHC_QUARTIERS, quartiers_for
-from urban_rag.resources import CmhcResource, ParquetStore, PostgisResource
-from urban_rag.storage import join
+from hbu_dataplatform import cmhc_assets
+from hbu_dataplatform.partitions import CMHC_QUARTIERS, quartiers_for
+from hbu_dataplatform.resources import CmhcResource, ParquetStore, PostgisResource
+from hbu_dataplatform.storage import join
 
 DATE = "2026-08-01"
 NEIGHBORHOOD = "VSMPE"
@@ -409,7 +409,7 @@ def test_the_reference_month_is_read_off_the_sheet(workbook, tmp_path):
 
 
 def test_every_mapped_borough_is_a_known_partition_key():
-    from urban_rag.partitions import NEIGHBORHOOD_NAMESPACES, known_neighborhoods
+    from hbu_dataplatform.partitions import NEIGHBORHOOD_NAMESPACES, known_neighborhoods
 
     # Every Montreal borough is mapped, and nothing is mapped that is not a
     # key of one city or the other.
@@ -814,7 +814,7 @@ def test_a_centre_the_survey_omits_entirely_is_empty_not_a_failure():
     missing rent as None by design. The borough prices off the vacancy survey
     and the roll instead.
     """
-    from urban_rag.cmhc_assets import _borough_rows
+    from hbu_dataplatform.cmhc_assets import _borough_rows
 
     # A snapshot that carries Montreal and nothing else.
     survey = pd.DataFrame(
@@ -841,7 +841,7 @@ def test_a_centre_that_publishes_only_some_of_its_quartiers_still_fails():
     would quietly change what the borough figure means - which is the whole
     reason this is a `Failure` and not a warning.
     """
-    from urban_rag.cmhc_assets import _borough_rows
+    from hbu_dataplatform.cmhc_assets import _borough_rows
 
     quartiers = quartiers_for(NEIGHBORHOOD)
     survey = pd.DataFrame(

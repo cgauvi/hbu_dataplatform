@@ -11,15 +11,15 @@ from dagster import MultiPartitionKey, materialize
 
 from tests.unit.asset_helpers import stub_publish
 from tests.unit.test_quebec_council import FakeResponse, make_pdf
-from urban_rag import council_assets
-from urban_rag.council_assets import (
+from hbu_dataplatform import council_assets
+from hbu_dataplatform.council_assets import (
     council_minutes,
     council_minutes_documents,
     council_planning_items,
 )
-from urban_rag.rag.documents import PdfFetcher
-from urban_rag.quebec_council import CouncilFetcher
-from urban_rag.resources import CouncilMinutesResource, ParquetStore, PdfCache, PostgisResource
+from hbu_dataplatform.rag.documents import PdfFetcher
+from hbu_dataplatform.quebec_council import CouncilFetcher
+from hbu_dataplatform.resources import CouncilMinutesResource, ParquetStore, PdfCache, PostgisResource
 
 DATE = "2026-08-01"
 

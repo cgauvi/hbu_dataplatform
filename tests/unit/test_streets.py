@@ -31,9 +31,9 @@ from shapely.geometry import LineString, MultiLineString, box
 
 from asset_helpers import materialization_metadata
 
-from urban_rag import tile_grid
-from urban_rag.frames import write_frame
-from urban_rag.open_data_assets import (
+from hbu_dataplatform import tile_grid
+from hbu_dataplatform.frames import write_frame
+from hbu_dataplatform.open_data_assets import (
     QUARTIERS_FILE,
     QUEBEC_BOROUGHS_FILE,
     SAGUENAY_LIMITS_FILE,
@@ -42,8 +42,8 @@ from urban_rag.open_data_assets import (
     reference_neighborhoods,
     street_network,
 )
-from urban_rag.resources import ParquetStore, PostgisResource, RqttResource
-from urban_rag.rqtt import (
+from hbu_dataplatform.resources import ParquetStore, PostgisResource, RqttResource
+from hbu_dataplatform.rqtt import (
     PUBLISHED_CRS,
     ROAD_LAYER,
     STREET_ID_FIELD,
@@ -51,9 +51,9 @@ from urban_rag.rqtt import (
     WGS84,
     RqttFetcher,
 )
-from urban_rag.storage import join
-from urban_rag import street_assets
-from urban_rag.street_assets import STREETS_FILE_OUT, _length_m, neighborhood_streets
+from hbu_dataplatform.storage import join
+from hbu_dataplatform import street_assets
+from hbu_dataplatform.street_assets import STREETS_FILE_OUT, _length_m, neighborhood_streets
 
 DATE = "2026-08-01"
 #: The cut cell the Montreal fixture sits under: a z14 cell holding Villeray,
@@ -670,7 +670,7 @@ def test_load_streets_promotes_every_segment_to_multi(monkeypatch):
     ever runs against a real database, which is where the promotion failing
     would first be seen.
     """
-    from urban_rag import postgis, warehouse
+    from hbu_dataplatform import postgis, warehouse
 
     seen: dict[str, object] = {}
 

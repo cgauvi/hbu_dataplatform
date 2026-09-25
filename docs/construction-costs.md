@@ -12,7 +12,7 @@ Unlike every other source here it publishes nothing to fetch as data. The cost
 table ships as one of the JavaScript files the page loads —
 `data/building-types.js`, 16 kB, declaring `CITIES` and a `TYPES` array whose
 entries carry a `rates` map of `city -> [low, high]`. That file is the source,
-so `urban_rag.estimator` reads it directly rather than driving the page, and
+so `hbu_dataplatform.estimator` reads it directly rather than driving the page, and
 parses the array literals rather than evaluating them: bare keys are quoted and
 the result goes through `json.loads`, so a file that grows a function call
 fails with its own text in the message instead of running.
@@ -46,7 +46,7 @@ Those are dollars per square foot, and the rows arrive in the guide's own
 order, which for this family is ascending storeys. **The band stays inside the
 label.** Turning `(13–39 Storeys)` into a `storeys_min`/`storeys_max` pair is
 reading the label, which is silver's job — see the layer contract in
-`urban_rag.layers`. There is no silver asset over these yet; when there is, it
+`hbu_dataplatform.layers`. There is no silver asset over these yet; when there is, it
 is the place that parse belongs.
 
 ## Parking is priced per stall, not per square foot

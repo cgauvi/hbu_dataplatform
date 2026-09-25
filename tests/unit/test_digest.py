@@ -26,7 +26,7 @@ import pandas as pd
 import pytest
 from shapely.geometry import Point, Polygon
 
-from urban_rag.digest import PROVENANCE_COLUMNS, frame_digest
+from hbu_dataplatform.digest import PROVENANCE_COLUMNS, frame_digest
 
 SQUARE = Polygon([(0, 0), (1, 0), (1, 1), (0, 1)])
 

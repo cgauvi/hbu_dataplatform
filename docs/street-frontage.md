@@ -169,7 +169,7 @@ miscoded, absent. City-wide the roll states 859 CUBF-45 units among 437,192:
 
 The 95,415 CUBF-45 units island-wide are mostly other municipalities, which do
 assess their roads. A roll reaching a parcel is a fact about tenure; it is not
-a map of the street network. `urban_rag.hbu.road_parcel_lots` says the same
+a map of the street network. `hbu_dataplatform.hbu.road_parcel_lots` says the same
 thing from the other side, and still reads the roll — for what the roll is
 good for, which is knowing that a parcel it *did* reach is not a development
 site.

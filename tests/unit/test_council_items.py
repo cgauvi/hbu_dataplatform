@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from urban_rag.council_items import (
+from hbu_dataplatform.council_items import (
     PLANNING_KINDS,
     addresses,
     agenda_items,

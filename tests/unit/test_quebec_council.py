@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from urban_rag.partitions import city_of, known_neighborhoods
-from urban_rag.quebec_council import (
+from hbu_dataplatform.partitions import city_of, known_neighborhoods
+from hbu_dataplatform.quebec_council import (
     KIND_CONSULTATION_FILE,
     KIND_COUNCIL_FILE,
     KIND_FICHE,
@@ -27,7 +27,7 @@ from urban_rag.quebec_council import (
     pdf_links,
     urls_in_text,
 )
-from urban_rag.rag.documents import PdfFetcher
+from hbu_dataplatform.rag.documents import PdfFetcher
 
 FIXTURES = Path(__file__).parent.parent / "fixtures" / "council"
 

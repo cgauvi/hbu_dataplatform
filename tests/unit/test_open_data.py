@@ -15,15 +15,15 @@ from dagster import materialize
 
 from asset_helpers import materialization_metadata
 
-from urban_rag import saguenay
-from urban_rag.open_data import CkanClient, OpenDataError, Resource, decode_csv
-from urban_rag.open_data_assets import (
+from hbu_dataplatform import saguenay
+from hbu_dataplatform.open_data import CkanClient, OpenDataError, Resource, decode_csv
+from hbu_dataplatform.open_data_assets import (
     DWELLINGS_CSV,
     QUARTIERS_GEOJSON,
     QUEBEC_BOROUGHS_GEOJSON,
     reference_neighborhoods,
 )
-from urban_rag.resources import OpenDataResource, ParquetStore, QuebecOpenDataResource
+from hbu_dataplatform.resources import OpenDataResource, ParquetStore, QuebecOpenDataResource
 
 DOWNLOAD_BASE = "https://donnees.montreal.ca/dataset/abc/resource/def/download"
 

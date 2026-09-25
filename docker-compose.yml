@@ -19,7 +19,7 @@ services:
       context: .
       target: runtime
     image: urban-rag:latest
-    command: ["dagster-webserver", "-h", "0.0.0.0", "-p", "2500", "-m", "urban_rag.definitions"]
+    command: ["dagster-webserver", "-h", "0.0.0.0", "-p", "2500", "-m", "hbu_dataplatform.definitions"]
     ports:
       - "${PORT:-2500}:2500"
     environment:
@@ -77,7 +77,7 @@ services:
       context: .
       target: runtime
     image: urban-rag:latest
-    command: ["dagster-daemon", "run", "-m", "urban_rag.definitions"]
+    command: ["dagster-daemon", "run", "-m", "hbu_dataplatform.definitions"]
     environment:
       REQUESTS_CA_BUNDLE: ${DOCKER_CA_BUNDLE:-${REQUESTS_CA_BUNDLE:-}}
       AWS_CA_BUNDLE: ${DOCKER_CA_BUNDLE:-}

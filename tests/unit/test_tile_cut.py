@@ -27,7 +27,7 @@ import random
 
 import pytest
 
-from urban_rag import tile_cut, tile_grid
+from hbu_dataplatform import tile_cut, tile_grid
 
 
 def cluster(count, lon, lat, spread, *, seed):
@@ -161,7 +161,7 @@ def test_every_cell_of_the_live_cut_names_its_city():
     """A run on the tile axis has no borough to ask the CRS of; it asks the
     cell. So the cut and its cities are one mapping, and every value is a
     city the crosswalks know."""
-    from urban_rag.partitions import City, city_of_tile
+    from hbu_dataplatform.partitions import City, city_of_tile
 
     assert set(tile_cut.TILE_CITIES) == tile_cut.CUT
     for cell in tile_cut.CUT:

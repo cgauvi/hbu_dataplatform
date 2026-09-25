@@ -9,7 +9,7 @@ are another city's.
 
 ## The key, and the two registries
 
-A neighborhood partition key resolves through `urban_rag.partitions`, which
+A neighborhood partition key resolves through `hbu_dataplatform.partitions`, which
 now carries a *city* for every key it knows: `city_of("VSMPE")` is
 `City.MONTREAL`, `city_of("CIL")` is `City.QUEBEC`. Quebec City's six
 arrondissements are keyed by the three-letter abbreviation the city itself
@@ -30,7 +30,7 @@ always were; only the outline's source moves.
 |---|---|---|
 | Borough outline | `donnees.montreal.ca` reference neighborhoods, dissolved on `no_arr` | Données Québec [Arrondissements](https://www.donneesquebec.ca/recherche/dataset/vque_2), one polygon per arrondissement, cut on `ABREVIATION` |
 | Zoning geometry | Spectrum, `<ns>/Reglement_urbanisme/VSP_REG_ZONE` | The city's ArcGIS Online feature service, layer 2 *Zonage en vigueur* of `CI_AMENAGEMENT_ENVIRONNEMENT` - the layer the city's own [interactive map](https://experience.arcgis.com/experience/aadd65187ef64037bd13170afb450e15) draws |
-| Zoning norms | One PDF *grille des usages et des normes* per zone, linked from the zone table and parsed by `urban_rag.zoning_grid` | One workbook for the city, [Grille de spécifications du zonage](https://www.donneesquebec.ca/recherche/dataset/grille-de-specifications-du-zonage), one row per zone, read by `urban_rag.quebec` |
+| Zoning norms | One PDF *grille des usages et des normes* per zone, linked from the zone table and parsed by `hbu_dataplatform.zoning_grid` | One workbook for the city, [Grille de spécifications du zonage](https://www.donneesquebec.ca/recherche/dataset/grille-de-specifications-du-zonage), one row per zone, read by `hbu_dataplatform.quebec` |
 | Zoning prose | The same PDF, chunked and embedded into the corpus | The city's map server generates a *grille de spécifications* sheet per zone at `GrillesZonage/HandlerZonage.ashx?<zone>`; the URL is built from the zone code rather than published, and the corpus is that sheet |
 | Council minutes | None — a Montreal borough has no *conseil de quartier* | The minutes of each of the arrondissement's councils, listed per council by `affichagesite.villequebec.quebec`, and the consultation fiches, *sommaires décisionnels* and resolutions they link to — read into `silver.council_planning_items`, see [council-minutes.md](council-minutes.md) |
 | Heritage | Whatever heritage tables the borough's Spectrum namespace publishes | Layers 5-11 of the city's `CI_COMMUNAUTE_CULTURE_PATRIMOINE` feature service - what the [patrimoine bâti](https://www.ville.quebec.qc.ca/citoyens/patrimoine/bati/index.aspx) search and its fiches draw - see [Heritage](#heritage) |
@@ -122,7 +122,7 @@ rather than failing the borough's zoning.
 
 ## What the grid translation does
 
-`urban_rag.quebec.grid_columns` turns one workbook row into the `GridColumn`
+`hbu_dataplatform.quebec.grid_columns` turns one workbook row into the `GridColumn`
 objects `zoning_grid_columns` has always emitted, so everything downstream -
 `lot_zoning_envelopes`, the setbacks, the CP-SAT programme, the map - reads
 a Quebec City zone exactly as it reads a Montreal one. The translation is

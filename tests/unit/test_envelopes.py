@@ -30,18 +30,18 @@ from dagster import Failure, MultiPartitionKey, materialize
 from shapely.geometry import Polygon
 from test_zoning_grid import grid_pdf
 
-from urban_rag.envelope_assets import (
+from hbu_dataplatform.envelope_assets import (
     LOT_ENVELOPES_FILE,
     ZONE_COLUMNS_FILE,
     lot_zoning_envelopes,
     zoning_grid_columns,
 )
-from urban_rag import envelope_assets
-from urban_rag.frames import write_frame
-from urban_rag.rag_assets import DOCUMENTS_FILE, linked_documents
-from urban_rag.resources import ParquetStore, PdfCache, PostgisResource
-from urban_rag.storage import join
-from urban_rag.zone_piece_assets import LOT_ZONE_PIECES_FILE, lot_zone_pieces
+from hbu_dataplatform import envelope_assets
+from hbu_dataplatform.frames import write_frame
+from hbu_dataplatform.rag_assets import DOCUMENTS_FILE, linked_documents
+from hbu_dataplatform.resources import ParquetStore, PdfCache, PostgisResource
+from hbu_dataplatform.storage import join
+from hbu_dataplatform.zone_piece_assets import LOT_ZONE_PIECES_FILE, lot_zone_pieces
 
 DATE = "2026-08-01"
 NEIGHBORHOOD = "VSMPE"
@@ -643,7 +643,7 @@ def test_a_row_is_one_call_to_solve_program(store, cache, stub_pdfs):
     `ZoneEnvelope` the way `hbu._program_row` does, which is the call the
     asset actually feeds.
     """
-    from urban_rag.program import (
+    from hbu_dataplatform.program import (
         BuildingLevel,
         Lot,
         UnitEconomics,

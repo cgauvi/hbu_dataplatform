@@ -10,7 +10,7 @@
         {
             "alias": "vect_db",
             "type": "file",
-            "path": "c:\\Users\\cgauvin\\Documents\\Dev\\urban_rag\\data\\vect_db.duckdb",
+            "path": "c:\\Users\\cgauvin\\Documents\\Dev\\urban\\hbu_dataplatform\\data\\vect_db.duckdb",
             "attached": false
         }
     ],

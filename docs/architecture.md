@@ -5,7 +5,7 @@
 The pipeline is a medallion: **bronze** holds what a publisher returned,
 **silver** the same facts at this platform's grain, **gold** one question
 answered. The layer is declared once, in
-[layers.py](../src/urban_rag/layers.py), and both the Dagster asset key
+[layers.py](../src/hbu_dataplatform/layers.py), and both the Dagster asset key
 (`silver/lot_zoning_envelopes`) and the prefix the asset writes under
 (`<root>/silver/lot_zoning_envelopes/...`) are derived from it — so the two
 cannot drift. `definitions.py` refuses to load if an asset has no declared
@@ -39,10 +39,10 @@ re-scrape, which for a live municipal source no later run can undo.
 ## Two spatial axes
 
 Every partitioned table has `scrape_date` as one key. Which spatial column is
-the other is the table's *axis* (`urban_rag.warehouse.Axis`), and there are two.
+the other is the table's *axis* (`hbu_dataplatform.warehouse.Axis`), and there are two.
 
 **The borough axis** — `neighborhood`, a key from
-[partitions.py](../src/urban_rag/partitions.py): `VSMPE`, `CIL`, `SAG` — is the
+[partitions.py](../src/hbu_dataplatform/partitions.py): `VSMPE`, `CIL`, `SAG` — is the
 **publisher's** unit. Bronze is fetched per borough because that is what a
 publisher answers for: a Spectrum namespace, an arrondissement outline handed
 to Infolot, a grid PDF per by-law. What stays borough-shaped downstream is what
@@ -54,7 +54,7 @@ a publisher bounds — the CMHC and C&W tables, `zoning_grid_columns`,
 tables from `silver.building_lot_intersections` to `gold.lot_building_massing`.
 A cell is a Web Mercator tile named by its quadkey — `0302303330102` is
 thirteen digits, so zoom 13 — and the cut
-([tile_cut.py](../src/urban_rag/tile_cut.py)) is a checked-in set of cells at
+([tile_cut.py](../src/hbu_dataplatform/tile_cut.py)) is a checked-in set of cells at
 whatever depth holds about 20,000 lots: z13 over Montreal, z10–z12 over Quebec
 City, seeded from the cadastre by `scripts/seed_tile_cut.py` and never
 re-derived, because a Dagster partition key that moved would orphan everything
@@ -100,7 +100,7 @@ dimension.
 ## The silver and gold tables
 
 Every silver and gold dataset has one table, in the schema its layer is named
-for, and one way of being written to it — `urban_rag.warehouse`, which is the
+for, and one way of being written to it — `hbu_dataplatform.warehouse`, which is the
 single writer. Before it, four assets reached Postgres through a loader each,
 all of them writing into `rag`, all of them deleting a partition and
 re-inserting it; the seven that did not reach Postgres at all had no table to
@@ -108,7 +108,7 @@ reach.
 
 Three rules hold for every one of those tables.
 
-**The schema is the layer.** Looked up from `urban_rag.layers` rather than
+**The schema is the layer.** Looked up from `hbu_dataplatform.layers` rather than
 written down twice, so moving an asset between layers moves its table with it
 instead of leaving the two disagreeing.
 
@@ -198,7 +198,7 @@ frame *per borough*, cut by where each unit's point falls, and every one of
 them is upserted in a single transaction. Each borough is still pruned against
 its own frame alone, so a unit that moved across a borough line between scrapes
 leaves the partition it left and not the one it joined. See
-[`src/urban_rag/warehouse.py`](../src/urban_rag/warehouse.py).
+[`src/hbu_dataplatform/warehouse.py`](../src/hbu_dataplatform/warehouse.py).
 
 ## A load ends by refreshing the statistics it invalidated
 
@@ -375,7 +375,7 @@ Spectrum namespace `19_VSMPE`, and the city for Quebec and Saguenay, which each
 publish one zoning layer and no namespace at all. It is what makes `C01-001` in
 one borough a different feature from `C01-001` in the next, now that
 `source_table` is the slug and the slug drops it. See
-`urban_rag.partitions.source_namespace_for` and
+`hbu_dataplatform.partitions.source_namespace_for` and
 hbu_infra's `027_features_source_namespace.sql`.
 
 The whole history still reads back as one dataset — `read_parquet` over

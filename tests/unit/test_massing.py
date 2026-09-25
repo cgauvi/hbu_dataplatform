@@ -1,4 +1,4 @@
-"""Offline tests for `urban_rag.massing` and the asset over it.
+"""Offline tests for `hbu_dataplatform.massing` and the asset over it.
 
 The fit is geometry and nothing is stubbed: every rectangle these draw is
 tested for actually being inside the envelope it was fitted into, which is the
@@ -24,16 +24,16 @@ from dagster import Failure, MultiPartitionKey, materialize
 from shapely.affinity import rotate, translate
 from shapely.geometry import MultiPolygon, Polygon, box
 
-from urban_rag import massing, massing_assets
-from urban_rag import program as program_module
-from urban_rag import postgis
-from urban_rag.frames import write_frame
-from urban_rag.hbu_assets import LOT_HBU_FILE, lot_highest_best_use
-from urban_rag.massing import MASSING_STATUSES, fit_rectangle
-from urban_rag.massing_assets import LOT_MASSING_FILE, lot_building_massing
-from urban_rag.resources import ParquetStore, PostgisResource
-from urban_rag.setback_assets import LOT_SETBACKS_FILE, lot_buildable_setbacks
-from urban_rag.storage import join
+from hbu_dataplatform import massing, massing_assets
+from hbu_dataplatform import program as program_module
+from hbu_dataplatform import postgis
+from hbu_dataplatform.frames import write_frame
+from hbu_dataplatform.hbu_assets import LOT_HBU_FILE, lot_highest_best_use
+from hbu_dataplatform.massing import MASSING_STATUSES, fit_rectangle
+from hbu_dataplatform.massing_assets import LOT_MASSING_FILE, lot_building_massing
+from hbu_dataplatform.resources import ParquetStore, PostgisResource
+from hbu_dataplatform.setback_assets import LOT_SETBACKS_FILE, lot_buildable_setbacks
+from hbu_dataplatform.storage import join
 
 DATE = "2026-08-01"
 NEIGHBORHOOD = "VSMPE"

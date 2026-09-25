@@ -40,8 +40,8 @@ import re
 
 import pytest
 
-from urban_rag.warehouse import TABLES, Table
-from urban_rag.postgis import MAP_CELL_COLUMNS
+from hbu_dataplatform.warehouse import TABLES, Table
+from hbu_dataplatform.postgis import MAP_CELL_COLUMNS
 
 psycopg = pytest.importorskip("psycopg")
 
@@ -245,7 +245,7 @@ def test_every_column_the_map_cell_asset_writes_is_declared_by_its_file(infra):
 
     missing = sorted(set(MAP_CELL_COLUMNS) - declared)
     assert not missing, (
-        f"urban_rag.postgis.MAP_CELL_COLUMNS writes {', '.join(missing)}, "
+        f"hbu_dataplatform.postgis.MAP_CELL_COLUMNS writes {', '.join(missing)}, "
         f"which {table.source} does not declare. The INSERT names its columns, "
         "so this fails on the staging table before a single row is computed - "
         "add them to the CREATE TABLE *and* to that file's "

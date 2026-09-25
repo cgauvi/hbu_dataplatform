@@ -142,7 +142,7 @@ deployment target is CPU-only, re-lock torch against
 not the Dockerfile, is what decides this.
 
 DuckDB's `vss` extension is baked in at build time through
-[rag/vss.py](../src/urban_rag/rag/vss.py)'s own downloader, so a running container
+[rag/vss.py](../src/hbu_dataplatform/rag/vss.py)'s own downloader, so a running container
 needs no egress to `extensions.duckdb.org`. The step is non-fatal — the build
 says so and carries on, and `load_vss` retries on first use.
 
@@ -240,7 +240,7 @@ cd ../hbu_dataplatform
 make dagster_run
 ```
 
-[src/urban_rag/dagster_home.py](../src/urban_rag/dagster_home.py) is what reads
+[src/hbu_dataplatform/dagster_home.py](../src/hbu_dataplatform/dagster_home.py) is what reads
 those variables: it writes `$DAGSTER_HOME/dagster.yaml` and then execs the
 dagster command it was handed. Both entry points go through it — the image's
 `ENTRYPOINT`, and every dagster target in the Makefile — so a laptop run and a

@@ -1,4 +1,4 @@
-"""What `urban_rag.zoning_grid` reads off a grid, and what it refuses to guess.
+"""What `hbu_dataplatform.zoning_grid` reads off a grid, and what it refuses to guess.
 
 The parser's whole subject is horizontal position, so the fixtures here are
 real PDFs rather than text: `grid_pdf` types a page the way a grille is
@@ -16,15 +16,15 @@ The offsets and the wording are copied from the published grids for zones
 C01-001 and C01-002 (Villeray-Saint-Michel-Parc-Extension, by-law 01-283), so
 the two-column case is a real one: a *Commerce* column authorised on every
 level and a bare *Habitation* column authorised on every level but the ground
-floor, which is the example `urban_rag.program` names in its own docstring.
+floor, which is the example `hbu_dataplatform.program` names in its own docstring.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from urban_rag.program import BuildingLevel
-from urban_rag.zoning_grid import (
+from hbu_dataplatform.program import BuildingLevel
+from hbu_dataplatform.zoning_grid import (
     GridParseError,
     parse_grid_pdf,
 )

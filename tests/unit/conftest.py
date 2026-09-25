@@ -1,7 +1,7 @@
 """Fixtures every unit test gets, and the one cross-cutting guard they opt out of.
 
 The bronze assets refuse to fetch into a month other than the one being lived
-in - see `urban_rag.guards`. That is a guard about the wall clock, and the unit
+in - see `hbu_dataplatform.guards`. That is a guard about the wall clock, and the unit
 tests are pinned to fixed August-2026 fixtures: left live, it would fail all of
 them from September 2026 onward, and every one of those failures would be about
 the calendar rather than about the asset under test.
@@ -18,8 +18,8 @@ import pytest
 from dagster import DagsterInstance
 from dagster._core.definitions.partitions.context import partition_loading_context
 
-from urban_rag import guards
-from urban_rag.partitions import DEFAULT_NEIGHBORHOODS, NEIGHBORHOOD_PARTITIONS_NAME
+from hbu_dataplatform import guards
+from hbu_dataplatform.partitions import DEFAULT_NEIGHBORHOODS, NEIGHBORHOOD_PARTITIONS_NAME
 
 
 @pytest.fixture(autouse=True)

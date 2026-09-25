@@ -1,4 +1,4 @@
-"""Offline tests for `urban_rag.warehouse`, the one write path into
+"""Offline tests for `hbu_dataplatform.warehouse`, the one write path into
 `silver.*` and `gold.*`.
 
 Everything this module does is Postgres in substance - COPY, `INSERT ... ON
@@ -32,13 +32,13 @@ import pytest
 from psycopg._queries import _query2pg_nocache
 from shapely.geometry import box
 
-from urban_rag import warehouse
-from urban_rag.hbu import CANDIDATE_COLUMNS, HBU_COLUMNS
-from urban_rag.hbu_assets import _GAP_OUTPUT_COLUMNS
-from urban_rag.massing import MASSING_COLUMNS, PARKING_COLUMNS
-from urban_rag.opportunity_assets import _CARRIED as OPPORTUNITY_CARRIED
-from urban_rag.layers import Layer, assets_in
-from urban_rag.warehouse import (
+from hbu_dataplatform import warehouse
+from hbu_dataplatform.hbu import CANDIDATE_COLUMNS, HBU_COLUMNS
+from hbu_dataplatform.hbu_assets import _GAP_OUTPUT_COLUMNS
+from hbu_dataplatform.massing import MASSING_COLUMNS, PARKING_COLUMNS
+from hbu_dataplatform.opportunity_assets import _CARRIED as OPPORTUNITY_CARRIED
+from hbu_dataplatform.layers import Layer, assets_in
+from hbu_dataplatform.warehouse import (
     MissingRelation,
     conflict_clause,
     table_for,
@@ -210,7 +210,7 @@ def upsert(cursor, frame=None, dataset="neighborhood_streets", **kwargs):
 
 
 def test_every_table_is_in_the_schema_its_asset_layer_names():
-    """The schema is derived from `urban_rag.layers`, never written twice.
+    """The schema is derived from `hbu_dataplatform.layers`, never written twice.
 
     An asset moved between layers moves its table with it; the alternative is
     a table in `silver` for an asset the tree files under `gold/`.
@@ -290,7 +290,7 @@ def test_the_lot_chain_is_on_the_tile_axis_and_the_publications_are_not():
 def test_a_dataset_with_no_table_names_the_registry_to_add_it_to():
     with pytest.raises(KeyError) as caught:
         table_for("nothing_publishes_this")
-    assert "urban_rag.warehouse.TABLES" in str(caught.value)
+    assert "hbu_dataplatform.warehouse.TABLES" in str(caught.value)
 
 
 # -- the SQL ---------------------------------------------------------------
@@ -610,7 +610,7 @@ def test_what_no_column_claimed_lands_in_the_jsonb_catch_all():
 
 
 def test_a_json_string_column_is_re_parsed_rather_than_quoted():
-    """`urban_rag.frames` JSON-encodes a nested cell on the way to parquet.
+    """`hbu_dataplatform.frames` JSON-encodes a nested cell on the way to parquet.
 
     Storing that string as a jsonb *string* would make a list upstream a
     quoted blob here, which nothing could query.

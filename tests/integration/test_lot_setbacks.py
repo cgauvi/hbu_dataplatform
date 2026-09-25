@@ -51,7 +51,7 @@ from conftest import (
     whole_lot_clips,
 )
 
-from urban_rag.postgis import (
+from hbu_dataplatform.postgis import (
     DEFAULT_ROAD_LOT_MIN_STREET_M,
     compute_lot_buildable_setbacks,
     compute_lot_frontage,

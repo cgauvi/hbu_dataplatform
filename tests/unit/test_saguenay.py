@@ -28,8 +28,8 @@ import pytest
 
 from test_zoning_grid import _pdf
 
-from urban_rag import partitions
-from urban_rag.partitions import (
+from hbu_dataplatform import partitions
+from hbu_dataplatform.partitions import (
     SAGUENAY_OUTLINE_TYPE,
     City,
     city_of,
@@ -42,15 +42,15 @@ from urban_rag.partitions import (
     saguenay_outline_name_for,
     submarket_for,
 )
-from urban_rag.program import BuildingLevel
-from urban_rag.saguenay import (
+from hbu_dataplatform.program import BuildingLevel
+from hbu_dataplatform.saguenay import (
     CLASS_MAX_DWELLINGS,
     SaguenayZoningClient,
     SaguenayZoningError,
     class_max_dwellings,
     parse_grid_pdf,
 )
-from urban_rag.zoning_grid import GridParseError
+from hbu_dataplatform.zoning_grid import GridParseError
 
 FONT_SIZE = 7.5
 GLYPH = FONT_SIZE * 0.6
@@ -349,7 +349,7 @@ def test_the_published_star_is_a_mark_and_a_norm_is_not():
     is pinned, alongside the cells that must *not* read as marks: a number is a
     norm, a unit caption is furniture, and a dash is an absent norm.
     """
-    from urban_rag.saguenay import _Cell, _is_mark
+    from hbu_dataplatform.saguenay import _Cell, _is_mark
 
     def cell(text: str) -> _Cell:
         return _Cell(start=310.0, end=322.0, text=text)

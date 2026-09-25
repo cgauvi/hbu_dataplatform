@@ -18,15 +18,15 @@ load_dotenv()
 import geopandas as gpd  # noqa: E402
 import shapely  # noqa: E402
 
-from urban_rag.open_data_assets import (  # noqa: E402
+from hbu_dataplatform.open_data_assets import (  # noqa: E402
     STREET_SEGMENTS_FILE,
     borough_boundary,
     street_network,
 )
-from urban_rag.partitions import metric_crs_for  # noqa: E402
-from urban_rag.resources import ParquetStore  # noqa: E402
-from urban_rag.rqtt import ROAD_CLASS_FIELD, STREET_ID_FIELD, STREET_NAME_FIELD  # noqa: E402
-from urban_rag.storage import join, output_root, storage_options  # noqa: E402
+from hbu_dataplatform.partitions import metric_crs_for  # noqa: E402
+from hbu_dataplatform.resources import ParquetStore  # noqa: E402
+from hbu_dataplatform.rqtt import ROAD_CLASS_FIELD, STREET_ID_FIELD, STREET_NAME_FIELD  # noqa: E402
+from hbu_dataplatform.storage import join, output_root, storage_options  # noqa: E402
 
 DATE = "2026-09-01"
 NEIGHBORHOOD = "VSMPE"

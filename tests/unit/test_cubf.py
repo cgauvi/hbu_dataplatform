@@ -26,7 +26,7 @@ from dagster import Failure, materialize
 
 from asset_helpers import materialization_metadata
 
-from urban_rag.cubf import (
+from hbu_dataplatform.cubf import (
     LISTE_SHEET,
     CubfError,
     CubfFetcher,
@@ -37,8 +37,8 @@ from urban_rag.cubf import (
     use_code_descriptions,
     use_code_key,
 )
-from urban_rag.cubf_assets import CUBF_FILE, cubf_use_codes
-from urban_rag.resources import CubfResource, ParquetStore
+from hbu_dataplatform.cubf_assets import CUBF_FILE, cubf_use_codes
+from hbu_dataplatform.resources import CubfResource, ParquetStore
 
 DATE = "2026-08-01"
 

@@ -1,4 +1,4 @@
-"""Offline tests for `urban_rag.hbu` and the three assets over it.
+"""Offline tests for `hbu_dataplatform.hbu` and the three assets over it.
 
 Nothing here is stubbed except the upsert. The real `solve_program` runs on
 every envelope these build, so what they cover includes the CP-SAT model - the
@@ -22,21 +22,21 @@ import pytest
 from asset_helpers import materialization_metadata, stub_publish as stub_publish_into
 from dagster import Failure, MultiPartitionKey, materialize
 
-from urban_rag import hbu, hbu_assets, opportunity_assets, postgis
-from urban_rag.cmhc_assets import (
+from hbu_dataplatform import hbu, hbu_assets, opportunity_assets, postgis
+from hbu_dataplatform.cmhc_assets import (
     AVERAGE_RENTS_FILE,
     VACANCY_FILE,
     average_rents,
     vacancy_rates,
 )
-from urban_rag.comparables_assets import (
+from hbu_dataplatform.comparables_assets import (
     LOT_COMPARABLES_FILE,
     lot_assessment_comparables,
 )
-from urban_rag.envelope_assets import LOT_ENVELOPES_FILE, lot_zoning_envelopes
-from urban_rag.frames import write_frame
-from urban_rag.frontage_assets import ROAD_LOTS_FILE, lot_frontage
-from urban_rag.hbu_assets import (
+from hbu_dataplatform.envelope_assets import LOT_ENVELOPES_FILE, lot_zoning_envelopes
+from hbu_dataplatform.frames import write_frame
+from hbu_dataplatform.frontage_assets import ROAD_LOTS_FILE, lot_frontage
+from hbu_dataplatform.hbu_assets import (
     LOT_GAP_FILE,
     LOT_HBU_FILE,
     LOT_PROGRAMS_FILE,
@@ -44,19 +44,19 @@ from urban_rag.hbu_assets import (
     lot_highest_best_use,
     lot_redevelopment_gap,
 )
-from urban_rag.opportunity_assets import (
+from hbu_dataplatform.opportunity_assets import (
     LOT_OPPORTUNITIES_FILE,
     lot_investment_opportunities,
 )
-from urban_rag.program import (
+from hbu_dataplatform.program import (
     M2_PER_SQFT,
     MONTHS_PER_YEAR,
     UNDISCOUNTED_INVESTMENT,
     ParkingRules,
 )
-from urban_rag.resources import ParquetStore, PostgisResource
-from urban_rag.setback_assets import LOT_SETBACKS_FILE, lot_buildable_setbacks
-from urban_rag.storage import join
+from hbu_dataplatform.resources import ParquetStore, PostgisResource
+from hbu_dataplatform.setback_assets import LOT_SETBACKS_FILE, lot_buildable_setbacks
+from hbu_dataplatform.storage import join
 
 DATE = "2026-08-01"
 NEIGHBORHOOD = "VSMPE"
@@ -1833,7 +1833,7 @@ def _envelope_polygon(shape):
     import geopandas as gpd
     from shapely.affinity import translate
 
-    from urban_rag.comparables import METRIC_CRS
+    from hbu_dataplatform.comparables import METRIC_CRS
 
     # An arbitrary origin inside MTM zone 8, so the shape lands where the
     # projection is defined rather than at its far edge.

@@ -1,4 +1,4 @@
-"""The tile axis, held across every `urban_rag.postgis` function that moved.
+"""The tile axis, held across every `hbu_dataplatform.postgis` function that moved.
 
 The per-function files - `test_postgis_intersections`, `_lot_profiles`,
 `_setbacks` - drive one computation each against a fake cursor and read what
@@ -27,7 +27,7 @@ import pytest
 import shapely.wkb
 from shapely.geometry import box
 
-from urban_rag import postgis, warehouse
+from hbu_dataplatform import postgis, warehouse
 
 TILE = "0302303330102"
 DATE = "2026-09-01"

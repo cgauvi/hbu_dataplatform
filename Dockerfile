@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.9
 #
-# Multi-stage image for urban_rag.
+# Multi-stage image for hbu_dataplatform.
 #
 #   docker build --target runtime -t urban-rag .
 #   docker build --target runtime --build-arg EXTRAS="" -t urban-rag:slim .
@@ -83,17 +83,17 @@ USER app
 # back to fetching the binary through requests. Baked in at build time to keep
 # the running container off the network; non-fatal, since load_vss() retries on
 # first use.
-RUN python -c "import duckdb; from urban_rag.rag.vss import load_vss; load_vss(duckdb.connect())" \
+RUN python -c "import duckdb; from hbu_dataplatform.rag.vss import load_vss; load_vss(duckdb.connect())" \
  || echo "vss not baked in; it will be installed on first use"
 
-ENTRYPOINT ["python", "-m", "urban_rag.dagster_home"]
+ENTRYPOINT ["python", "-m", "hbu_dataplatform.dagster_home"]
 VOLUME ["/data", "/dagster_home"]
 EXPOSE 2500
 
 # `dagster dev` runs the webserver and the daemon in one process, which is fine
 # for a single container but not for a real deployment - see docker-compose.yml
 # for the split the schedules actually need.
-CMD ["dagster", "dev", "-h", "0.0.0.0", "-p", "2500", "-m", "urban_rag.definitions"]
+CMD ["dagster", "dev", "-h", "0.0.0.0", "-p", "2500", "-m", "hbu_dataplatform.definitions"]
 
 # -- dev -------------------------------------------------------------------
 # The devcontainer target. The project itself is NOT installed here: the
@@ -126,7 +126,7 @@ USER app
 # network: `--extra dev` above installs duckdb-extension-vss, so the binary is
 # already in the image and `INSTALL vss` - which some TLS-inspecting proxies
 # truncate mid-body - is not needed. The project's own downloader is not an
-# option here anyway, since `--no-install-project` means urban_rag is absent.
+# option here anyway, since `--no-install-project` means hbu_dataplatform is absent.
 # Non-fatal, and `make docker-test` is what needs it: every test in
 # tests/unit/test_store.py does.
 RUN python -c "from duckdb_extensions import import_extension; import_extension('vss')" \

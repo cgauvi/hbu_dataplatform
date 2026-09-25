@@ -16,12 +16,12 @@ import pytest
 from dagster import Failure, MultiPartitionKey, materialize
 from shapely.geometry import box
 
-from urban_rag.bdoi import BdoiError, BdoiFetcher, QUEBEC_FILES, read_shapefile_zip
-from urban_rag.bdoi_assets import BUILDINGS_FILE, neighborhood_buildings
-from urban_rag.frames import write_frame
-from urban_rag.open_data_assets import QUARTIERS_FILE, reference_neighborhoods
-from urban_rag.resources import BdoiResource, ParquetStore
-from urban_rag.storage import join
+from hbu_dataplatform.bdoi import BdoiError, BdoiFetcher, QUEBEC_FILES, read_shapefile_zip
+from hbu_dataplatform.bdoi_assets import BUILDINGS_FILE, neighborhood_buildings
+from hbu_dataplatform.frames import write_frame
+from hbu_dataplatform.open_data_assets import QUARTIERS_FILE, reference_neighborhoods
+from hbu_dataplatform.resources import BdoiResource, ParquetStore
+from hbu_dataplatform.storage import join
 
 DATE = "2026-08-01"
 NEIGHBORHOOD = "VSMPE"

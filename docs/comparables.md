@@ -18,9 +18,9 @@ make comparables DATE=2026-09-01 NEIGHBORHOOD=VSMPE
 make comparables DATE=2026-09-01 NEIGHBORHOOD=VSMPE OPEX=0.40 K_COMPARABLES=12
 ```
 
-The arithmetic is in [`urban_rag.comparables`](../src/urban_rag/comparables.py),
+The arithmetic is in [`hbu_dataplatform.comparables`](../src/hbu_dataplatform/comparables.py),
 which has no Dagster imports; the partition handling is in
-[`urban_rag.comparables_assets`](../src/urban_rag/comparables_assets.py). The
+[`hbu_dataplatform.comparables_assets`](../src/hbu_dataplatform/comparables_assets.py). The
 table is hbu_infra's `sql/016_silver_lot_assessment_comparables.sql`.
 
 ## It re-derives the placement rather than copying the totals
@@ -60,7 +60,7 @@ this borough's submarket. Every row carries the lot in `income_assumptions`.
 | average rent, vacancy rate | CMHC, for this borough | ✅ |
 | office, industrial $/sqft/yr | C&W MarketBeat, escalated by StatCan — [commercial-rents.md](commercial-rents.md) | ✅ |
 | retail $/sqft/yr | `RETAIL_BASE`, escalated by StatCan's retail index | stated |
-| their vacancies | `urban_rag.program`, 7% | stated |
+| their vacancies | `hbu_dataplatform.program`, 7% | stated |
 | operating expense ratio (new build) | `OPEX`, default 0.35 | stated |
 | maintenance premium for age | the roll's `year_built` on a stated curve — [maintenance.md](maintenance.md) | age measured, curve stated |
 | market value factor | `MARKET_FACTOR`, default 1.0 | stated |

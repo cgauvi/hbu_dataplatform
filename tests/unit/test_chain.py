@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from urban_rag.rag.chain import build_chain, format_documents
+from hbu_dataplatform.rag.chain import build_chain, format_documents
 
 
 @dataclass

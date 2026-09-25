@@ -13,19 +13,19 @@ import pandas as pd
 import pytest
 from dagster import Failure, MultiPartitionKey, materialize
 
-from urban_rag.assets import (
+from hbu_dataplatform.assets import (
     CATALOG_FILE,
     neighborhood_features,
     spectrum_table_catalog,
 )
-from urban_rag.resources import (
+from hbu_dataplatform.resources import (
     ParquetStore,
     QuebecOpenDataResource,
     QuebecZoningResource,
     SaguenayZoningResource,
     SpectrumResource,
 )
-from urban_rag.spectrum import Column, TableMetadata
+from hbu_dataplatform.spectrum import Column, TableMetadata
 
 DATE = "2026-08-01"
 NEIGHBORHOOD = "VSMPE"

@@ -74,7 +74,7 @@ bge-m3 is the default for the whole project, not only this corpus:
 anything already indexed has to be rebuilt.
 
 Which column of which table is worth indexing is a registry, not a guess:
-`DOCUMENT_SOURCES` in [rag/documents.py](../src/urban_rag/rag/documents.py) — today
+`DOCUMENT_SOURCES` in [rag/documents.py](../src/hbu_dataplatform/rag/documents.py) — today
 `Reglement_urbanisme__VSP_REG_ZONE` → `LIEN_GRILLE`, and nothing else. Most
 other tables link to web pages, photos, or one shared modality page.
 `VSP_REG_PPCMOI` is the exception worth knowing about: its `EN_SAVOIR_PLUS`
@@ -134,7 +134,7 @@ Two things that bite on this machine specifically:
 
 - **`INSTALL vss` returns `HTTP 403`.** DuckDB's own extension downloader is
   refused by the inspecting proxy, though `curl` fetches the identical URL fine.
-  [rag/vss.py](../src/urban_rag/rag/vss.py) falls back to downloading the extension
+  [rag/vss.py](../src/hbu_dataplatform/rag/vss.py) falls back to downloading the extension
   through `requests` (which honours the corporate bundle) and installing it from
   a local file, cached under `~/.cache/urban_rag/duckdb/`. Set
   `URBAN_RAG_VSS_EXTENSION` to a pre-downloaded `.duckdb_extension` on a machine
@@ -163,7 +163,7 @@ uv run urban-rag index  --backend postgres            # full reload from parquet
 
 `URBAN_RAG_BACKEND=postgres` makes it the default; `make status BACKEND=postgres`
 does the same through the Makefile. Both stores return the same `Hit`, so
-[retriever.py](../src/urban_rag/rag/retriever.py) and the chain neither know nor
+[retriever.py](../src/hbu_dataplatform/rag/retriever.py) and the chain neither know nor
 care which one answered.
 
 ### Loading is an asset, not a command
@@ -176,7 +176,7 @@ asset, one partition at a time:
 ```bash
 make publish DATE=2026-09-01 NEIGHBORHOOD=VSMPE
 # or
-uv run dagster asset materialize --select gold/document_index --partition "2026-09-01|VSMPE" -m urban_rag.definitions
+uv run dagster asset materialize --select gold/document_index --partition "2026-09-01|VSMPE" -m hbu_dataplatform.definitions
 ```
 
 It is a load, not a computation — no encoder, no PDF, no model weights — so it

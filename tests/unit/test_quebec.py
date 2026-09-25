@@ -10,8 +10,8 @@ import openpyxl
 import pytest
 from dagster import DagsterInstance
 
-from urban_rag import partitions
-from urban_rag.partitions import (
+from hbu_dataplatform import partitions
+from hbu_dataplatform.partitions import (
     DEFAULT_NEIGHBORHOODS,
     NEIGHBORHOOD_PARTITIONS_NAME,
     City,
@@ -25,8 +25,8 @@ from urban_rag.partitions import (
     source_namespace_for,
     unregister_neighborhoods,
 )
-from urban_rag.program import BuildingLevel
-from urban_rag.quebec import (
+from hbu_dataplatform.program import BuildingLevel
+from hbu_dataplatform.quebec import (
     DEFAULT_SHEET_URL_TEMPLATE,
     GRID_URL_COLUMN,
     GRID_ZONE_COLUMN,
@@ -58,7 +58,7 @@ def test_the_collision_source_namespace_exists_to_resolve_is_real():
     has to match `rag.chunks.source_table` - so the slug alone cannot tell the
     two rows apart, and neither can the zone number.
     """
-    from urban_rag.frames import table_slug
+    from hbu_dataplatform.frames import table_slug
 
     vsmpe = "/19_VSMPE/Reglement_urbanisme/VSP_REG_ZONE"
     rpp = "/16_RPP/Reglement_urbanisme/VSP_REG_ZONE"
@@ -494,8 +494,8 @@ def test_the_sheet_url_template_is_overridable():
 def test_the_sheet_link_column_is_montreals():
     """The whole point of the name: `DOCUMENT_SOURCES` keys on it for all three
     cities, so a Quebec zone row has to spell it the way Montreal's does."""
-    from urban_rag.rag.documents import DOCUMENT_SOURCES
-    from urban_rag.quebec import ZONING_SLUG
+    from hbu_dataplatform.rag.documents import DOCUMENT_SOURCES
+    from hbu_dataplatform.quebec import ZONING_SLUG
 
     assert GRID_URL_COLUMN == "LIEN_GRILLE"
     assert DOCUMENT_SOURCES[ZONING_SLUG] == GRID_URL_COLUMN
@@ -526,7 +526,7 @@ GRADE_DOMAIN = {
 def test_a_coded_field_gets_its_label_beside_the_code():
     import pandas as pd
 
-    from urban_rag.quebec import coded_values, label_coded_values
+    from hbu_dataplatform.quebec import coded_values, label_coded_values
 
     labels = coded_values(GRADE_DOMAIN)
     assert list(labels) == ["EVALUATION_VALEUR_PATRIMO_NO"]
@@ -540,13 +540,13 @@ def test_a_coded_field_gets_its_label_beside_the_code():
 
 
 def test_presume_and_confirme_are_not_grades():
-    from urban_rag.quebec import UNGRADED_CODES
+    from hbu_dataplatform.quebec import UNGRADED_CODES
 
     assert UNGRADED_CODES == {5, 6}
 
 
 def test_a_fiche_url_is_built_from_the_fiche_number():
-    from urban_rag.quebec import fiche_url_for
+    from hbu_dataplatform.quebec import fiche_url_for
 
     assert fiche_url_for(353) == (
         "https://www.ville.quebec.qc.ca/citoyens/patrimoine/bati/fiche.aspx?fiche=353"
@@ -559,8 +559,8 @@ def test_a_fiche_url_is_built_from_the_fiche_number():
 def test_every_heritage_layer_reaches_lot_features():
     """A layer without one of `FEATURE_ID_COLUMNS` is skipped by the join -
     which is how Saguenay's zoning once went missing."""
-    from urban_rag.cadastre_assets import FEATURE_ID_COLUMNS
-    from urban_rag.quebec import FICHE_URL_COLUMN, HERITAGE_ID_COLUMN, HERITAGE_LAYERS
+    from hbu_dataplatform.cadastre_assets import FEATURE_ID_COLUMNS
+    from hbu_dataplatform.quebec import FICHE_URL_COLUMN, HERITAGE_ID_COLUMN, HERITAGE_LAYERS
 
     assert HERITAGE_ID_COLUMN in FEATURE_ID_COLUMNS
     # The fiche is not a by-law: the corpus must not download it.
@@ -612,7 +612,7 @@ def test_the_heritage_layers_land_beside_the_zoning(tmp_path):
 
     import pandas as pd
 
-    from urban_rag.assets import _quebec_heritage
+    from hbu_dataplatform.assets import _quebec_heritage
 
     session = HeritageSession()
     service = QuebecZoningClient(

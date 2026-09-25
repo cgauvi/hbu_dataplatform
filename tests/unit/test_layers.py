@@ -1,6 +1,6 @@
 """The medallion declaration, and the two things that must not drift from it.
 
-`urban_rag.layers.ASSET_LAYERS` is the single place a layer is named. Two
+`hbu_dataplatform.layers.ASSET_LAYERS` is the single place a layer is named. Two
 consumers read it - `ParquetStore.partition_dir` for the S3 prefix, and each
 asset's `key_prefix` for the Dagster key - and the failure mode of them
 disagreeing is an asset whose key says `silver` and whose parquet lands under
@@ -11,9 +11,9 @@ from __future__ import annotations
 
 import pytest
 
-from urban_rag.definitions import ASSETS, _assert_layers_declared
-from urban_rag.layers import ASSET_LAYERS, Layer, key_prefix, layer_of
-from urban_rag.resources import ParquetStore
+from hbu_dataplatform.definitions import ASSETS, _assert_layers_declared
+from hbu_dataplatform.layers import ASSET_LAYERS, Layer, key_prefix, layer_of
+from hbu_dataplatform.resources import ParquetStore
 
 
 def test_every_registered_asset_has_a_layer_and_vice_versa():

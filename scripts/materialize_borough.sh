@@ -17,7 +17,7 @@
 # the lot chain, DATE x TILE, one run per cell of the cut the borough's lots
 # fall in: `cadastre` lands the borough in rag.lots with each lot's cell, and
 # every tile step after it asks Postgres which cells those were
-# (`python -m urban_rag.tiles of`) and runs once per cell. That is also why a
+# (`python -m hbu_dataplatform.tiles of`) and runs once per cell. That is also why a
 # reload of a borough re-runs the whole chain for every cell it touches - a
 # reload remints lot_uid and cascades into all of them.
 #
@@ -38,13 +38,13 @@ export DAGSTER_HOME="$PWD/.dagster_home"
 export PYTHONPATH=src
 export PATH="$PWD/.venv/bin:$PATH"
 export AWS_PROFILE="${AWS_PROFILE:-charles_gauvin_east_1}"
-# The CA bundles come from .env (urban_rag.dagster_home loads it): the
+# The CA bundles come from .env (hbu_dataplatform.dagster_home loads it): the
 # combined Zscaler-plus-certifi file, which is what every publisher here needs.
 LOG_DIR="${LOG_DIR:-$PWD/.dagster_home/logs/materialize/$NEIGHBORHOOD/$DATE}"
 mkdir -p "$LOG_DIR"
 
-PY=".venv/bin/python -m urban_rag.dagster_home"
-MODULE=urban_rag.definitions
+PY=".venv/bin/python -m hbu_dataplatform.dagster_home"
+MODULE=hbu_dataplatform.definitions
 CODE_MUN="${CODE_MUN:-[\"66023\",\"23027\",\"94068\"]}"
 
 # step name -> "<partition kind> <asset selection> [extra dagster args]"
@@ -105,7 +105,7 @@ if [ ${#ORDER[@]} -eq 0 ]; then ORDER=("${DEFAULT_ORDER[@]}"); fi
 TILES=()
 tiles_of_borough() {
   if [ ${#TILES[@]} -eq 0 ]; then
-    mapfile -t TILES < <($PY python -m urban_rag.tiles of "$NEIGHBORHOOD" "$DATE")
+    mapfile -t TILES < <($PY python -m hbu_dataplatform.tiles of "$NEIGHBORHOOD" "$DATE")
     echo "$(date '+%H:%M:%S')  $NEIGHBORHOOD holds ${#TILES[@]} cell(s): ${TILES[*]}"
   fi
 }
@@ -125,7 +125,7 @@ for step in "${ORDER[@]}"; do
   echo "$(date '+%H:%M:%S')  $step  -> $log"
   status=0
   case "$kind" in
-    -)  $PY python -m urban_rag.neighborhoods add "$NEIGHBORHOOD" > "$log" 2>&1 || status=$? ;;
+    -)  $PY python -m hbu_dataplatform.neighborhoods add "$NEIGHBORHOOD" > "$log" 2>&1 || status=$? ;;
     date)
         # shellcheck disable=SC2086
         run_step "$log" "$DATE" "$selection" $extra || status=$? ;;
