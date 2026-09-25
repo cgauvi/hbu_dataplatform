@@ -56,7 +56,6 @@ from hbu_dataplatform.sources.cubf.client import (
 )
 from hbu_dataplatform.core.frames import write_frame
 from hbu_dataplatform.core.layers import key_prefix
-from hbu_dataplatform.boundaries.assets import GROUP as OPEN_DATA_GROUP
 from hbu_dataplatform.partitions.axes import date_partitions
 from hbu_dataplatform.sources.cubf.resources import CubfResource
 from hbu_dataplatform.core.resources import ParquetStore
@@ -66,7 +65,7 @@ from hbu_dataplatform.core.storage import clear_parquet, join
 #: than restated, for the reason those two share it: this is a public
 #: open-data publication read straight off a published URL, and the group is
 #: what the Dagster UI sorts it into.
-GROUP = OPEN_DATA_GROUP
+GROUP = "bronze_open_data"
 
 #: The one file this asset writes, under `bronze/cubf_use_codes/<YYYY-MM-DD>/`.
 #: Read back by `hbu_dataplatform.sources.roll.assets.assessment_units`.

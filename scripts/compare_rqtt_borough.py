@@ -18,11 +18,8 @@ load_dotenv()
 import geopandas as gpd  # noqa: E402
 import shapely  # noqa: E402
 
-from hbu_dataplatform.boundaries.assets import (
-    STREET_SEGMENTS_FILE,
-    borough_boundary,
-    street_network,
-)
+from hbu_dataplatform.sources.rqtt.assets import STREET_SEGMENTS_FILE, street_network
+from hbu_dataplatform.boundaries.assets import borough_boundary
 from hbu_dataplatform.partitions.cities import metric_crs_for  # noqa: E402
 from hbu_dataplatform.core.resources import ParquetStore  # noqa: E402
 from hbu_dataplatform.sources.rqtt.client import (

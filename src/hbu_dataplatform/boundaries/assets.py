@@ -21,13 +21,11 @@ import pandas as pd
 import shapely
 from dagster import (
     AssetExecutionContext,
-    Config,
     Failure,
     MaterializeResult,
     MetadataValue,
     asset,
 )
-from pydantic import Field
 
 from hbu_dataplatform.partitions.guards import guard_current_scrape_month
 from hbu_dataplatform.core.frames import (
@@ -49,20 +47,6 @@ from hbu_dataplatform.cities.quebec_city.registry import quebec_abbreviation_for
 from hbu_dataplatform.cities.montreal.resources import OpenDataResource
 from hbu_dataplatform.core.resources import ParquetStore
 from hbu_dataplatform.sources.donnees_quebec import QuebecOpenDataResource
-from hbu_dataplatform.sources.rqtt.resources import RqttResource
-from hbu_dataplatform.sources.rqtt.client import (
-    EXCLUDED_ROAD_CHARACTERISTICS,
-    EXCLUDED_ROAD_CLASSES,
-    ROAD_CLASS_FIELD,
-    ROAD_LAYER,
-    STREET_ID_FIELD,
-    STREET_NAME_FIELD,
-    UNREAD_LAYERS,
-    RqttError,
-    bbox_in_source_crs,
-    read_layer,
-    roadway_only,
-)
 from hbu_dataplatform.core.storage import clear_parquet, filesystem, join
 
 GROUP = "bronze_open_data"
@@ -90,36 +74,6 @@ DWELLINGS_COUNT_COLUMN = "nb_log"
 #: Column in the reference layer holding the borough code a boundary is cut
 #: on - see `hbu_dataplatform.cities.montreal.registry.NEIGHBORHOOD_BOROUGH_CODES`.
 BOROUGH_CODE_COLUMN = "no_arr"
-
-#: The one file the street network is written to, under
-#: `bronze/street_network/<YYYY-MM-DD>/`. Read back by
-#: `hbu_dataplatform.sources.rqtt.assets` to cut each borough's slice out of it.
-#:
-#: One file for every city, where there used to be three. The three municipal
-#: layers this replaced - Montreal's `geobase-double`, Quebec City's `vque_18`,
-#: Saguenay's `sag-reseau-routier` - agreed on nothing but the fact of being
-#: roads, so each needed its own slug, its own id and name columns, and its own
-#: branch here. The RQTT is one province-wide publication with one schema, so a
-#: fourth city needs a bounding box and no code at all. See `hbu_dataplatform.sources.rqtt.client`.
-STREET_SEGMENTS_FILE = "street_segments.parquet"
-
-#: This platform's own names for the segment's key and the street's name, which
-#: `street_assets._as_street_sides` renames the publisher's pair to.
-#:
-#: `COTE_RUE_ID` is a *côté de rue*, a side of street, and is now a historical
-#: name rather than a description: the geobase double drew two lines per
-#: street, one along each curb, and the RQTT draws one down the axis. The name
-#: is kept because it is in the primary key of `silver.neighborhood_streets`
-#: and `silver.lot_frontage`, denormalised into `gold.lot_profiles`, and read
-#: by the map's tile queries - re-keying all of that would buy a better word
-#: and risk the lineage. What the change of geometry costs is in
-#: `street_assets._as_street_sides` and
-#: `postgis.DEFAULT_FRONTAGE_FALLBACK_BUFFERS_M`.
-STREET_ID_COLUMN = "COTE_RUE_ID"
-
-#: The street's name, kept as its own column all the way to `silver.neighborhood_streets`
-#: because it is what a frontage row is read for.
-STREET_NAME_COLUMN = "NOM_VOIE"
 
 #: Quebec City's six arrondissements, from Données Québec
 #: (https://www.donneesquebec.ca/recherche/dataset/vque_2): one polygon each,
@@ -313,194 +267,6 @@ def reference_neighborhoods(
         metadata["dwellings_error"] = str(exc)
 
     return MaterializeResult(metadata=metadata)
-
-
-class StreetNetworkConfig(Config):
-    """Which cities' road networks to cut out of the province-wide RQTT.
-
-    The archive covers Quebec, and this pipeline has boroughs in three cities,
-    so the snapshot is bounded before it is read: the whole `Reseau_routier` is
-    some millions of segments and an island's worth is ninety-odd thousand.
-    The bound is a bounding box per city rather than an attribute filter,
-    because the RQTT publishes no municipality code - see `hbu_dataplatform.sources.rqtt.client`.
-
-    It defaults to every city `partitions.City` knows. Naming fewer is how a
-    run is made cheap while working on one city; naming none is not allowed,
-    because an empty street network is not a smaller snapshot, it is a broken
-    one.
-
-    `road_classes` and `road_characteristics` are the values *dropped*, and
-    they default to `rqtt.EXCLUDED_ROAD_CLASSES` and
-    `rqtt.EXCLUDED_ROAD_CHARACTERISTICS` - a ferry link, a footbridge, a
-    railway bridge, a pipeline crossing. Read `rqtt.EXCLUDED_ROAD_CLASSES` for
-    why highways and ramps are deliberately *not* on that list.
-    """
-
-    cities: list[str] = Field(
-        default=[city.value for city in City],
-        description="City names to bound the read by. Empty is refused.",
-    )
-    road_classes: list[str] = Field(
-        default=list(EXCLUDED_ROAD_CLASSES),
-        description="ClsRte values to drop. Empty keeps every class.",
-    )
-    road_characteristics: list[str] = Field(
-        default=list(EXCLUDED_ROAD_CHARACTERISTICS),
-        description="CaractRte values to drop. Empty keeps every one.",
-    )
-
-
-@asset(
-    key_prefix=key_prefix("street_network"),
-    partitions_def=date_partitions,
-    deps=[reference_neighborhoods],
-    group_name=GROUP,
-    kinds={"geopackage", "geoparquet"},
-    description=(
-        "Quebec's road network from the RQTT, bounded to the cities this "
-        "pipeline has boroughs in and snapshot per scrape date under "
-        f"bronze/street_network/<YYYY-MM-DD>/{STREET_SEGMENTS_FILE}. One "
-        "centre line per segment, as published: the borough slice is cut in "
-        "silver. One file for every city, where Montreal's geobase double, "
-        "Quebec City's vque_18 and Saguenay's sag-reseau-routier used to be "
-        "three. Source: https://diffusion.mern.gouv.qc.ca - RQTT, CC-BY 4.0."
-    ),
-)
-@guard_current_scrape_month
-def street_network(
-    context: AssetExecutionContext,
-    config: StreetNetworkConfig,
-    rqtt: RqttResource,
-    store: ParquetStore,
-) -> MaterializeResult:
-    scrape_date = context.partition_key
-    output_dir = store.partition_dir(context.asset_key.path[-1], scrape_date)
-
-    if not config.cities:
-        raise Failure(
-            "street_network was asked for no cities; an empty street network "
-            "is a broken snapshot rather than a cheap one."
-        )
-    try:
-        cities = [City(name) for name in config.cities]
-    except ValueError as exc:
-        raise Failure(
-            f"{exc}; the cities this platform knows are "
-            f"{', '.join(city.value for city in City)}."
-        ) from None
-
-    fetcher = rqtt.fetcher()
-    try:
-        # The vintage is discovered, not asked for: the URL has no version in
-        # it. It travels onto every row and into the metadata, because it is
-        # the only record of which RQTT this partition was built from.
-        geopackage, version = fetcher.geopackage()
-    except RqttError as exc:
-        raise Failure(f"RQTT read for {scrape_date} failed: {exc}") from exc
-
-    scraped_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    removed = clear_parquet(output_dir)
-    if removed:
-        context.log.info("Removed %d file(s) from a previous run", len(removed))
-
-    per_city: dict[str, int] = {}
-    frames = []
-    for city in cities:
-        bounds = city_bounds(store, scrape_date, city)
-        try:
-            segments = read_layer(
-                geopackage, ROAD_LAYER, bbox=bbox_in_source_crs(bounds)
-            )
-        except RqttError as exc:
-            raise Failure(f"{city.value}: {exc}") from exc
-        if segments.empty:
-            raise Failure(
-                f"The RQTT has no road segment inside {city.value}'s bounding "
-                f"box {bounds}; check that reference_neighborhoods for "
-                f"{scrape_date} holds that city's outline."
-            )
-        per_city[city.value] = len(segments)
-        frames.append(segments)
-
-    # Concatenated rather than kept apart: the three boxes are hundreds of
-    # kilometres from each other, so a segment cannot be in two of them, and
-    # silver clips each borough out of whatever is on disk. The de-duplication
-    # is a guard against that assumption rather than a step that does work.
-    network = gpd.GeoDataFrame(
-        pd.concat(frames, ignore_index=True), crs=frames[0].crs
-    )
-    boxed = len(network)
-    network = network.drop_duplicates(subset=[STREET_ID_FIELD])
-
-    dropped = boxed - len(network)
-    network = roadway_only(
-        network,
-        classes=tuple(config.road_classes),
-        characteristics=tuple(config.road_characteristics),
-    ).reset_index(drop=True)
-    not_roadway = boxed - dropped - len(network)
-
-    if STREET_ID_FIELD not in network.columns:
-        raise Failure(
-            f"{ROAD_LAYER} has no {STREET_ID_FIELD} column; it publishes "
-            f"{', '.join(sorted(network.columns))}."
-        )
-
-    # Column names are left exactly as the MRNF spells them - silver is where
-    # `AQRP_UUID` becomes `COTE_RUE_ID` - the way the rest of the lot lineage
-    # carries its publishers' names through bronze untouched.
-    network["rqtt_version"] = version
-    network["source_file"] = geopackage.name
-    network["source_layer"] = ROAD_LAYER
-    network["scrape_date"] = scrape_date
-    network["scraped_at"] = scraped_at
-
-    path = write_frame(network, join(output_dir, STREET_SEGMENTS_FILE))
-    invalid = count_invalid_geometries(network)
-    if invalid:
-        # Reported, not repaired, so the snapshot stays a faithful copy.
-        context.log.warning(
-            "%s: %d invalid geometr(ies)", STREET_SEGMENTS_FILE, invalid
-        )
-    context.log.info(
-        "RQTT %s: %d segment(s) across %s (%d not roadway, %d duplicate) -> %s",
-        version,
-        len(network),
-        ", ".join(f"{name} {count}" for name, count in per_city.items()),
-        not_roadway,
-        dropped,
-        path,
-    )
-
-    return MaterializeResult(
-        metadata={
-            "dagster/row_count": len(network),
-            "num_street_segments": len(network),
-            "num_segments_by_city": MetadataValue.json(per_city),
-            "num_not_roadway": not_roadway,
-            "num_duplicate_ids": dropped,
-            # The key silver declares its grain on. Reported rather than
-            # enforced: bronze keeps whatever the publisher sent, and a
-            # duplicate here is the publisher's fact, not this asset's failure.
-            "num_street_ids": int(network[STREET_ID_FIELD].nunique()),
-            "num_street_names": int(network[STREET_NAME_FIELD].nunique()),
-            "num_unnamed_segments": int(network[STREET_NAME_FIELD].isna().sum()),
-            "num_invalid_geometries": invalid,
-            "road_classes": MetadataValue.json(
-                network[ROAD_CLASS_FIELD].value_counts(dropna=False).to_dict()
-                if ROAD_CLASS_FIELD in network.columns
-                else {}
-            ),
-            # The one record of which RQTT this is: the URL states no version,
-            # and the MRNF overwrites it three times a year.
-            "rqtt_version": version,
-            "geopackage_path": MetadataValue.path(str(geopackage)),
-            "layers_not_read": MetadataValue.json(list(UNREAD_LAYERS)),
-            "output_path": MetadataValue.path(str(path)),
-            "source_url": MetadataValue.url(fetcher.url),
-            "license": "CC-BY 4.0",
-        }
-    )
 
 
 def _geojson_to_frame(

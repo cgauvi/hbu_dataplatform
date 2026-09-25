@@ -67,7 +67,8 @@ from hbu_dataplatform.partitions.guards import guards_scrape_month
 from hbu_dataplatform.core.layers import ASSET_LAYERS, Layer, layer_of
 from hbu_dataplatform.hbu.lot_profiles_assets import lot_profiles
 from hbu_dataplatform.hbu.massing_assets import lot_building_massing
-from hbu_dataplatform.boundaries.assets import reference_neighborhoods, street_network
+from hbu_dataplatform.boundaries.assets import reference_neighborhoods
+from hbu_dataplatform.sources.rqtt.assets import street_network
 from hbu_dataplatform.partitions.axes import (
     TILE_DIMENSION,
     date_partitions,

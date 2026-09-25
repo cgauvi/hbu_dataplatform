@@ -37,9 +37,11 @@ from hbu_dataplatform.boundaries.assets import (
     QUARTIERS_FILE,
     QUEBEC_BOROUGHS_FILE,
     SAGUENAY_LIMITS_FILE,
+    reference_neighborhoods,
+)
+from hbu_dataplatform.sources.rqtt.assets import (
     STREET_ID_COLUMN,
     STREET_SEGMENTS_FILE,
-    reference_neighborhoods,
     street_network,
 )
 from hbu_dataplatform.core.resources import ParquetStore, PostgisResource
