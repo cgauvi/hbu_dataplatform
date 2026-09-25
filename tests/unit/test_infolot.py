@@ -25,7 +25,8 @@ from hbu_dataplatform.sources.infolot.client import (
 from hbu_dataplatform.core.frames import write_frame
 from hbu_dataplatform.sources.infolot.assets import LOTS_FILE, neighborhood_lots
 from hbu_dataplatform.boundaries.assets import QUARTIERS_FILE, reference_neighborhoods
-from hbu_dataplatform.core.resources import InfolotResource, ParquetStore
+from hbu_dataplatform.sources.infolot.resources import InfolotResource
+from hbu_dataplatform.core.resources import ParquetStore
 from hbu_dataplatform.core.storage import join
 
 DATE = "2026-08-01"

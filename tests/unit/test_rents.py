@@ -56,12 +56,8 @@ from hbu_dataplatform.cities.montreal.rents.assets import (
     commercial_rents,
     montreal_commercial_rents,
 )
-from hbu_dataplatform.core.resources import (
-    CrspiResource,
-    MarketBeatResource,
-    ParquetStore,
-    PostgisResource,
-)
+from hbu_dataplatform.cities.montreal.resources import CrspiResource, MarketBeatResource
+from hbu_dataplatform.core.resources import ParquetStore, PostgisResource
 from hbu_dataplatform.core.storage import join
 
 DATE = "2026-08-01"

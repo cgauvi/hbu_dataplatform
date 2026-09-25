@@ -1,4 +1,4 @@
-"""Client for donnees.montreal.ca, the city's CKAN open-data portal.
+"""Client for a CKAN open-data portal: donnees.montreal.ca, Données Québec.
 
 Two calls cover everything the pipeline needs: ``package_show`` for a
 dataset's resource list, and a plain GET on a resource's ``url`` for the file
@@ -26,8 +26,6 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from hbu_dataplatform.core.http import USER_AGENT, default_ca_bundle
-
-DEFAULT_BASE_URL = "https://donnees.montreal.ca"
 
 #: Encodings the portal's CSVs are published in, in the order tried. The
 #: BOM-aware variant comes first: Excel-exported files carry one, and reading
@@ -80,7 +78,7 @@ class CkanClient:
 
     def __init__(
         self,
-        base_url: str = DEFAULT_BASE_URL,
+        base_url: str,
         *,
         timeout_seconds: float = 60.0,
         request_delay_seconds: float = 0.25,

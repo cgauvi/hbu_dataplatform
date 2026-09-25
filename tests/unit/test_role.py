@@ -38,7 +38,8 @@ from hbu_dataplatform.sources.cubf.assets import CUBF_FILE, cubf_use_codes
 from hbu_dataplatform.core.frames import write_frame
 from hbu_dataplatform.boundaries.assets import QUARTIERS_FILE, reference_neighborhoods
 from hbu_dataplatform.cities.montreal.registry import borough_code_for
-from hbu_dataplatform.core.resources import ParquetStore, PostgisResource, RoleResource
+from hbu_dataplatform.core.resources import ParquetStore, PostgisResource
+from hbu_dataplatform.sources.roll.resources import RoleResource
 from hbu_dataplatform.sources.roll.assets import (
     ARROND_PREFIX,
     ASSESSMENT_UNITS_FILE,

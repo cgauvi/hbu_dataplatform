@@ -38,7 +38,8 @@ from hbu_dataplatform.sources.cubf.client import (
     use_code_key,
 )
 from hbu_dataplatform.sources.cubf.assets import CUBF_FILE, cubf_use_codes
-from hbu_dataplatform.core.resources import CubfResource, ParquetStore
+from hbu_dataplatform.sources.cubf.resources import CubfResource
+from hbu_dataplatform.core.resources import ParquetStore
 
 DATE = "2026-08-01"
 

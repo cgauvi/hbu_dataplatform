@@ -157,7 +157,8 @@ from hbu_dataplatform.partitions.axes import (
 )
 from hbu_dataplatform.core.postgis import fetch_lots
 from hbu_dataplatform.core.pg import PostgresUnavailable
-from hbu_dataplatform.core.resources import ParquetStore, PostgisResource, RoleResource
+from hbu_dataplatform.core.resources import ParquetStore, PostgisResource
+from hbu_dataplatform.sources.roll.resources import RoleResource
 from hbu_dataplatform.sources.roll.client import (
     CADASTRE_LAYER,
     JOIN_KEY,

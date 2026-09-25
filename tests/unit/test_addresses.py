@@ -38,7 +38,8 @@ from hbu_dataplatform.sources.addresses.client import (
 )
 from hbu_dataplatform.core.frames import write_frame
 from hbu_dataplatform.boundaries.assets import QUARTIERS_FILE, reference_neighborhoods
-from hbu_dataplatform.core.resources import AdressesQuebecResource, ParquetStore
+from hbu_dataplatform.sources.addresses.resources import AdressesQuebecResource
+from hbu_dataplatform.core.resources import ParquetStore
 from hbu_dataplatform.core.storage import join
 
 DATE = "2026-08-01"

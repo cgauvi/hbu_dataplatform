@@ -18,7 +18,8 @@ from dagster import materialize
 from asset_helpers import materialization_metadata
 
 from hbu_dataplatform.core.open_data import CkanClient
-from hbu_dataplatform.core.resources import ParquetStore, RfuResource
+from hbu_dataplatform.core.resources import ParquetStore
+from hbu_dataplatform.sources.rfu.resources import RfuResource
 from hbu_dataplatform.sources.rfu.client import (
     COMPARATIVE_FACTOR_COLUMN,
     RFU_YEAR_VAR,

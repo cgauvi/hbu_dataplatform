@@ -47,7 +47,8 @@ from hbu_dataplatform.sources.cmhc.assets import (
 )
 from hbu_dataplatform.sources.cmhc import assets as cmhc_assets
 from hbu_dataplatform.partitions.cities import CMHC_QUARTIERS, quartiers_for
-from hbu_dataplatform.core.resources import CmhcResource, ParquetStore, PostgisResource
+from hbu_dataplatform.sources.cmhc.resources import CmhcResource
+from hbu_dataplatform.core.resources import ParquetStore, PostgisResource
 from hbu_dataplatform.core.storage import join
 
 DATE = "2026-08-01"

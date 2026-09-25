@@ -25,7 +25,8 @@ from hbu_dataplatform.core.layers import key_prefix
 from hbu_dataplatform.core.open_data import OpenDataError, decode_csv
 from hbu_dataplatform.partitions.cities import City, MUNICIPALITY_CODES
 from hbu_dataplatform.partitions.axes import date_partitions
-from hbu_dataplatform.core.resources import ParquetStore, RfuResource
+from hbu_dataplatform.core.resources import ParquetStore
+from hbu_dataplatform.sources.rfu.resources import RfuResource
 from hbu_dataplatform.sources.rfu.client import (
     COMPARATIVE_FACTOR_COLUMN,
     GEO_CODE_COLUMN,

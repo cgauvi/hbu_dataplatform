@@ -25,7 +25,8 @@ from hbu_dataplatform.sources.bdoi.client import (
 from hbu_dataplatform.sources.bdoi.assets import BUILDINGS_FILE, neighborhood_buildings
 from hbu_dataplatform.core.frames import write_frame
 from hbu_dataplatform.boundaries.assets import QUARTIERS_FILE, reference_neighborhoods
-from hbu_dataplatform.core.resources import BdoiResource, ParquetStore
+from hbu_dataplatform.sources.bdoi.resources import BdoiResource
+from hbu_dataplatform.core.resources import ParquetStore
 from hbu_dataplatform.core.storage import join
 
 DATE = "2026-08-01"

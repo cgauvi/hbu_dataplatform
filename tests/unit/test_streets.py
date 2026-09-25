@@ -42,7 +42,8 @@ from hbu_dataplatform.boundaries.assets import (
     reference_neighborhoods,
     street_network,
 )
-from hbu_dataplatform.core.resources import ParquetStore, PostgisResource, RqttResource
+from hbu_dataplatform.core.resources import ParquetStore, PostgisResource
+from hbu_dataplatform.sources.rqtt.resources import RqttResource
 from hbu_dataplatform.sources.rqtt.client import (
     PUBLISHED_CRS,
     ROAD_LAYER,

@@ -42,7 +42,8 @@ from hbu_dataplatform.cities.montreal.costs.estimator import (
 from hbu_dataplatform.core.frames import write_frame
 from hbu_dataplatform.core.layers import key_prefix
 from hbu_dataplatform.partitions.axes import date_partitions
-from hbu_dataplatform.core.resources import EstimatorResource, ParquetStore
+from hbu_dataplatform.cities.montreal.resources import EstimatorResource
+from hbu_dataplatform.core.resources import ParquetStore
 from hbu_dataplatform.core.storage import clear_parquet, join
 
 GROUP = "bronze_construction_costs"

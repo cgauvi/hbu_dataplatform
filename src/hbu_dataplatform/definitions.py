@@ -87,30 +87,29 @@ from hbu_dataplatform.rag.assets import (
     document_index,
     linked_documents,
 )
-from hbu_dataplatform.core.resources import (
-    AdressesQuebecResource,
-    BdoiResource,
-    CmhcResource,
+from hbu_dataplatform.sources.addresses.resources import AdressesQuebecResource
+from hbu_dataplatform.sources.bdoi.resources import BdoiResource
+from hbu_dataplatform.sources.cmhc.resources import CmhcResource
+from hbu_dataplatform.cities.quebec_city.resources import (
     CouncilMinutesResource,
+    QuebecZoningResource,
+)
+from hbu_dataplatform.cities.montreal.resources import (
     CrspiResource,
-    CubfResource,
-    EmbeddingModel,
     EstimatorResource,
-    InfolotResource,
     MarketBeatResource,
     OpenDataResource,
-    ParquetStore,
-    PdfCache,
-    PgVectorResource,
-    PostgisResource,
-    QuebecOpenDataResource,
-    QuebecZoningResource,
-    RfuResource,
-    RoleResource,
-    RqttResource,
-    SaguenayZoningResource,
     SpectrumResource,
 )
+from hbu_dataplatform.sources.cubf.resources import CubfResource
+from hbu_dataplatform.rag.resources import EmbeddingModel, PdfCache, PgVectorResource
+from hbu_dataplatform.sources.infolot.resources import InfolotResource
+from hbu_dataplatform.core.resources import ParquetStore, PostgisResource
+from hbu_dataplatform.sources.donnees_quebec import QuebecOpenDataResource
+from hbu_dataplatform.sources.rfu.resources import RfuResource
+from hbu_dataplatform.sources.roll.resources import RoleResource
+from hbu_dataplatform.sources.rqtt.resources import RqttResource
+from hbu_dataplatform.cities.saguenay.resources import SaguenayZoningResource
 from hbu_dataplatform.sources.rfu.assets import uniformized_property_wealth
 from hbu_dataplatform.sources.roll.assets import (
     assessment_units,

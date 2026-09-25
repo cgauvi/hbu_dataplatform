@@ -111,12 +111,8 @@ from hbu_dataplatform.partitions.axes import (
 )
 from hbu_dataplatform.cities.montreal.registry import submarket_for
 from hbu_dataplatform.core.pg import PostgresUnavailable
-from hbu_dataplatform.core.resources import (
-    CrspiResource,
-    MarketBeatResource,
-    ParquetStore,
-    PostgisResource,
-)
+from hbu_dataplatform.cities.montreal.resources import CrspiResource, MarketBeatResource
+from hbu_dataplatform.core.resources import ParquetStore, PostgisResource
 from hbu_dataplatform.core.storage import (
     clear_parquet,
     filesystem,

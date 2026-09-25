@@ -58,7 +58,8 @@ from hbu_dataplatform.core.frames import write_frame
 from hbu_dataplatform.core.layers import key_prefix
 from hbu_dataplatform.boundaries.assets import GROUP as OPEN_DATA_GROUP
 from hbu_dataplatform.partitions.axes import date_partitions
-from hbu_dataplatform.core.resources import CubfResource, ParquetStore
+from hbu_dataplatform.sources.cubf.resources import CubfResource
+from hbu_dataplatform.core.resources import ParquetStore
 from hbu_dataplatform.core.storage import clear_parquet, join
 
 #: Shared with `hbu_dataplatform.boundaries.assets` and `hbu_dataplatform.sources.roll.assets` rather

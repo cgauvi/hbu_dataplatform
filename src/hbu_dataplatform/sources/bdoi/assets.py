@@ -33,7 +33,8 @@ from hbu_dataplatform.core.frames import count_invalid_geometries, write_frame
 from hbu_dataplatform.core.layers import key_prefix
 from hbu_dataplatform.boundaries.assets import borough_boundary, reference_neighborhoods
 from hbu_dataplatform.partitions.axes import scrape_partitions
-from hbu_dataplatform.core.resources import BdoiResource, ParquetStore
+from hbu_dataplatform.sources.bdoi.resources import BdoiResource
+from hbu_dataplatform.core.resources import ParquetStore
 from hbu_dataplatform.core.storage import clear_parquet, join
 
 GROUP = "bronze_bdoi"

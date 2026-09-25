@@ -93,11 +93,8 @@ from hbu_dataplatform.core.postgis import (
     neighborhoods_of_tile,
 )
 from hbu_dataplatform.core.pg import PostgresUnavailable
-from hbu_dataplatform.core.resources import (
-    AdressesQuebecResource,
-    ParquetStore,
-    PostgisResource,
-)
+from hbu_dataplatform.sources.addresses.resources import AdressesQuebecResource
+from hbu_dataplatform.core.resources import ParquetStore, PostgisResource
 from hbu_dataplatform.core.storage import (
     clear_parquet,
     filesystem,

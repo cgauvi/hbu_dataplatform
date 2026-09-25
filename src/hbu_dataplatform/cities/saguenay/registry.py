@@ -1,7 +1,7 @@
 """Saguenay as one partition key, and how it resolves into the city's
 publishers: the administrative-limit layer on Données Québec and CMHC's
 Saguenay quartiers. The zoning layer and the grid PDFs are in
-`hbu_dataplatform.cities.saguenay.zoning`; `hbu_dataplatform.partitions.cities`
+`hbu_dataplatform.cities.saguenay.zoning`; `hbu_dataplatform.partitions.axes.cities`
 composes this with the other cities' registries.
 """
 

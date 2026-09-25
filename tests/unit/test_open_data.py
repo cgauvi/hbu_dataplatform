@@ -29,11 +29,9 @@ from hbu_dataplatform.boundaries.assets import (
     QUEBEC_BOROUGHS_GEOJSON,
     reference_neighborhoods,
 )
-from hbu_dataplatform.core.resources import (
-    OpenDataResource,
-    ParquetStore,
-    QuebecOpenDataResource,
-)
+from hbu_dataplatform.cities.montreal.resources import OpenDataResource
+from hbu_dataplatform.core.resources import ParquetStore
+from hbu_dataplatform.sources.donnees_quebec import QuebecOpenDataResource
 
 DOWNLOAD_BASE = "https://donnees.montreal.ca/dataset/abc/resource/def/download"
 

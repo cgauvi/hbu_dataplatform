@@ -32,7 +32,8 @@ from hbu_dataplatform.cities.montreal.costs.assets import (
     montreal_nonresidential_costs,
     montreal_residential_costs,
 )
-from hbu_dataplatform.core.resources import EstimatorResource, ParquetStore
+from hbu_dataplatform.cities.montreal.resources import EstimatorResource
+from hbu_dataplatform.core.resources import ParquetStore
 from hbu_dataplatform.core.storage import join
 
 from asset_helpers import materialization_metadata

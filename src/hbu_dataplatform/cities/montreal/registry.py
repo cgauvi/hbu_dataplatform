@@ -3,7 +3,7 @@ each of the city's publishers files that borough under.
 
 A key here is a Montreal borough. It resolves into a Spectrum namespace, a
 ``no_arr`` code on the city's reference-neighborhood layer, CMHC's Montreal
-quartiers and Cushman & Wakefield's submarkets. `hbu_dataplatform.partitions.cities`
+quartiers and Cushman & Wakefield's submarkets. `hbu_dataplatform.partitions.axes.cities`
 composes these with the other cities' registries into the one map every
 asset switches on.
 """

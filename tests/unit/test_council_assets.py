@@ -19,12 +19,9 @@ from hbu_dataplatform.cities.quebec_city.council.assets import (
 )
 from hbu_dataplatform.rag.documents import PdfFetcher
 from hbu_dataplatform.cities.quebec_city.council.councils import CouncilFetcher
-from hbu_dataplatform.core.resources import (
-    CouncilMinutesResource,
-    ParquetStore,
-    PdfCache,
-    PostgisResource,
-)
+from hbu_dataplatform.cities.quebec_city.resources import CouncilMinutesResource
+from hbu_dataplatform.core.resources import ParquetStore, PostgisResource
+from hbu_dataplatform.rag.resources import PdfCache
 
 DATE = "2026-08-01"
 

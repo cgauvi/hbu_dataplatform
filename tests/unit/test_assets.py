@@ -18,13 +18,11 @@ from hbu_dataplatform.zoning.features_assets import (
     neighborhood_features,
     spectrum_table_catalog,
 )
-from hbu_dataplatform.core.resources import (
-    ParquetStore,
-    QuebecOpenDataResource,
-    QuebecZoningResource,
-    SaguenayZoningResource,
-    SpectrumResource,
-)
+from hbu_dataplatform.core.resources import ParquetStore
+from hbu_dataplatform.sources.donnees_quebec import QuebecOpenDataResource
+from hbu_dataplatform.cities.quebec_city.resources import QuebecZoningResource
+from hbu_dataplatform.cities.saguenay.resources import SaguenayZoningResource
+from hbu_dataplatform.cities.montreal.resources import SpectrumResource
 from hbu_dataplatform.cities.montreal.spectrum import Column, TableMetadata
 
 DATE = "2026-08-01"

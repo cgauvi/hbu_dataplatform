@@ -33,7 +33,8 @@ from hbu_dataplatform.sources.infolot.client import (
 from hbu_dataplatform.core.layers import key_prefix
 from hbu_dataplatform.boundaries.assets import borough_boundary, reference_neighborhoods
 from hbu_dataplatform.partitions.axes import scrape_partitions
-from hbu_dataplatform.core.resources import InfolotResource, ParquetStore
+from hbu_dataplatform.sources.infolot.resources import InfolotResource
+from hbu_dataplatform.core.resources import ParquetStore
 from hbu_dataplatform.core.storage import clear_parquet, join
 
 GROUP = "bronze_infolot"

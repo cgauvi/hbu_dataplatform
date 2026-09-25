@@ -46,12 +46,10 @@ from hbu_dataplatform.partitions.cities import City, city_of
 from hbu_dataplatform.cities.montreal.registry import borough_code_for
 from hbu_dataplatform.partitions.axes import date_partitions
 from hbu_dataplatform.cities.quebec_city.registry import quebec_abbreviation_for
-from hbu_dataplatform.core.resources import (
-    OpenDataResource,
-    ParquetStore,
-    QuebecOpenDataResource,
-    RqttResource,
-)
+from hbu_dataplatform.cities.montreal.resources import OpenDataResource
+from hbu_dataplatform.core.resources import ParquetStore
+from hbu_dataplatform.sources.donnees_quebec import QuebecOpenDataResource
+from hbu_dataplatform.sources.rqtt.resources import RqttResource
 from hbu_dataplatform.sources.rqtt.client import (
     EXCLUDED_ROAD_CHARACTERISTICS,
     EXCLUDED_ROAD_CLASSES,

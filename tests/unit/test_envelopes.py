@@ -39,7 +39,8 @@ from hbu_dataplatform.zoning.envelope_assets import (
 from hbu_dataplatform.zoning import envelope_assets
 from hbu_dataplatform.core.frames import write_frame
 from hbu_dataplatform.rag.assets import DOCUMENTS_FILE, linked_documents
-from hbu_dataplatform.core.resources import ParquetStore, PdfCache, PostgisResource
+from hbu_dataplatform.core.resources import ParquetStore, PostgisResource
+from hbu_dataplatform.rag.resources import PdfCache
 from hbu_dataplatform.core.storage import join
 from hbu_dataplatform.zoning.zone_piece_assets import (
     LOT_ZONE_PIECES_FILE,

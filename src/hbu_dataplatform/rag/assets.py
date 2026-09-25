@@ -54,13 +54,8 @@ from hbu_dataplatform.core.layers import key_prefix
 from hbu_dataplatform.partitions.axes import borough_partition_of, scrape_partitions
 from hbu_dataplatform.core.pg import PostgresUnavailable
 from hbu_dataplatform.rag.results import IndexMismatch
-from hbu_dataplatform.core.resources import (
-    EmbeddingModel,
-    ParquetStore,
-    PdfCache,
-    PgVectorResource,
-    PostgisResource,
-)
+from hbu_dataplatform.rag.resources import EmbeddingModel, PdfCache, PgVectorResource
+from hbu_dataplatform.core.resources import ParquetStore, PostgisResource
 from hbu_dataplatform.core.storage import dirname, filesystem, join, storage_options
 from hbu_dataplatform.core.warehouse import MissingRelation, publish, published_metadata
 

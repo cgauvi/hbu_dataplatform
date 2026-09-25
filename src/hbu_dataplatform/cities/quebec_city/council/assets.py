@@ -66,12 +66,9 @@ from hbu_dataplatform.cities.quebec_city.council.councils import (
 )
 from hbu_dataplatform.rag.documents import DocumentError, document_id, read_pdf
 from hbu_dataplatform.core.pg import PostgresUnavailable
-from hbu_dataplatform.core.resources import (
-    CouncilMinutesResource,
-    ParquetStore,
-    PdfCache,
-    PostgisResource,
-)
+from hbu_dataplatform.cities.quebec_city.resources import CouncilMinutesResource
+from hbu_dataplatform.core.resources import ParquetStore, PostgisResource
+from hbu_dataplatform.rag.resources import PdfCache
 from hbu_dataplatform.core.storage import dirname, filesystem, join, storage_options
 from hbu_dataplatform.core.warehouse import MissingRelation, publish, published_metadata
 
