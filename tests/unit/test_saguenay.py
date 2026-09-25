@@ -29,19 +29,21 @@ import pytest
 from test_zoning_grid import _pdf
 
 from hbu_dataplatform.partitions import axes as partitions
-from hbu_dataplatform.partitions.axes import (
+from hbu_dataplatform.cities.saguenay.registry import (
     SAGUENAY_OUTLINE_TYPE,
+    saguenay_outline_name_for,
+)
+from hbu_dataplatform.partitions.cities import (
     City,
     city_of,
     cmhc_centre_for,
-    known_neighborhoods,
     metric_crs_for,
     metric_srid_for,
     municipality_code_for,
     quartiers_for,
-    saguenay_outline_name_for,
-    submarket_for,
 )
+from hbu_dataplatform.partitions.axes import known_neighborhoods
+from hbu_dataplatform.cities.montreal.registry import submarket_for
 from hbu_dataplatform.hbu.program import BuildingLevel
 from hbu_dataplatform.cities.saguenay.zoning import (
     CLASS_MAX_DWELLINGS,

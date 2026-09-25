@@ -101,12 +101,8 @@ from hbu_dataplatform.hbu.massing import (
     SHRINK_STEPS,
     massing_frame,
 )
-from hbu_dataplatform.partitions.axes import (
-    city_of_tile,
-    metric_crs_for_city,
-    tile_partition_of,
-    tile_scrape_partitions,
-)
+from hbu_dataplatform.partitions.cities import city_of_tile, metric_crs_for_city
+from hbu_dataplatform.partitions.axes import tile_partition_of, tile_scrape_partitions
 from hbu_dataplatform.core.pg import PostgresUnavailable
 from hbu_dataplatform.core.resources import ParquetStore, PostgisResource
 from hbu_dataplatform.zoning.setback_assets import (

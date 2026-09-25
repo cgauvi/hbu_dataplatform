@@ -37,7 +37,7 @@ from hbu_dataplatform.sources.cubf.client import USE_DESCRIPTION_COLUMN
 from hbu_dataplatform.sources.cubf.assets import CUBF_FILE, cubf_use_codes
 from hbu_dataplatform.core.frames import write_frame
 from hbu_dataplatform.boundaries.assets import QUARTIERS_FILE, reference_neighborhoods
-from hbu_dataplatform.partitions.axes import borough_code_for
+from hbu_dataplatform.cities.montreal.registry import borough_code_for
 from hbu_dataplatform.core.resources import ParquetStore, PostgisResource, RoleResource
 from hbu_dataplatform.sources.roll.assets import (
     ARROND_PREFIX,

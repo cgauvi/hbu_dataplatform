@@ -138,12 +138,8 @@ from hbu_dataplatform.cities.montreal.rents.assets import (
     COMMERCIAL_RENTS_FILE,
     commercial_rents,
 )
-from hbu_dataplatform.partitions.axes import (
-    city_of_tile,
-    metric_crs_for_city,
-    tile_partition_of,
-    tile_scrape_partitions,
-)
+from hbu_dataplatform.partitions.cities import city_of_tile, metric_crs_for_city
+from hbu_dataplatform.partitions.axes import tile_partition_of, tile_scrape_partitions
 from hbu_dataplatform.core.pg import PostgresUnavailable
 from hbu_dataplatform.core.resources import ParquetStore, PostgisResource
 from hbu_dataplatform.sources.roll.assets import (

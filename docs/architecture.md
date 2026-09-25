@@ -375,7 +375,7 @@ Spectrum namespace `19_VSMPE`, and the city for Quebec and Saguenay, which each
 publish one zoning layer and no namespace at all. It is what makes `C01-001` in
 one borough a different feature from `C01-001` in the next, now that
 `source_table` is the slug and the slug drops it. See
-`hbu_dataplatform.partitions.axes.source_namespace_for` and
+`hbu_dataplatform.partitions.cities.source_namespace_for` and
 hbu_infra's `027_features_source_namespace.sql`.
 
 The whole history still reads back as one dataset — `read_parquet` over

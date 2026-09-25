@@ -88,10 +88,9 @@ from dagster import (
 from hbu_dataplatform.zoning.features_assets import neighborhood_features
 from hbu_dataplatform.core.frames import write_frame
 from hbu_dataplatform.core.layers import key_prefix
+from hbu_dataplatform.partitions.cities import City, city_of
 from hbu_dataplatform.partitions.axes import (
-    City,
     borough_partition_of,
-    city_of,
     scrape_partitions,
     tile_partition_of,
     tile_scrape_partitions,

@@ -35,15 +35,14 @@ from hbu_dataplatform.core.frames import (
 from hbu_dataplatform.sources.infolot.client import esri_polygon
 from hbu_dataplatform.core.layers import key_prefix
 from hbu_dataplatform.boundaries.assets import borough_boundary, reference_neighborhoods
-from hbu_dataplatform.partitions.axes import (
+from hbu_dataplatform.partitions.cities import (
     City,
     city_of,
-    date_partitions,
     municipality_code_for,
-    namespace_for,
-    scrape_partitions,
     source_namespace_for,
 )
+from hbu_dataplatform.partitions.axes import date_partitions, scrape_partitions
+from hbu_dataplatform.cities.montreal.registry import namespace_for
 from hbu_dataplatform.cities.saguenay import zoning as saguenay
 from hbu_dataplatform.cities.saguenay.zoning import SaguenayZoningError
 from hbu_dataplatform.cities.quebec_city.zoning import (

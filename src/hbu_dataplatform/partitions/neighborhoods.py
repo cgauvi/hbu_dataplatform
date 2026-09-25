@@ -27,12 +27,12 @@ import sys
 from hbu_dataplatform.partitions.axes import (
     DEFAULT_NEIGHBORHOODS,
     NEIGHBORHOOD_PARTITIONS_NAME,
-    city_of,
     enabled_neighborhoods,
     known_neighborhoods,
     register_neighborhoods,
     unregister_neighborhoods,
 )
+from hbu_dataplatform.partitions.cities import city_of
 
 
 def main(argv: list[str] | None = None) -> int:

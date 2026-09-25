@@ -72,12 +72,14 @@ from hbu_dataplatform.boundaries.assets import (
     reference_neighborhoods,
     street_network,
 )
-from hbu_dataplatform.partitions.axes import (
+from hbu_dataplatform.partitions.cities import (
     City,
     city_of,
     city_of_tile,
-    enabled_neighborhoods,
     metric_crs_for_city,
+)
+from hbu_dataplatform.partitions.axes import (
+    enabled_neighborhoods,
     tile_partition_of,
     tile_scrape_partitions,
 )

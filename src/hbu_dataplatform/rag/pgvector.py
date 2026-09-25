@@ -52,11 +52,7 @@ from hbu_dataplatform.core.pg import (
     _first_line,
 )
 from hbu_dataplatform.rag.results import COLUMNS, SCHEMA_VERSION, Hit, IndexMismatch
-from hbu_dataplatform.core.storage import (
-    filesystem,
-    is_s3_uri,
-    storage_options,
-)
+from hbu_dataplatform.core.storage import filesystem, is_s3_uri, storage_options
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, psycopg is imported lazily
     from psycopg import Connection, Cursor

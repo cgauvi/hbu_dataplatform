@@ -147,11 +147,9 @@ from hbu_dataplatform.core.frames import count_invalid_geometries, write_frame
 from hbu_dataplatform.core.layers import key_prefix
 from hbu_dataplatform.boundaries.assets import GROUP as OPEN_DATA_GROUP
 from hbu_dataplatform.boundaries.assets import borough_boundary, reference_neighborhoods
+from hbu_dataplatform.partitions.cities import MUNICIPALITY_CODES, City, city_of
+from hbu_dataplatform.cities.montreal.registry import borough_code_for
 from hbu_dataplatform.partitions.axes import (
-    MUNICIPALITY_CODES,
-    City,
-    borough_code_for,
-    city_of,
     date_partitions,
     enabled_neighborhoods,
     tile_partition_of,

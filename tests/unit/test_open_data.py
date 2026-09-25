@@ -16,6 +16,7 @@ from dagster import materialize
 from asset_helpers import materialization_metadata
 
 from hbu_dataplatform.cities.saguenay import zoning as saguenay
+from hbu_dataplatform.cities.saguenay import registry as saguenay_registry
 from hbu_dataplatform.core.open_data import (
     CkanClient,
     OpenDataError,
@@ -279,8 +280,8 @@ class QuebecFakeSession:
         if url.endswith("package_show"):
             dataset = (params or {}).get("id")
             packages = {
-                saguenay.LIMITS_DATASET: _saguenay_package(
-                    saguenay.LIMITS_DATASET, saguenay.LIMITS_GEOJSON
+                saguenay_registry.LIMITS_DATASET: _saguenay_package(
+                    saguenay_registry.LIMITS_DATASET, saguenay_registry.LIMITS_GEOJSON
                 ),
                 saguenay.ZONING_DATASET: _saguenay_package(
                     saguenay.ZONING_DATASET, saguenay.ZONING_GEOJSON
@@ -291,7 +292,7 @@ class QuebecFakeSession:
         filename = url.rsplit("/", 1)[-1]
         files = {
             QUEBEC_BOROUGHS_GEOJSON: QUEBEC_GEOJSON,
-            saguenay.LIMITS_GEOJSON: SAGUENAY_LIMITS_BYTES,
+            saguenay_registry.LIMITS_GEOJSON: SAGUENAY_LIMITS_BYTES,
         }
         if filename not in files:
             raise AssertionError(f"unexpected Données Québec download: {url}")

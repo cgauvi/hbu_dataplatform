@@ -65,11 +65,8 @@ from hbu_dataplatform.sources.bdoi.assets import BUILDINGS_FILE, neighborhood_bu
 from hbu_dataplatform.core.frames import count_invalid_geometries
 from hbu_dataplatform.sources.infolot.assets import LOTS_FILE, neighborhood_lots
 from hbu_dataplatform.core.layers import key_prefix
-from hbu_dataplatform.partitions.axes import (
-    borough_partition_of,
-    scrape_partitions,
-    source_namespace_for,
-)
+from hbu_dataplatform.partitions.axes import borough_partition_of, scrape_partitions
+from hbu_dataplatform.partitions.cities import source_namespace_for
 from hbu_dataplatform.core.postgis import (
     GroundOutsideCut,
     MissingRelation,

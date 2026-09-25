@@ -40,7 +40,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from hbu_dataplatform.core import tile_cut, tile_grid  # noqa: E402
-from hbu_dataplatform.partitions.axes import city_of  # noqa: E402
+from hbu_dataplatform.partitions.cities import city_of  # noqa: E402
 from hbu_dataplatform.core.postgis import connect  # noqa: E402
 from hbu_dataplatform.core.pg import PgSettings  # noqa: E402
 

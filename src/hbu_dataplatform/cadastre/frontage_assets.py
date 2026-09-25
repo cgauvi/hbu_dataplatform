@@ -131,12 +131,8 @@ from pydantic import Field
 from hbu_dataplatform.cadastre.building_lots_assets import building_lot_intersections
 from hbu_dataplatform.core.frames import write_frame
 from hbu_dataplatform.core.layers import key_prefix
-from hbu_dataplatform.partitions.axes import (
-    city_of_tile,
-    metric_srid_for_city,
-    tile_partition_of,
-    tile_scrape_partitions,
-)
+from hbu_dataplatform.partitions.cities import city_of_tile, metric_srid_for_city
+from hbu_dataplatform.partitions.axes import tile_partition_of, tile_scrape_partitions
 from hbu_dataplatform.hbu.hbu import ROAD_LOT_FLAG_COLUMN
 from hbu_dataplatform.core.postgis import (
     DEFAULT_FRONTAGE_FALLBACK_BUFFERS_M,

@@ -103,14 +103,13 @@ from hbu_dataplatform.cities.montreal.rents.marketbeat import (
     market_total,
     parse_submarkets,
 )
+from hbu_dataplatform.partitions.cities import City, city_of
 from hbu_dataplatform.partitions.axes import (
-    City,
     borough_partition_of,
-    city_of,
     date_partitions,
     scrape_partitions,
-    submarket_for,
 )
+from hbu_dataplatform.cities.montreal.registry import submarket_for
 from hbu_dataplatform.core.pg import PostgresUnavailable
 from hbu_dataplatform.core.resources import (
     CrspiResource,

@@ -37,16 +37,15 @@ from hbu_dataplatform.core.frames import (
 )
 from hbu_dataplatform.core.layers import key_prefix
 from hbu_dataplatform.core.open_data import OpenDataError, decode_csv
-from hbu_dataplatform.cities.saguenay import zoning as saguenay
-from hbu_dataplatform.partitions.axes import (
+from hbu_dataplatform.cities.saguenay import registry as saguenay_registry
+from hbu_dataplatform.cities.saguenay.registry import (
     SAGUENAY_OUTLINE_TYPE,
-    City,
-    borough_code_for,
-    city_of,
-    date_partitions,
-    quebec_abbreviation_for,
     saguenay_outline_name_for,
 )
+from hbu_dataplatform.partitions.cities import City, city_of
+from hbu_dataplatform.cities.montreal.registry import borough_code_for
+from hbu_dataplatform.partitions.axes import date_partitions
+from hbu_dataplatform.cities.quebec_city.registry import quebec_abbreviation_for
 from hbu_dataplatform.core.resources import (
     OpenDataResource,
     ParquetStore,
@@ -91,7 +90,7 @@ DWELLINGS_CSV = "nombrelogementsquartiersreference.csv"
 DWELLINGS_COUNT_COLUMN = "nb_log"
 
 #: Column in the reference layer holding the borough code a boundary is cut
-#: on - see `hbu_dataplatform.partitions.axes.NEIGHBORHOOD_BOROUGH_CODES`.
+#: on - see `hbu_dataplatform.cities.montreal.registry.NEIGHBORHOOD_BOROUGH_CODES`.
 BOROUGH_CODE_COLUMN = "no_arr"
 
 #: The one file the street network is written to, under
@@ -127,7 +126,7 @@ STREET_NAME_COLUMN = "NOM_VOIE"
 #: Quebec City's six arrondissements, from Données Québec
 #: (https://www.donneesquebec.ca/recherche/dataset/vque_2): one polygon each,
 #: EPSG:4326, carrying the three-letter ``ABREVIATION`` the partition keys in
-#: `hbu_dataplatform.partitions.axes.QUEBEC_BOROUGH_ABBREVIATIONS` are. Written beside
+#: `hbu_dataplatform.cities.quebec_city.registry.QUEBEC_BOROUGH_ABBREVIATIONS` are. Written beside
 #: the Montreal quartiers under the same date, and cut on by
 #: `borough_boundary` for a Quebec City key.
 QUEBEC_BOROUGHS_DATASET = "vque_2"
@@ -255,15 +254,15 @@ def reference_neighborhoods(
     # And the third city's, on the same footing and for the same reason. The
     # layer is small - twelve polygons - and every Saguenay partition is cut
     # against one of them.
-    saguenay_package = quebec.package(saguenay.LIMITS_DATASET)
-    limits = saguenay_package.resource(saguenay.LIMITS_GEOJSON)
+    saguenay_package = quebec.package(saguenay_registry.LIMITS_DATASET)
+    limits = saguenay_package.resource(saguenay_registry.LIMITS_GEOJSON)
     saguenay_frame = _geojson_to_frame(
         quebec.download(limits),
         source_file=limits.filename,
         scrape_date=scrape_date,
         scraped_at=scraped_at,
     )
-    for column in (saguenay.LIMIT_NAME_FIELD, saguenay.LIMIT_TYPE_FIELD):
+    for column in (saguenay_registry.LIMIT_NAME_FIELD, saguenay_registry.LIMIT_TYPE_FIELD):
         if column not in saguenay_frame.columns:
             raise Failure(
                 f"{limits.filename} has no {column} column; it publishes "
@@ -283,11 +282,11 @@ def reference_neighborhoods(
     metadata |= {
         "num_saguenay_limits": len(saguenay_frame),
         "saguenay_limit_types": ", ".join(
-            sorted(saguenay_frame[saguenay.LIMIT_TYPE_FIELD].dropna().astype(str).unique())
+            sorted(saguenay_frame[saguenay_registry.LIMIT_TYPE_FIELD].dropna().astype(str).unique())
         ),
         "num_saguenay_invalid_geometries": saguenay_invalid,
         "saguenay_source_url": MetadataValue.url(
-            f"{quebec_open_data.base_url}/dataset/{saguenay.LIMITS_DATASET}"
+            f"{quebec_open_data.base_url}/dataset/{saguenay_registry.LIMITS_DATASET}"
         ),
         "saguenay_license": saguenay_package.license_title or "unknown",
         "saguenay_limits_last_modified": limits.last_modified or "unknown",
@@ -686,17 +685,17 @@ def _saguenay_boundary(store: ParquetStore, scrape_date: str, neighborhood: str)
         limits = gpd.read_parquet(handle)
 
     wanted = limits[
-        (limits[saguenay.LIMIT_TYPE_FIELD].astype(str) == SAGUENAY_OUTLINE_TYPE)
-        & (limits[saguenay.LIMIT_NAME_FIELD].astype(str) == name)
+        (limits[saguenay_registry.LIMIT_TYPE_FIELD].astype(str) == SAGUENAY_OUTLINE_TYPE)
+        & (limits[saguenay_registry.LIMIT_NAME_FIELD].astype(str) == name)
     ]
     if wanted.empty:
         published = sorted(
-            f"{row[saguenay.LIMIT_TYPE_FIELD]}/{row[saguenay.LIMIT_NAME_FIELD]}"
+            f"{row[saguenay_registry.LIMIT_TYPE_FIELD]}/{row[saguenay_registry.LIMIT_NAME_FIELD]}"
             for _, row in limits.iterrows()
         )
         raise Failure(
-            f"No limit carries {saguenay.LIMIT_TYPE_FIELD}="
-            f"{SAGUENAY_OUTLINE_TYPE!r} and {saguenay.LIMIT_NAME_FIELD}="
+            f"No limit carries {saguenay_registry.LIMIT_TYPE_FIELD}="
+            f"{SAGUENAY_OUTLINE_TYPE!r} and {saguenay_registry.LIMIT_NAME_FIELD}="
             f"{name!r} for {neighborhood}; the layer has: {', '.join(published)}"
         )
     return shapely.union_all(shapely.make_valid(wanted.geometry.values._data))
@@ -748,7 +747,7 @@ def city_bounds(
 
     if city is City.SAGUENAY:
         outline = outline[
-            outline[saguenay.LIMIT_TYPE_FIELD].astype(str) == SAGUENAY_OUTLINE_TYPE
+            outline[saguenay_registry.LIMIT_TYPE_FIELD].astype(str) == SAGUENAY_OUTLINE_TYPE
         ]
     if outline.empty:
         raise Failure(f"{path} holds no polygon to bound {city.value} with.")

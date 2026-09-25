@@ -34,7 +34,7 @@ import argparse
 import sys
 
 from hbu_dataplatform.core import tile_cut
-from hbu_dataplatform.partitions.axes import city_of_tile
+from hbu_dataplatform.partitions.cities import city_of_tile
 
 
 def main(argv: list[str] | None = None) -> int:

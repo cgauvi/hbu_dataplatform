@@ -46,7 +46,7 @@ from hbu_dataplatform.sources.cmhc.assets import (
     vacancy_rates,
 )
 from hbu_dataplatform.sources.cmhc import assets as cmhc_assets
-from hbu_dataplatform.partitions.axes import CMHC_QUARTIERS, quartiers_for
+from hbu_dataplatform.partitions.cities import CMHC_QUARTIERS, quartiers_for
 from hbu_dataplatform.core.resources import CmhcResource, ParquetStore, PostgisResource
 from hbu_dataplatform.core.storage import join
 
@@ -409,10 +409,8 @@ def test_the_reference_month_is_read_off_the_sheet(workbook, tmp_path):
 
 
 def test_every_mapped_borough_is_a_known_partition_key():
-    from hbu_dataplatform.partitions.axes import (
-        NEIGHBORHOOD_NAMESPACES,
-        known_neighborhoods,
-    )
+    from hbu_dataplatform.cities.montreal.registry import NEIGHBORHOOD_NAMESPACES
+    from hbu_dataplatform.partitions.axes import known_neighborhoods
 
     # Every Montreal borough is mapped, and nothing is mapped that is not a
     # key of one city or the other.

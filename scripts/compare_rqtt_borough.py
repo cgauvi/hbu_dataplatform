@@ -23,7 +23,7 @@ from hbu_dataplatform.boundaries.assets import (
     borough_boundary,
     street_network,
 )
-from hbu_dataplatform.partitions.axes import metric_crs_for  # noqa: E402
+from hbu_dataplatform.partitions.cities import metric_crs_for  # noqa: E402
 from hbu_dataplatform.core.resources import ParquetStore  # noqa: E402
 from hbu_dataplatform.sources.rqtt.client import (
     ROAD_CLASS_FIELD,

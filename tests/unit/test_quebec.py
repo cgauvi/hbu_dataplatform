@@ -10,20 +10,22 @@ import openpyxl
 import pytest
 from dagster import DagsterInstance
 
-from hbu_dataplatform.partitions import axes as partitions
+from hbu_dataplatform.partitions.cities import quartiers_for
 from hbu_dataplatform.partitions.axes import (
     DEFAULT_NEIGHBORHOODS,
     NEIGHBORHOOD_PARTITIONS_NAME,
+    enabled_neighborhoods,
+    known_neighborhoods,
+    register_neighborhoods,
+    unregister_neighborhoods,
+)
+from hbu_dataplatform.partitions.cities import (
     City,
     city_of,
     cmhc_centre_for,
-    enabled_neighborhoods,
-    known_neighborhoods,
     metric_crs_for,
     metric_srid_for,
-    register_neighborhoods,
     source_namespace_for,
-    unregister_neighborhoods,
 )
 from hbu_dataplatform.hbu.program import BuildingLevel
 from hbu_dataplatform.cities.quebec_city.zoning import (
@@ -120,7 +122,7 @@ def test_the_metric_projection_follows_the_city():
 def test_every_default_key_is_known_and_has_a_cmhc_crosswalk():
     for key in DEFAULT_NEIGHBORHOODS:
         assert key in known_neighborhoods()
-        assert partitions.quartiers_for(key)
+        assert quartiers_for(key)
 
 
 def test_a_fresh_instance_is_seeded_with_the_defaults():

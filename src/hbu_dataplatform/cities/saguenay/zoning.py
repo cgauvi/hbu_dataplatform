@@ -65,16 +65,6 @@ from hbu_dataplatform.zoning.zoning_grid import (
 ZONING_DATASET = "sag_zonage"
 ZONING_GEOJSON = "sag_zonage.geojson"
 
-#: The administrative limit - the city, its three arrondissements and the
-#: former municipalities amalgamated into it - read for Saguenay the way
-#: `vque_2` is read for Quebec City.
-#:
-#: The road network that used to sit beside it here (`sag-reseau-routier`) is
-#: gone: every city's streets now come from the province-wide RQTT, so there is
-#: no Saguenay-specific street feed to name. See `hbu_dataplatform.sources.rqtt.client`.
-LIMITS_DATASET = "sag_limite_administrative"
-LIMITS_GEOJSON = "sag_limiteadministrative.geojson"
-
 #: The zone number, on the zoning layer and in the by-law. A string in the
 #: GeoJSON ("1000", "70520"), and the join key between the polygon, the grid
 #: and `rag.features.feature_id`.
@@ -85,11 +75,6 @@ ZONE_CODE_FIELD = "no_zone"
 #: re-published with a neighbour's rows in it would otherwise pass silently.
 OBJECT_ID_FIELD = "id"
 MUNICIPALITY_FIELD = "municipalite"
-
-#: Columns the limit layer names its polygons by - see
-#: `partitions.SAGUENAY_OUTLINE_TYPE` for why both are needed.
-LIMIT_NAME_FIELD = "nom"
-LIMIT_TYPE_FIELD = "type"
 
 #: Where the grid index and the zoning snapshot are written, in the shape
 #: `frames.table_slug` gives a Spectrum table - `<folder>__<TABLE>` - so they
@@ -1098,10 +1083,6 @@ __all__ = [
     "CLASS_MAX_DWELLINGS",
     "GRID_PDF_URL",
     "GRID_URL_COLUMN",
-    "LIMITS_DATASET",
-    "LIMITS_GEOJSON",
-    "LIMIT_NAME_FIELD",
-    "LIMIT_TYPE_FIELD",
     "MUNICIPALITY_FIELD",
     "OBJECT_ID_FIELD",
     "SaguenayZoningClient",

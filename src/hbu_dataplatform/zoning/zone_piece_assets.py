@@ -79,12 +79,8 @@ from hbu_dataplatform.cadastre.building_lots_assets import building_lot_intersec
 from hbu_dataplatform.core.frames import write_frame
 from hbu_dataplatform.cadastre.frontage_assets import lot_frontage
 from hbu_dataplatform.core.layers import key_prefix
-from hbu_dataplatform.partitions.axes import (
-    city_of_tile,
-    metric_srid_for_city,
-    tile_partition_of,
-    tile_scrape_partitions,
-)
+from hbu_dataplatform.partitions.cities import city_of_tile, metric_srid_for_city
+from hbu_dataplatform.partitions.axes import tile_partition_of, tile_scrape_partitions
 from hbu_dataplatform.core.postgis import (
     DEFAULT_ZONE_PIECE_EDGE_TOLERANCE_M,
     MIN_ZONE_OVERLAP_M2,

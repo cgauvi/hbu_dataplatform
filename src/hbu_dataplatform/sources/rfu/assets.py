@@ -23,7 +23,8 @@ from hbu_dataplatform.partitions.guards import guard_current_scrape_month
 from hbu_dataplatform.core.frames import write_frame
 from hbu_dataplatform.core.layers import key_prefix
 from hbu_dataplatform.core.open_data import OpenDataError, decode_csv
-from hbu_dataplatform.partitions.axes import City, MUNICIPALITY_CODES, date_partitions
+from hbu_dataplatform.partitions.cities import City, MUNICIPALITY_CODES
+from hbu_dataplatform.partitions.axes import date_partitions
 from hbu_dataplatform.core.resources import ParquetStore, RfuResource
 from hbu_dataplatform.sources.rfu.client import (
     COMPARATIVE_FACTOR_COLUMN,

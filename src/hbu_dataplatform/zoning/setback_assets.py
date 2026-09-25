@@ -71,12 +71,8 @@ from hbu_dataplatform.zoning.envelope_assets import lot_zoning_envelopes
 from hbu_dataplatform.core.frames import write_frame
 from hbu_dataplatform.cadastre.frontage_assets import lot_frontage
 from hbu_dataplatform.core.layers import key_prefix
-from hbu_dataplatform.partitions.axes import (
-    city_of_tile,
-    metric_srid_for_city,
-    tile_partition_of,
-    tile_scrape_partitions,
-)
+from hbu_dataplatform.partitions.cities import city_of_tile, metric_srid_for_city
+from hbu_dataplatform.partitions.axes import tile_partition_of, tile_scrape_partitions
 from hbu_dataplatform.core.postgis import (
     DEFAULT_SETBACK_BATCH_LOTS,
     DEFAULT_SETBACK_EDGE_TOLERANCE_M,
