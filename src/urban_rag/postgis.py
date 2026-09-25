@@ -58,17 +58,38 @@ else, because the lots its WHERE clause dropped were the ones a reader could no
 longer see. Keeping every lot and carrying `has_building` costs one boolean and
 makes that question a filter; see `compute_lot_profiles`.
 
+**A run owns a cell and reads the snapshot.** Every table the lot chain
+writes is partitioned on `cell_partition` - the cell of the tile cut
+(`urban_rag.tile_cut`) that a lot's representative point falls in - and each
+`compute_*` below takes the ``tile`` it is writing. The *owned* set is that
+cell's lots: `l.cell_partition = tile AND l.scrape_date = date` on `rag.lots`,
+or the same pair on whichever lot-keyed silver table the step reads, since a
+row keyed on a lot belongs to the lot's cell. Everything the owned set is
+measured *against* - the neighbouring parcels a lot abuts, the buildings that
+stand on it, the features that govern it, the street sides that name its
+frontage, the address points on it - is bound by `scrape_date` alone and found
+through the GiST index, with no borough predicate and no halo. That is the
+whole point of the axis. When every read was `WHERE neighborhood = X` the
+borough line was a wall the geometry could not see through: a lot on the
+outline lost the frontage its road lot carried in the next borough, the
+sliver check counted the parcel across the line as a survey gap, a building
+clipped at the line read as a shed, and an address two metres over it snapped
+to nothing. None of those facts respects a line drawn in 2002. A row is
+stamped with its lot's own `neighborhood`, `cell_key` and `cell_partition` -
+never with a literal the caller passed - and `neighborhood` survives on every
+table as the attribute the map still reads by.
+
 None of this is a live view, and a partition is still a snapshot - but it is
 now refreshed by an upsert followed by a prune rather than by a delete followed
 by an insert. The difference is what a reader querying mid-load sees: with the
-old order, a borough's rows were simply gone for the length of the recompute.
+old order, a cell's rows were simply gone for the length of the recompute.
 `urban_rag.warehouse` documents the trade in full; the part that matters here
 is that a key which does not survive a re-scrape - BDOI publishes no building
 id, unlike Infolot's lot number - degrades to exactly the delete-and-insert it
 always was, because every old row is pruned and every new one inserted.
-"Latest" still falls out for free: whatever is in the table for a neighborhood
-*is* its latest scrape, and the Dagster asset that calls this only ever writes
-the partition it was just handed.
+"Latest" still falls out for free: whatever is in the table for a cell *is*
+its latest scrape, and the Dagster asset that calls this only ever writes the
+partition it was just handed.
 """
 
 from __future__ import annotations
@@ -81,16 +102,132 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator, Sequence
 import geopandas as gpd
 import pandas as pd
 
-from urban_rag import tile_grid, warehouse
+from urban_rag import tile_cut, tile_grid, warehouse
 from urban_rag.rag.pgvector import PgSettings, PostgresUnavailable
 from urban_rag.warehouse import MissingRelation  # noqa: F401  (re-exported)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, psycopg is imported lazily
-    from psycopg import Connection
+    from psycopg import Connection, Cursor
 
 #: Columns never written to `attributes`: they get their own column, or (for
 #: `scraped_at`) mean nothing once the row has its own Postgres `loaded_at`.
-_ALWAYS_EXCLUDED = {"neighborhood", "scrape_date", "scraped_at"}
+#: `cell_key` and `cell_partition` are computed on the way in from the
+#: geometry, so a frame that happens to carry them - a silver parquet read
+#: back - must not also pack a stale copy into the jsonb.
+_ALWAYS_EXCLUDED = {
+    "neighborhood",
+    "scrape_date",
+    "scraped_at",
+    "cell_key",
+    "cell_partition",
+}
+
+
+class GroundOutsideCut(RuntimeError):
+    """Rows were loaded whose ground no cell of the tile cut covers.
+
+    The loaders below give every row its `cell_key` and resolve it to the
+    cut cell that owns it - `cell_partition`, the column the lot chain is
+    partitioned on. A key the cut has no cell for resolves to NULL, and a
+    row with no partition is a row no tile run will ever compute over: it
+    would sit in `rag.lots` invisible to the whole chain. So the load fails
+    here, naming the ground, rather than letting a city land and then
+    produce nothing. The fix is the one `urban_rag.tile_cut` describes -
+    re-seed the cut over the cadastre and check the new cells in.
+    """
+
+    def __init__(
+        self, table: str, partition: str, num_rows: int, sample: Sequence[str]
+    ) -> None:
+        self.table = table
+        self.partition = partition
+        self.num_rows = num_rows
+        self.sample = tuple(sample)
+        super().__init__(
+            f"{table}: {num_rows} row(s) of {partition} fall outside the tile "
+            f"cut (version {tile_cut.CUT_VERSION}, {len(tile_cut.CUT)} cells) - "
+            f"e.g. {', '.join(self.sample) or 'no key'}. Re-seed the cut with "
+            "scripts/seed_tile_cut.py and check the new cells into "
+            "urban_rag.tile_cut before loading this ground."
+        )
+
+
+def _cut_param() -> list[str]:
+    """The live cut as the `text[]` `warehouse.tile_of` takes.
+
+    Read at call time rather than at import so a test that narrows the cut
+    sees its own. Sorted for a stable statement, not for the function's sake:
+    members never nest, so at most one prefixes any key.
+    """
+    return sorted(tile_cut.CUT)
+
+
+def _cell_key_sql(geometry: str) -> str:
+    """The SQL for a row's `cell_key`, over the geometry expression given.
+
+    `warehouse.quadkey` (hbu_infra's sql/028) at the grid's base zoom, over
+    `ST_PointOnSurface` - guaranteed interior, unlike a centroid, which for a
+    flag lot such as 1 740 794 falls outside the parcel. The same three
+    spellings of the grid `tests/unit/test_tile_grid.py` holds together.
+    """
+    return (
+        f"warehouse.quadkey(ST_X(ST_PointOnSurface({geometry})), "
+        f"ST_Y(ST_PointOnSurface({geometry})), {tile_grid.BASE_CELL_ZOOM})"
+    )
+
+
+def _require_ground_in_cut(
+    cursor: "Cursor", table: str, where: str, params: Sequence[Any], partition: str
+) -> None:
+    """Raise `GroundOutsideCut` if any row just loaded has no partition."""
+    cursor.execute(
+        f"SELECT count(*), (array_agg(cell_key ORDER BY cell_key))[1:3] "
+        f"FROM {table} WHERE {where} "
+        "AND cell_key IS NOT NULL AND cell_partition IS NULL",
+        list(params),
+    )
+    row = cursor.fetchone()
+    num_rows = int(row[0]) if row else 0
+    if num_rows:
+        raise GroundOutsideCut(table, partition, num_rows, row[1] or ())
+
+
+def tiles_of_neighborhood(
+    connection: "Connection", *, neighborhood: str, scrape_date: str
+) -> tuple[str, ...]:
+    """The cut cells a borough's lots fall in, from what is loaded.
+
+    What a borough reload touches: `_replace_partition` deletes the borough's
+    lots and mints new `lot_uid`s, and the cascade reaches every tile these
+    cells name. `scripts/materialize_tiles.sh` reads this to know which tile
+    runs follow a borough's load.
+    """
+    cursor = connection.cursor()
+    cursor.execute(
+        "SELECT DISTINCT cell_partition FROM rag.lots "
+        "WHERE neighborhood = %s AND scrape_date = %s::date "
+        "AND cell_partition IS NOT NULL ORDER BY 1",
+        [neighborhood, scrape_date],
+    )
+    return tuple(row[0] for row in cursor.fetchall())
+
+
+def neighborhoods_of_tile(
+    connection: "Connection", *, tile: str, scrape_date: str
+) -> tuple[str, ...]:
+    """The boroughs whose lots a cut cell holds, from what is loaded.
+
+    The bridge a tile run uses to read a borough-partitioned upstream - the
+    CMHC and C&W tables, the zoning grid - for exactly the boroughs its lots
+    were fetched under.
+    """
+    cursor = connection.cursor()
+    cursor.execute(
+        "SELECT DISTINCT neighborhood FROM rag.lots "
+        "WHERE cell_partition = %s AND scrape_date = %s::date ORDER BY 1",
+        [tile, scrape_date],
+    )
+    return tuple(row[0] for row in cursor.fetchall())
 
 
 def _psycopg():
@@ -238,25 +375,30 @@ def load_streets(
     connection: "Connection",
     frame: gpd.GeoDataFrame,
     *,
-    neighborhood: str,
+    tile: str,
     scrape_date: str,
 ) -> dict[str, int]:
-    """Publish this borough's street sides to `silver.neighborhood_streets`.
+    """Publish one cell's street sides to `silver.neighborhood_streets`.
 
-    ``frame`` is one borough's slice of the geobase double, so the rows are
-    street *sides* rather than centre lines: `COTE_RUE_ID` is unique across the
-    island (91,546 of 91,546 in the first snapshot), which makes it as real a
-    natural key as Infolot's lot number - and it is what the upsert conflicts
-    on, inside the (scrape_date, neighborhood) partition.
+    ``frame`` is the sides whose midpoint falls in ``tile``, each stored
+    *whole* - a side is never clipped at a cell edge, any more than at a
+    borough line now: the cell is a claim on who writes the row, not a cutter.
+    The rows are street *sides* rather than centre lines, and `COTE_RUE_ID` is
+    unique across the network (91,546 of 91,546 in the first snapshot), which
+    makes it as real a natural key as Infolot's lot number - and it is what the
+    upsert conflicts on, inside the (scrape_date, cell_partition) partition.
+    The asset hands the frame in already carrying `cell_key`, `cell_partition`
+    and the `neighborhood` its midpoint falls in (NULL off every known
+    outline), so nothing here derives them.
 
     The one loader here that is a plain `urban_rag.warehouse` call and nothing
     else, because it is the one whose rows arrive as a frame rather than out of
     a join computed in the database. `NOM_VOIE` becomes `street_name` and
     `COTE_RUE_ID` becomes `cote_rue_id` through the table's own column map;
-    `length_m` is measured in SQL below rather than in the frame, since the
-    frame's `length_in_borough_m` is computed in a projected CRS by the asset
-    and this column is the geography measure every other table here uses.
-    Everything else the layer publishes lands in `attributes`.
+    `length_m` is measured here rather than taken from the frame, since the
+    asset's own length is planar in the city's projection and this column is
+    the geography measure every other table here uses. Everything else the
+    layer publishes lands in `attributes`.
 
     The geometry is forced to `MultiLineString` on the way, because the column
     is typed one and a typmod rejects a bare `LineString`. `_replace_partition`
@@ -272,7 +414,7 @@ def load_streets(
         connection,
         "neighborhood_streets",
         frame,
-        neighborhood=neighborhood,
+        partition=tile,
         scrape_date=scrape_date,
     )
 
@@ -280,9 +422,9 @@ def load_streets(
 def _as_multi_line(geometry: Any):
     """One street side as the `MultiLineString` its column is typed as.
 
-    A side clipped at a borough line comes back as either shape - one piece or
-    two - and `geometry(MultiLineString, 4326)` rejects the single one by
-    typmod rather than promoting it.
+    The network publishes a side as a single `LineString`, and
+    `geometry(MultiLineString, 4326)` rejects that by typmod rather than
+    promoting it; a side that arrives already multi is left as it is.
     """
     from shapely.geometry import MultiLineString
 
@@ -434,22 +576,39 @@ def load_features(
     # No ST_Multi here, unlike `_replace_partition`: rag.features.geom is typed
     # `geometry(Geometry, 4326)` precisely because one layer's rows are
     # polygons and another's are points, so nothing needs normalising.
+    # `ST_PointOnSurface` is defined on all three - on a point it is the point.
     cursor.execute(
         f"""
         INSERT INTO rag.features (
             feature_id, source_table, source_namespace, neighborhood,
-            scrape_date, attributes, geom
+            scrape_date, attributes, geom, cell_key, cell_partition
         )
         SELECT feature_id, source_table, source_namespace, neighborhood,
-               scrape_date, attributes,
-               ST_SetSRID(ST_GeomFromWKB(geom), 4326)
-        FROM {staging}
-        -- Still on `neighborhood`, not on `source_namespace`: this phase adds
-        -- the column and populates it, and the constraint swap waits until
-        -- `neighborhood` actually leaves the key. The two are 1:1 today, so
-        -- conflicting on either resolves the same rows.
-        ON CONFLICT (source_table, feature_id, neighborhood, scrape_date) DO NOTHING
-        """
+               scrape_date, attributes, geom,
+               cell_key, warehouse.tile_of(cell_key, %(cut)s::text[])
+        FROM (
+            SELECT feature_id, source_table, source_namespace, neighborhood,
+                   scrape_date, attributes,
+                   ST_SetSRID(ST_GeomFromWKB(geom), 4326) AS geom
+              FROM {staging}
+        ) AS shaped
+        CROSS JOIN LATERAL (SELECT {_cell_key_sql('geom')} AS cell_key) AS addressed
+        -- On `source_namespace`, the publisher's own unit, now that
+        -- `neighborhood` has left the key of everything downstream: a cell
+        -- straddling two Montreal boroughs holds a `C01-001` from each, and
+        -- only the namespace tells them apart. hbu_infra's sql/005 swaps the
+        -- constraint to match.
+        ON CONFLICT (source_table, feature_id, source_namespace, scrape_date)
+        DO NOTHING
+        """,
+        {"cut": _cut_param()},
+    )
+    _require_ground_in_cut(
+        cursor,
+        "rag.features",
+        "neighborhood = %s AND scrape_date = %s::date AND source_table = %s",
+        [neighborhood, scrape_date, source_table],
+        f"{neighborhood} {scrape_date} {source_table}",
     )
     analyze(connection, "rag.features")
     return inserted
@@ -510,17 +669,21 @@ MIN_BUILDING_PCT_OF_BUILDING = 10.0
 def compute_intersections(
     connection: "Connection",
     *,
-    neighborhood: str,
+    tile: str,
     scrape_date: str,
     min_overlap_m2: float = MIN_BUILDING_OVERLAP_M2,
     min_pct_of_building: float = MIN_BUILDING_PCT_OF_BUILDING,
 ) -> dict[str, object]:
-    """(Re)compute `silver.building_lot_intersections` for one partition.
+    """(Re)compute `silver.building_lot_intersections` for one (tile, date).
 
-    Assumes `load_lots`/`load_buildings` already landed this partition's rows
-    in `rag.lots`/`rag.buildings` - the join is `ON l.neighborhood =
-    b.neighborhood AND l.scrape_date = b.scrape_date`, so a stale lot from a
-    different date simply cannot match.
+    The owned set is the cell's lots; the buildings are the snapshot's. A
+    footprint is joined to a lot by `ST_Intersects` and `scrape_date` alone,
+    so a building whose outline was loaded under the next borough - a terrace
+    digitised straight through the borough line - lands on the lots it stands
+    on, and "ten per cent of the whole building" is measured against the
+    whole building rather than against the part one borough's load held.
+    Assumes the cadastre loads have landed every borough the cell touches; a
+    lot from a different date simply cannot match.
 
     Published through `urban_rag.warehouse.upsert_select` rather than inserted
     directly: the rows are produced in the database and never pass through
@@ -546,6 +709,8 @@ def compute_intersections(
         (
             "scrape_date",
             "neighborhood",
+            "cell_key",
+            "cell_partition",
             "building_uid",
             "lot_uid",
             "lot_number",
@@ -573,26 +738,32 @@ def compute_intersections(
         -- absolute area difference of 0.0 - the same answer, three times
         -- faster. Keep the fences if this statement is ever rewritten.
         WITH pairs AS MATERIALIZED (
+            -- The lot's own borough and cell on the row, never the caller's:
+            -- the write is the cell's lots, and the buildings are whichever
+            -- ones stand on them, wherever they were loaded from.
             SELECT
-                b.scrape_date,
-                b.neighborhood,
+                l.scrape_date,
+                l.neighborhood,
+                l.cell_key,
+                l.cell_partition,
                 b.building_uid,
                 l.lot_uid,
                 l.lot_number,
                 ST_Area(geography(b.geom)) AS building_area_m2,
                 ST_Intersection(b.geom, l.geom) AS clipped_geom
-            FROM rag.buildings b
-            JOIN rag.lots l
-              ON l.neighborhood = b.neighborhood
-             AND l.scrape_date = b.scrape_date
+            FROM rag.lots l
+            JOIN rag.buildings b
+              ON b.scrape_date = l.scrape_date
              AND ST_Intersects(b.geom, l.geom)
-            WHERE b.neighborhood = %(neighborhood)s
-              AND b.scrape_date = %(scrape_date)s::date
+            WHERE l.cell_partition = %(tile)s
+              AND l.scrape_date = %(scrape_date)s::date
         ),
         measured AS MATERIALIZED (
             SELECT
                 scrape_date,
                 neighborhood,
+                cell_key,
+                cell_partition,
                 building_uid,
                 lot_uid,
                 lot_number,
@@ -608,6 +779,8 @@ def compute_intersections(
         SELECT
             scrape_date,
             neighborhood,
+            cell_key,
+            cell_partition,
             building_uid,
             lot_uid,
             lot_number,
@@ -630,12 +803,12 @@ def compute_intersections(
                          / building_area_m2 >= %(min_pct_of_building)s)
         """,
         {
-            "neighborhood": neighborhood,
+            "tile": tile,
             "scrape_date": scrape_date,
             "min_overlap_m2": min_overlap_m2,
             "min_pct_of_building": min_pct_of_building,
         },
-        neighborhood=neighborhood,
+        partition=tile,
         scrape_date=scrape_date,
     )
 
@@ -643,9 +816,9 @@ def compute_intersections(
         """
         SELECT count(DISTINCT building_uid), COALESCE(sum(intersection_area_m2), 0)
         FROM silver.building_lot_intersections
-        WHERE neighborhood = %s AND scrape_date = %s::date
+        WHERE cell_partition = %s AND scrape_date = %s::date
         """,
-        [neighborhood, scrape_date],
+        [tile, scrape_date],
     )
     buildings_matched, total_area_m2 = cursor.fetchone()
     return {
@@ -659,10 +832,10 @@ def compute_intersections(
 def compute_lot_features(
     connection: "Connection",
     *,
-    neighborhood: str,
+    tile: str,
     scrape_date: str,
 ) -> dict[str, object]:
-    """(Re)compute `silver.lot_features` for one (neighborhood, scrape_date).
+    """(Re)compute `silver.lot_features` for one (tile, scrape_date).
 
     The join that gives a lot its documents, and the reason it has to be a
     spatial one: the lots come from Infolot, Quebec's cadastre, keyed by
@@ -671,10 +844,16 @@ def compute_lot_features(
     cadastre has no zoning column at all, so there is no id to link and the
     geometry is the only thing the two share.
 
-    Assumes `load_lots` and `load_features` have already landed this
-    partition's rows - the join is `ON l.neighborhood = f.neighborhood AND
-    l.scrape_date = f.scrape_date`, so a lot from a different date cannot match
-    a feature from this one.
+    The owned set is the cell's lots and the features are the snapshot's,
+    joined on `ST_Intersects` and `scrape_date` alone. A borough's zoning layer
+    stops at its outline and the outline is drawn to the lot line, so the
+    ordinary case is unchanged; what the global read admits is the feature the
+    *next* borough drew a few centimetres over the line - a sliver, not a
+    zone, and the cutoffs downstream (`MIN_ZONE_OVERLAP_M2`,
+    `MIN_ZONE_PCT_OF_LOT`) are what drop it. `num_cross_namespace_pieces`
+    counts those rows - a feature published by a borough other than the lot's
+    - so the day two adjacent boroughs are loaded, the size of that fringe is
+    on the run's metadata rather than a surprise in a zone piece.
 
     What counts as a match depends on what the feature is. An areal feature -
     a zone, a heritage sector - has to overlap the lot in *area*: a zone
@@ -690,6 +869,8 @@ def compute_lot_features(
         (
             "scrape_date",
             "neighborhood",
+            "cell_key",
+            "cell_partition",
             "lot_uid",
             "source_table",
             "feature_id",
@@ -704,6 +885,8 @@ def compute_lot_features(
         SELECT
             l.scrape_date,
             l.neighborhood,
+            l.cell_key,
+            l.cell_partition,
             l.lot_uid,
             f.source_table,
             f.feature_id,
@@ -718,21 +901,20 @@ def compute_lot_features(
             clipped.geom
         FROM rag.lots l
         JOIN rag.features f
-          ON f.neighborhood = l.neighborhood
-         AND f.scrape_date = l.scrape_date
+          ON f.scrape_date = l.scrape_date
          AND ST_Intersects(l.geom, f.geom)
         -- Computed once via LATERAL rather than four times inline: the clip is
         -- the expensive part of this query, ST_Area is not.
         CROSS JOIN LATERAL (SELECT ST_Intersection(l.geom, f.geom) AS geom) AS clipped
-        WHERE l.neighborhood = %(neighborhood)s
+        WHERE l.cell_partition = %(tile)s
           AND l.scrape_date = %(scrape_date)s::date
           AND NOT ST_IsEmpty(clipped.geom)
           -- See the docstring: areal features must overlap in area, features
           -- that have no area only have to intersect.
           AND (ST_Dimension(clipped.geom) = 2 OR ST_Dimension(f.geom) < 2)
         """,
-        {"neighborhood": neighborhood, "scrape_date": scrape_date},
-        neighborhood=neighborhood,
+        {"tile": tile, "scrape_date": scrape_date},
+        partition=tile,
         scrape_date=scrape_date,
     )
 
@@ -741,18 +923,34 @@ def compute_lot_features(
         SELECT count(DISTINCT lot_uid), count(DISTINCT feature_uid),
                count(DISTINCT source_table)
         FROM silver.lot_features
-        WHERE neighborhood = %s AND scrape_date = %s::date
+        WHERE cell_partition = %s AND scrape_date = %s::date
         """,
-        [neighborhood, scrape_date],
+        [tile, scrape_date],
     )
     lots_matched, features_matched, layers = cursor.fetchone()
+
+    # The borough-line watch. A row whose feature was published by a borough
+    # other than the lot's is the neighbour's layer reaching over the line,
+    # and until two adjacent boroughs are loaded this is 0 everywhere. See the
+    # docstring.
+    cursor.execute(
+        """
+        SELECT count(*)
+        FROM silver.lot_features lf
+        JOIN rag.features f ON f.feature_uid = lf.feature_uid
+        WHERE lf.cell_partition = %s AND lf.scrape_date = %s::date
+          AND f.neighborhood IS DISTINCT FROM lf.neighborhood
+        """,
+        [tile, scrape_date],
+    )
+    (num_cross_namespace,) = cursor.fetchone()
 
     # The denominator: "18 402 pairs" says nothing about coverage without the
     # count of lots that got none, which is the symptom of a partition loaded
     # only half way.
     cursor.execute(
-        "SELECT count(*) FROM rag.lots WHERE neighborhood = %s AND scrape_date = %s::date",
-        [neighborhood, scrape_date],
+        "SELECT count(*) FROM rag.lots WHERE cell_partition = %s AND scrape_date = %s::date",
+        [tile, scrape_date],
     )
     (num_lots,) = cursor.fetchone()
 
@@ -763,6 +961,7 @@ def compute_lot_features(
         "features_matched": int(features_matched),
         "layers": int(layers),
         "num_lots": int(num_lots),
+        "num_cross_namespace_pieces": int(num_cross_namespace),
     }
 
 
@@ -1014,16 +1213,41 @@ _FRONTAGE_RELATIONS: tuple[tuple[str, str], ...] = (
 )
 
 
+#: `silver.lot_frontage`, in the order both writes below produce it. One
+#: tuple for the exact measure and the fallback, so a column added to one
+#: cannot be forgotten by the other - the two rows have to be the same shape
+#: of answer.
+_LOT_FRONTAGE_WRITE_COLUMNS: tuple[str, ...] = (
+    "scrape_date",
+    "neighborhood",
+    "cell_key",
+    "cell_partition",
+    "lot_uid",
+    "cote_rue_id",
+    "lot_number",
+    "street_name",
+    "buffer_m",
+    "frontage_m",
+    "lot_perimeter_m",
+    "pct_of_perimeter",
+    "frontage_rank",
+    "geom",
+)
+
 #: The fallback measure, run once per reach in `DEFAULT_FRONTAGE_FALLBACK_BUFFERS_M`.
 #:
-#: Reads the two temp tables `compute_lot_frontage` has already built and the
+#: Reads the temp tables `compute_lot_frontage` has already built and the
 #: partition of `silver.lot_frontage` it has already written, which is what
 #: makes this the *second* step rather than a second measure: `candidates` is
-#: every non-road parcel that came out of step one with no row, and a tier
-#: after the first sees only what the tier before it could not place.
+#: every non-road parcel of the cell that came out of step one with no row,
+#: and a tier after the first sees only what the tier before it could not
+#: place. The sides it reaches for are the snapshot's, so a parcel on the
+#: borough outline is measured against the street across the line as readily
+#: as against its own.
 _FALLBACK_FRONTAGE_SELECT = """
     WITH candidates AS (
-        SELECT l.lot_uid, l.lot_number, l.neighborhood, l.scrape_date,
+        SELECT l.lot_uid, l.lot_number, l.neighborhood,
+               l.cell_key, l.cell_partition, l.scrape_date,
                l.geom, l.lot_perimeter_m
         FROM _frontage_lots l
         -- A road lot fronts on nothing here for the same reason it fronts on
@@ -1031,10 +1255,13 @@ _FALLBACK_FRONTAGE_SELECT = """
         WHERE NOT EXISTS (
             SELECT 1 FROM _frontage_road_sides r WHERE r.road_lot_uid = l.lot_uid
         )
+          -- The lot's own cell on the anti-join: a frontage row belongs to
+          -- its lot's cell by ownership, so this is exact and it is what
+          -- prunes the read to one leaf.
           AND NOT EXISTS (
               SELECT 1 FROM silver.lot_frontage f
               WHERE f.lot_uid = l.lot_uid
-                AND f.neighborhood = l.neighborhood
+                AND f.cell_partition = l.cell_partition
                 AND f.scrape_date = l.scrape_date
           )
     ),
@@ -1086,6 +1313,8 @@ _FALLBACK_FRONTAGE_SELECT = """
         SELECT
             c.scrape_date,
             c.neighborhood,
+            c.cell_key,
+            c.cell_partition,
             c.lot_uid,
             c.lot_number,
             f.cote_rue_id,
@@ -1099,11 +1328,12 @@ _FALLBACK_FRONTAGE_SELECT = """
             ST_Transform(ST_LineMerge(ST_Collect(f.geom)), 4326) AS geom
         FROM faced f
         JOIN candidates c ON c.lot_uid = f.lot_uid
-        GROUP BY c.scrape_date, c.neighborhood, c.lot_uid, c.lot_number,
-                 c.lot_perimeter_m, f.cote_rue_id
+        GROUP BY c.scrape_date, c.neighborhood, c.cell_key, c.cell_partition,
+                 c.lot_uid, c.lot_number, c.lot_perimeter_m, f.cote_rue_id
     )
     SELECT
-        scrape_date, neighborhood, lot_uid, cote_rue_id, lot_number,
+        scrape_date, neighborhood, cell_key, cell_partition,
+        lot_uid, cote_rue_id, lot_number,
         street_name,
         -- The reach that answered, on the row. `FRONTAGE_NO_BUFFER` marks the
         -- exact rows; anything else marks an estimate and says how wide a one.
@@ -1122,7 +1352,7 @@ _FALLBACK_FRONTAGE_SELECT = """
 def _measure_fallback_frontage(
     cursor: "Cursor",
     *,
-    neighborhood: str,
+    tile: str,
     scrape_date: str,
     buffers_m: Sequence[float],
     parallel_ratio: float = FRONTAGE_PARALLEL_RATIO,
@@ -1145,7 +1375,7 @@ def _measure_fallback_frontage(
 
     Returns the counts the caller reports: rows written, lots placed, and the
     same split by reach, since "how many needed 16 m" is the number that says
-    whether the ladder is the right shape for a borough.
+    whether the ladder is the right shape for a city.
     """
     written = 0
     by_buffer: dict[str, int] = {}
@@ -1153,26 +1383,13 @@ def _measure_fallback_frontage(
         result = warehouse.upsert_select(
             cursor,
             "lot_frontage",
-            (
-                "scrape_date",
-                "neighborhood",
-                "lot_uid",
-                "cote_rue_id",
-                "lot_number",
-                "street_name",
-                "buffer_m",
-                "frontage_m",
-                "lot_perimeter_m",
-                "pct_of_perimeter",
-                "frontage_rank",
-                "geom",
-            ),
+            _LOT_FRONTAGE_WRITE_COLUMNS,
             _FALLBACK_FRONTAGE_SELECT,
             {
                 "buffer_m": float(buffer_m),
                 "parallel_ratio": float(parallel_ratio),
             },
-            neighborhood=neighborhood,
+            partition=tile,
             scrape_date=scrape_date,
             prune=False,
         )
@@ -1180,10 +1397,10 @@ def _measure_fallback_frontage(
         cursor.execute(
             """
             SELECT count(DISTINCT lot_uid) FROM silver.lot_frontage
-            WHERE neighborhood = %s AND scrape_date = %s::date
+            WHERE cell_partition = %s AND scrape_date = %s::date
               AND buffer_m = %s::double precision
             """,
-            [neighborhood, scrape_date, float(buffer_m)],
+            [tile, scrape_date, float(buffer_m)],
         )
         (placed,) = cursor.fetchone()
         by_buffer[f"{float(buffer_m):g}"] = int(placed)
@@ -1197,17 +1414,17 @@ def _measure_fallback_frontage(
 def compute_lot_frontage(
     connection: "Connection",
     *,
-    neighborhood: str,
+    tile: str,
     scrape_date: str,
     min_street_m: float = DEFAULT_ROAD_LOT_MIN_STREET_M,
     fallback_buffers_m: Sequence[float] = DEFAULT_FRONTAGE_FALLBACK_BUFFERS_M,
     metric_srid: int = FRONTAGE_METRIC_SRID,
 ) -> dict[str, object]:
-    """(Re)compute `silver.lot_frontage` for one (neighborhood, scrape_date).
+    """(Re)compute `silver.lot_frontage` for one (tile, scrape_date).
 
-    ``metric_srid`` is the projected system the borough is surveyed in -
-    `partitions.metric_srid_for`; MTM zone 8 for Montreal, zone 7 for Quebec
-    City - and is what every metre below is measured in.
+    ``metric_srid`` is the projected system the cell's city is surveyed in -
+    `partitions.metric_srid_for_city`; MTM zone 8 for Montreal, zone 7 for
+    Quebec City - and is what every metre below is measured in.
 
     How much street each lot faces, and which street. A lot with 30 m on a
     boulevard is a different development site from the one behind it with 6 m
@@ -1312,12 +1529,36 @@ def compute_lot_frontage(
     proposing eleven dwellings on avenue Querbes. `frontage_assets` writes it,
     `hbu.select_highest_best_use` gates on it. `ROAD_LOT_COLUMNS` is the shape.
 
-    Assumes `load_lots` and `load_streets` have already landed this partition's
-    rows - both sides are filtered to (`neighborhood`, `scrape_date`) before
-    anything is measured, so a street side from another date cannot identify a
-    road lot from this one. `rag.lots` is loaded by `building_lot_intersections`
-    and not here: two assets loading the same table from the same file in two
-    transactions is the race that asset's docstring exists to describe.
+    **The cell is written; the snapshot is read.** The lots that get rows are
+    the cell's - `cell_partition = tile` on `rag.lots` - and everything they
+    are measured against is the whole snapshot's: every street side, whichever
+    cell's run stored it, and every parcel a subject could abut or nearly abut.
+    Under the borough axis both were cut at the outline, and the outline is
+    where the measure went wrong. A lot on the borough line fronts on a road
+    lot the *next* borough's cadastre holds - the roadway is a parcel, and a
+    boundary street's parcel is filed under one side of it - so the edge it
+    shared with that parcel was not in the join and the lot read as landlocked
+    or, worse, was rescued by the fallback at a reach it did not need. The
+    side that would have named the edge was clipped to the borough and half
+    of it was in the other partition. And the sliver counter, seeing the
+    parcel across the line at distance 0.3 m and no road lot it abutted, would
+    have counted a survey gap that was only the borough. None of that survives
+    a read bound by `scrape_date` alone.
+
+    The one bound left is the one that cannot change the answer.
+    `_frontage_pool` is every parcel in the snapshot within `_SLIVER_GAP_M` of
+    a subject lot, and it is that and not the whole snapshot because the two
+    questions asked of a neighbour - does it share an edge, is it within half
+    a metre - both need it within half a metre. Identifying road lots over the
+    whole snapshot instead would repeat every other cell's work on each run,
+    for parcels no subject can touch; the pool is found through the subjects'
+    own GiST index, and a subject is in it at distance 0 from itself.
+
+    Assumes the cadastre and the streets have landed for every cell this one
+    borders - a street side from another date cannot identify a road lot from
+    this one. `rag.lots` is loaded by `neighborhood_cadastre` and not here: two
+    assets loading the same table from the same file in two transactions is
+    the race that asset's docstring exists to describe.
     """
     cursor = connection.cursor()
     _require_relations(cursor, _FRONTAGE_RELATIONS)
@@ -1327,7 +1568,7 @@ def compute_lot_frontage(
     # than CTEs. The projection is what every predicate below runs against, and
     # doing it inline would reproject each parcel once per candidate pair; the
     # indexes are what turn the road-lot test and the adjacency join into index
-    # probes instead of scans of the borough.
+    # probes instead of scans of the snapshot.
     #
     # Dropped first rather than declared ON COMMIT DROP. This runs inside the
     # caller's transaction - `connect` above commits on a clean exit - so
@@ -1339,48 +1580,86 @@ def compute_lot_frontage(
     for table in (
         "_frontage_sides",
         "_frontage_lots",
+        "_frontage_pool",
         "_frontage_road_sides",
         "_frontage_road_geoms",
     ):
         cursor.execute(f"DROP TABLE IF EXISTS {table}")
 
+    # Every side in the snapshot, stored whole by whichever cell's run owned
+    # its midpoint. Bound by the date alone: a side is a name and a road-lot
+    # test, and both have to reach across the cell edge and the borough line.
     cursor.execute(
         f"""
         CREATE TEMP TABLE _frontage_sides AS
         SELECT cote_rue_id, street_name, ST_Transform(geom, {srid}) AS geom
         FROM silver.neighborhood_streets
-        WHERE neighborhood = %s AND scrape_date = %s::date
+        WHERE scrape_date = %s::date
         """,
-        [neighborhood, scrape_date],
+        [scrape_date],
     )
     cursor.execute("CREATE INDEX ON _frontage_sides USING gist (geom)")
 
+    # The subjects: the cell's own lots, and the only ones that get rows. Their
+    # borough and cell travel with them so every row written below is stamped
+    # with the lot's own rather than with anything the caller passed.
     cursor.execute(
         f"""
         CREATE TEMP TABLE _frontage_lots AS
-        SELECT lot_uid, lot_number, neighborhood, scrape_date,
+        SELECT lot_uid, lot_number, neighborhood, cell_key, cell_partition,
+               scrape_date,
                ST_Transform(geom, {srid}) AS geom,
                -- A property of the lot, so it is carried from here rather than
                -- recomputed per road lot the parcel happens to touch.
                ST_Perimeter(ST_Transform(geom, {srid})) AS lot_perimeter_m
         FROM rag.lots
-        WHERE neighborhood = %s AND scrape_date = %s::date
+        WHERE cell_partition = %s AND scrape_date = %s::date
         """,
-        [neighborhood, scrape_date],
+        [tile, scrape_date],
     )
     cursor.execute("CREATE INDEX ON _frontage_lots USING gist (geom)")
     cursor.execute("CREATE INDEX ON _frontage_lots (lot_uid)")
+    cursor.execute("ANALYZE _frontage_lots")
+
+    # The neighbours: every parcel in the snapshot a subject could share an
+    # edge with or sit a survey gap from, which is every parcel within
+    # `_SLIVER_GAP_M` of one. See the docstring for why this is the bound and
+    # not the cell, the borough or a halo. The subjects are in it too, at
+    # distance 0 from themselves, so a road lot inside the cell is found here
+    # exactly as one across the edge is. Driven by the subjects' index rather
+    # than a bound on `rag.lots`: the snapshot is scanned once, projected once,
+    # and each parcel probes `_frontage_lots`.
+    cursor.execute(
+        f"""
+        CREATE TEMP TABLE _frontage_pool AS
+        SELECT l.lot_uid, l.lot_number, l.geom
+        FROM (
+            SELECT lot_uid, lot_number, ST_Transform(geom, {srid}) AS geom
+            FROM rag.lots
+            WHERE scrape_date = %(scrape_date)s::date
+        ) l
+        WHERE EXISTS (
+            SELECT 1 FROM _frontage_lots o
+            WHERE ST_DWithin(o.geom, l.geom, %(gap_m)s::double precision)
+        )
+        """,
+        {"scrape_date": scrape_date, "gap_m": float(_SLIVER_GAP_M)},
+    )
+    cursor.execute("CREATE INDEX ON _frontage_pool USING gist (geom)")
+    cursor.execute("CREATE INDEX ON _frontage_pool (lot_uid)")
 
     # Which parcels are the roadway, and which sides run down each of them.
     # One table for both questions because they are one question: a road lot is
     # a parcel some side runs inside, and that same side is what names the
     # edges the parcel produces. See `DEFAULT_ROAD_LOT_MIN_STREET_M` for why
-    # the length test separates roads from everything else so cleanly.
+    # the length test separates roads from everything else so cleanly. Over
+    # the pool, not the subjects: the road lot a boundary parcel fronts on is
+    # a neighbour.
     cursor.execute(
         """
         CREATE TEMP TABLE _frontage_road_sides AS
         SELECT l.lot_uid AS road_lot_uid, s.cote_rue_id, s.street_name, s.geom
-        FROM _frontage_lots l
+        FROM _frontage_pool l
         JOIN _frontage_sides s ON s.geom && l.geom
         WHERE ST_Length(ST_Intersection(s.geom, l.geom))
               >= %(min_street_m)s::double precision
@@ -1392,10 +1671,18 @@ def compute_lot_frontage(
     # Without stats the planner costs the LATERAL below against a default row
     # estimate and can still choose a scan over the index it was just handed.
     cursor.execute("ANALYZE _frontage_sides")
-    cursor.execute("ANALYZE _frontage_lots")
+    cursor.execute("ANALYZE _frontage_pool")
     cursor.execute("ANALYZE _frontage_road_sides")
 
-    cursor.execute("SELECT count(DISTINCT road_lot_uid) FROM _frontage_road_sides")
+    # The cell's own road lots. A road lot in the pool but not among the
+    # subjects is the next cell's to report, from its own run.
+    cursor.execute(
+        """
+        SELECT count(DISTINCT r.road_lot_uid)
+        FROM _frontage_road_sides r
+        JOIN _frontage_lots l ON l.lot_uid = r.road_lot_uid
+        """
+    )
     (num_road_lots,) = cursor.fetchone()
 
     # *Which* parcels those are, not only how many. This is the only place in
@@ -1411,6 +1698,8 @@ def compute_lot_frontage(
     # readable rather than asserted: a parcel carrying 363 m of street line is
     # the roadway on any reading of the cutoff, and one carrying 1.2 m is a
     # side clipping the corner of a parcel where the two publishers disagree.
+    # Joined to the subjects, not the pool: the frame names the cell's own
+    # road lots, and each cell's run names its own.
     cursor.execute(
         """
         SELECT l.lot_uid,
@@ -1430,25 +1719,14 @@ def compute_lot_frontage(
     result = warehouse.upsert_select(
         cursor,
         "lot_frontage",
-        (
-            "scrape_date",
-            "neighborhood",
-            "lot_uid",
-            "cote_rue_id",
-            "lot_number",
-            "street_name",
-            "buffer_m",
-            "frontage_m",
-            "lot_perimeter_m",
-            "pct_of_perimeter",
-            "frontage_rank",
-            "geom",
-        ),
+        _LOT_FRONTAGE_WRITE_COLUMNS,
         """
+        -- The road lots out of the pool, so a subject on the cell edge or the
+        -- borough line meets the roadway parcel filed on the other side of it.
         WITH roads AS (
             SELECT DISTINCT r.road_lot_uid AS lot_uid, l.geom
             FROM _frontage_road_sides r
-            JOIN _frontage_lots l ON l.lot_uid = r.road_lot_uid
+            JOIN _frontage_pool l ON l.lot_uid = r.road_lot_uid
         ),
         -- The shared boundary itself. Two parcels that abut in this cadastre
         -- share their edge exactly, so this is the frontage with nothing
@@ -1491,6 +1769,8 @@ def compute_lot_frontage(
             SELECT
                 p.scrape_date,
                 p.neighborhood,
+                p.cell_key,
+                p.cell_partition,
                 p.lot_uid,
                 p.lot_number,
                 n.cote_rue_id,
@@ -1511,11 +1791,12 @@ def compute_lot_frontage(
                 ST_Transform(ST_LineMerge(ST_Collect(n.geom)), 4326) AS geom
             FROM named n
             JOIN _frontage_lots p ON p.lot_uid = n.lot_uid
-            GROUP BY p.scrape_date, p.neighborhood, p.lot_uid, p.lot_number,
-                     p.lot_perimeter_m, n.cote_rue_id
+            GROUP BY p.scrape_date, p.neighborhood, p.cell_key, p.cell_partition,
+                     p.lot_uid, p.lot_number, p.lot_perimeter_m, n.cote_rue_id
         )
         SELECT
-            scrape_date, neighborhood, lot_uid, cote_rue_id, lot_number,
+            scrape_date, neighborhood, cell_key, cell_partition,
+            lot_uid, cote_rue_id, lot_number,
             street_name,
             %(no_buffer)s::double precision, frontage_m, lot_perimeter_m,
             CASE WHEN lot_perimeter_m > 0
@@ -1528,7 +1809,7 @@ def compute_lot_frontage(
         WHERE frontage_m > 0
         """,
         {"no_buffer": float(FRONTAGE_NO_BUFFER)},
-        neighborhood=neighborhood,
+        partition=tile,
         scrape_date=scrape_date,
     )
 
@@ -1537,7 +1818,7 @@ def compute_lot_frontage(
     # published partition and this is the statement that makes it answerable.
     fallback = _measure_fallback_frontage(
         cursor,
-        neighborhood=neighborhood,
+        tile=tile,
         scrape_date=scrape_date,
         buffers_m=fallback_buffers_m,
     )
@@ -1547,45 +1828,46 @@ def compute_lot_frontage(
         SELECT count(DISTINCT lot_uid), count(DISTINCT cote_rue_id),
                COALESCE(sum(frontage_m), 0), COALESCE(max(frontage_m), 0)
         FROM silver.lot_frontage
-        WHERE neighborhood = %s AND scrape_date = %s::date
+        WHERE cell_partition = %s AND scrape_date = %s::date
         """,
-        [neighborhood, scrape_date],
+        [tile, scrape_date],
     )
     lots_matched, streets_matched, total_frontage_m, max_frontage_m = cursor.fetchone()
 
     # The denominators. "4 812 pairs" says nothing about coverage without the
     # count of lots that got none - a lot facing no street at all is either an
     # interior parcel or the symptom of a street snapshot that never landed.
+    # `num_streets` is the cell's own sides, the ones this run's neighbour
+    # stored; the sides the measure actually read are the snapshot's.
     cursor.execute(
-        "SELECT count(*) FROM rag.lots WHERE neighborhood = %s AND scrape_date = %s::date",
-        [neighborhood, scrape_date],
+        "SELECT count(*) FROM rag.lots WHERE cell_partition = %s AND scrape_date = %s::date",
+        [tile, scrape_date],
     )
     (num_lots,) = cursor.fetchone()
     cursor.execute(
         "SELECT count(*) FROM silver.neighborhood_streets "
-        "WHERE neighborhood = %s AND scrape_date = %s::date",
-        [neighborhood, scrape_date],
+        "WHERE cell_partition = %s AND scrape_date = %s::date",
+        [tile, scrape_date],
     )
     (num_streets,) = cursor.fetchone()
 
-    # Which lots those are, not only how many. Every lot in a Montreal borough
-    # that is not itself a road is expected to face at least one street side;
-    # the ones that do not are either genuine interior parcels or the symptom
-    # of a street snapshot that stops short of them, and either way they are
-    # the rows to go and look at. Road lots are excluded rather than reported
-    # as landlocked - a street facing no street is the definition, not a
+    # Which lots those are, not only how many. Every lot in a city block that
+    # is not itself a road is expected to face at least one street side; the
+    # ones that do not are either genuine interior parcels or the symptom of
+    # a street snapshot that stops short of them, and either way they are the
+    # rows to go and look at. Road lots are excluded rather than reported as
+    # landlocked - a street facing no street is the definition, not a
     # finding. Capped because a partition that has gone wrong produces
     # thousands of them, and the count is what says how wrong; the sample only
     # says where to start. Ordered so a re-run names the same lots.
     cursor.execute(
         f"""
         SELECT lot_number
-        FROM rag.lots l
-        WHERE l.neighborhood = %s AND l.scrape_date = %s::date
-          AND NOT EXISTS (
+        FROM _frontage_lots l
+        WHERE NOT EXISTS (
               SELECT 1 FROM silver.lot_frontage f
               WHERE f.lot_uid = l.lot_uid
-                AND f.neighborhood = l.neighborhood
+                AND f.cell_partition = l.cell_partition
                 AND f.scrape_date = l.scrape_date
           )
           AND NOT EXISTS (
@@ -1594,8 +1876,7 @@ def compute_lot_frontage(
           )
         ORDER BY lot_number
         LIMIT {_LOTS_WITHOUT_FRONTAGE_SAMPLE}
-        """,
-        [neighborhood, scrape_date],
+        """
     )
     lots_without_frontage = [row[0] for row in cursor.fetchall()]
 
@@ -1606,24 +1887,29 @@ def compute_lot_frontage(
     # is a survey gap, `ST_Intersects` drops it from the join, and the lot ends
     # up looking exactly like an interior parcel. This is that band, and on a
     # topologically clean cadastre it is empty. See `_SLIVER_GAP_M`.
-    # Materialised with a GiST index rather than left as a CTE. The two
-    # predicates below are correlated subqueries evaluated once per lot, and a
-    # CTE carries no index - so against one the planner has nothing but a scan
-    # of every road lot per lot, and neither `ST_DWithin` nor `ST_Intersects`
-    # brings a `&&` of its own to cut that down the way the shared-edge join
-    # above does. A dense borough hides it, because almost every lot abuts a
-    # road lot and the outer set is nearly empty; a municipality with rural
-    # parcels does not. On SAG (71,995 lots) this counter ran for **2h08m**
-    # and had not finished, holding the step's write lock on
-    # `silver.lot_frontage` against every reader for its whole duration, while
-    # the frontage it reports on had been computed in about two and a half
-    # minutes.
+    #
+    # The road lots come out of the pool, so a parcel on the borough line is
+    # tested against the roadway across it and no longer reads as a gap for
+    # want of a neighbour the partition could not see. Materialised with a
+    # GiST index rather than left as a CTE, and linear in the subjects: the
+    # two predicates below are correlated subqueries evaluated once per lot,
+    # and a CTE carries no index - so against one the planner has nothing but
+    # a scan of every road lot per lot, and neither `ST_DWithin` nor
+    # `ST_Intersects` brings a `&&` of its own to cut that down the way the
+    # shared-edge join above does. A dense borough hides it, because almost
+    # every lot abuts a road lot and the outer set is nearly empty; a
+    # municipality with rural parcels does not. On SAG (71,995 lots) this
+    # counter ran for **2h08m** and had not finished, holding the step's write
+    # lock on `silver.lot_frontage` against every reader for its whole
+    # duration, while the frontage it reports on had been computed in about
+    # two and a half minutes. Do not widen the pool past `_SLIVER_GAP_M` and
+    # do not lose the index; either brings that back.
     cursor.execute(
         """
         CREATE TEMP TABLE _frontage_road_geoms AS
         SELECT DISTINCT l.lot_uid, l.geom
         FROM _frontage_road_sides r
-        JOIN _frontage_lots l ON l.lot_uid = r.road_lot_uid
+        JOIN _frontage_pool l ON l.lot_uid = r.road_lot_uid
         """
     )
     cursor.execute("CREATE INDEX ON _frontage_road_geoms USING gist (geom)")
@@ -1797,15 +2083,18 @@ _SETBACK_EDGES = "_setback_edges"
 #: re-derived for every candidate envelope of every parcel.
 _SETBACK_EDGES_SQL = """
 WITH parcels AS (
-    SELECT lot_uid, lot_number,
+    -- The cell's lots, with the borough and cell each row will be stamped
+    -- with. The frontage rows read below are the same lots' and so the same
+    -- cell's, by ownership - nothing here has to reach past the cell.
+    SELECT lot_uid, lot_number, neighborhood, cell_key, cell_partition,
            ST_Transform(geom, %(srid)s) AS geom
       FROM rag.lots
-     WHERE neighborhood = %(neighborhood)s
+     WHERE cell_partition = %(tile)s
        AND scrape_date = %(scrape_date)s::date
        -- One batch's lots. `compute_lot_buildable_setbacks` drives this in
-       -- slices rather than over the borough at once - see its docstring on
-       -- why the whole borough in one statement is not survivable over a
-       -- tunnel. Always present, so the batched and unbatched paths are one
+       -- slices rather than over the cell at once - see its docstring on why
+       -- the whole cell in one statement is not survivable over a tunnel.
+       -- Always present, so the batched and unbatched paths are one
        -- statement rather than two that can drift.
        AND lot_uid = ANY(%(lot_uids)s)
 ),
@@ -1817,7 +2106,7 @@ WITH parcels AS (
 -- have its third edge come back as a side.
 -- Scoped to the batch, and transformed once.
 --
--- This used to select every frontage row in the borough and call
+-- This used to select every frontage row in the partition and call
 -- `ST_Transform` three times over each of them - once per FILTER. Both were
 -- waste. `street` is only ever reached as `JOIN street s ON s.lot_uid =
 -- <a parcels lot>`, and `parcels` is one batch, so the rows outside the batch
@@ -1833,7 +2122,7 @@ street AS (
       FROM (
           SELECT lot_uid, frontage_rank, ST_Transform(geom, %(srid)s) AS geom_m
             FROM silver.lot_frontage
-           WHERE neighborhood = %(neighborhood)s
+           WHERE cell_partition = %(tile)s
              AND scrape_date = %(scrape_date)s::date
              AND lot_uid = ANY(%(lot_uids)s)
       ) f
@@ -1920,6 +2209,9 @@ secondary_class AS (
 )
 SELECT p.lot_uid,
        p.lot_number,
+       p.neighborhood,
+       p.cell_key,
+       p.cell_partition,
        p.geom AS lot_geom,
        ST_Area(p.geom) AS lot_area_m2,
        s.front_geom,
@@ -1987,35 +2279,35 @@ def _empty_setback_result(
 
 
 def _setback_lot_uids(
-    cursor: "Cursor", neighborhood: str, scrape_date: str
+    cursor: "Cursor", tile: str, scrape_date: str
 ) -> list[str]:
-    """Every lot of the partition, in a stable order.
+    """Every lot of the cell, in a stable order.
 
     The set `compute_lot_buildable_setbacks` slices into batches and, at the
-    end, prunes against. Ordered so two runs cut the same borough at the same
+    end, prunes against. Ordered so two runs cut the same cell at the same
     places: a resumed run then continues where the last one stopped instead of
     re-carving lots it has already published under a different batching.
     """
     cursor.execute(
         """
         SELECT lot_uid FROM rag.lots
-        WHERE neighborhood = %s AND scrape_date = %s::date
+        WHERE cell_partition = %s AND scrape_date = %s::date
         ORDER BY lot_uid
         """,
-        [neighborhood, scrape_date],
+        [tile, scrape_date],
     )
     return [row[0] for row in cursor.fetchall()]
 
 
 def _setback_lots_already_published(
-    cursor: "Cursor", neighborhood: str, scrape_date: str, tolerance: float
+    cursor: "Cursor", tile: str, scrape_date: str, tolerance: float
 ) -> set[str]:
     """Lots this partition already holds rows for, at ``tolerance``.
 
     Keyed on `edge_tolerance_m` and not on the partition alone, which is the
     difference between a resume and a silent half-answer: the tolerance
     travels on every row precisely so a run at a new one can tell its own work
-    from the previous setting's, and redo the borough rather than leave two
+    from the previous setting's, and redo the cell rather than leave two
     settings mixed in one table.
 
     **And on `piece_area_m2` being there**, which is the same guard against a
@@ -2033,11 +2325,11 @@ def _setback_lots_already_published(
     cursor.execute(
         """
         SELECT DISTINCT lot_uid FROM silver.lot_buildable_setbacks
-        WHERE neighborhood = %s AND scrape_date = %s::date
+        WHERE cell_partition = %s AND scrape_date = %s::date
           AND edge_tolerance_m = %s
           AND piece_area_m2 IS NOT NULL
         """,
-        [neighborhood, scrape_date, tolerance],
+        [tile, scrape_date, tolerance],
     )
     return {row[0] for row in cursor.fetchall()}
 
@@ -2045,7 +2337,7 @@ def _setback_lots_already_published(
 def compute_lot_buildable_setbacks(
     connection: "Connection",
     *,
-    neighborhood: str,
+    tile: str,
     scrape_date: str,
     edge_tolerance_m: float = DEFAULT_SETBACK_EDGE_TOLERANCE_M,
     batch_lots: int = DEFAULT_SETBACK_BATCH_LOTS,
@@ -2053,10 +2345,18 @@ def compute_lot_buildable_setbacks(
     progress: "Callable[[str], None] | None" = None,
     metric_srid: int = SETBACK_METRIC_SRID,
 ) -> dict[str, object]:
-    """(Re)compute `silver.lot_buildable_setbacks` for one partition.
+    """(Re)compute `silver.lot_buildable_setbacks` for one (tile, scrape_date).
 
-    ``metric_srid`` is the borough's surveyed projection, as for
+    ``metric_srid`` is the surveyed projection of the cell's city, as for
     `compute_lot_frontage`.
+
+    Every input here is the cell's own. The parcel, its frontage rows, its
+    envelopes and its zone pieces are all keyed on the lot, and a row keyed on
+    a lot belongs to the lot's cell - so each read is `cell_partition = tile`
+    and nothing has to reach past the edge. The neighbours this measure never
+    looks at: a margin comes off the lot's *own* boundary, and which parcel is
+    on the other side of it is a fact about the neighbour the grid does not
+    price.
 
     What is left of each lot once the four margins its zoning grid states are
     taken off it, at the grain the grid states them: one row per (lot, zone,
@@ -2154,18 +2454,19 @@ def compute_lot_buildable_setbacks(
     a zone covering a square centimetre is one nobody may build in.
 
     Assumes `compute_lot_frontage`, `compute_lot_zone_pieces` and
-    `lot_zoning_envelopes` have all landed this partition. Both are dependencies on the assets rather than something
-    the SQL can check: a borough whose envelopes were never computed yields no
-    rows and looks exactly like a borough whose grids all failed to parse,
-    which is why the caller gets `num_envelopes` back to tell them apart.
+    `lot_zoning_envelopes` have all landed this partition. Those are
+    dependencies on the assets rather than something the SQL can check: a
+    cell whose envelopes were never computed yields no rows and looks exactly
+    like one whose grids all failed to parse, which is why the caller gets
+    `num_envelopes` back to tell them apart.
 
-    **The borough is done in committed slices, and that is a durability
-    decision rather than a performance one.** ``batch_lots`` lots are sorted,
-    carved and published per transaction, and each one commits before the next
+    **The cell is done in committed slices, and that is a durability decision
+    rather than a performance one.** ``batch_lots`` lots are sorted, carved
+    and published per transaction, and each one commits before the next
     begins. The work is identical either way; what the slice size decides is
     how much of it a dropped connection costs.
 
-    That matters because of where this runs from. The whole borough in one
+    That matters because of where this runs from. A whole cell in one
     statement is the better part of an hour of `ST_Difference`, and a laptop
     reaches the database through an SSM port-forward whose session is torn
     down and rebuilt periodically - `hbu_infra/scripts/tunnel.sh` reconnects in
@@ -2178,7 +2479,7 @@ def compute_lot_buildable_setbacks(
     ``resume`` is what makes the retry cheap rather than merely possible. A
     re-run skips the lots already published for this partition **at this
     ``edge_tolerance_m``** - the tolerance is on every row, so a run at a
-    different one correctly redoes the borough instead of silently mixing two
+    different one correctly redoes the cell instead of silently mixing two
     settings in one table. Pass ``resume=False`` to force the whole partition.
 
     The prune that makes a partition a snapshot still happens, once, after the
@@ -2197,7 +2498,7 @@ def compute_lot_buildable_setbacks(
     _require_relations(cursor, _BUILDABLE_RELATIONS)
 
     parameters: dict[str, Any] = {
-        "neighborhood": neighborhood,
+        "tile": tile,
         "scrape_date": scrape_date,
         "srid": int(metric_srid),
         "step_m": float(SETBACK_SEGMENT_M),
@@ -2205,7 +2506,7 @@ def compute_lot_buildable_setbacks(
         "tolerance_m": tolerance,
     }
 
-    expected = _setback_lot_uids(cursor, neighborhood, scrape_date)
+    expected = _setback_lot_uids(cursor, tile, scrape_date)
 
     # The denominators, and the two gaps worth telling apart: a lot with no
     # frontage row could not be sorted, and a lot with no envelope row has no
@@ -2213,18 +2514,18 @@ def compute_lot_buildable_setbacks(
     cursor.execute(
         """
         SELECT count(*) FROM rag.lots
-        WHERE neighborhood = %s AND scrape_date = %s::date
+        WHERE cell_partition = %s AND scrape_date = %s::date
         """,
-        [neighborhood, scrape_date],
+        [tile, scrape_date],
     )
     (num_lots,) = cursor.fetchone()
     cursor.execute(
         """
         SELECT count(*), count(DISTINCT lot_uid)
         FROM silver.lot_zoning_envelopes
-        WHERE neighborhood = %s AND scrape_date = %s::date
+        WHERE cell_partition = %s AND scrape_date = %s::date
         """,
-        [neighborhood, scrape_date],
+        [tile, scrape_date],
     )
     num_envelopes, lots_with_envelopes = cursor.fetchone()
 
@@ -2244,7 +2545,7 @@ def compute_lot_buildable_setbacks(
         )
 
     done = (
-        _setback_lots_already_published(cursor, neighborhood, scrape_date, tolerance)
+        _setback_lots_already_published(cursor, tile, scrape_date, tolerance)
         if resume
         else set()
     )
@@ -2293,16 +2594,17 @@ def compute_lot_buildable_setbacks(
         # batch a replace of exactly its own lots, inside its own transaction.
         cursor.execute(
             "DELETE FROM silver.lot_buildable_setbacks "
-            "WHERE neighborhood = %s AND scrape_date = %s::date "
+            "WHERE cell_partition = %s AND scrape_date = %s::date "
             "AND lot_uid = ANY(%s)",
-            [neighborhood, scrape_date, batch],
+            [tile, scrape_date, batch],
         )
 
         result = warehouse.upsert_select(
             cursor,
             "lot_buildable_setbacks",
             (
-                "scrape_date", "neighborhood", "lot_uid", "feature_id",
+                "scrape_date", "neighborhood", "cell_key", "cell_partition",
+                "lot_uid", "feature_id",
                 "column_index", "lot_number", "source_table", "lot_area_m2",
                 "piece_area_m2", "num_lot_zones",
                 "front_edge_m", "secondary_front_edge_m", "side_edge_m",
@@ -2365,7 +2667,7 @@ def compute_lot_buildable_setbacks(
                     e.rear_on_street_margin_min_m AS rear_on_street_setback_m,
                     COALESCE(e.rear_margin_min_m, 0.0) AS rear_setback_m
                   FROM silver.lot_zoning_envelopes e
-                 WHERE e.neighborhood = %(neighborhood)s
+                 WHERE e.cell_partition = %(tile)s
                    AND e.scrape_date = %(scrape_date)s::date
             ),
             applied AS (
@@ -2415,7 +2717,7 @@ def compute_lot_buildable_setbacks(
                        num_lot_zones,
                        ST_Transform(geom, %(srid)s) AS geom
                   FROM silver.lot_zone_pieces
-                 WHERE neighborhood = %(neighborhood)s
+                 WHERE cell_partition = %(tile)s
                    AND scrape_date = %(scrape_date)s::date
                    AND lot_uid = ANY(%(lot_uids)s)
             ),
@@ -2458,6 +2760,9 @@ def compute_lot_buildable_setbacks(
                 -- governs to build on rather than the whole 27 044.
                 SELECT a.*,
                        b.lot_number AS cadastre_lot_number,
+                       b.neighborhood,
+                       b.cell_key,
+                       b.cell_partition,
                        b.lot_area_m2,
                        p.piece_area_m2,
                        p.num_lot_zones,
@@ -2524,7 +2829,11 @@ def compute_lot_buildable_setbacks(
             )
             SELECT
                 %(scrape_date)s::date,
-                %(neighborhood)s,
+                -- The lot's own, carried through the boundary sort from
+                -- `rag.lots`; never a literal from the caller.
+                m.neighborhood,
+                m.cell_key,
+                m.cell_partition,
                 m.lot_uid,
                 m.feature_id,
                 m.column_index,
@@ -2583,7 +2892,7 @@ def compute_lot_buildable_setbacks(
             FROM measured m
             """.replace("{setback_edges}", _SETBACK_EDGES),
             batch_parameters,
-            neighborhood=neighborhood,
+            partition=tile,
             scrape_date=scrape_date,
             # The snapshot prune happens once, after the loop: this slice's
             # staging table knows only its own lots, and pruning against it
@@ -2611,9 +2920,9 @@ def compute_lot_buildable_setbacks(
     # keeps them.
     cursor.execute(
         "DELETE FROM silver.lot_buildable_setbacks "
-        "WHERE neighborhood = %s AND scrape_date = %s::date "
+        "WHERE cell_partition = %s AND scrape_date = %s::date "
         "AND NOT (lot_uid = ANY(%s))",
-        [neighborhood, scrape_date, expected],
+        [tile, scrape_date, expected],
     )
     pruned = max(cursor.rowcount, 0)
     connection.commit()
@@ -2627,9 +2936,9 @@ def compute_lot_buildable_setbacks(
                COALESCE(sum(buildable_area_m2), 0),
                COALESCE(avg(buildable_pct_of_lot), 0)
         FROM silver.lot_buildable_setbacks
-        WHERE neighborhood = %s AND scrape_date = %s::date
+        WHERE cell_partition = %s AND scrape_date = %s::date
         """,
-        [neighborhood, scrape_date],
+        [tile, scrape_date],
     )
     (
         lots_measured,
@@ -2640,18 +2949,18 @@ def compute_lot_buildable_setbacks(
         mean_buildable_pct,
     ) = cursor.fetchone()
 
-    # How the borough's stock reads under each mode, which is the one number
-    # that says whether the side rule is doing what it should: a VSMPE where
-    # nothing came back 'contigu' is a mode column that failed to parse, not a
-    # borough of detached houses.
+    # How the cell's stock reads under each mode, which is the one number
+    # that says whether the side rule is doing what it should: a VSMPE cell
+    # where nothing came back 'contigu' is a mode column that failed to parse,
+    # not a block of detached houses.
     cursor.execute(
         """
         SELECT side_setback_rule, count(*)
         FROM silver.lot_buildable_setbacks
-        WHERE neighborhood = %s AND scrape_date = %s::date
+        WHERE cell_partition = %s AND scrape_date = %s::date
         GROUP BY side_setback_rule
         """,
-        [neighborhood, scrape_date],
+        [tile, scrape_date],
     )
     by_side_rule = {str(rule): int(count) for rule, count in cursor.fetchall()}
 
@@ -2837,7 +3146,7 @@ _ZONE_PIECE_RELATIONS: tuple[tuple[str, str], ...] = (
 def compute_lot_zone_pieces(
     connection: "Connection",
     *,
-    neighborhood: str,
+    tile: str,
     scrape_date: str,
     zone_sources: Sequence[str],
     min_pct_of_lot: float = MIN_ZONE_PCT_OF_LOT,
@@ -2846,10 +3155,18 @@ def compute_lot_zone_pieces(
     edge_tolerance_m: float = DEFAULT_ZONE_PIECE_EDGE_TOLERANCE_M,
     metric_srid: int = ZONE_PIECE_METRIC_SRID,
 ) -> dict[str, object]:
-    """(Re)compute `silver.lot_zone_pieces` for one (neighborhood, scrape_date).
+    """(Re)compute `silver.lot_zone_pieces` for one (tile, scrape_date).
 
-    ``metric_srid`` is the borough's surveyed projection, as for
+    ``metric_srid`` is the surveyed projection of the cell's city, as for
     `compute_lot_frontage`.
+
+    Every input is the cell's own - the clips, the frontage rows and the
+    footprints are all keyed on the lot and so belong to the lot's cell - and
+    every read is `cell_partition = tile`. What the global read one step
+    upstream changes here is the clip itself: `lot_features` now holds the
+    whole intersection of a lot with a zone, whichever borough published the
+    zone, so `min_piece_area_m2` is applied to the whole piece rather than to
+    the part one borough's layer reached.
 
     The piece of a lot that one zone governs, as a site in its own right: its
     own area, its own street, and its own share of what already stands on the
@@ -2928,7 +3245,7 @@ def compute_lot_zone_pieces(
     srid = int(metric_srid)
 
     parameters: dict[str, Any] = {
-        "neighborhood": neighborhood,
+        "tile": tile,
         "scrape_date": scrape_date,
         "sources": sources,
         "min_pct_of_lot": float(min_pct_of_lot),
@@ -2955,6 +3272,11 @@ def compute_lot_zone_pieces(
         CREATE TEMP TABLE _zone_pieces AS
         SELECT lf.lot_uid,
                lf.lot_number,
+               -- The lot's own, as `lot_features` stamped them; every row
+               -- written below carries these three and not the caller's.
+               lf.neighborhood,
+               lf.cell_key,
+               lf.cell_partition,
                lf.source_table,
                lf.feature_id,
                lf.lot_area_m2,
@@ -2983,7 +3305,7 @@ def compute_lot_zone_pieces(
                )::integer AS zone_rank,
                count(*) OVER (PARTITION BY lf.lot_uid)::integer AS num_lot_zones
           FROM silver.lot_features lf
-         WHERE lf.neighborhood = %(neighborhood)s
+         WHERE lf.cell_partition = %(tile)s
            AND lf.scrape_date = %(scrape_date)s::date
            AND lf.source_table = ANY(%(sources)s)
            -- A zone that clipped to a line or a point covers no ground, and
@@ -3012,7 +3334,7 @@ def compute_lot_zone_pieces(
         SELECT lot_uid, cote_rue_id, street_name, buffer_m, frontage_m,
                ST_Transform(geom, {srid}) AS geom
           FROM silver.lot_frontage
-         WHERE neighborhood = %(neighborhood)s
+         WHERE cell_partition = %(tile)s
            AND scrape_date = %(scrape_date)s::date
            AND geom IS NOT NULL
         """,
@@ -3023,9 +3345,9 @@ def compute_lot_zone_pieces(
 
     # Each lot's street edges, cut to each of its pieces and re-ranked inside
     # it. Joined on `lot_uid` and *then* filtered spatially rather than by a
-    # bare ST_Intersects over the borough: a frontage can only belong to a
-    # piece of its own lot, so the cheap equality is what bounds the work and
-    # the geometry only has to settle which piece.
+    # bare ST_Intersects over the cell: a frontage can only belong to a piece
+    # of its own lot, so the cheap equality is what bounds the work and the
+    # geometry only has to settle which piece.
     cursor.execute(
         """
         CREATE TEMP TABLE _zone_piece_frontage AS
@@ -3063,7 +3385,7 @@ def compute_lot_zone_pieces(
         WITH footprints AS (
             SELECT lot_uid, building_uid, ST_Transform(geom, {srid}) AS geom
               FROM silver.building_lot_intersections
-             WHERE neighborhood = %(neighborhood)s
+             WHERE cell_partition = %(tile)s
                AND scrape_date = %(scrape_date)s::date
                AND geom IS NOT NULL
         )
@@ -3086,7 +3408,7 @@ def compute_lot_zone_pieces(
         _ZONE_PIECE_COLUMNS,
         _ZONE_PIECE_SELECT.format(srid=srid),
         parameters,
-        neighborhood=neighborhood,
+        partition=tile,
         scrape_date=scrape_date,
     )
 
@@ -3103,7 +3425,7 @@ def compute_lot_zone_pieces(
                                   AND piece_area_m2 >= %(min_piece_area_m2)s),
                coalesce(sum(piece_area_m2) FILTER (WHERE NOT is_primary_zone), 0.0)
           FROM silver.lot_zone_pieces
-         WHERE neighborhood = %(neighborhood)s
+         WHERE cell_partition = %(tile)s
            AND scrape_date = %(scrape_date)s::date
         """,
         parameters,
@@ -3130,8 +3452,8 @@ def compute_lot_zone_pieces(
         "num_split_lots": int(num_split_lots),
         "num_pieces_on_split_lots": int(pieces_on_split_lots),
         # The two counts that say whether the piece grain is doing anything on
-        # this borough: how many *secondary* pieces are large enough to be
-        # sites, and how much land they hold. On VSMPE that is 121 ha which
+        # this cell: how many *secondary* pieces are large enough to be
+        # sites, and how much land they hold. Over VSMPE that is 121 ha which
         # used to be priced under the primary zone's grid.
         "num_large_secondary_pieces": int(large_secondary_pieces),
         "secondary_piece_area_ha": round(float(secondary_area_m2) / 10_000.0, 1),
@@ -3161,7 +3483,8 @@ _ZONE_PIECE_TEMP_TABLES: tuple[str, ...] = (
 
 #: `silver.lot_zone_pieces`, in the order sql/025 declares it.
 _ZONE_PIECE_COLUMNS: tuple[str, ...] = (
-    "scrape_date", "neighborhood", "lot_uid", "feature_id",
+    "scrape_date", "neighborhood", "cell_key", "cell_partition",
+    "lot_uid", "feature_id",
     "lot_number", "source_table",
     "lot_area_m2", "piece_area_m2", "pct_of_lot",
     "num_lot_zones", "zone_rank", "is_primary_zone",
@@ -3220,7 +3543,9 @@ totals AS (
 )
 SELECT
     %(scrape_date)s::date,
-    %(neighborhood)s,
+    p.neighborhood,
+    p.cell_key,
+    p.cell_partition,
     p.lot_uid,
     p.feature_id,
     p.lot_number,
@@ -3372,7 +3697,7 @@ def _stage_lot_envelopes(
 def compute_lot_profiles(
     connection: "Connection",
     *,
-    neighborhood: str,
+    tile: str,
     scrape_date: str,
     max_built_area_m2: float = DEFAULT_MAX_BUILT_AREA_M2,
     min_overlap_m2: float = MIN_ZONE_OVERLAP_M2,
@@ -3382,15 +3707,23 @@ def compute_lot_profiles(
     construction_costs: dict | None = None,
     zoning_envelopes: "Sequence[tuple[str, dict]]" = (),
 ) -> dict[str, object]:
-    """(Re)compute `gold.lot_profiles` for one (neighborhood, scrape_date).
+    """(Re)compute `gold.lot_profiles` for one (tile, scrape_date).
 
-    One row per lot in the borough - every lot, not a selection of them. Three
+    One row per lot in the cell - every lot, not a selection of them. Three
     joins that each hold one row per (lot x something) are collapsed onto that
     grain and land side by side:
 
     * `silver.building_lot_intersections` -> `num_buildings`, `built_area_m2`, `category`
     * `silver.lot_frontage`  -> `primary_*` and `secondary_*`, `num_frontages`
     * `rag.lot_documents` -> `doc_*` and the `documents` array
+
+    Every one of them is keyed on the lot and so is the cell's own by
+    ownership, read as `cell_partition = tile`. `rag.lot_documents` is the
+    exception in form and not in substance: the corpus stays per borough and
+    the view carries the borough the document was indexed under, so it is
+    joined to the cell's lots by `lot_uid` alone and its `neighborhood` rides
+    along in each `documents` entry rather than being a predicate - a lot's
+    documents are whatever its features cite, wherever those were filed.
 
     That third one is read at `min_overlap_m2` *and* `min_pct_of_lot`: a zone
     clipping under a square metre of a parcel, or under one per cent of it,
@@ -3442,17 +3775,20 @@ def compute_lot_profiles(
     the same kind of LEFT JOIN as the three above, so a lot no readable grid
     reaches keeps its row and reports zero. ``vacancy_rates`` and
     ``average_rents`` are `silver/vacancy_rates` and `silver/average_rents`,
-    one object each for the whole borough: CMHC surveys neighborhoods and
-    publishes no geometry, so there is nothing per-lot about them and they are
-    written identically onto every row of the partition. That denormalisation
-    is what replaced `lots_with_vacancy_rates`, which used to pivot the same
-    grid onto the cadastre one layer earlier - where it rode through
-    `rag.lots.attributes` and both spatial joins without anything reading it.
+    handed in as ``{neighborhood: object}`` - one object per borough the cell's
+    lots were loaded for: CMHC surveys neighborhoods and publishes no
+    geometry, so the only thing per-lot about them is which borough the lot is
+    in, and each lot is written its own borough's object. A cell that
+    straddles two boroughs prices each side at its own survey. That
+    denormalisation is what replaced `lots_with_vacancy_rates`, which used to
+    pivot the same grid onto the cadastre one layer earlier - where it rode
+    through `rag.lots.attributes` and both spatial joins without anything
+    reading it.
 
     ``construction_costs`` is the fourth and takes the same shape for a
     stronger version of the same reason: the Altus cost guide prices nine
     Canadian markets and knows nothing about boroughs, let alone parcels, so
-    one Montreal object is written onto every row of every partition. It is
+    one city object is written onto every row of every partition. It is
     what makes a profile row answer "what is this parcel worth building"
     without a second read - a rent on one side, a dollar per square foot and a
     dollar per stall on the other.
@@ -3513,7 +3849,8 @@ def compute_lot_profiles(
         cursor,
         "lot_profiles",
         (
-            "scrape_date", "neighborhood", "lot_number", "lot_uid", "lot_area_m2",
+            "scrape_date", "neighborhood", "cell_key", "cell_partition",
+            "lot_number", "lot_uid", "lot_area_m2",
             "has_building", "num_buildings", "built_area_m2", "built_pct_of_lot",
             "largest_building_area_m2", "category", "max_built_area_m2",
             "num_frontages", "total_frontage_m",
@@ -3549,7 +3886,7 @@ def compute_lot_profiles(
         -- Each CTE scans its join once for the whole partition and groups it
         -- to one row per lot. Written this way rather than as three LATERALs
         -- because `rag.lot_documents` is a view over a DISTINCT across every
-        -- chunk in the borough, and a lateral would risk re-running that once
+        -- chunk in the corpus, and a lateral would risk re-running that once
         -- per lot.
         WITH built AS (
             SELECT bl.lot_uid,
@@ -3557,7 +3894,7 @@ def compute_lot_profiles(
                    sum(bl.intersection_area_m2) AS built_area_m2,
                    max(bl.building_area_m2) AS largest_building_area_m2
               FROM silver.building_lot_intersections bl
-             WHERE bl.neighborhood = %(neighborhood)s
+             WHERE bl.cell_partition = %(tile)s
                AND bl.scrape_date = %(scrape_date)s::date
              GROUP BY bl.lot_uid
         ),
@@ -3592,7 +3929,7 @@ def compute_lot_profiles(
                    (array_agg(f.cote_rue_id
                         ORDER BY f.frontage_rank, f.cote_rue_id))[2] AS secondary_cote_rue_id
               FROM silver.lot_frontage f
-             WHERE f.neighborhood = %(neighborhood)s
+             WHERE f.cell_partition = %(tile)s
                AND f.scrape_date = %(scrape_date)s::date
              GROUP BY f.lot_uid
         ),
@@ -3615,12 +3952,22 @@ def compute_lot_profiles(
             -- other: 1.19 square metres of a commercial zone on a 438 square
             -- metre residential parcel clears the absolute cutoff and is
             -- still a survey disagreement.
+            --
+            -- Joined to the cell's lots by `lot_uid`, never by borough. The
+            -- view is one row per (lot, feature, document) and the borough
+            -- on it is the document's - the one the grid was indexed under -
+            -- so it is carried into each entry below rather than used to
+            -- narrow the read; `lot_uid` is unique per snapshot and the
+            -- owned set is what bounds the scan.
             SELECT DISTINCT ON (ld.lot_uid, ld.source_table, ld.doc_id)
                    ld.lot_uid, ld.source_table, ld.doc_id, ld.url, ld.title,
-                   ld.feature_id, ld.pct_of_lot
+                   ld.feature_id, ld.pct_of_lot, ld.neighborhood
               FROM rag.lot_documents ld
-             WHERE ld.neighborhood = %(neighborhood)s
-               AND ld.scrape_date = %(scrape_date)s::date
+              JOIN rag.lots owned
+                ON owned.lot_uid = ld.lot_uid
+               AND owned.cell_partition = %(tile)s
+               AND owned.scrape_date = %(scrape_date)s::date
+             WHERE ld.scrape_date = %(scrape_date)s::date
                AND ld.overlap_area_m2 >= %(min_overlap_m2)s
                AND ld.pct_of_lot >= %(min_pct_of_lot)s
              ORDER BY ld.lot_uid, ld.source_table, ld.doc_id, ld.pct_of_lot DESC
@@ -3655,7 +4002,11 @@ def compute_lot_profiles(
                        'doc_id',       a.doc_id,
                        'url',          a.url,
                        'title',        a.title,
-                       'pct_of_lot',   a.pct_of_lot
+                       'pct_of_lot',   a.pct_of_lot,
+                       -- The borough the document was indexed under, which
+                       -- is what a `C01-001` cited from two boroughs' grids
+                       -- is told apart by.
+                       'neighborhood', a.neighborhood
                    ) ORDER BY a.pct_of_lot DESC, a.source_table, a.doc_id) AS documents
               FROM applies a
              GROUP BY a.lot_uid
@@ -3679,7 +4030,7 @@ def compute_lot_profiles(
                        'rear_setback_m', b.rear_setback_m
                    ) AS buildable
               FROM silver.lot_buildable_setbacks b
-             WHERE b.neighborhood = %(neighborhood)s
+             WHERE b.cell_partition = %(tile)s
                AND b.scrape_date = %(scrape_date)s::date
         ),
         buildable_lot AS (
@@ -3697,7 +4048,7 @@ def compute_lot_profiles(
                    b.footprint_cap_binding,
                    b.side_setback_rule
               FROM silver.lot_buildable_setbacks b
-             WHERE b.neighborhood = %(neighborhood)s
+             WHERE b.cell_partition = %(tile)s
                AND b.scrape_date = %(scrape_date)s::date
                AND b.lot_number IS NOT NULL
              ORDER BY b.lot_number,
@@ -3739,6 +4090,8 @@ def compute_lot_profiles(
         SELECT
             l.scrape_date,
             l.neighborhood,
+            l.cell_key,
+            l.cell_partition,
             l.lot_number,
             l.lot_uid,
             l.area_m2,
@@ -3843,13 +4196,16 @@ def compute_lot_profiles(
             comparables.assessed_to_estimated_ratio,
             COALESCE(comparables.num_comparables, 0),
             COALESCE(comparables.comparables, '{}'::jsonb),
-            -- The borough's own figures, written identically onto every lot:
-            -- CMHC publishes no geometry, so there is nothing to join on and
-            -- nothing per-lot to say.
-            %(vacancy_rates)s::jsonb,
-            (%(vacancy_rates)s::jsonb ->> 'overall_vacancy_rate_pct')::double precision,
-            %(average_rents)s::jsonb,
-            (%(average_rents)s::jsonb ->> 'overall_average_rent_cad')::double precision,
+            -- The caller's CMHC figures, keyed by borough, and each lot takes
+            -- its own borough's: CMHC publishes no geometry, so the lot's
+            -- `neighborhood` is the only thing to join on. A cell straddling
+            -- two boroughs prices each side at its own survey.
+            COALESCE(%(vacancy_rates)s::jsonb -> l.neighborhood, '{}'::jsonb),
+            (%(vacancy_rates)s::jsonb -> l.neighborhood
+                ->> 'overall_vacancy_rate_pct')::double precision,
+            COALESCE(%(average_rents)s::jsonb -> l.neighborhood, '{}'::jsonb),
+            (%(average_rents)s::jsonb -> l.neighborhood
+                ->> 'overall_average_rent_cad')::double precision,
             -- The city's figures, on every row of every borough. The guide
             -- prices nine Canadian markets and no geometry at all, so this is
             -- the same denormalisation as the two above with even less to join
@@ -3884,7 +4240,7 @@ def compute_lot_profiles(
                ON buildable.lot_number = l.lot_number
         -- No CTE, unlike the four above: silver.lot_assessed_values is
         -- already one row per lot - its primary key is (scrape_date,
-        -- neighborhood, lot_number) - so there is nothing to group and this
+        -- cell_partition, lot_number) - so there is nothing to group and this
         -- join cannot fan the row out. Keyed on lot_number for the reason the
         -- envelopes are, and one that is stronger here: that table carries no
         -- lot_uid at all, because it is written from the geoparquet tree
@@ -3897,7 +4253,7 @@ def compute_lot_profiles(
               -- time instead of leaving it to be derived through an
               -- equivalence class - and it is how all four CTEs above scope
               -- themselves, so the whole statement reads one way.
-              AND assessed.neighborhood = %(neighborhood)s
+              AND assessed.cell_partition = %(tile)s
               AND assessed.scrape_date = %(scrape_date)s::date
         -- The same shape as the join above it, and for all the same reasons:
         -- silver.lot_assessment_comparables is one row per lot by its own
@@ -3907,13 +4263,13 @@ def compute_lot_profiles(
         -- two sets of columns cannot disagree about the value a rate divides.
         LEFT JOIN silver.lot_assessment_comparables comparables
                ON comparables.lot_number = l.lot_number
-              AND comparables.neighborhood = %(neighborhood)s
+              AND comparables.cell_partition = %(tile)s
               AND comparables.scrape_date = %(scrape_date)s::date
-        WHERE l.neighborhood = %(neighborhood)s
+        WHERE l.cell_partition = %(tile)s
           AND l.scrape_date = %(scrape_date)s::date
         """.replace("{envelope_staging}", _ENVELOPE_STAGING),
         {
-            "neighborhood": neighborhood,
+            "tile": tile,
             "scrape_date": scrape_date,
             "threshold": threshold,
             "min_overlap_m2": min_overlap_m2,
@@ -3922,7 +4278,7 @@ def compute_lot_profiles(
             "average_rents": Jsonb(average_rents or {}),
             "construction_costs": Jsonb(construction_costs or {}),
         },
-        neighborhood=neighborhood,
+        partition=tile,
         scrape_date=scrape_date,
     )
 
@@ -3930,10 +4286,10 @@ def compute_lot_profiles(
         """
         SELECT category, count(*), COALESCE(sum(lot_area_m2), 0)
         FROM gold.lot_profiles
-        WHERE neighborhood = %s AND scrape_date = %s::date
+        WHERE cell_partition = %s AND scrape_date = %s::date
         GROUP BY category
         """,
-        [neighborhood, scrape_date],
+        [tile, scrape_date],
     )
     counted: dict[str, int] = {}
     area_by_category: dict[str, float] = {}
@@ -4008,9 +4364,9 @@ def compute_lot_profiles(
                ),
                COALESCE(sum(net_operating_income_cad), 0)
         FROM gold.lot_profiles
-        WHERE neighborhood = %s AND scrape_date = %s::date
+        WHERE cell_partition = %s AND scrape_date = %s::date
         """,
-        [neighborhood, scrape_date],
+        [tile, scrape_date],
     )
     (
         num_profiles,
@@ -4050,8 +4406,8 @@ def compute_lot_profiles(
     # inserted: the two agreeing is what says every lot got a profile, and a
     # partition that was never loaded reports 0 here instead of looking empty.
     cursor.execute(
-        "SELECT count(*) FROM rag.lots WHERE neighborhood = %s AND scrape_date = %s::date",
-        [neighborhood, scrape_date],
+        "SELECT count(*) FROM rag.lots WHERE cell_partition = %s AND scrape_date = %s::date",
+        [tile, scrape_date],
     )
     (num_lots,) = cursor.fetchone()
 
@@ -4681,7 +5037,9 @@ def compute_map_cell_aggregates(
         MAP_CELL_COLUMNS,
         _aggregate_select(wanted),
         params,
-        neighborhood=neighborhood,
+        # Still the borough axis: this table is a fact about a pixel, read by
+        # borough, and its inputs are only *read* by the attribute.
+        partition=neighborhood,
         scrape_date=scrape_date,
     )
 
@@ -4823,11 +5181,17 @@ def _require_columns(
 #: columns are bigserials a reload mints again, so on its own a row would carry
 #: no key that survives one, and the parquet has carried the number for exactly
 #: that reason since before the table did.
+#:
+#: `cell_key` and `cell_partition` travel on every lot-chain read here, as
+#: `neighborhood` always has: the tile-axis asset that reads the parquet back
+#: writes a table partitioned on the second and needs both on its own rows.
 _BUILDING_LOT_COLUMNS = (
     "building_uid",
     "lot_uid",
     "lot_number",
     "neighborhood",
+    "cell_key",
+    "cell_partition",
     "scrape_date",
     "building_area_m2",
     "intersection_area_m2",
@@ -4846,6 +5210,8 @@ _LOT_FEATURE_COLUMNS = (
     "source_table",
     "feature_id",
     "neighborhood",
+    "cell_key",
+    "cell_partition",
     "scrape_date",
     "lot_area_m2",
     "overlap_area_m2",
@@ -4865,6 +5231,8 @@ _LOT_FRONTAGE_COLUMNS = (
     "cote_rue_id",
     "street_name",
     "neighborhood",
+    "cell_key",
+    "cell_partition",
     "scrape_date",
     "buffer_m",
     "frontage_m",
@@ -4884,6 +5252,8 @@ _LOT_BUILDABLE_COLUMNS = (
     "lot_uid",
     "lot_number",
     "neighborhood",
+    "cell_key",
+    "cell_partition",
     "scrape_date",
     "feature_id",
     "column_index",
@@ -4934,6 +5304,8 @@ _LOT_PROFILE_COLUMNS = (
     "lot_uid",
     "lot_number",
     "neighborhood",
+    "cell_key",
+    "cell_partition",
     "scrape_date",
     "lot_area_m2",
     "has_building",
@@ -5022,10 +5394,52 @@ _LOT_PROFILE_COLUMNS = (
 )
 
 
-def fetch_building_lots(
-    connection: "Connection", *, neighborhood: str, scrape_date: str
+#: `rag.lots`, whole: the working set a tile-axis asset reads its lots from.
+#:
+#: The bronze cadastre parquet is one borough's, and a cell is not a borough -
+#: it holds part of one, or parts of two - so an asset on the tile axis has no
+#: file to read its lots from and reads them here, by `cell_partition`. The
+#: `attributes` jsonb comes back as the dict psycopg parses it into, which is
+#: what the assets that used to read the roll's columns out of the parquet
+#: read out of it now.
+_LOT_COLUMNS = (
+    "lot_uid",
+    "lot_number",
+    "neighborhood",
+    "cell_key",
+    "cell_partition",
+    "area_m2",
+    "attributes",
+)
+
+
+def fetch_lots(
+    connection: "Connection", *, tile: str, scrape_date: str
 ) -> gpd.GeoDataFrame:
-    """This partition's `silver.building_lot_intersections` rows, as a frame.
+    """One cell's `rag.lots` rows, as the GeoDataFrame a tile asset starts from.
+
+    The read that replaces the per-borough bronze parquet for everything on
+    the tile axis: `lot_uid`, `lot_number`, the lot's own `neighborhood`,
+    `cell_key` and `cell_partition`, its geodesic `area_m2`, the publisher's
+    fields as `attributes`, and the parcel. Ordered by lot number so a run's
+    log and a parquet written from it read in the cadastre's own order.
+    """
+    return _fetch_partition(
+        connection,
+        _LOT_COLUMNS,
+        """
+        FROM rag.lots
+        WHERE cell_partition = %s AND scrape_date = %s::date
+        ORDER BY lot_number
+        """,
+        [tile, scrape_date],
+    )
+
+
+def fetch_building_lots(
+    connection: "Connection", *, tile: str, scrape_date: str
+) -> gpd.GeoDataFrame:
+    """This cell's `silver.building_lot_intersections` rows, as a frame.
 
     No join to `rag.lots` any more: the lot number is the table's own column
     since the move to `silver`, which is one less relation this read depends
@@ -5036,33 +5450,33 @@ def fetch_building_lots(
         _BUILDING_LOT_COLUMNS,
         """
         FROM silver.building_lot_intersections
-        WHERE neighborhood = %s AND scrape_date = %s::date
+        WHERE cell_partition = %s AND scrape_date = %s::date
         ORDER BY building_uid, lot_uid
         """,
-        [neighborhood, scrape_date],
+        [tile, scrape_date],
     )
 
 
 def fetch_lot_features(
-    connection: "Connection", *, neighborhood: str, scrape_date: str
+    connection: "Connection", *, tile: str, scrape_date: str
 ) -> gpd.GeoDataFrame:
-    """This partition's `silver.lot_features` rows, as a GeoDataFrame."""
+    """This cell's `silver.lot_features` rows, as a GeoDataFrame."""
     return _fetch_partition(
         connection,
         _LOT_FEATURE_COLUMNS,
         """
         FROM silver.lot_features
-        WHERE neighborhood = %s AND scrape_date = %s::date
+        WHERE cell_partition = %s AND scrape_date = %s::date
         ORDER BY lot_uid, source_table, feature_id
         """,
-        [neighborhood, scrape_date],
+        [tile, scrape_date],
     )
 
 
 def fetch_lot_frontage(
-    connection: "Connection", *, neighborhood: str, scrape_date: str
+    connection: "Connection", *, tile: str, scrape_date: str
 ) -> gpd.GeoDataFrame:
-    """This partition's `silver.lot_frontage` rows, longest frontage first.
+    """This cell's `silver.lot_frontage` rows, longest frontage first.
 
     Ordered in SQL rather than left to the reader, so the parquet itself
     answers "which lots have the most street" by being read from the top.
@@ -5072,10 +5486,10 @@ def fetch_lot_frontage(
         _LOT_FRONTAGE_COLUMNS,
         """
         FROM silver.lot_frontage
-        WHERE neighborhood = %s AND scrape_date = %s::date
+        WHERE cell_partition = %s AND scrape_date = %s::date
         ORDER BY frontage_m DESC, lot_number, cote_rue_id
         """,
-        [neighborhood, scrape_date],
+        [tile, scrape_date],
     )
 
 
@@ -5089,6 +5503,8 @@ _LOT_ZONE_PIECE_COLUMNS = (
     "lot_number",
     "source_table",
     "neighborhood",
+    "cell_key",
+    "cell_partition",
     "scrape_date",
     "lot_area_m2",
     "piece_area_m2",
@@ -5120,9 +5536,9 @@ _LOT_ZONE_PIECE_COLUMNS = (
 
 
 def fetch_lot_zone_pieces(
-    connection: "Connection", *, neighborhood: str, scrape_date: str
+    connection: "Connection", *, tile: str, scrape_date: str
 ) -> gpd.GeoDataFrame:
-    """This partition's `silver.lot_zone_pieces` rows, largest piece first.
+    """This cell's `silver.lot_zone_pieces` rows, largest piece first.
 
     Ordered by area within each lot rather than by the cadastre's numbering, so
     the parquet read from the top of a lot's rows is that lot's primary zone -
@@ -5134,10 +5550,10 @@ def fetch_lot_zone_pieces(
         _LOT_ZONE_PIECE_COLUMNS,
         """
         FROM silver.lot_zone_pieces
-        WHERE neighborhood = %s AND scrape_date = %s::date
+        WHERE cell_partition = %s AND scrape_date = %s::date
         ORDER BY lot_uid, zone_rank, feature_id
         """,
-        [neighborhood, scrape_date],
+        [tile, scrape_date],
     )
 
 
@@ -5268,16 +5684,35 @@ def load_addresses(
             )
             inserted += 1
 
+    # An address point is its own representative point, so `cell_key` here is
+    # simply the quadkey of where it stands - and the tile that owns it is
+    # the address's own, not the lot's it may later snap to: a point on the
+    # far side of a cell edge from its parcel is still written by the run
+    # that owns the point.
     cursor.execute(
-        """
+        f"""
         INSERT INTO rag.addresses (
-            address_id, neighborhood, scrape_date, attributes, geom
+            address_id, neighborhood, scrape_date, attributes, geom,
+            cell_key, cell_partition
         )
-        SELECT address_id, neighborhood, scrape_date, attributes,
-               ST_SetSRID(ST_GeomFromWKB(geom), 4326)
-          FROM rag_addresses_load
+        SELECT address_id, neighborhood, scrape_date, attributes, geom,
+               cell_key, warehouse.tile_of(cell_key, %(cut)s::text[])
+          FROM (
+            SELECT address_id, neighborhood, scrape_date, attributes,
+                   ST_SetSRID(ST_GeomFromWKB(geom), 4326) AS geom
+              FROM rag_addresses_load
+          ) AS shaped
+          CROSS JOIN LATERAL (SELECT {_cell_key_sql('geom')} AS cell_key) AS addressed
         ON CONFLICT (address_id, scrape_date) DO NOTHING
-        """
+        """,
+        {"cut": _cut_param()},
+    )
+    _require_ground_in_cut(
+        cursor,
+        "rag.addresses",
+        "neighborhood = %s AND scrape_date = %s::date",
+        [neighborhood, scrape_date],
+        f"{neighborhood} {scrape_date}",
     )
     analyze(connection, "rag.addresses")
     return inserted
@@ -5286,17 +5721,29 @@ def load_addresses(
 def compute_lot_addresses(
     connection: "Connection",
     *,
-    neighborhood: str,
+    tile: str,
     scrape_date: str,
     max_snap_m: float = DEFAULT_ADDRESS_SNAP_M,
 ) -> dict[str, object]:
-    """(Re)compute `silver.lot_addresses` for one (neighborhood, scrape_date).
+    """(Re)compute `silver.lot_addresses` for one (tile, scrape_date).
 
     Every address point on a parcel, carried at the grain of the *piece* the
     rest of this platform answers at: one row per address, stating the lot it
     stands on, the zone piece it stands in, and where it ranks among that
     piece's addresses. That is what makes it joinable to the gold tables, which
     are keyed on `(lot_uid, feature_id)` - see `compute_lot_zone_pieces`.
+
+    **The row is the point's, not the lot's.** This is the one lot-chain table
+    keyed on something other than the lot - the publisher's address id - so
+    the row belongs to the cell its *point* falls in, and the owned set is
+    `rag.addresses` at `cell_partition = tile`; the `cell_key`,
+    `cell_partition` and `neighborhood` written are the point's own, as
+    `load_addresses` stamped them. The parcels it is placed on are the
+    snapshot's, bound by `scrape_date` alone: a point two metres over the cell
+    edge or the borough line snaps to the parcel across it, which under the
+    borough axis it could not - the lot it belonged to was in the other
+    partition, and the point counted as unmatched. The zone piece is then read
+    by the lot's own cell, which is where a row keyed on a lot lives.
 
     **The publisher has no lot number**, so this join is the only thing that
     puts an address on a parcel. `urban_rag.adresses_quebec` says why: the
@@ -5337,7 +5784,7 @@ def compute_lot_addresses(
     _require_relations(cursor, _ADDRESS_RELATIONS)
 
     parameters: dict[str, Any] = {
-        "neighborhood": neighborhood,
+        "tile": tile,
         "scrape_date": scrape_date,
         "max_snap_m": snap,
         "m_per_degree_lat": _M_PER_DEGREE_LAT,
@@ -5347,12 +5794,16 @@ def compute_lot_addresses(
         cursor.execute(f"DROP TABLE IF EXISTS {table}")
 
     # The points, with the parsed parts lifted out of the jsonb once rather
-    # than in each of the three statements below.
+    # than in each of the three statements below. The cell's own points, and
+    # their own borough and cell - see the docstring.
     cursor.execute(
         """
         CREATE TEMP TABLE _address_points AS
         SELECT a.address_uid,
                a.address_id,
+               a.neighborhood,
+               a.cell_key,
+               a.cell_partition,
                a.geom,
                a.attributes->>'formatted_address'          AS formatted_address,
                a.attributes->>'unit'                       AS unit,
@@ -5367,7 +5818,7 @@ def compute_lot_addresses(
                a.attributes->>'source_version'             AS source_version,
                (a.attributes->>'object_id')::bigint        AS object_id
           FROM rag.addresses a
-         WHERE a.neighborhood = %(neighborhood)s
+         WHERE a.cell_partition = %(tile)s
            AND a.scrape_date = %(scrape_date)s::date
            AND a.geom IS NOT NULL
         """,
@@ -5378,7 +5829,11 @@ def compute_lot_addresses(
     cursor.execute("ANALYZE _address_points")
 
     # The parcel each point belongs to. `within` first; whatever is left over
-    # gets one chance at the nearest parcel inside the snap.
+    # gets one chance at the nearest parcel inside the snap. The parcels are
+    # the snapshot's - no cell and no borough on `rag.lots`, the GiST index
+    # finds the one under or beside the point wherever it was loaded from -
+    # and the lot's own cell rides along so the piece read below can be
+    # pruned to the leaf that holds it.
     #
     # DISTINCT ON takes the *smallest* containing parcel, which is the answer
     # that is right when the cadastre overlaps itself - a point on a shared
@@ -5390,12 +5845,12 @@ def compute_lot_addresses(
         WITH within AS (
             SELECT DISTINCT ON (p.address_uid)
                    p.address_uid, l.lot_uid, l.lot_number,
+                   l.cell_partition AS lot_cell_partition,
                    'within'::text AS match_basis,
                    0.0::double precision AS snap_distance_m
               FROM _address_points p
               JOIN rag.lots l
-                ON l.neighborhood = %(neighborhood)s
-               AND l.scrape_date = %(scrape_date)s::date
+                ON l.scrape_date = %(scrape_date)s::date
                AND ST_Intersects(l.geom, p.geom)
              ORDER BY p.address_uid, ST_Area(l.geom), l.lot_uid
         ),
@@ -5409,13 +5864,13 @@ def compute_lot_addresses(
         snapped AS (
             SELECT DISTINCT ON (o.address_uid)
                    o.address_uid, l.lot_uid, l.lot_number,
+                   l.cell_partition AS lot_cell_partition,
                    'snapped'::text AS match_basis,
                    ST_Distance(l.geom::geography, o.geom::geography)
                        AS snap_distance_m
               FROM leftover o
               JOIN rag.lots l
-                ON l.neighborhood = %(neighborhood)s
-               AND l.scrape_date = %(scrape_date)s::date
+                ON l.scrape_date = %(scrape_date)s::date
                -- The index-using candidate filter, in degrees. The radius is
                -- taken at *this point's* latitude and divided by its cosine,
                -- which makes it the longitude radius - the larger of the two,
@@ -5445,7 +5900,11 @@ def compute_lot_addresses(
     cursor.execute("ANALYZE _address_match")
 
     # The zone piece each matched point stands in, and the fallbacks the
-    # docstring argues for when it stands in none of them.
+    # docstring argues for when it stands in none of them. A piece is keyed on
+    # its lot and so lives in the *lot's* cell - which is the matched parcel's
+    # `cell_partition`, not this run's - and that is the predicate here: it is
+    # the ownership rule, so it cannot change the answer, and it is what lets
+    # the planner open one leaf rather than every one.
     cursor.execute(
         """
         CREATE TEMP TABLE _address_piece AS
@@ -5456,18 +5915,23 @@ def compute_lot_addresses(
               FROM _address_match m
               JOIN _address_points p ON p.address_uid = m.address_uid
               JOIN silver.lot_zone_pieces z
-                ON z.neighborhood = %(neighborhood)s
+                ON z.cell_partition = m.lot_cell_partition
                AND z.scrape_date = %(scrape_date)s::date
                AND z.lot_uid = m.lot_uid
                AND ST_Intersects(z.geom, p.geom)
              ORDER BY m.address_uid, z.zone_rank, z.feature_id
         ),
+        matched_lots AS (
+            SELECT DISTINCT lot_uid, lot_cell_partition FROM _address_match
+        ),
         primary_piece AS (
             SELECT DISTINCT ON (z.lot_uid)
                    z.lot_uid, z.feature_id, z.source_table
               FROM silver.lot_zone_pieces z
-             WHERE z.neighborhood = %(neighborhood)s
-               AND z.scrape_date = %(scrape_date)s::date
+              JOIN matched_lots m
+                ON m.lot_uid = z.lot_uid
+               AND z.cell_partition = m.lot_cell_partition
+             WHERE z.scrape_date = %(scrape_date)s::date
              ORDER BY z.lot_uid, z.zone_rank, z.feature_id
         )
         SELECT m.address_uid,
@@ -5493,7 +5957,7 @@ def compute_lot_addresses(
         _LOT_ADDRESS_COLUMNS,
         _LOT_ADDRESS_SELECT,
         parameters,
-        neighborhood=neighborhood,
+        partition=tile,
         scrape_date=scrape_date,
     )
 
@@ -5508,7 +5972,7 @@ def compute_lot_addresses(
                count(DISTINCT (lot_uid, feature_id)),
                count(*) FILTER (WHERE street_name IS NULL)
           FROM silver.lot_addresses
-         WHERE neighborhood = %(neighborhood)s
+         WHERE cell_partition = %(tile)s
            AND scrape_date = %(scrape_date)s::date
         """,
         parameters,
@@ -5561,7 +6025,7 @@ def compute_lot_addresses(
 
 #: `silver.lot_addresses`, in the order sql/026 declares it.
 _LOT_ADDRESS_COLUMNS: tuple[str, ...] = (
-    "scrape_date", "neighborhood", "address_id",
+    "scrape_date", "neighborhood", "cell_key", "cell_partition", "address_id",
     "lot_uid", "lot_number", "feature_id", "source_table",
     "match_basis", "snap_distance_m", "piece_basis",
     "formatted_address", "unit", "civic_number", "civic_suffix",
@@ -5599,6 +6063,11 @@ WITH placed AS (
            z.source_table,
            z.piece_basis,
            p.address_id,
+           -- The point's own, not the lot's: this table is keyed on the
+           -- address and the row belongs to the cell the point stands in.
+           p.neighborhood,
+           p.cell_key,
+           p.cell_partition,
            p.formatted_address,
            p.unit,
            p.civic_number,
@@ -5630,7 +6099,9 @@ lot_counts AS (
      GROUP BY lot_uid
 )
 SELECT %(scrape_date)s::date,
-       %(neighborhood)s::text,
+       pl.neighborhood,
+       pl.cell_key,
+       pl.cell_partition,
        pl.address_id,
        pl.lot_uid,
        pl.lot_number,
@@ -5670,7 +6141,8 @@ WINDOW piece_order AS (
 
 #: `silver.lot_addresses`, for the parquet the asset writes beside the table.
 _LOT_ADDRESS_FETCH_COLUMNS: tuple[str, ...] = (
-    "neighborhood", "lot_uid", "lot_number", "feature_id", "source_table",
+    "neighborhood", "cell_key", "cell_partition",
+    "lot_uid", "lot_number", "feature_id", "source_table",
     "address_id", "formatted_address", "unit", "civic_number", "civic_suffix",
     "civic_address", "street_name", "municipality", "postal_code",
     "num_units", "characteristic", "source_version", "object_id",
@@ -5681,10 +6153,12 @@ _LOT_ADDRESS_FETCH_COLUMNS: tuple[str, ...] = (
 
 
 def fetch_lot_addresses(
-    connection: "Connection", *, neighborhood: str, scrape_date: str
+    connection: "Connection", *, tile: str, scrape_date: str
 ) -> gpd.GeoDataFrame:
-    """This partition's `silver.lot_addresses` rows, grouped by site.
+    """This cell's `silver.lot_addresses` rows, grouped by site.
 
+    The cell's by the *point's* address - see `compute_lot_addresses` - so a
+    lot on the cell edge may have its doors split across two cells' files.
     Ordered by lot, then by zone piece, then by the rank within it, so a
     reader taking the top of a lot's rows gets its primary piece's lowest
     civic number - the address a map labels the parcel with.
@@ -5694,17 +6168,17 @@ def fetch_lot_addresses(
         _LOT_ADDRESS_FETCH_COLUMNS,
         """
         FROM silver.lot_addresses
-        WHERE neighborhood = %s AND scrape_date = %s::date
+        WHERE cell_partition = %s AND scrape_date = %s::date
         ORDER BY lot_uid, feature_id, address_rank
         """,
-        [neighborhood, scrape_date],
+        [tile, scrape_date],
     )
 
 
 def fetch_lot_buildable_setbacks(
-    connection: "Connection", *, neighborhood: str, scrape_date: str
+    connection: "Connection", *, tile: str, scrape_date: str
 ) -> gpd.GeoDataFrame:
-    """This partition's `silver.lot_buildable_setbacks` rows, roomiest first.
+    """This cell's `silver.lot_buildable_setbacks` rows, roomiest first.
 
     Ordered by what is left of the lot rather than by the cadastre's own
     numbering, the same choice `fetch_lot_frontage` makes and for the same
@@ -5717,28 +6191,32 @@ def fetch_lot_buildable_setbacks(
         _LOT_BUILDABLE_COLUMNS,
         """
         FROM silver.lot_buildable_setbacks
-        WHERE neighborhood = %s AND scrape_date = %s::date
+        WHERE cell_partition = %s AND scrape_date = %s::date
         ORDER BY footprint_cap_m2 DESC, lot_number, feature_id, column_index
         """,
-        [neighborhood, scrape_date],
+        [tile, scrape_date],
     )
 
 
 #: `rag.lots`, for the two assets that need a parcel's *shape* rather than its
 #: area. Deliberately narrow: this is read to fit rectangles onto, so the
-#: attributes jsonb and the lot number's neighbours are weight nobody uses.
+#: attributes jsonb and the lot number's neighbours are weight nobody uses -
+#: but the cell and key travel, because what those assets write is a tile
+#: table that has to carry them.
 _LOT_GEOMETRY_COLUMNS = (
     "lot_uid",
     "lot_number",
     "neighborhood",
+    "cell_key",
+    "cell_partition",
     "area_m2 AS lot_area_m2",
 )
 
 
 def fetch_lot_polygons(
-    connection: "Connection", *, neighborhood: str, scrape_date: str
+    connection: "Connection", *, tile: str, scrape_date: str
 ) -> gpd.GeoDataFrame:
-    """This partition's cadastral parcels, as shapes to fit things onto.
+    """This cell's cadastral parcels, as shapes to fit things onto.
 
     The one read here that goes back to `rag.lots` rather than to a silver or
     gold table, and it is needed twice for the same reason: a surface stall
@@ -5762,10 +6240,10 @@ def fetch_lot_polygons(
         _LOT_GEOMETRY_COLUMNS,
         """
         FROM rag.lots
-        WHERE neighborhood = %s AND scrape_date = %s::date
+        WHERE cell_partition = %s AND scrape_date = %s::date
         ORDER BY lot_uid
         """,
-        [neighborhood, scrape_date],
+        [tile, scrape_date],
     )
 
 
@@ -5778,15 +6256,17 @@ _ZONE_PIECE_GEOMETRY_COLUMNS = (
     "feature_id",
     "lot_number",
     "neighborhood",
+    "cell_key",
+    "cell_partition",
     "piece_area_m2",
     "num_lot_zones",
 )
 
 
 def fetch_zone_piece_polygons(
-    connection: "Connection", *, neighborhood: str, scrape_date: str
+    connection: "Connection", *, tile: str, scrape_date: str
 ) -> gpd.GeoDataFrame:
-    """This partition's zone pieces, as shapes to fit things onto.
+    """This cell's zone pieces, as shapes to fit things onto.
 
     The piece twin of `fetch_lot_polygons`, and the reason there are two: a
     surface stall stands on the *ground the zone governs*, not on the parcel.
@@ -5804,20 +6284,20 @@ def fetch_zone_piece_polygons(
         _ZONE_PIECE_GEOMETRY_COLUMNS,
         """
         FROM silver.lot_zone_pieces
-        WHERE neighborhood = %s AND scrape_date = %s::date
+        WHERE cell_partition = %s AND scrape_date = %s::date
         ORDER BY lot_uid, feature_id
         """,
-        [neighborhood, scrape_date],
+        [tile, scrape_date],
     )
 
 
 def fetch_lot_profiles(
-    connection: "Connection", *, neighborhood: str, scrape_date: str
+    connection: "Connection", *, tile: str, scrape_date: str
 ) -> gpd.GeoDataFrame:
-    """This partition's `gold.lot_profiles` rows, as a GeoDataFrame.
+    """This cell's `gold.lot_profiles` rows, as a GeoDataFrame.
 
     Ordered by lot number rather than by any of the measures: this one is the
-    borough's whole inventory, so the order a reader wants is the cadastre's
+    cell's whole inventory, so the order a reader wants is the cadastre's
     own. `silver.lot_frontage` sorts by frontage because it is read for the top of
     that list; this is read for a named parcel.
     """
@@ -5826,10 +6306,10 @@ def fetch_lot_profiles(
         _LOT_PROFILE_COLUMNS,
         """
         FROM gold.lot_profiles
-        WHERE neighborhood = %s AND scrape_date = %s::date
+        WHERE cell_partition = %s AND scrape_date = %s::date
         ORDER BY lot_number
         """,
-        [neighborhood, scrape_date],
+        [tile, scrape_date],
     )
 
 
@@ -6068,20 +6548,40 @@ def _replace_partition(
         if natural_key_target
         else ""
     )
+    # The row's permanent address and the cut cell that owns it, computed on
+    # the way in. Before this the address was only ever backfilled by
+    # hbu_infra's sql/028 on `db init`, so a reload wiped it - the column
+    # that decides the partition was erased by loading the partition.
     cursor.execute(
         f"""
         INSERT INTO {table} (
-            {key_list}neighborhood, scrape_date, area_m2, attributes, geom
+            {key_list}neighborhood, scrape_date, area_m2, attributes, geom,
+            cell_key, cell_partition
         )
         SELECT
             {key_list}neighborhood,
             scrape_date,
-            ST_Area(geography(ST_Multi(ST_SetSRID(ST_GeomFromWKB(geom), 4326)))),
+            ST_Area(geography(geom)),
             attributes,
-            ST_Multi(ST_SetSRID(ST_GeomFromWKB(geom), 4326))
-        FROM {staging}
+            geom,
+            cell_key,
+            warehouse.tile_of(cell_key, %(cut)s::text[])
+        FROM (
+            SELECT {key_list}neighborhood, scrape_date, attributes,
+                   ST_Multi(ST_SetSRID(ST_GeomFromWKB(geom), 4326)) AS geom
+              FROM {staging}
+        ) AS shaped
+        CROSS JOIN LATERAL (SELECT {_cell_key_sql('geom')} AS cell_key) AS addressed
         {conflict}
-        """
+        """,
+        {"cut": _cut_param()},
+    )
+    _require_ground_in_cut(
+        cursor,
+        table,
+        "neighborhood = %s AND scrape_date = %s::date",
+        [neighborhood, scrape_date],
+        f"{neighborhood} {scrape_date}",
     )
     analyze(connection, table)
     return inserted

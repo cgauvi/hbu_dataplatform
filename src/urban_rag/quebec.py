@@ -48,6 +48,7 @@ import re
 import time
 import unicodedata
 from collections.abc import Iterable, Iterator, Mapping
+from dataclasses import dataclass
 from typing import Any
 
 import pandas as pd
@@ -117,6 +118,72 @@ GRID_ZONE_COLUMN = "zone"
 DEFAULT_BATCH_SIZE = 200
 
 WGS84 = 4326
+
+
+# ---------------------------------------------------------------------------
+# heritage
+# ---------------------------------------------------------------------------
+
+#: The city's heritage layers, on the same ArcGIS Online organisation as the
+#: zoning. What the *patrimoine bâti* search
+#: (https://www.ville.quebec.qc.ca/citoyens/patrimoine/bati/index.aspx) and
+#: its fiches are drawn from - Quebec City's counterpart to the heritage
+#: tables a Montreal borough publishes under its Spectrum namespace. Layers
+#: 0-4 and 12 are public art, plaques and libraries, and are not read.
+DEFAULT_HERITAGE_SERVICE_URL = (
+    "https://services1.arcgis.com/4GCvRJNX6LNyFVQ0/arcgis/rest/services/"
+    "CI_COMMUNAUTE_CULTURE_PATRIMOINE/FeatureServer"
+)
+
+#: One studied building's fiche on the city's site, by its ``NO_SEQ``.
+FICHE_URL_TEMPLATE = (
+    "https://www.ville.quebec.qc.ca/citoyens/patrimoine/bati/fiche.aspx?fiche={no_seq}"
+)
+
+#: Where that URL is written. Not `GRID_URL_COLUMN`: the fiche is an HTML page
+#: about a building, not a by-law, and the corpus assets download whatever
+#: that column names.
+FICHE_URL_COLUMN = "LIEN_FICHE"
+
+#: The column the feature id is copied into, one of
+#: `cadastre_assets.FEATURE_ID_COLUMNS`, which is what gets a heritage
+#: layer into `rag.features` and so into `silver.lot_features`.
+HERITAGE_ID_COLUMN = "ID"
+
+#: Suffix of the column a coded value's label is written to, beside the code.
+LABEL_SUFFIX = "_LIBELLE"
+
+
+@dataclass(frozen=True)
+class HeritageLayer:
+    """One heritage layer: where it is, what it is filed as, what identifies a row."""
+
+    layer_id: int
+    slug: str
+    id_field: str
+
+
+#: The seven layers read, in the service's order. ``NO_SEQ`` is the fiche
+#: number and unique across the 15,801 studied buildings. The status layers
+#: have nothing better than ``OBJECTID``: their one stable-looking key, the
+#: provincial or federal register link, is blank on 16 of their 236 rows.
+HERITAGE_LAYERS: tuple[HeritageLayer, ...] = (
+    HeritageLayer(5, "Patrimoine__IMMEUBLE_CITE", OBJECT_ID_FIELD),
+    HeritageLayer(6, "Patrimoine__IMMEUBLE_CLASSE", OBJECT_ID_FIELD),
+    HeritageLayer(7, "Patrimoine__DESIGNE_FEDERAL", OBJECT_ID_FIELD),
+    HeritageLayer(8, "Patrimoine__SITE_CITE", OBJECT_ID_FIELD),
+    HeritageLayer(9, "Patrimoine__SITE_DECLARE_CLASSE", OBJECT_ID_FIELD),
+    HeritageLayer(10, "Patrimoine__AIRE_PROTECTION", OBJECT_ID_FIELD),
+    HeritageLayer(11, "Patrimoine__BATIMENT_ETUDIE", "NO_SEQ"),
+)
+
+#: Where a studied building's grade is, and its codes that are *not* a grade.
+#: 1 exceptionnel, 2 supérieur, 3 bon and 4 faible are the scale; 5 présumé
+#: and 6 confirmé say an interest was presumed or confirmed and the building
+#: never graded - 62% of the layer. Reading the code as an ordinal puts them
+#: below *faible*, which is backwards.
+HERITAGE_GRADE_FIELD = "EVALUATION_VALEUR_PATRIMO_NO"
+UNGRADED_CODES = frozenset({5, 6})
 
 
 #: Where a usage may go in the building, as the grid's *Localisation* codes
@@ -230,6 +297,23 @@ class QuebecZoningClient:
     def query_url(self) -> str:
         return f"{self.layer_url}/query"
 
+    def on_layer(self, layer_url: str) -> QuebecZoningClient:
+        """The same reader over another layer, sharing this one's session.
+
+        The heritage layers are the same kind of service on the same
+        organisation, so they are read the same two-phase way and paced the
+        same.
+        """
+        return QuebecZoningClient(
+            layer_url,
+            grid_url=self.grid_url,
+            sheet_url_template=self.sheet_url_template,
+            timeout_seconds=self.timeout_seconds,
+            request_delay_seconds=self.request_delay_seconds,
+            batch_size=self.batch_size,
+            session=self._session,
+        )
+
     def _post(self, data: dict[str, Any]) -> dict:
         if self.request_delay_seconds:
             time.sleep(self.request_delay_seconds)
@@ -328,6 +412,45 @@ class QuebecZoningClient:
                 f"{response.headers.get('Content-Type')!r})"
             )
         return content
+
+
+def coded_values(layer_metadata: Mapping[str, Any]) -> dict[str, dict[Any, str]]:
+    """Each coded field's code-to-label map, off the layer's own description.
+
+    The query endpoint hands back the code (``EVALUATION_VALEUR_PATRIMO_NO``
+    ``2``); the label (*supérieur*) lives only in the field's domain.
+    """
+    labels: dict[str, dict[Any, str]] = {}
+    for field in layer_metadata.get("fields") or []:
+        domain = field.get("domain") or {}
+        if domain.get("type") != "codedValue":
+            continue
+        labels[field["name"]] = {
+            entry["code"]: entry["name"] for entry in domain.get("codedValues") or []
+        }
+    return labels
+
+
+def label_coded_values(
+    frame: pd.DataFrame, labels: Mapping[str, Mapping[Any, str]]
+) -> pd.DataFrame:
+    """``frame`` with a ``<field>_LIBELLE`` column beside every coded field.
+
+    Added, not substituted: the code stays as published, so the file is
+    still a faithful copy. A code the domain does not list reads as missing.
+    """
+    out = frame.copy()
+    for field, mapping in labels.items():
+        if field in out.columns:
+            out[f"{field}{LABEL_SUFFIX}"] = out[field].map(dict(mapping))
+    return out
+
+
+def fiche_url_for(no_seq: object) -> str | None:
+    """One studied building's fiche, or None for a row without a fiche number."""
+    if no_seq is None or (isinstance(no_seq, float) and math.isnan(no_seq)):
+        return None
+    return FICHE_URL_TEMPLATE.format(no_seq=int(no_seq))
 
 
 # ---------------------------------------------------------------------------

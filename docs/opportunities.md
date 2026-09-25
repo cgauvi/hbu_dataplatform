@@ -11,9 +11,9 @@ thesis**, and **ranks** the under-built ones within that thesis — and it
 re-solves nothing.
 
 ```bash
-make opportunities DATE=2026-08-26 NEIGHBORHOOD=VSMPE
-make opportunities DATE=2026-08-26 NEIGHBORHOOD=VSMPE MIXED_MIN_SHARE=0.10 TOP_N=10
-make opportunities DATE=2026-08-26 NEIGHBORHOOD=VSMPE LAND_FACTOR=1.3
+make opportunities DATE=2026-09-01 NEIGHBORHOOD=VSMPE
+make opportunities DATE=2026-09-01 NEIGHBORHOOD=VSMPE MIXED_MIN_SHARE=0.10 TOP_N=10
+make opportunities DATE=2026-09-01 NEIGHBORHOOD=VSMPE LAND_FACTOR=1.3
 ```
 
 The arithmetic is in [`urban_rag.opportunities`](../src/urban_rag/opportunities.py);
@@ -54,7 +54,8 @@ Five values, four of them theses:
 
 A street and a park land in `none` and cannot be ranked, which is the whole of
 what this asset has to do about them: `lot_highest_best_use` withholds the
-program from a `road_parcel` and an `equipment_zone` lot, so no proposed floor
+program from a `road_parcel`, an `equipment_zone` and a `single_family_zone`
+lot (see [single-family.md](single-family.md)), so no proposed floor
 reaches the thesis rules above and no shortlist can contain one. Read
 `hbu_status` on `gold.lot_highest_best_use` to tell those apart from a parcel
 the solver merely found infeasible.

@@ -49,7 +49,7 @@ def test_no_silver_or_gold_asset_carries_the_guard():
 def test_the_bronze_layer_is_not_accidentally_empty():
     """Both assertions above pass trivially if nothing is bronze."""
     bronze = [name for name, layer in ASSET_LAYERS.items() if layer is Layer.BRONZE]
-    assert len(bronze) == 17
+    assert len(bronze) == 19
 
 
 def test_an_unguarded_bronze_asset_is_a_load_error(monkeypatch):

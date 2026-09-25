@@ -157,6 +157,23 @@ def test_the_live_cut_is_seeded_and_well_formed():
         tile_grid.cell_of_quadkey(cell)
 
 
+def test_every_cell_of_the_live_cut_names_its_city():
+    """A run on the tile axis has no borough to ask the CRS of; it asks the
+    cell. So the cut and its cities are one mapping, and every value is a
+    city the crosswalks know."""
+    from urban_rag.partitions import City, city_of_tile
+
+    assert set(tile_cut.TILE_CITIES) == tile_cut.CUT
+    for cell in tile_cut.CUT:
+        assert isinstance(city_of_tile(cell), City)
+        assert tile_cut.city_value_of(cell) == city_of_tile(cell).value
+
+
+def test_a_cell_outside_the_cut_has_no_city():
+    with pytest.raises(KeyError, match="not a cell of the cut"):
+        tile_cut.city_value_of("0302310121")
+
+
 def test_the_live_cut_still_covers_the_cities_it_was_built_from():
     """A lot in Villeray and one in La Cité-Limoilou each resolve to one cell.
 

@@ -23,8 +23,9 @@ is the two questions a reader asks next:
 
 The arithmetic is all in `urban_rag.comparables`, which has no Dagster imports
 and is where the judgements are written down. This module is the partition
-handling: read four parquet files, place the roll's units on the borough's
-lots, hand the frame over, write the answer and publish it.
+handling: read the tile's lots and the province's roll off the tree, read the
+lots in reach out of the table, place the roll's units on all of them, hand the
+frame over, write the answer for the tile's own lots and publish it.
 
 **The unit-to-lot placement is `role_assets.place_units_on_lots`, not a second
 copy of it.** `lot_assessed_values` sums `rl0404a` over exactly the same
@@ -50,11 +51,25 @@ around it. Their income and cap rate are null rather than zero, and their
 estimated value comes from the ground-area basis, which is the only one a
 parcel carrying nothing can be valued on.
 
-**The pool is the borough.** `lot_assessed_values` is partitioned by borough,
-so the valued lots available to be comparables are the ones in this partition
-and a parcel on the boundary draws its neighbours from its own side of it.
-`num_candidates` is reported per run so a thin pool is visible rather than
-inferred.
+**The pool is the snapshot.** The subjects are one tile's lots, and the lots
+they may be compared to are every valued lot in `silver.lot_assessed_values`
+for the scrape date whose polygon lies within the subjects' envelope expanded
+by `max_distance_m` - whichever tile or borough wrote them. That is the one
+bound the tile axis allows a read, because it cannot change the answer: a
+comparable within the radius of a lot in the tile cannot lie further out than
+that. It is read out of the table rather than off the tree because the halo
+spans whichever cells happen to touch it, and the table is where the snapshot
+is in one place. A parcel on a borough line now draws its neighbours from both
+sides of it, which it never could while the pool stopped at the partition.
+`num_candidates` counts the snapshot's valued lots in reach - the tile's own
+and the halo's - so a thin pool is still visible; a halo whose tiles have not
+run yet shows up as a count near the tile's own.
+
+**Rents are the lot's borough's, not the tile's.** CMHC and Cushman &
+Wakefield publish per borough and a tile can span two, so the income side is
+priced per lot by its own `neighborhood`: one set of assumptions per borough
+the tile holds, each read off that borough's silver partition, and each row
+carries the one that priced it.
 
 **Two rates, because the denominator is a choice.** `cap_rate_pct` is the yield
 on the roll's own assessed value, scaled by `market_value_factor` if the reader
@@ -64,14 +79,17 @@ comparables say the lot is worth. They differ by exactly
 assessment and whose neighbourhood are telling different stories.
 
 **It owns `silver.lot_assessment_comparables`** (hbu_infra's sql/016), upserted
-on (scrape_date, neighborhood, lot_number) like every other borough-scoped
-silver table, and the parquet is written first - so a database that is down
-costs a re-run of the load rather than of the join and the neighbour search.
-`lot_profiles` joins the table on `lot_number`, the same way it joins
-`lot_assessed_values`.
+on (scrape_date, cell_partition, lot_number) like every other lot-chain
+table. The database is read before the join now - the pool comes out of it -
+so a database that is down costs the run rather than only the publish; the
+parquet is still written before the upsert, so a publish that fails costs a
+re-run of the load and not of the neighbour search. `lot_profiles` joins the
+table on `lot_number`, the same way it joins `lot_assessed_values`.
 """
 
 import json
+import math
+from collections.abc import Sequence
 from datetime import datetime, timezone
 
 import geopandas as gpd
@@ -80,9 +98,12 @@ from dagster import (
     AssetDep,
     AssetExecutionContext,
     Config,
+    DimensionPartitionMapping,
     Failure,
+    IdentityPartitionMapping,
     MaterializeResult,
     MetadataValue,
+    MultiPartitionMapping,
     MultiToSingleDimensionPartitionMapping,
     asset,
 )
@@ -105,6 +126,7 @@ from urban_rag.comparables import (
     nearest_comparables,
     summarise_comparables,
 )
+from urban_rag import tile_grid
 from urban_rag.frames import write_frame
 from urban_rag.layers import key_prefix
 from urban_rag.program import (
@@ -113,7 +135,12 @@ from urban_rag.program import (
     MAX_MAINTENANCE_PREMIUM,
 )
 from urban_rag.rent_assets import COMMERCIAL_RENTS_FILE, commercial_rents
-from urban_rag.partitions import metric_crs_for, scrape_partitions
+from urban_rag.partitions import (
+    city_of_tile,
+    metric_crs_for_city,
+    tile_partition_of,
+    tile_scrape_partitions,
+)
 from urban_rag.rag.pgvector import PostgresUnavailable
 from urban_rag.resources import ParquetStore, PostgisResource
 from urban_rag.role_assets import (
@@ -133,8 +160,45 @@ from urban_rag.storage import clear_parquet, filesystem, join, storage_options
 from urban_rag.warehouse import MissingRelation, publish, published_metadata
 
 #: The one file a partition writes, under
-#: `silver/lot_assessment_comparables/<YYYY-MM-DD>/<neighborhood>/`.
+#: `silver/lot_assessment_comparables/<YYYY-MM-DD>/<tile>/`.
 LOT_COMPARABLES_FILE = "lot_assessment_comparables.parquet"
+
+#: How a tile asset depends on a borough one: the date maps to itself and the
+#: borough dimension is left unlisted, which Dagster reads as "all of them".
+#: The CMHC and C&W tables are a borough's, and a tile does not know which
+#: boroughs it holds until it reads its lots.
+_BOROUGH_BRIDGE = MultiPartitionMapping(
+    {"date": DimensionPartitionMapping("date", IdentityPartitionMapping())}
+)
+
+#: What every row carries about the lot it is: its own borough, which is what
+#: the income is priced by, and the cell address the warehouse partitions on.
+#: Off `lot_assessed_values` and never stamped here - a tile can span two
+#: boroughs.
+_OWNERSHIP_COLUMNS = ("neighborhood", "cell_key", "cell_partition")
+
+#: What a lot in reach has to say to be a candidate, and all it has to say:
+#: `_assemble` measures its ground and `place_units_on_lots` finds what stands
+#: on it, so the table is asked only for what those two cannot derive. The
+#: same columns the tile's own file carries for the same lot.
+_CANDIDATE_COLUMNS = (
+    "lot_number",
+    "neighborhood",
+    "cell_key",
+    "cell_partition",
+    "num_assessment_units",
+    "num_shared_units",
+    "num_units_by_point",
+    "total_assessed_value",
+    "total_assessed_value_apportioned",
+    "roll_year",
+)
+
+#: Metres per degree of latitude, and of longitude at the equator. Only ever
+#: used to turn the search radius into a degree margin that is *at least* the
+#: radius - the margin is a bound on the read, and the metric does its own
+#: measuring in metres.
+_METRES_PER_DEGREE = 111_320.0
 
 #: The CMHC cell every reader means by "the rent here" / "the vacancy rate
 #: here". The same pair `lot_profiles` flattens out of its own jsonb, named
@@ -152,7 +216,9 @@ class ComparablesConfig(Config):
     given; 8 is the size an appraisal actually reasons over, and a larger one
     buys a steadier median at the price of reaching further for it.
     ``max_distance_m`` is the radius past which a lot stops being a comparable
-    however similar it looks - 2 km is most of a borough. ``distance_scale_m``
+    however similar it looks - 2 km is most of a borough - and it is also how
+    far past the tile the pool is read, since nothing further can be a
+    neighbour. ``distance_scale_m``
     and ``size_ratio_scale`` are what one *unit* of unlikeness is: 500 m of
     ground, and a factor of two in size. ``use_weight`` is how much the CUBF
     class counts against those, and leads at 1.5 because a comparable of the
@@ -266,22 +332,22 @@ class ComparablesConfig(Config):
 
 @asset(
     key_prefix=key_prefix("lot_assessment_comparables"),
-    partitions_def=scrape_partitions,
+    partitions_def=tile_scrape_partitions,
     deps=[
-        # Partitioned by (neighborhood, date) like this asset, so neither needs
-        # a mapping. The first is where the geometry and the two totals come
-        # from; the two CMHC assets are the borough's rent and vacancy, which
-        # is the whole of the measured half of the income.
+        # Tile-axis like this asset, so no mapping: the tile's own valued lots
+        # and the two totals come from here. The halo of lots in reach is read
+        # out of the same asset's table - see the module docstring.
         lot_assessed_values,
-        vacancy_rates,
-        average_rents,
-        # What a square foot of retail, office and warehouse floor earns here,
-        # resolved for this borough's MarketBeat submarket. Partitioned the
-        # same way, so no mapping - and a hard dependency rather than an
-        # optional read, because without it every non-residential income term
-        # falls back to a stated constant and the cap rates quietly change
-        # meaning.
-        commercial_rents,
+        # Borough-axis: the CMHC rent and vacancy, and what a square foot of
+        # retail, office and warehouse floor earns in the borough's MarketBeat
+        # submarket. Bridged on the date - the tile resolves its boroughs from
+        # its lots at run time. A hard dependency rather than an optional read,
+        # because without the rents every non-residential income term falls
+        # back to a stated constant and the cap rates quietly change meaning.
+        *(
+            AssetDep(upstream, partition_mapping=_BOROUGH_BRIDGE)
+            for upstream in (vacancy_rates, average_rents, commercial_rents)
+        ),
         # Partitioned by date alone: the roll is one publication for the
         # province. Mapped onto this asset's `date` dimension the same way
         # `lot_assessed_values` maps the same two.
@@ -298,24 +364,25 @@ class ComparablesConfig(Config):
     group_name=SILVER_GROUP,
     kinds={"postgres", "geoparquet"},
     description=(
-        "What every lot in one borough yields, and which lots are like it. "
+        "What every lot in one tile yields, and which lots are like it. "
         "One row per NO_LOT with the roll's characteristics summed over the "
         "units standing on it - dwellings, floor area split into residential, "
         "commercial and industrial by each unit's own CUBF use code, and the "
         "use code, year and storeys of the unit carrying most of the value. "
-        "Priced against CMHC's borough rent and vacancy for the dwellings and "
-        "urban_rag.program's stated per-square-foot rates for the rest, that "
+        "Priced against CMHC's rent and vacancy for the lot's own borough and "
+        "the surveyed per-square-foot rates for the rest, that "
         "gives gross_income_cad and net_operating_income_cad, and over the "
         "assessed value cap_rate_pct. comparables is the k most similar lots "
-        "in the borough - scored on use code, lot area, floor area, dwellings "
-        "and ground distance at once - with the dollars per dwelling and per "
+        "in the snapshot within max_distance_m - whatever tile or borough "
+        "holds them - scored on use code, lot area, floor area, dwellings "
+        "and ground distance at once, with the dollars per dwelling and per "
         "square metre they imply flattened beside it; estimated_value_cad is "
         "that applied back to this lot and assessed_to_estimated_ratio is the "
         "two side by side. A lot no assessment unit stands on keeps its row "
         "with null income and a value estimated from ground area alone. "
         "Written to silver/lot_assessment_comparables/<YYYY-MM-DD>/"
-        f"<neighborhood>/{LOT_COMPARABLES_FILE} and upserted into "
-        "silver.lot_assessment_comparables on (scrape_date, neighborhood, "
+        f"<tile>/{LOT_COMPARABLES_FILE} and upserted into "
+        "silver.lot_assessment_comparables on (scrape_date, cell_partition, "
         "lot_number)."
     ),
 )
@@ -325,17 +392,13 @@ def lot_assessment_comparables(
     store: ParquetStore,
     postgis: PostgisResource,
 ) -> MaterializeResult:
-    dimensions = context.partition_key.keys_by_dimension
-    neighborhood = dimensions["neighborhood"]
-    scrape_date = dimensions["date"][:10]
+    tile, scrape_date = tile_partition_of(context)
 
     lots = _read_geoparquet(
-        store.partition_dir(
-            lot_assessed_values.key.path[-1], scrape_date, neighborhood
-        ),
+        store.partition_dir(lot_assessed_values.key.path[-1], scrape_date, tile),
         LOT_VALUES_FILE,
         asset_name=lot_assessed_values.key.path[-1],
-        partition=f"{neighborhood} {scrape_date}",
+        partition=f"tile {tile} {scrape_date}",
     )
     units = _read_geoparquet(
         store.partition_dir(assessment_units.key.path[-1], scrape_date),
@@ -351,26 +414,62 @@ def lot_assessment_comparables(
     )
     if lots.empty:
         raise Failure(
-            f"{lot_assessed_values.key.path[-1]} holds no lot for "
-            f"{neighborhood} {scrape_date}; there is nothing to compare."
+            f"{lot_assessed_values.key.path[-1]} holds no lot for tile "
+            f"{tile} {scrape_date}; there is nothing to compare."
         )
-    if LOT_NUMBER_COLUMN not in lots.columns:
+    missing = [
+        name
+        for name in (LOT_NUMBER_COLUMN, *_OWNERSHIP_COLUMNS)
+        if name not in lots.columns
+    ]
+    if missing:
         raise Failure(
-            f"The {lot_assessed_values.key.path[-1]} partition for "
-            f"{neighborhood} {scrape_date} has no {LOT_NUMBER_COLUMN} column - "
-            "it was not written by that asset."
+            f"The {lot_assessed_values.key.path[-1]} partition for tile "
+            f"{tile} {scrape_date} has no {', '.join(missing)} column - it "
+            "was not written by that asset on the tile axis."
         )
 
-    assumptions = _income_assumptions(
-        context, store, neighborhood=neighborhood, scrape_date=scrape_date,
-        config=config,
+    # The boroughs the tile's lots belong to, off the lots themselves: each is
+    # priced by its own borough's survey rows.
+    neighborhoods = tuple(sorted(lots["neighborhood"].dropna().unique()))
+    assumptions = {
+        neighborhood: _income_assumptions(
+            context, store, neighborhood=neighborhood, scrape_date=scrape_date,
+            config=config,
+        )
+        for neighborhood in neighborhoods
+    }
+
+    # The halo: every valued lot of the snapshot in reach of the tile that the
+    # tile does not own. Candidates only - never subjects, never written.
+    try:
+        with postgis.connect() as connection:
+            halo = _fetch_candidates(
+                connection,
+                tile=tile,
+                scrape_date=scrape_date,
+                radius_m=config.max_distance_m,
+            )
+    except (PostgresUnavailable, MissingRelation) as exc:
+        raise Failure(
+            f"silver.lot_assessed_values could not be read for the lots in "
+            f"reach of tile {tile} {scrape_date}: {exc}"
+        ) from exc
+    halo = halo[~halo[LOT_NUMBER_COLUMN].isin(set(lots[LOT_NUMBER_COLUMN]))]
+    num_subjects = len(lots)
+    pool = (
+        pd.concat([lots, halo.to_crs(lots.crs)], ignore_index=True)
+        if not halo.empty
+        else lots.reset_index(drop=True)
     )
+    pool = gpd.GeoDataFrame(pool, geometry=lots.geometry.name, crs=lots.crs)
 
     # The same placement `lot_assessed_values` totalled over, re-derived
-    # because that asset keeps the totals and not the pairs. `lot_key` is
-    # added here for the same reason it is added there: it is the only thing
+    # because that asset keeps the totals and not the pairs - over the halo
+    # too, since a comparable is read by what stands on it. `lot_key` is added
+    # here for the same reason it is added there: it is the only thing
     # standing between the roll's "1243415" and Infolot's "1 243 415".
-    keyed = lots.assign(lot_key=lots[LOT_NUMBER_COLUMN].map(lot_key))
+    keyed = pool.assign(lot_key=pool[LOT_NUMBER_COLUMN].map(lot_key))
     pairs = place_units_on_lots(
         crosswalk,
         units.to_crs(keyed.crs) if units.crs != keyed.crs else units,
@@ -381,19 +480,26 @@ def lot_assessment_comparables(
         pairs, units, lot_column=LOT_NUMBER_COLUMN, join_key=JOIN_KEY
     )
 
-    frame = _assemble(lots, characteristics, metric_crs=metric_crs_for(neighborhood))
-    subjects = _subject_frame(frame)
+    assembled = _assemble(
+        pool, characteristics, metric_crs=metric_crs_for_city(city_of_tile(tile))
+    )
+    everyone = _subject_frame(assembled)
     neighbours = nearest_comparables(
-        subjects,
+        everyone,
         k=config.k,
         weights=config.weights(),
         max_distance_m=config.max_distance_m,
-    )
+    )[:num_subjects]
+    num_candidates = int(everyone["total_assessed_value"].notna().sum())
+
+    # The tile's own lots are the first `num_subjects` rows of the pool, and
+    # only they are written: the halo was there to be compared to.
+    frame = assembled.iloc[:num_subjects].copy()
     frame = pd.concat(
         [frame, summarise_comparables(neighbours, index=frame.index)], axis=1
     )
     frame = pd.concat([frame, estimate_value(frame)], axis=1)
-    frame = _with_income(frame, assumptions, config)
+    frame = _with_income_by_borough(frame, assumptions, config)
     # `comparables` and `income_assumptions` go into the parquet as JSON
     # *strings* rather than as nested objects, the same posture
     # `lot_zoning_envelopes` takes with `usages` and `levels`: Arrow would
@@ -410,7 +516,7 @@ def lot_assessment_comparables(
             {
                 "k": config.k,
                 "max_distance_m": config.max_distance_m,
-                "num_candidates": int(subjects["total_assessed_value"].notna().sum()),
+                "num_candidates": num_candidates,
                 **config.weights().as_metadata(),
                 "neighbors": entries,
             },
@@ -418,19 +524,20 @@ def lot_assessment_comparables(
         )
         for entries in neighbours
     ]
-    frame["income_assumptions"] = json.dumps(
-        assumptions.as_metadata(), ensure_ascii=False
-    )
-    # Overwritten rather than trusted, the posture `lot_assessed_values` takes
-    # with the same two: this partition's borough and date are the ones that
-    # were asked for, not whatever a stale upstream file carried.
-    frame["neighborhood"] = neighborhood
+    # The borough's assumptions that priced the row, per row - a tile holding
+    # two boroughs carries two sets.
+    payloads = {
+        neighborhood: json.dumps(value.as_metadata(), ensure_ascii=False)
+        for neighborhood, value in assumptions.items()
+    }
+    frame["income_assumptions"] = frame["neighborhood"].map(payloads)
+    # The date is overwritten rather than trusted, the posture
+    # `lot_assessed_values` takes: this partition's date is the one that was
+    # asked for. The borough is the lot's own and is left as it came.
     frame["scrape_date"] = scrape_date
     frame["computed_at"] = datetime.now(timezone.utc).isoformat()
 
-    output_dir = store.partition_dir(
-        context.asset_key.path[-1], scrape_date, neighborhood
-    )
+    output_dir = store.partition_dir(context.asset_key.path[-1], scrape_date, tile)
     removed = clear_parquet(output_dir)
     if removed:
         context.log.info("Removed %d file(s) from a previous run", len(removed))
@@ -438,23 +545,109 @@ def lot_assessment_comparables(
 
     # After the parquet, for the reason every silver asset here writes first:
     # the file is the record, and a database that is down should cost a re-run
-    # of the load rather than of the borough-wide neighbour search.
+    # of the load rather than of the neighbour search.
     try:
         loaded = publish(
             postgis.connect,
             {"lot_assessment_comparables": frame},
-            neighborhood=neighborhood,
+            partition=tile,
             scrape_date=scrape_date,
         )
     except (PostgresUnavailable, MissingRelation) as exc:
         raise Failure(
             f"{path} was written, but silver.lot_assessment_comparables could "
-            f"not be updated for {neighborhood} {scrape_date}: {exc}"
+            f"not be updated for tile {tile} {scrape_date}: {exc}"
         ) from exc
 
     return _result(
-        context, frame, path, assumptions, config, pairs=pairs, loaded=loaded
+        context,
+        frame,
+        path,
+        assumptions[neighborhoods[0]],
+        config,
+        pairs=pairs[pairs[LOT_NUMBER_COLUMN].isin(set(frame[LOT_NUMBER_COLUMN]))],
+        loaded=loaded,
+        tile=tile,
+        neighborhoods=neighborhoods,
+        num_candidates=num_candidates,
+        num_halo=len(halo),
     )
+
+
+def tile_envelope(tile: str, radius_m: float) -> tuple[float, float, float, float]:
+    """``(west, south, east, north)`` of a cut cell, widened by ``radius_m``.
+
+    The one bound the pool read is allowed, because it cannot change the
+    answer: a comparable within ``radius_m`` of a lot in the cell lies inside
+    this box. The margin is converted to degrees at the cell's poleward edge,
+    where a degree of longitude is shortest, so it is at least ``radius_m``
+    everywhere in the cell - a little generous towards the equator, never
+    short.
+    """
+    west, south, east, north = tile_grid.tile_bounds(*tile_grid.cell_of_quadkey(tile))
+    lat_margin = radius_m / _METRES_PER_DEGREE
+    poleward = min(max(abs(south), abs(north)) + lat_margin, 89.0)
+    lon_margin = radius_m / (_METRES_PER_DEGREE * math.cos(math.radians(poleward)))
+    return (
+        west - lon_margin,
+        south - lat_margin,
+        east + lon_margin,
+        north + lat_margin,
+    )
+
+
+def _fetch_candidates(
+    connection, *, tile: str, scrape_date: str, radius_m: float
+) -> gpd.GeoDataFrame:
+    """Every valued lot of the snapshot within ``radius_m`` of the tile.
+
+    Read out of `silver.lot_assessed_values` rather than off the tree: the
+    halo spans whichever cells happen to touch it, and the table is where the
+    snapshot is in one place. Valued only - an unvalued lot can never be a
+    comparable - and by bounding box against `tile_envelope`, which the GiST
+    index on `geom` answers. The tile's own lots come back too and are
+    dropped by the caller, which already holds them.
+    """
+    import shapely.wkb
+
+    west, south, east, north = tile_envelope(tile, radius_m)
+    cursor = connection.cursor()
+    cursor.execute(
+        f"SELECT {', '.join(_CANDIDATE_COLUMNS)}, ST_AsBinary(geom) "
+        "FROM silver.lot_assessed_values "
+        "WHERE scrape_date = %s::date "
+        "AND total_assessed_value IS NOT NULL "
+        "AND geom && ST_MakeEnvelope(%s, %s, %s, %s, 4326)",
+        [scrape_date, west, south, east, north],
+    )
+    rows = cursor.fetchall()
+    frame = pd.DataFrame(rows, columns=[*_CANDIDATE_COLUMNS, "geom_wkb"])
+    geometries = [
+        shapely.wkb.loads(bytes(value)) if value is not None else None
+        for value in frame.pop("geom_wkb")
+    ]
+    frame = frame.rename(columns={"lot_number": LOT_NUMBER_COLUMN})
+    for column in ("total_assessed_value", "total_assessed_value_apportioned"):
+        frame[column] = pd.to_numeric(frame[column], errors="coerce").astype("Float64")
+    return gpd.GeoDataFrame(frame, geometry=geometries, crs="EPSG:4326")
+
+
+def _with_income_by_borough(
+    frame: pd.DataFrame,
+    assumptions: dict[str, IncomeAssumptions],
+    config: ComparablesConfig,
+) -> pd.DataFrame:
+    """`_with_income`, one borough's lots at a time, in the frame's own order.
+
+    CMHC and C&W price a borough, and a tile can hold two: each lot is
+    charged its own borough's rent and vacancy rather than whichever borough
+    the tile mostly is.
+    """
+    parts = [
+        _with_income(group, assumptions[neighborhood], config)
+        for neighborhood, group in frame.groupby("neighborhood", sort=False)
+    ]
+    return pd.concat(parts).loc[frame.index]
 
 
 def _assemble(
@@ -717,8 +910,16 @@ def _result(
     *,
     pairs: pd.DataFrame,
     loaded: dict,
+    tile: str,
+    neighborhoods: Sequence[str],
+    num_candidates: int,
+    num_halo: int,
 ) -> MaterializeResult:
-    """The run's log line and its metadata, off the frame that was written."""
+    """The run's log line and its metadata, off the frame that was written.
+
+    ``assumptions`` is the first borough's, for the handful of scalar survey
+    keys below; a tile holding two boroughs carries both sets on its rows.
+    """
     num_lots = len(frame)
     with_comparables = int((frame["num_comparables"] > 0).sum())
     with_cap_rate = int(frame["cap_rate_pct"].notna().sum())
@@ -746,8 +947,8 @@ def _result(
     context.log.info(
         "%s %s: %d lot(s) - %d with a comparable set, %d with a cap rate "
         "(median %.2f pct), %d with an estimated value; $%.1fM of net "
-        "operating income across the borough -> %s",
-        frame["neighborhood"].iloc[0],
+        "operating income across the tile -> %s",
+        tile,
         frame["scrape_date"].iloc[0],
         num_lots,
         with_comparables,
@@ -761,15 +962,21 @@ def _result(
     return MaterializeResult(
         metadata={
             "dagster/row_count": num_lots,
+            "tile": tile,
+            # Whose rents priced the rows.
+            "neighborhoods": ", ".join(neighborhoods),
             "num_lots": num_lots,
-            # The pool every neighbour list was drawn from. A lot only gets to
-            # be a comparable if the roll gave it a value, so this is well
-            # under num_lots and a thin one is what a partition whose roll did
-            # not land looks like from here.
-            "num_candidates": int(frame["total_assessed_value"].notna().sum()),
+            # The pool every neighbour list was drawn from: the snapshot's
+            # valued lots in reach of the tile, its own and the halo's. A lot
+            # only gets to be a comparable if the roll gave it a value, so a
+            # thin pool is a roll that did not land - or a halo whose tiles
+            # have not run yet, which is what `num_halo_candidates` near 0 on
+            # an interior tile says.
+            "num_candidates": num_candidates,
+            "num_halo_candidates": num_halo,
             "num_with_comparables": with_comparables,
             # A lot with none is one with nothing inside max_distance_m. In a
-            # borough that is a handful on the edge of an industrial strip; a
+            # tile that is a handful on the edge of an industrial strip; a
             # large number means the radius is tighter than the parcels are
             # spread.
             "num_without_comparables": num_lots - with_comparables,
@@ -778,7 +985,7 @@ def _result(
             ),
             "num_units_placed": int(pairs[JOIN_KEY].nunique()),
             "num_units_disagreeing": disagreeing,
-            # What the roll says stands on the borough, which is the whole of
+            # What the roll says stands on the tile, which is the whole of
             # the income's measured side.
             "num_dwellings": _total(frame, "num_dwellings"),
             "num_rental_rooms": _total(frame, "num_rental_rooms"),

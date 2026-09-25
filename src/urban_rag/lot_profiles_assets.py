@@ -1,5 +1,5 @@
-"""Every lot in the borough, with what stands on it, what it faces, and what
-governs it - one row per cadastral parcel.
+"""Every lot in a tile of the cut, with what stands on it, what it faces, and
+what governs it - one row per cadastral parcel.
 
 This is the platform's gold layer for the lot lineage. Four silver joins each
 hold one row per (lot x something), and each of them is the wrong shape for the
@@ -92,10 +92,13 @@ INSERT by this asset instead of read out of a `rag` table.
 `lot_zoning_envelopes` is staged into a temp table and aggregated into
 `zoning_envelopes` - every grid column that governs the lot, with the norms it
 states, so a reader holding one profile row has what `program.solve_program`
-needs. `vacancy_rates` and `average_rents` become one object each. Those two
-are the *borough's* figures and are identical on every row of the partition,
-which is the point: CMHC surveys neighborhoods and publishes no geometry, so
-there is nothing per-lot about them and nothing to join on.
+needs. `vacancy_rates` and `average_rents` become one object each *per
+borough*. Those two are the borough's figures and are identical on every lot
+of a borough, which is the point: CMHC surveys neighborhoods and publishes no
+geometry, so there is nothing per-lot about them and the one thing to join on
+is the lot's own `neighborhood`. A tile is priced at the rows of every borough
+its lots belong to - `neighborhoods_of_tile` says which - and a tile on a
+borough line carries two objects, each on its own side's lots.
 
 **The cost columns are the fourth, and the same trade at a coarser grain.**
 `montreal_residential_costs` and `montreal_nonresidential_costs` are the
@@ -132,18 +135,19 @@ read the bronze cadastre directly. The geometry repair that asset also did did
 not go away - it moved to `building_lot_intersections`, next to the
 `ST_Intersection` calls it exists for.
 
-Downstream of `building_lot_intersections`, `lot_frontage`, `document_index`,
-`lot_zoning_envelopes`, `vacancy_rates` and `average_rents` for the *same*
-partition, and of the two cost snapshots for the same *date* - those are
-partitioned by date alone, so they map onto the `date` dimension the way
-`vacancy_rates` maps its own bronze survey. The first three are what land
-`rag.lots`, `silver.building_lot_intersections`, `silver.lot_features`, `silver.lot_frontage` and
-`rag.chunks`, so by the time this runs the work here is five parquet reads and
-one SQL statement. Like those,
-the answer is computed in Postgres and then written to the tree as well -
-`gold.lot_profiles` is what the query side reads, and
-`gold/lot_profiles/<date>/<neighborhood>/` is the record it can be rebuilt
-from.
+Downstream of `building_lot_intersections`, `lot_frontage`,
+`lot_zoning_envelopes` and the assessment pair for the *same tile*; of
+`document_index`, `vacancy_rates` and `average_rents` for the *boroughs the
+tile holds* - those stay on the borough axis, and the dependency is the bridge
+between the two, every borough of the date; and of the two cost snapshots for
+the same *date* - those are partitioned by date alone, so they map onto the
+`date` dimension the way `vacancy_rates` maps its own bronze survey. The first
+group is what lands `rag.lots`, `silver.building_lot_intersections`,
+`silver.lot_features`, `silver.lot_frontage` and `rag.chunks`, so by the time
+this runs the work here is a handful of parquet reads and one SQL statement.
+Like those, the answer is computed in Postgres and then written to the tree as
+well - `gold.lot_profiles` is what the query side reads, and
+`gold/lot_profiles/<date>/<tile>/` is the record it can be rebuilt from.
 
 **Two of the relations this reads are hbu_infra's to create.**
 sql/009_gold_lot_profiles.sql creates the table itself, and sql/006_lot_documents.sql
@@ -164,9 +168,12 @@ from dagster import (
     AssetDep,
     AssetExecutionContext,
     Config,
+    DimensionPartitionMapping,
     Failure,
+    IdentityPartitionMapping,
     MaterializeResult,
     MetadataValue,
+    MultiPartitionMapping,
     MultiToSingleDimensionPartitionMapping,
     asset,
 )
@@ -196,13 +203,14 @@ from urban_rag.estimator_assets import (
 from urban_rag.frames import write_frame
 from urban_rag.frontage_assets import lot_frontage
 from urban_rag.layers import key_prefix
-from urban_rag.partitions import scrape_partitions
+from urban_rag.partitions import tile_partition_of, tile_scrape_partitions
 from urban_rag.postgis import (
     DEFAULT_MAX_BUILT_AREA_M2,
     LOT_CATEGORIES,
     MissingRelation,
     compute_lot_profiles,
     fetch_lot_profiles,
+    neighborhoods_of_tile,
 )
 from urban_rag.rag.pgvector import PostgresUnavailable
 from urban_rag.rag_assets import document_index
@@ -215,8 +223,15 @@ from urban_rag.storage import clear_parquet, filesystem, join, storage_options
 GROUP = "gold_lots"
 
 #: The one file a partition is written to, under
-#: `gold/lot_profiles/<YYYY-MM-DD>/<neighborhood>/`.
+#: `gold/lot_profiles/<YYYY-MM-DD>/<tile>/`.
 LOT_PROFILES_FILE = "lot_profiles.parquet"
+
+#: How this tile asset depends on a borough-axis one: the date one to one,
+#: the borough dimension unlisted, which Dagster reads as all of them. Which
+#: boroughs actually matter is `neighborhoods_of_tile`'s answer at run time.
+_BOROUGH_BRIDGE = MultiPartitionMapping(
+    {"date": DimensionPartitionMapping("date", IdentityPartitionMapping())}
+)
 
 #: Columns of `lot_zoning_envelopes` that do *not* travel into the
 #: `zoning_envelopes` jsonb: the lot's own facts, which the profile row already
@@ -369,11 +384,14 @@ class LotProfilesConfig(Config):
 
 @asset(
     key_prefix=key_prefix("lot_profiles"),
-    partitions_def=scrape_partitions,
+    partitions_def=tile_scrape_partitions,
     deps=[
         building_lot_intersections,
         lot_frontage,
-        document_index,
+        # The corpus is indexed per borough and stays there; the lot documents
+        # view joins it to the tile's lots through the features' namespace,
+        # so the dependency is the bridge - every borough of the date.
+        AssetDep(document_index, partition_mapping=_BOROUGH_BRIDGE),
         lot_zoning_envelopes,
         # Read out of Postgres rather than from the tree, unlike the envelopes
         # beside it: it is one row per (lot, zone, column) there already, which
@@ -381,7 +399,7 @@ class LotProfilesConfig(Config):
         # for the flattened columns, and joined entry by entry into the
         # zoning_envelopes array. See `compute_lot_profiles`.
         lot_buildable_setbacks,
-        # Partitioned by (neighborhood, date) like this asset, so it needs no
+        # Partitioned by (tile, date) like this asset, so it needs no
         # mapping - unlike the two cost snapshots below. The join is a plain
         # LEFT JOIN in SQL, so a partition whose roll has not landed still
         # profiles every lot; the dependency is what keeps the two in step
@@ -392,8 +410,11 @@ class LotProfilesConfig(Config):
         # that asset's parquet - so declaring both is what puts this asset
         # behind the whole assessment lineage rather than behind its first half.
         lot_assessment_comparables,
-        vacancy_rates,
-        average_rents,
+        # CMHC publishes per borough, so these stay on the borough axis and a
+        # tile reads one partition per borough its lots belong to - the
+        # bridge, with `neighborhoods_of_tile` naming the boroughs at run time.
+        AssetDep(vacancy_rates, partition_mapping=_BOROUGH_BRIDGE),
+        AssetDep(average_rents, partition_mapping=_BOROUGH_BRIDGE),
         # Partitioned by date alone: the guide prices nine Canadian markets and
         # knows nothing about boroughs, so one snapshot serves every one of
         # them. Mapped onto this asset's `date` dimension the same way
@@ -411,7 +432,8 @@ class LotProfilesConfig(Config):
     group_name=GROUP,
     kinds={"postgres", "geoparquet"},
     description=(
-        "Every lot in the borough, one row each: the neighborhood it is in, "
+        "Every lot in one tile of the cut, one row each: the neighborhood it "
+        "is in, "
         "whether a building stands on it (has_building) and how many "
         "(num_buildings), the footprint area on it and that area as a share "
         "of the lot, its primary and secondary street frontage in metres with "
@@ -423,7 +445,7 @@ class LotProfilesConfig(Config):
         "lineage onto the same row: zoning_envelopes is this lot's "
         "lot_zoning_envelopes rows - every grid column that governs it, with "
         "the norms it states and the buildable area left under that column's "
-        "own margins - and vacancy_rates/average_rents are the "
+        "own margins - and vacancy_rates/average_rents are the lot's own "
         "borough's CMHC survey, with the all/all cell flattened into "
         "overall_vacancy_rate_pct and overall_average_rent_cad. What the "
         "ground is assessed at comes from silver.lot_assessed_values, joined "
@@ -448,8 +470,8 @@ class LotProfilesConfig(Config):
         "object. Replaces the "
         "old vacant_lots asset: that selection is now `WHERE NOT "
         "has_building`. Upserted into gold.lot_profiles on (scrape_date, "
-        "neighborhood, lot_number) for the query side, and written to "
-        "gold/lot_profiles/<YYYY-MM-DD>/<neighborhood>/"
+        "cell_partition, lot_number) for the query side, and written to "
+        "gold/lot_profiles/<YYYY-MM-DD>/<tile>/"
         f"{LOT_PROFILES_FILE} as the record."
     ),
 )
@@ -459,50 +481,57 @@ def lot_profiles(
     store: ParquetStore,
     postgis: PostgisResource,
 ) -> MaterializeResult:
-    dimensions = context.partition_key.keys_by_dimension
-    neighborhood = dimensions["neighborhood"]
-    scrape_date = dimensions["date"][:10]
+    tile, scrape_date = tile_partition_of(context)
 
-    # Read before the connection is opened: five parquet reads and a JSON
+    # Which boroughs the tile's lots belong to, off `rag.lots` - the bridge to
+    # the two CMHC inputs, which are published per borough. Its own short
+    # connection, ahead of the reads below: a tile no cadastre was loaded for
+    # is cheaper to learn about here than after the reads.
+    neighborhoods = _neighborhoods_of_tile(postgis, tile, scrape_date)
+
+    # Read before the write connection is opened: the parquet reads and a JSON
     # build have no business happening inside a write transaction, and a
     # partition missing one of them should fail naming what to materialize
     # rather than after deleting the rows it was going to replace.
     envelopes = _lot_envelopes(
         _read(
-            store.partition_dir(
-                lot_zoning_envelopes.key.path[-1], scrape_date, neighborhood
-            ),
+            store.partition_dir(lot_zoning_envelopes.key.path[-1], scrape_date, tile),
             LOT_ENVELOPES_FILE,
             asset_name=lot_zoning_envelopes.key.path[-1],
-            neighborhood=neighborhood,
+            partition=tile,
             scrape_date=scrape_date,
         )
     )
-    vacancy = _vacancy_payload(
-        _read(
-            store.partition_dir(
-                vacancy_rates.key.path[-1], scrape_date, neighborhood
-            ),
-            VACANCY_FILE,
-            asset_name=vacancy_rates.key.path[-1],
-            neighborhood=neighborhood,
-            scrape_date=scrape_date,
+    # One object per borough, keyed by borough, and joined to each lot on its
+    # own `neighborhood` in SQL: a tile on a borough line carries two surveys,
+    # each on its own side's lots.
+    vacancy = {
+        neighborhood: _vacancy_payload(
+            _read(
+                store.partition_dir(vacancy_rates.key.path[-1], scrape_date, neighborhood),
+                VACANCY_FILE,
+                asset_name=vacancy_rates.key.path[-1],
+                partition=neighborhood,
+                scrape_date=scrape_date,
+            )
         )
-    )
-    rents = _rents_payload(
-        _read(
-            store.partition_dir(
-                average_rents.key.path[-1], scrape_date, neighborhood
-            ),
-            AVERAGE_RENTS_FILE,
-            asset_name=average_rents.key.path[-1],
-            neighborhood=neighborhood,
-            scrape_date=scrape_date,
+        for neighborhood in neighborhoods
+    }
+    rents = {
+        neighborhood: _rents_payload(
+            _read(
+                store.partition_dir(average_rents.key.path[-1], scrape_date, neighborhood),
+                AVERAGE_RENTS_FILE,
+                asset_name=average_rents.key.path[-1],
+                partition=neighborhood,
+                scrape_date=scrape_date,
+            )
         )
-    )
-    # No neighborhood on either of these: the cost guide is partitioned by date
-    # alone, so `<date>/` is the whole path and every borough of that day reads
-    # the same two files.
+        for neighborhood in neighborhoods
+    }
+    # No tile and no borough on either of these: the cost guide is partitioned
+    # by date alone, so `<date>/` is the whole path and every tile of that day
+    # reads the same two files.
     costs = _construction_costs_payload(
         context,
         residential=_read(
@@ -526,7 +555,7 @@ def lot_profiles(
         with postgis.connect() as connection:
             result = compute_lot_profiles(
                 connection,
-                neighborhood=neighborhood,
+                tile=tile,
                 scrape_date=scrape_date,
                 max_built_area_m2=config.max_built_area_m2,
                 vacancy_rates=vacancy,
@@ -536,30 +565,27 @@ def lot_profiles(
             )
             num_lots = int(result["num_lots"])
             if num_lots == 0:
-                # Not "the borough has no lots": the partition was never
-                # loaded. Distinguishing the two is the whole point of failing
+                # Not "the tile has no lots": the cadastre was never loaded
+                # for it. Distinguishing the two is the whole point of failing
                 # here instead of writing a perfectly well-formed zero. Raised
                 # inside the transaction so the DELETE above rolls back with
                 # it rather than leaving the previous run's rows removed.
                 raise Failure(
-                    f"rag.lots holds no lot for {neighborhood} {scrape_date} - "
-                    "materialize building_lot_intersections for this partition "
-                    "first."
+                    f"rag.lots holds no lot for tile {tile} {scrape_date} - "
+                    "load the cadastre (neighborhood_cadastre) for the boroughs "
+                    "it covers and materialize building_lot_intersections for "
+                    "this tile first."
                 )
             # Inside the transaction that computed it, so the file is that
             # answer rather than whatever a concurrent run leaves behind after
             # the commit.
-            frame = fetch_lot_profiles(
-                connection, neighborhood=neighborhood, scrape_date=scrape_date
-            )
+            frame = fetch_lot_profiles(connection, tile=tile, scrape_date=scrape_date)
     except PostgresUnavailable as exc:
-        raise Failure(f"Postgres unreachable for {neighborhood} {scrape_date}: {exc}")
+        raise Failure(f"Postgres unreachable for tile {tile} {scrape_date}: {exc}")
     except MissingRelation as exc:
         raise Failure(str(exc))
 
-    output_dir = store.partition_dir(
-        context.asset_key.path[-1], scrape_date, neighborhood
-    )
+    output_dir = store.partition_dir(context.asset_key.path[-1], scrape_date, tile)
     removed = clear_parquet(output_dir)
     if removed:
         context.log.info("Removed %d file(s) from a previous run", len(removed))
@@ -568,11 +594,11 @@ def lot_profiles(
     profiles = int(result["profiles"])
     by_category = result["by_category"]
     context.log.info(
-        "%s %s: %d lot(s) profiled - %d built on, %d with frontage "
+        "tile %s %s: %d lot(s) profiled - %d built on, %d with frontage "
         "(%d on two streets), %d with a document, %d with a zoning envelope "
         "(%d in all), %d with a buildable area (mean %.1f pct of lot, %d "
         "bound by margins); %s at <= %.0f m2 -> %s",
-        neighborhood,
+        tile,
         scrape_date,
         profiles,
         int(result["num_with_building"]),
@@ -596,9 +622,9 @@ def lot_profiles(
         # have, which is what a stale silver/lot_zoning_envelopes looks like
         # from here. Not fatal - the lots that did match are still right.
         context.log.warning(
-            "%s %s: %d of %d envelope row(s) matched no lot in rag.lots - "
-            "re-materialize lot_zoning_envelopes for this partition",
-            neighborhood,
+            "tile %s %s: %d of %d envelope row(s) matched no lot in rag.lots - "
+            "re-materialize lot_zoning_envelopes for this tile",
+            tile,
             scrape_date,
             staged - landed,
             staged,
@@ -609,6 +635,8 @@ def lot_profiles(
     return MaterializeResult(
         metadata={
             "dagster/row_count": profiles,
+            "tile": tile,
+            "neighborhoods": ", ".join(neighborhoods),
             # These two agreeing is what says every lot got a profile. They
             # can only differ if the INSERT dropped rows, which nothing in it
             # should do - so a gap here is a bug rather than a data quality
@@ -719,20 +747,29 @@ def lot_profiles(
             "net_operating_income_millions": round(
                 result["net_operating_income_cad"] / 1e6, 2
             ),
-            # Borough figures, identical on every row - reported once here
-            # rather than left to be read out of one lot's jsonb. "suppressed"
-            # is CMHC publishing nothing for the borough, which is a fact
-            # about the survey and not a gap in this partition.
-            "cmhc_survey_year": vacancy.get("survey_year") or "unknown",
-            "cmhc_survey_period": vacancy.get("survey_period") or "unknown",
+            # Borough figures, identical on every lot of a borough - reported
+            # once per borough here, keyed by it, rather than left to be read
+            # out of one lot's jsonb. "suppressed" is CMHC publishing nothing
+            # for the borough, which is a fact about the survey and not a gap
+            # in this partition.
+            "cmhc_survey_year": MetadataValue.json(
+                _per_borough(vacancy, "survey_year")
+            ),
+            "cmhc_survey_period": MetadataValue.json(
+                _per_borough(vacancy, "survey_period")
+            ),
             "overall_vacancy_rate_pct": _rate_metadata(
                 result["overall_vacancy_rate_pct"]
             ),
             "overall_average_rent_cad": _rate_metadata(
                 result["overall_average_rent_cad"]
             ),
-            "num_cmhc_vacancy_cells": len(vacancy.get("cells", [])),
-            "num_cmhc_rent_cells": len(rents.get("cells", [])),
+            "num_cmhc_vacancy_cells": sum(
+                len(payload.get("cells", [])) for payload in vacancy.values()
+            ),
+            "num_cmhc_rent_cells": sum(
+                len(payload.get("cells", [])) for payload in rents.values()
+            ),
             # The cost guide's figures, reported once for the same reason the
             # CMHC ones are: they are identical on every row, and reading them
             # out of one lot's jsonb to check a run would be absurd. Which
@@ -761,30 +798,70 @@ def lot_profiles(
     )
 
 
+def _neighborhoods_of_tile(
+    postgis: PostgisResource, tile: str, scrape_date: str
+) -> tuple[str, ...]:
+    """The boroughs whose lots this tile holds, off `rag.lots`.
+
+    The bridge to the two CMHC inputs, which are published per borough. A
+    tile with no lot at all is a cadastre that was never loaded, and is the
+    same failure `compute_lot_profiles`' zero-lot check raises - here it is
+    raised before the reads, which is where it is cheapest.
+    """
+    try:
+        with postgis.connect() as connection:
+            neighborhoods = neighborhoods_of_tile(
+                connection, tile=tile, scrape_date=scrape_date
+            )
+    except PostgresUnavailable as exc:
+        raise Failure(f"Postgres unreachable for tile {tile} {scrape_date}: {exc}")
+    except MissingRelation as exc:
+        raise Failure(str(exc))
+    if not neighborhoods:
+        raise Failure(
+            f"rag.lots holds no lot for tile {tile} {scrape_date} - load the "
+            "cadastre (neighborhood_cadastre) for the boroughs it covers first."
+        )
+    return tuple(neighborhoods)
+
+
+def _per_borough(payloads: dict[str, dict], key: str) -> dict[str, object]:
+    """One key of each borough's CMHC object, keyed by borough, for the run.
+
+    "unknown" rather than a null where the survey stated nothing, the same
+    reading the single-borough metadata gave it.
+    """
+    return {
+        neighborhood: payload.get(key) or "unknown"
+        for neighborhood, payload in payloads.items()
+    }
+
+
 def _read(
     partition_dir: str,
     name: str,
     *,
     asset_name: str,
     scrape_date: str,
-    neighborhood: str | None = None,
+    partition: str | None = None,
 ) -> pd.DataFrame:
     """One upstream partition's parquet, or a `Failure` naming what to run.
 
-    The five inputs read this way are declared deps, so a missing file means
-    the partition was never materialized rather than that this asset is
-    reaching for something optional - and the message that helps says which
-    asset to run, the same posture `building_lot_intersections` takes.
+    The inputs read this way are declared deps, so a missing file means the
+    partition was never materialized rather than that this asset is reaching
+    for something optional - and the message that helps says which asset to
+    run, the same posture `building_lot_intersections` takes.
 
-    ``neighborhood`` is optional because the two cost snapshots are partitioned
-    by date alone; naming a borough in *their* failure would send the reader
+    ``partition`` is the tile for a lot-chain upstream and the borough for a
+    CMHC one, and is optional because the two cost snapshots are partitioned
+    by date alone; naming a tile in *their* failure would send the reader
     looking for a partition key that does not exist.
     """
     path = join(partition_dir, name)
     if not filesystem(path).exists(path):
-        partition = scrape_date if neighborhood is None else f"{neighborhood} {scrape_date}"
+        named = scrape_date if partition is None else f"{partition} {scrape_date}"
         raise Failure(
-            f"{path} is missing - materialize {asset_name} for {partition} first."
+            f"{path} is missing - materialize {asset_name} for {named} first."
         )
     return pd.read_parquet(path, storage_options=storage_options(path))
 
@@ -862,7 +939,7 @@ def _decode_json_columns(entry: dict) -> dict:
 
 
 def _vacancy_payload(frame: pd.DataFrame) -> dict:
-    """`vacancy_rates` as the object every lot of the partition carries.
+    """One borough's `vacancy_rates` as the object every lot of it carries.
 
     The survey provenance sits at the top and the grid travels underneath as
     `cells`, because a borough figure is the unweighted mean of its quartiers
@@ -906,7 +983,7 @@ def _vacancy_payload(frame: pd.DataFrame) -> dict:
 
 
 def _rents_payload(frame: pd.DataFrame) -> dict:
-    """`average_rents` as the object every lot of the partition carries."""
+    """One borough's `average_rents` as the object every lot of it carries."""
     cells = _records(
         frame[
             [
@@ -951,10 +1028,11 @@ def _construction_costs_payload(
     """The cost guide as the object every lot of the partition carries.
 
     Built the same way as the two CMHC objects, and denormalised for a stronger
-    version of the same reason. CMHC at least surveys neighborhoods; the Altus
-    guide prices nine Canadian *markets* and publishes no geometry at all, so a
-    Montreal rate is the same rate in Villeray as in Verdun and there is
-    nothing whatever to join it on. One object, on every row.
+    version of the same reason. CMHC at least surveys neighborhoods, which is
+    why those two are keyed by borough; the Altus guide prices nine Canadian
+    *markets* and publishes no geometry at all, so a Montreal rate is the same
+    rate in Villeray as in Verdun and there is nothing whatever to join it on.
+    One object, on every row of every tile.
 
     Two families travel under their own keys rather than in one flat `cells`
     list, because they are not in the same unit and mixing them is exactly the

@@ -61,8 +61,9 @@ so a rebuild does not re-download bge-m3; the venv is not, so a rebuilt image
 is never shadowed by a stale copy of itself.
 
 The retrieval stack is in the devcontainer image, which is why it is several
-gigabytes: the Dagster code location does not load without it — see [The rag
-extra is not optional](#the-rag-extra-costs-several-gigabytes-for-five-assets-that-never-load-it).
+gigabytes. The Dagster code location loads without it; only `ask`, `search` and
+`index` need it — see [The rag extra costs several
+gigabytes](#the-rag-extra-costs-several-gigabytes-for-five-assets-that-never-load-it).
 
 ### WSL
 
@@ -106,22 +107,22 @@ corpus — under `s3://$S3_BUCKET/` instead of `/data`. The prefixes are the sam
 [output layout](architecture.md#output-layout) the local tree uses, one per asset:
 
 ```
-s3://$S3_BUCKET/bronze/spectrum_table_catalog/2026-08-20/tables.parquet
-s3://$S3_BUCKET/bronze/neighborhood_features/2026-08-20/VSMPE/*.parquet
-s3://$S3_BUCKET/bronze/reference_neighborhoods/2026-08-20/*.parquet
-s3://$S3_BUCKET/bronze/neighborhood_lots/2026-08-20/VSMPE/lots.parquet
-s3://$S3_BUCKET/bronze/neighborhood_buildings/2026-08-20/VSMPE/buildings.parquet
-s3://$S3_BUCKET/bronze/cmhc_vacancy_survey/2026-08-20/quartier_vacancy_rates.parquet
-s3://$S3_BUCKET/bronze/montreal_residential_costs/2026-08-20/residential_costs.parquet
-s3://$S3_BUCKET/bronze/linked_documents/2026-08-20/VSMPE/documents.parquet
-s3://$S3_BUCKET/silver/vacancy_rates/2026-08-20/VSMPE/vacancy_rates.parquet
-s3://$S3_BUCKET/silver/average_rents/2026-08-20/VSMPE/average_rents.parquet
-s3://$S3_BUCKET/silver/building_lot_intersections/2026-08-20/VSMPE/building_lots.parquet
-s3://$S3_BUCKET/silver/building_lot_intersections/2026-08-20/VSMPE/lot_features.parquet
-s3://$S3_BUCKET/silver/lot_zoning_envelopes/2026-08-20/VSMPE/lot_zoning_envelopes.parquet
-s3://$S3_BUCKET/silver/document_chunks/2026-08-20/VSMPE/chunks.parquet
-s3://$S3_BUCKET/silver/document_embeddings/2026-08-20/VSMPE/embeddings.parquet
-s3://$S3_BUCKET/gold/lot_profiles/2026-08-20/VSMPE/lot_profiles.parquet
+s3://$S3_BUCKET/bronze/spectrum_table_catalog/2026-09-01/tables.parquet
+s3://$S3_BUCKET/bronze/neighborhood_features/2026-09-01/VSMPE/*.parquet
+s3://$S3_BUCKET/bronze/reference_neighborhoods/2026-09-01/*.parquet
+s3://$S3_BUCKET/bronze/neighborhood_lots/2026-09-01/VSMPE/lots.parquet
+s3://$S3_BUCKET/bronze/neighborhood_buildings/2026-09-01/VSMPE/buildings.parquet
+s3://$S3_BUCKET/bronze/cmhc_vacancy_survey/2026-09-01/quartier_vacancy_rates.parquet
+s3://$S3_BUCKET/bronze/montreal_residential_costs/2026-09-01/residential_costs.parquet
+s3://$S3_BUCKET/bronze/linked_documents/2026-09-01/VSMPE/documents.parquet
+s3://$S3_BUCKET/silver/vacancy_rates/2026-09-01/VSMPE/vacancy_rates.parquet
+s3://$S3_BUCKET/silver/average_rents/2026-09-01/VSMPE/average_rents.parquet
+s3://$S3_BUCKET/silver/building_lot_intersections/2026-09-01/0302303330102/building_lots.parquet
+s3://$S3_BUCKET/silver/building_lot_intersections/2026-09-01/0302303330102/lot_features.parquet
+s3://$S3_BUCKET/silver/lot_zoning_envelopes/2026-09-01/0302303330102/lot_zoning_envelopes.parquet
+s3://$S3_BUCKET/silver/document_chunks/2026-09-01/VSMPE/chunks.parquet
+s3://$S3_BUCKET/silver/document_embeddings/2026-09-01/VSMPE/embeddings.parquet
+s3://$S3_BUCKET/gold/lot_profiles/2026-09-01/0302303330102/lot_profiles.parquet
 ```
 
 A bucket policy or lifecycle rule can now be written per layer: bronze is the
@@ -189,14 +190,14 @@ fine with `uv sync --extra dev` alone.
 make docker-build-slim
 ```
 
-builds a ~510 MB image whose code location loads and lists all five assets -
+builds a ~510 MB image whose code location loads and lists every asset -
 `ask`/`search`/`index` just are not available without the `rag` extra to run
 the encoder they need.
 
 ### Compose
 
 `dagster dev` is a single process running both the webserver and the daemon,
-which is fine on a laptop and wrong for a deployment: with no daemon, the two
+which is fine on a laptop and wrong for a deployment: with no daemon, the eighteen
 monthly schedules never fire. [docker-compose.yml](../docker-compose.yml) splits
 them, which is also the shape that maps onto two ECS services:
 

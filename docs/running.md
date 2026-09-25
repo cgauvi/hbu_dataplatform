@@ -43,29 +43,44 @@ uv run dagster asset materialize --select bronze/street_network --partition 2026
 # the Montreal construction cost rates, date-partitioned only
 uv run dagster asset materialize --select bronze/montreal_residential_costs,bronze/montreal_nonresidential_costs --partition 2026-09-01 -m urban_rag.definitions
 
-# that borough's road centre lines, cut out of it
-uv run dagster asset materialize --select silver/neighborhood_streets --partition "2026-09-01|VSMPE" -m urban_rag.definitions
+# the cell's road centre lines - the sides whose midpoint falls in it, whole.
+# Everything from here on that reads the cadastre is DATE x TILE: one cell of
+# the quadkey cut (`make tiles` lists them; see architecture.md, "Two spatial
+# axes"), not a borough
+uv run dagster asset materialize --select silver/neighborhood_streets --partition "2026-09-01|0302303330102" -m urban_rag.definitions
+
+# the hop from the borough to the cells: land VSMPE's lots, buildings and
+# features in rag.* with each row's cell address. Its `tiles_touched` metadata
+# is the list of cells the tile runs below have to be run for
+uv run dagster asset materialize --select silver/neighborhood_cadastre --partition "2026-09-01|VSMPE" -m urban_rag.definitions
+
+# the two spatial joins, for the lots this cell owns against every building
+# and feature in the snapshot
+uv run dagster asset materialize --select silver/building_lot_intersections --partition "2026-09-01|0302303330102" -m urban_rag.definitions
 
 # the province-wide assessment roll and the merge that makes it readable, both
 # date-partitioned only. The first run of a roll year downloads 572 MB and
 # unpacks a 2.8 GB GeoPackage into data/cache/role/; later dates reuse both.
 # Needs reference_neighborhoods for the same date: the merge is also cut into
-# one silver.assessment_units partition per borough against those outlines
-uv run dagster asset materialize --select bronze/property_assessment_roll,silver/assessment_units --partition 2026-09-01 -m urban_rag.definitions
+# one silver.assessment_units partition per borough against those outlines.
+# cubf_use_codes rides along because the merge looks every unit's use code up
+# in it, and fails naming it when that date has none
+uv run dagster asset materialize --select bronze/property_assessment_roll,bronze/cubf_use_codes,silver/assessment_units --partition 2026-09-01 -m urban_rag.definitions
 
-# what every lot in that borough is assessed at — needs the two above for the
-# same date and neighborhood_lots for the same partition
-uv run dagster asset materialize --select silver/lot_assessed_values --partition "2026-09-01|VSMPE" -m urban_rag.definitions
+# what every lot in that cell is assessed at — needs the roll above for the
+# same date and neighborhood_cadastre for every borough the cell holds
+uv run dagster asset materialize --select silver/lot_assessed_values --partition "2026-09-01|0302303330102" -m urban_rag.definitions
 
 # what each lot yields on that, and which lots are like it — needs the line
-# above plus vacancy_rates and average_rents for the same partition. Run it
+# above for every cell in reach (the pool is the snapshot, not the cell) plus
+# vacancy_rates and average_rents for the boroughs the cell holds. Run it
 # with the same BY_POINT as lot_assessed_values above: that flag decides which
 # units reach a lot at all
-uv run dagster asset materialize --select silver/lot_assessment_comparables --partition "2026-09-01|VSMPE" -m urban_rag.definitions
+uv run dagster asset materialize --select silver/lot_assessment_comparables --partition "2026-09-01|0302303330102" -m urban_rag.definitions
 
-# how much street each lot faces — needs building_lot_intersections first, for
-# the rag.lots this reads, and hbu_infra's sql/007 + sql/008 applied
-uv run dagster asset materialize --select silver/lot_frontage --partition "2026-09-01|VSMPE" -m urban_rag.definitions
+# how much street each lot faces — needs neighborhood_cadastre first, for the
+# rag.lots this reads, and hbu_infra's sql/007 + sql/008 applied
+uv run dagster asset materialize --select silver/lot_frontage --partition "2026-09-01|0302303330102" -m urban_rag.definitions
 
 # then the corpus over that snapshot's linked PDFs
 uv run dagster asset materialize --select "bronze/linked_documents,silver/document_chunks,silver/document_embeddings" --partition "2026-09-01|VSMPE" -m urban_rag.definitions
@@ -76,19 +91,23 @@ uv run dagster asset materialize --select gold/document_index --partition "2026-
 # the ground each zone governs, cut out of each lot: one row per (lot, zone),
 # with that piece's own area and the street it faces. Everything below reads
 # it, because a zoning boundary crossing a large parcel makes two sites of it
-uv run dagster asset materialize --select silver/lot_zone_pieces --partition "2026-09-01|VSMPE" -m urban_rag.definitions
+uv run dagster asset materialize --select silver/lot_zone_pieces --partition "2026-09-01|0302303330102" -m urban_rag.definitions
 
-# the zoning grids read as tables, and the envelope per (lot, zone, grid column)
-uv run dagster asset materialize --select "silver/zoning_grid_columns,silver/lot_zoning_envelopes" --partition "2026-09-01|VSMPE" -m urban_rag.definitions
+# the zoning grids read as tables - per borough, a grid is a by-law's - and
+# the envelope per (lot, zone, grid column), per cell
+uv run dagster asset materialize --select silver/zoning_grid_columns --partition "2026-09-01|VSMPE" -m urban_rag.definitions
+uv run dagster asset materialize --select silver/lot_zoning_envelopes --partition "2026-09-01|0302303330102" -m urban_rag.definitions
 
-# finally the gold row per lot, which reads the three silver parquet
-# partitions above as well as rag.lots — needs hbu_infra's sql/009 + sql/006
-uv run dagster asset materialize --select gold/lot_profiles --partition "2026-09-01|VSMPE" -m urban_rag.definitions
+# finally the gold row per lot, which reads the silver parquet partitions
+# above as well as rag.lots — needs hbu_infra's sql/009 + sql/006
+uv run dagster asset materialize --select gold/lot_profiles --partition "2026-09-01|0302303330102" -m urban_rag.definitions
 ```
 
-Schedules run monthly in `America/Toronto`, all on the 1st. Eighteen of them,
+Schedules run monthly in `America/Toronto`, all on the 1st. Nineteen of them,
 in three bands — the sources that have no upstream here first, then the
-borough cuts, then the joins over them:
+borough cuts, then the cadastre landing and the tile runs over it. A tile
+schedule fires once per cell of the cut rather than once per registered
+borough:
 
 | | |
 | --- | --- |
@@ -98,19 +117,20 @@ borough cuts, then the joins over them:
 | 04:45 | the two CMHC surveys · `uniformized_property_wealth` |
 | 04:47 | the MarketBeats and the rent index · the two cost snapshots |
 | 04:50 | `street_network` — the province-wide RQTT |
-| 04:52 | `property_assessment_roll` and `assessment_units` |
+| 04:52 | `property_assessment_roll`, `cubf_use_codes` and `assessment_units` |
 | 05:40 | `neighborhood_lots` |
 | 05:50 | `neighborhood_buildings` |
 | 05:55 | `vacancy_rates` |
 | 05:58 | `average_rents` |
 | 06:10 | `commercial_rents` |
-| 06:20 | `neighborhood_streets` — the borough's cut of the RQTT |
-| 06:30 | `lot_assessed_values` |
-| 06:40 | `lot_assessment_comparables` |
-| 07:00 | `building_lot_intersections` |
+| 06:20 | `neighborhood_streets` — the cell's sides of the RQTT, whole |
+| 07:00 | `neighborhood_cadastre` — every registered borough landed in `rag.*` |
+| 07:20 | `building_lot_intersections` — per cell |
+| 07:40 | `lot_assessed_values` — per cell |
+| 08:20 | `lot_assessment_comparables` — per cell, and forty minutes back because its pool is every cell's values |
 
 The minutes inside a band only keep independent fetches from overlapping; the
-gaps between bands are real dependencies. Eleven assets have no schedule at
+gaps between bands are real dependencies. Twelve assets have no schedule at
 all, and neither do the envelope pair, the corpus chain or
 `neighborhood_addresses` — see [Assets](assets.md). All scheduled runs target
 *this month's* partition — `end_offset=1` on the monthly partitions exists for that reason,
@@ -150,6 +170,49 @@ partitions stay empty because the borough genuinely was not scraped then.
 Materialize the current month for the new borough instead, and let the
 schedules carry it from there. Its silver and gold partitions follow from that
 bronze, and *those* are backfillable in the ordinary way.
+
+## The tile axis
+
+The lot chain — everything from `building_lot_intersections` to
+`lot_building_massing` — is not partitioned by borough but by **cell of the
+tile cut**: a Web Mercator tile named by its quadkey, `0302303330102` for the
+Villeray cell, at whatever depth holds about 20,000 lots. The axis is static,
+every cell of `urban_rag.tile_cut.CUT`, so there is nothing to register;
+`make tiles` lists them with their city, and a partition key reads
+`2026-09-01|0302303330102`. Why the chain runs this way is in
+[architecture.md](architecture.md#two-spatial-axes).
+
+What that changes for an operator:
+
+- **Create the month's partitions before running cells side by side.**
+  `make tiles-ensure DATE=...` creates every tile table's leaf for every
+  cell, one short transaction each. A cell that creates its own mid-run
+  takes an exclusive lock on the parent table: two doing it at once
+  deadlock, and one alone blocks every other cell until it commits.
+  Sequential runs do not need it; parallel ones do.
+- **A borough is loaded, then its cells are run.** `make cadastre
+  NEIGHBORHOOD=VSMPE` lands the borough in `rag.*` and reports
+  `tiles_touched`; `make tiles-of NEIGHBORHOOD=VSMPE` asks Postgres for the
+  same list afterwards. Every tile step then runs once per cell —
+  `make frontage TILE=...` — and `scripts/materialize_borough.sh` does that
+  loop for you: its tile steps resolve the borough's cells and run each.
+- **A reload touches every cell the borough is in.** Reloading a borough
+  remints `lot_uid` and the cascade empties its lots' rows in every cell
+  they fall in, so the whole tile chain re-runs for those cells, not just
+  one partition. A cell straddling two boroughs needs both landed before
+  its runs mean anything.
+- **A new city is a re-seed, not a registration.** The cut only covers
+  ground that has been loaded, so the first `neighborhood_cadastre` run of
+  a fourth city fails with `num_rows_outside_cut`. Apply hbu_infra's
+  `028_cell_key.sql` so its lots have a `cell_key`, run
+  `scripts/seed_tile_cut.py` behind the tunnel, paste the `TILE_CITIES` it
+  prints into `tile_cut.py` (it refuses to print a cut that moves an
+  existing cell — adding a city is additive), and deploy. The new cells
+  appear on the axis; the old ones and everything under them are untouched.
+- **Borough-axis inputs are read per lot.** The CMHC and C&W tables and the
+  zoning grids stay per borough; a tile run resolves which boroughs its lots
+  came from and joins each lot on its own `neighborhood`, which every row of
+  the lot chain still carries.
 
 ## The scrape-month guard
 

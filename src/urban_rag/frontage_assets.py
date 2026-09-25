@@ -83,14 +83,23 @@ numbers are logged as a warning and published as metadata rather than left to
 be noticed; see `num_lots_without_frontage`.
 
 **This asset loads nothing.** Both sides of the join are already in Postgres
-when it runs: `rag.lots` because `building_lot_intersections` put it there, and
+when it runs: `rag.lots` because `neighborhood_cadastre` put it there, and
 `silver.neighborhood_streets` because that asset owns its own table. Each of
 those is loaded in exactly one place, which is not tidiness but the fix for a
 real race - see `building_lots_assets` on why loading the cadastre from two
 assets means whoever commits second replaces the rows the first just computed
-against. So the dependencies here are on those two assets, the guards below are
-on their partitions being populated, and the only table this one writes is its
-own.
+against. So the dependencies here are on `building_lot_intersections` and
+`neighborhood_streets`, the guards below are on their partitions being
+populated, and the only table this one writes is its own.
+
+**A run is one tile, and the pool is the snapshot.** The lots measured are the
+ones a cut cell owns - `rag.lots.cell_partition` - and the road lots and street
+sides they are measured against are every one in the snapshot, with no borough
+and no tile predicate on them. That is what the tile axis buys this measure: a
+parcel on a borough line shares its edge with the road lot on the other side
+of it, and a borough-wide run could not see that lot at all. See
+`urban_rag.partitions.tile_partitions` for the axis and `postgis.compute_lot_frontage`
+for the read.
 
 **`silver.lot_frontage` is owned by hbu_infra**, like every other table this
 repo writes into - sql/008_silver_lot_frontage.sql. Until it is applied to the
@@ -122,7 +131,12 @@ from pydantic import Field
 from urban_rag.building_lots_assets import building_lot_intersections
 from urban_rag.frames import write_frame
 from urban_rag.layers import key_prefix
-from urban_rag.partitions import metric_srid_for, scrape_partitions
+from urban_rag.partitions import (
+    city_of_tile,
+    metric_srid_for_city,
+    tile_partition_of,
+    tile_scrape_partitions,
+)
 from urban_rag.hbu import ROAD_LOT_FLAG_COLUMN
 from urban_rag.postgis import (
     DEFAULT_FRONTAGE_FALLBACK_BUFFERS_M,
@@ -140,7 +154,7 @@ from urban_rag.street_assets import STREETS_FILE_OUT, neighborhood_streets
 GROUP = "silver_streets"
 
 #: The frontages themselves, under
-#: `silver/lot_frontage/<YYYY-MM-DD>/<neighborhood>/`.
+#: `silver/lot_frontage/<YYYY-MM-DD>/<tile>/`.
 LOT_FRONTAGE_FILE = "lot_frontage.parquet"
 
 #: The parcels that *are* the street, beside them - one row per road lot, with
@@ -196,7 +210,7 @@ class FrontageConfig(Config):
 
 @asset(
     key_prefix=key_prefix("lot_frontage"),
-    partitions_def=scrape_partitions,
+    partitions_def=tile_scrape_partitions,
     deps=[building_lot_intersections, neighborhood_streets],
     group_name=GROUP,
     kinds={"postgres", "geoparquet"},
@@ -208,11 +222,11 @@ class FrontageConfig(Config):
         "parcels a silver.neighborhood_streets side runs inside, and that side "
         "also names the street; frontage_rank is 1 for the street a lot mostly "
         "fronts on, so a corner lot has two rows and an interior lot none. "
-        "Computed against the rag.lots that "
-        "building_lot_intersections landed for the same partition, upserted "
-        "into silver.lot_frontage on (scrape_date, neighborhood, lot_uid, "
+        "Computed for the lots one tile owns against every road lot and street "
+        "side in the snapshot - no borough line bounds the pool - upserted "
+        "into silver.lot_frontage on (scrape_date, cell_partition, lot_uid, "
         f"cote_rue_id) and written to silver/lot_frontage/<YYYY-MM-DD>/"
-        f"<neighborhood>/{LOT_FRONTAGE_FILE}. The road lots themselves are "
+        f"<tile>/{LOT_FRONTAGE_FILE}. The road lots themselves are "
         f"written beside it as {ROAD_LOTS_FILE} - one row per parcel that is "
         "the street, which is a set no other input to this platform holds, "
         "since the assessment roll does not reach Montreal's roadways. "
@@ -225,14 +239,10 @@ def lot_frontage(
     store: ParquetStore,
     postgis: PostgisResource,
 ) -> MaterializeResult:
-    dimensions = context.partition_key.keys_by_dimension
-    neighborhood = dimensions["neighborhood"]
-    scrape_date = dimensions["date"][:10]
+    tile, scrape_date = tile_partition_of(context)
 
     streets_path = join(
-        store.partition_dir(
-            neighborhood_streets.key.path[-1], scrape_date, neighborhood
-        ),
+        store.partition_dir(neighborhood_streets.key.path[-1], scrape_date, tile),
         STREETS_FILE_OUT,
     )
     # Read only to check the partition is there and to report the denominator:
@@ -241,9 +251,7 @@ def lot_frontage(
     # That asset used to write only parquet and this one loaded the table on its
     # way past, which left a table whose writer was not the asset it is named
     # for.
-    streets = _read_streets(
-        streets_path, neighborhood=neighborhood, scrape_date=scrape_date
-    )
+    streets = _read_streets(streets_path, tile=tile, scrape_date=scrape_date)
     if streets.empty:
         raise Failure(f"{streets_path} holds no street side to measure against.")
 
@@ -251,9 +259,9 @@ def lot_frontage(
         with postgis.connect() as connection:
             result = compute_lot_frontage(
                 connection,
-                neighborhood=neighborhood,
+                tile=tile,
                 scrape_date=scrape_date,
-                metric_srid=metric_srid_for(neighborhood),
+                metric_srid=metric_srid_for_city(city_of_tile(tile)),
                 min_street_m=config.min_street_m,
                 fallback_buffers_m=tuple(config.fallback_buffers_m),
             )
@@ -261,37 +269,33 @@ def lot_frontage(
             if num_streets == 0:
                 raise Failure(
                     f"silver.neighborhood_streets holds no street side for "
-                    f"{neighborhood} {scrape_date}, though {streets_path} has "
-                    f"{len(streets)} - re-materialize neighborhood_streets for "
-                    "this partition."
+                    f"{scrape_date}, though {streets_path} has {len(streets)} "
+                    "- re-materialize neighborhood_streets for this tile."
                 )
             num_lots = int(result["num_lots"])
             if num_lots == 0:
                 # Not "no lot faces a street": no lots at all, which means the
-                # cadastre was never loaded rather than that the borough is
+                # cadastre was never loaded rather than that the tile is
                 # landlocked. Raised inside the transaction so the frontage it
                 # just computed rolls back with it rather than sitting in
                 # silver.lot_frontage against a cadastre that is not there.
                 raise Failure(
-                    f"rag.lots holds no lot for {neighborhood} {scrape_date} - "
-                    "materialize building_lot_intersections for this partition "
+                    f"rag.lots holds no lot for tile {tile} {scrape_date} - "
+                    "materialize neighborhood_cadastre for the boroughs this "
+                    "tile covers, then building_lot_intersections for it, "
                     "first."
                 )
             # Inside the transaction that computed it, so the file is that
             # answer rather than whatever a concurrent run leaves behind after
             # the commit. Written outside it, below, so an S3 upload does not
             # hold a write transaction open for its duration.
-            frame = fetch_lot_frontage(
-                connection, neighborhood=neighborhood, scrape_date=scrape_date
-            )
+            frame = fetch_lot_frontage(connection, tile=tile, scrape_date=scrape_date)
     except PostgresUnavailable as exc:
-        raise Failure(f"Postgres unreachable for {neighborhood} {scrape_date}: {exc}")
+        raise Failure(f"Postgres unreachable for tile {tile} {scrape_date}: {exc}")
     except MissingRelation as exc:
         raise Failure(str(exc))
 
-    output_dir = store.partition_dir(
-        context.asset_key.path[-1], scrape_date, neighborhood
-    )
+    output_dir = store.partition_dir(context.asset_key.path[-1], scrape_date, tile)
     removed = clear_parquet(output_dir)
     if removed:
         context.log.info("Removed %d file(s) from a previous run", len(removed))
@@ -299,13 +303,13 @@ def lot_frontage(
     # Beside the frontages, and in the same partition, because it is the same
     # answer read the other way round: these are the parcels the measure
     # identified as the street and therefore measured nothing for. Written
-    # unconditionally - a borough with no road lot writes an empty file rather
+    # unconditionally - a tile with no road lot writes an empty file rather
     # than none, so a reader can tell "no roadway here" from "this asset has
     # not run".
     road_lots_path = write_frame(
         _road_lot_frame(
             result["road_lots"],
-            neighborhood=neighborhood,
+            tile=tile,
             scrape_date=scrape_date,
             min_street_m=config.min_street_m,
         ),
@@ -322,7 +326,7 @@ def lot_frontage(
         "%s %s: %d street side(s) identifying %d road lot(s) -> %d frontage(s) "
         "across %d of %d non-road lot(s), %.1f km in total, longest %.1f m "
         "-> %s",
-        neighborhood,
+        tile,
         scrape_date,
         num_streets,
         num_road_lots,
@@ -341,7 +345,7 @@ def lot_frontage(
             "%s %s: %d lot(s) shared no boundary with a road lot and were "
             "measured against a buffered street side instead (%s) - their "
             "rows carry that reach in buffer_m",
-            neighborhood,
+            tile,
             scrape_date,
             int(result["lots_from_buffer"]),
             ", ".join(
@@ -350,13 +354,13 @@ def lot_frontage(
             ),
         )
 
-    # Every lot in a Montreal borough that is not itself a road is expected to
-    # face a street. The ones that do not are named rather than only counted: a
-    # handful are genuine interior parcels or parcels reached only by a lane,
-    # but a run where the share jumps is a street snapshot that stopped short -
-    # and the lot numbers are what turns that from a percentage into something
-    # to go and look at. A warning rather than a Failure - see
-    # `test_no_lot_matching_is_not_a_failure`: a borough measuring badly is a
+    # Every lot that is not itself a road is expected to face a street. The
+    # ones that do not are named rather than only counted: a handful are
+    # genuine interior parcels or parcels reached only by a lane, but a run
+    # where the share jumps is a street snapshot that stopped short - and the
+    # lot numbers are what turns that from a percentage into something to go
+    # and look at. A warning rather than a Failure - see
+    # `test_no_lot_matching_is_not_a_failure`: a tile measuring badly is a
     # number to read, not a partition to refuse.
     # The measure is an exact shared boundary, which is right because the
     # cadastre is a topological survey - abutting parcels reference the same
@@ -371,7 +375,7 @@ def lot_frontage(
             "%s %s: %d parcel(s) lie within a sliver of a road lot without "
             "touching one - the cadastre is not topologically clean here and "
             "their frontage is being dropped, not measured as zero",
-            neighborhood,
+            tile,
             scrape_date,
             slivers,
         )
@@ -382,7 +386,7 @@ def lot_frontage(
         context.log.warning(
             "%s %s: %d of %d non-road lot(s) (%.1f %%) share no boundary with "
             "any road lot and are flagged as potentially problematic%s",
-            neighborhood,
+            tile,
             scrape_date,
             unmatched,
             num_candidates,
@@ -393,19 +397,20 @@ def lot_frontage(
     return MaterializeResult(
         metadata={
             "dagster/row_count": int(result["frontages"]),
+            "tile": tile,
             "num_frontages": int(result["frontages"]),
             "num_streets": num_streets,
             "num_lots": num_lots,
             # The parcels that *are* the street, and so the gap between
             # `num_lots` and the denominator the two counts below are read
-            # against. A borough where this collapses to near zero is a street
-            # snapshot that did not land, not a borough without roads.
+            # against. A tile where this collapses to near zero is a street
+            # snapshot that did not land, not a tile without roads.
             "num_road_lots": num_road_lots,
             "num_lots_with_frontage": lots_matched,
             # The symptom worth seeing: a lot facing nothing is a true interior
             # parcel, one reached only by a lane, or a partition whose street
             # snapshot stops short of it. Under a few percent is the first two;
-            # a third of the borough is the last.
+            # a third of the tile is the last.
             "num_lots_without_frontage": max(unmatched, 0),
             # Of those, the ones that are a survey gap rather than an interior
             # parcel: within a sliver of a road lot and abutting none, so the
@@ -432,7 +437,7 @@ def lot_frontage(
             "num_frontages_from_buffer": int(result["frontages_from_buffer"]),
             "num_lots_from_buffer": int(result["lots_from_buffer"]),
             # Which reach placed them, tier by tier. "how many needed 16 m" is
-            # what says whether the ladder is the right shape for a borough:
+            # what says whether the ladder is the right shape for a tile:
             # a tail piling up on the last rung means the parcels beyond it
             # are being lost, and one that never fires means it is decoration.
             "lots_by_buffer_m": MetadataValue.json(result["lots_by_buffer"]),
@@ -476,7 +481,7 @@ def lot_frontage(
 def _road_lot_frame(
     road_lots: pd.DataFrame,
     *,
-    neighborhood: str,
+    tile: str,
     scrape_date: str,
     min_street_m: float,
 ) -> pd.DataFrame:
@@ -484,10 +489,12 @@ def _road_lot_frame(
 
     The partition travels as columns rather than in the path, because the path
     carries bare keys rather than hive `key=value` pairs - the same reason
-    `neighborhood_streets` writes them onto its own frame. `lot_number` is what
-    the reader joins on: `lot_uid` is a bigserial that means nothing outside
-    the partition that minted it, and `hbu` speaks lot numbers for exactly that
-    reason.
+    `neighborhood_streets` writes them onto its own frame. The tile and the
+    date are the partition and are stamped; a borough is not, because a tile
+    can span two and the lot's own `neighborhood` is the compute's to report
+    when it does. `lot_number` is what the reader joins on: `lot_uid` is a
+    bigserial that means nothing outside the load that minted it, and `hbu`
+    speaks lot numbers for exactly that reason.
 
     `near_cutoff` is computed here rather than downstream because this is the
     only place `min_street_m` is known - the reader has a file, not the config
@@ -499,7 +506,7 @@ def _road_lot_frame(
         if not frame.empty
         else pd.Series(dtype="bool")
     )
-    frame["neighborhood"] = neighborhood
+    frame["tile"] = tile
     frame["scrape_date"] = scrape_date
     return frame
 
@@ -507,7 +514,7 @@ def _road_lot_frame(
 def _min_street_m_inside(road_lots: pd.DataFrame) -> float:
     """The least street line any parcel had to carry to be called the roadway.
 
-    0.0 when nothing was - which is a borough whose street snapshot did not
+    0.0 when nothing was - which is a tile whose street snapshot did not
     land, and is already reported as `num_road_lots` being zero.
     """
     if road_lots.empty or "street_m_inside" not in road_lots.columns:
@@ -539,13 +546,11 @@ def _near_the_cutoff(road_lots: pd.DataFrame, min_street_m: float) -> int:
     )
 
 
-def _read_streets(
-    path: str, *, neighborhood: str, scrape_date: str
-) -> gpd.GeoDataFrame:
+def _read_streets(path: str, *, tile: str, scrape_date: str) -> gpd.GeoDataFrame:
     try:
         return gpd.read_parquet(path, storage_options=storage_options(path))
     except FileNotFoundError as exc:
         raise Failure(
             f"{path} does not exist - materialize neighborhood_streets for "
-            f"{neighborhood} {scrape_date} first."
+            f"tile {tile} {scrape_date} first."
         ) from exc

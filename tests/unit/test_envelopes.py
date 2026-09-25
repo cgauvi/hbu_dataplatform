@@ -45,6 +45,7 @@ from urban_rag.zone_piece_assets import LOT_ZONE_PIECES_FILE, lot_zone_pieces
 
 DATE = "2026-08-01"
 NEIGHBORHOOD = "VSMPE"
+TILE = "0302303330102"
 ZONE_TABLE = "Reglement_urbanisme__VSP_REG_ZONE"
 GRID_URL = "http://example.invalid/zone/C01-001.pdf"
 
@@ -114,6 +115,7 @@ def write_pieces(
     secondary_frontages=(None,),
     secondary_streets=(None,),
     footprint_shares=None,
+    source_table=None,
 ):
     """One partition of `lot_zone_pieces`, at the columns this asset reads.
 
@@ -151,8 +153,10 @@ def write_pieces(
             "lot_uid": list(lot_uids),
             "feature_id": list(zones),
             "lot_number": [f"2 216 {uid:03d}" for uid in lot_uids],
-            "source_table": [ZONE_TABLE] * count,
+            "source_table": [source_table or ZONE_TABLE] * count,
             "neighborhood": [NEIGHBORHOOD] * count,
+            "cell_key": [TILE + "00000"] * count,
+            "cell_partition": [TILE] * count,
             "scrape_date": [DATE] * count,
             "lot_area_m2": [lot_area_m2] * count,
             "piece_area_m2": areas,
@@ -193,7 +197,7 @@ def write_pieces(
     write_frame(
         frame,
         join(
-            store.partition_dir(lot_zone_pieces.key.path[-1], DATE, NEIGHBORHOOD),
+            store.partition_dir(lot_zone_pieces.key.path[-1], DATE, TILE),
             LOT_ZONE_PIECES_FILE,
         ),
     )
@@ -226,7 +230,7 @@ def run_columns(store, cache):
 def run_envelopes(store, run_config=None):
     return materialize(
         [lot_zoning_envelopes],
-        partition_key=MultiPartitionKey({"date": DATE, "neighborhood": NEIGHBORHOOD}),
+        partition_key=MultiPartitionKey({"date": DATE, "tile": TILE}),
         resources={"store": store, "postgis": PostgisResource()},
         selection=[lot_zoning_envelopes],
         run_config=run_config,
@@ -248,7 +252,7 @@ def read_envelopes(store):
     return pd.read_parquet(
         join(
             store.partition_dir(
-                lot_zoning_envelopes.key.path[-1], DATE, NEIGHBORHOOD
+                lot_zoning_envelopes.key.path[-1], DATE, TILE
             ),
             LOT_ENVELOPES_FILE,
         )
@@ -570,9 +574,22 @@ def test_a_zone_a_grid_cites_twice_is_one_zone(store, cache, stub_pdfs):
     ).any()
 
 
-def test_a_zone_no_grid_was_parsed_for_fails_the_partition(store, cache, stub_pdfs):
+def test_a_cell_whose_zones_have_no_grid_publishes_an_empty_partition(
+    store, cache, stub_pdfs
+):
+    """A cell can hold one piece, and that piece's zone can publish no grid -
+    Saguenay has dozens. Same layer as the grid, no matching zone: that is an
+    empty cell, not a broken join."""
     write_pieces(store, zones=("C01-999",))
-    with pytest.raises(Failure, match="share no zone number"):
+    materialize_both(store, cache, stub_pdfs)
+    assert read_envelopes(store).empty
+
+
+def test_a_join_that_shares_no_layer_with_the_grid_fails(store, cache, stub_pdfs):
+    """What a broken join looks like: not one zone missing, but the pieces'
+    layer nowhere in the grid at all."""
+    write_pieces(store, source_table="Some_other__LAYER")
+    with pytest.raises(Failure, match="share no zoning layer"):
         materialize_both(store, cache, stub_pdfs)
 
 
@@ -677,3 +694,67 @@ def test_a_row_is_one_call_to_solve_program(store, cache, stub_pdfs):
     assert program.total_dwellings > 0
     assert program.zone == "C01-001"
     assert program.lot_number == "2 216 001"
+
+
+# -- the tile axis ------------------------------------------------------------
+
+
+def test_the_envelopes_publish_under_the_tile(store, cache, stub_pdfs, stub_publish):
+    """The grid is a borough's partition; the envelope is the tile's."""
+    write_pieces(store)
+    materialize_both(store, cache, stub_pdfs)
+
+    assert stub_publish["partition"] == (TILE, DATE)
+    frame = stub_publish["datasets"]["lot_zoning_envelopes"]
+    assert set(frame["cell_partition"]) == {TILE}
+    assert set(frame["neighborhood"]) == {NEIGHBORHOOD}
+
+
+def test_a_tile_spanning_two_boroughs_reads_each_lots_own_grid(
+    store, cache, stub_pdfs
+):
+    """Montreal restarts its zone numbers in every borough, so C01-001 in
+    VSMPE and C01-001 in PMR are two zones - and a tile holding both lots must
+    hand each its own borough's grid, not whichever it read first."""
+    write_pieces(store, lot_uids=(1, 2), zones=("C01-001", "C01-001"), pct=(100.0, 100.0),
+                 frontages=(30.0, 30.0), streets=("Jarry", "Jarry"),
+                 secondary_frontages=(None, None), secondary_streets=(None, None))
+    pieces_path = join(
+        store.partition_dir(lot_zone_pieces.key.path[-1], DATE, TILE),
+        LOT_ZONE_PIECES_FILE,
+    )
+    pieces = gpd.read_parquet(pieces_path)
+    pieces.loc[pieces["lot_uid"] == 2, "neighborhood"] = "PMR"
+    write_frame(pieces, pieces_path)
+
+    stub_pdfs[GRID_URL] = grid_pdf()
+    write_documents(store)
+    run_columns(store, cache)
+    # The other borough's grid for the same zone number, one storey higher.
+    other = read_columns(store).assign(neighborhood="PMR")
+    other["floors_max"] = other["floors_max"] + 1
+    write_frame(
+        other,
+        join(
+            store.partition_dir(zoning_grid_columns.key.path[-1], DATE, "PMR"),
+            ZONE_COLUMNS_FILE,
+        ),
+    )
+
+    result = run_envelopes(store)
+
+    assert result.success
+    frame = read_envelopes(store)
+    by_lot = frame[frame["permits_residential"]].set_index("lot_uid")
+    assert by_lot.loc[1, "floors_max"] == 6
+    assert by_lot.loc[2, "floors_max"] == 7
+    assert by_lot.loc[2, "neighborhood"] == "PMR"
+    metadata = materialization_metadata(result, lot_zoning_envelopes)
+    assert metadata["tile"].value == TILE
+    assert metadata["neighborhoods"].value == f"PMR, {NEIGHBORHOOD}"
+
+
+def test_a_borough_with_no_grid_partition_names_the_file(store, cache, stub_pdfs):
+    write_pieces(store)
+    with pytest.raises(Failure, match="zoning_grid_columns"):
+        run_envelopes(store)

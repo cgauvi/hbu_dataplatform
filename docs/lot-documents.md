@@ -121,7 +121,7 @@ join back out of `silver.lot_features` instead of recomputing it per query.
 cadastral boundary and a zoning boundary are drawn by different offices from
 different surveys, so they miss each other by centimetres all along a street
 and every lot picks up a sliver of its neighbour's zone. Nothing is thresholded
-away at load time — the same posture `silver.building_lot_intersections` takes toward the
+away when the pieces are cut — the same posture `silver.building_lot_intersections` takes toward the
 corner of a triplex crossing a lot line — because the cutoff belongs to the
 question, not to the geometry. `pct_of_lot` is the column to filter on, and
 `coverage_rank = 1` takes the zone that actually governs the lot. A lot

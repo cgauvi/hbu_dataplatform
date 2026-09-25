@@ -32,6 +32,8 @@ always were; only the outline's source moves.
 | Zoning geometry | Spectrum, `<ns>/Reglement_urbanisme/VSP_REG_ZONE` | The city's ArcGIS Online feature service, layer 2 *Zonage en vigueur* of `CI_AMENAGEMENT_ENVIRONNEMENT` - the layer the city's own [interactive map](https://experience.arcgis.com/experience/aadd65187ef64037bd13170afb450e15) draws |
 | Zoning norms | One PDF *grille des usages et des normes* per zone, linked from the zone table and parsed by `urban_rag.zoning_grid` | One workbook for the city, [Grille de spécifications du zonage](https://www.donneesquebec.ca/recherche/dataset/grille-de-specifications-du-zonage), one row per zone, read by `urban_rag.quebec` |
 | Zoning prose | The same PDF, chunked and embedded into the corpus | The city's map server generates a *grille de spécifications* sheet per zone at `GrillesZonage/HandlerZonage.ashx?<zone>`; the URL is built from the zone code rather than published, and the corpus is that sheet |
+| Council minutes | None — a Montreal borough has no *conseil de quartier* | The minutes of each of the arrondissement's councils, listed per council by `affichagesite.villequebec.quebec`, and the consultation fiches, *sommaires décisionnels* and resolutions they link to — read into `silver.council_planning_items`, see [council-minutes.md](council-minutes.md) |
+| Heritage | Whatever heritage tables the borough's Spectrum namespace publishes | Layers 5-11 of the city's `CI_COMMUNAUTE_CULTURE_PATRIMOINE` feature service - what the [patrimoine bâti](https://www.ville.quebec.qc.ca/citoyens/patrimoine/bati/index.aspx) search and its fiches draw - see [Heritage](#heritage) |
 | Streets | The RQTT, bounded to the island | The same RQTT, bounded to Quebec City — one source for both since it replaced `geobase-double` and `vque_18` together ([rqtt.md](rqtt.md)) |
 | Lots, buildings, roll, CUBF | Province-wide | The same, unchanged |
 | CMHC vacancy and rents | The Montréal centre of the national survey and the Montréal CMA's HMIP page | The Québec centre of the same workbook and the Québec CMA's page (HMIP geography 1400) |
@@ -80,6 +82,43 @@ which is why the template is only ever applied to a code that came off the
 zoning layer itself. A blank one costs nothing anyway: it has no text layer, so
 `read_pdf` refuses it and `linked_documents` files it under `failures` like any
 dead link.
+
+### Heritage
+
+The *patrimoine bâti* search and its fiches are a front end over an open
+ArcGIS service on the same organisation as the zoning,
+`CI_COMMUNAUTE_CULTURE_PATRIMOINE`. `_quebec_features` reads seven of its
+layers, bounded by the borough outline like the zones, one parquet each beside
+them:
+
+| Layer | Slug | City-wide rows | Id |
+|---|---|---|---|
+| 11 *Bâtiment étudié* | `Patrimoine__BATIMENT_ETUDIE` | 15,801 building footprints | `NO_SEQ`, the fiche number |
+| 5 *Immeuble cité (municipal)* | `Patrimoine__IMMEUBLE_CITE` | 12 | `OBJECTID` |
+| 6 *Immeuble classé (provincial)* | `Patrimoine__IMMEUBLE_CLASSE` | 103 | `OBJECTID` |
+| 7 *Lieu, bâtiment ou monument désigné (fédéral)* | `Patrimoine__DESIGNE_FEDERAL` | 96 | `OBJECTID` |
+| 8 *Site patrimonial cité* | `Patrimoine__SITE_CITE` | 4 | `OBJECTID` |
+| 9 *Site patrimonial déclaré ou classé* | `Patrimoine__SITE_DECLARE_CLASSE` | 14 | `OBJECTID` |
+| 10 *Aire de protection* | `Patrimoine__AIRE_PROTECTION` | 7 | `OBJECTID` |
+
+The id is copied to `ID`, one of `FEATURE_ID_COLUMNS`, which is what carries
+the layers into `rag.features` and `silver.lot_features`. The status layers'
+register link (`LIEN_URL_GOUVERNEMENTALE`) would be the better key but is blank
+on 16 of their 236 rows. Each coded field gets a `<field>_LIBELLE` column with
+the domain's label beside the code, and a studied building gets its fiche as
+`LIEN_FICHE` - not `LIEN_GRILLE`, which the corpus would download.
+
+**The grade is not an ordinal.** `EVALUATION_VALEUR_PATRIMO_NO` is 1
+exceptionnel, 2 supérieur, 3 bon, 4 faible - and then 5 *présumé* and 6
+*confirmé*, an interest presumed or confirmed on a building never graded: 62%
+of the layer city-wide. `quebec.UNGRADED_CODES` names them. `DEMOLI`,
+`FICHE_ETAT` and `STATUT_ACTIF` hold one value on every row. The construction
+period, style and photos are on the fiche page only and are not read.
+
+Nothing downstream reads these tables yet: the site-thesis screen still takes
+its heritage signal from the grid's *Secteur d'intérêt patrimonial* row alone.
+A layer that fails to read is skipped and listed under `heritage_failures`
+rather than failing the borough's zoning.
 
 ## What the grid translation does
 
@@ -221,12 +260,18 @@ grid translation does" above.
 make neighborhood-add NEIGHBORHOOD=CIL      # once; the axis lives in the instance
 make quartiers streets                      # both cities' outlines and networks
 make features lots buildings NEIGHBORHOOD=CIL
-make borough-streets building-lots frontage zone-pieces NEIGHBORHOOD=CIL
-make envelopes setbacks NEIGHBORHOOD=CIL    # envelopes reads the workbook, not PDFs
+make cadastre NEIGHBORHOOD=CIL              # lands them in rag.*; prints the cells CIL fell in
+make tile-streets building-lots frontage zone-pieces TILE=0302312101   # per cell - see `make tiles`
+make grid-columns NEIGHBORHOOD=CIL          # reads the workbook, not PDFs
+make envelopes setbacks TILE=0302312101
 make roll                                   # CODE_MUN now defaults to both cities
-make lot-values NEIGHBORHOOD=CIL
+make lot-values TILE=0302312101
 make corpus publish NEIGHBORHOOD=CIL        # the per-zone sheets: fetch, chunk, embed, load
 ```
+
+CIL spans several cells of the cut — `make tiles-of NEIGHBORHOOD=CIL` lists
+them — so every `TILE=` line above runs once per cell;
+`scripts/materialize_borough.sh CIL 2026-09-01` does the loop. See [The tile axis](running.md#the-tile-axis).
 
 `features` has to run before `corpus` on a partition scraped before
 2026-09-16: `LIEN_GRILLE` is minted by that asset, and a zones parquet written

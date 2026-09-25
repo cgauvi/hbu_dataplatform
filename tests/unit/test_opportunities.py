@@ -57,6 +57,8 @@ from urban_rag.storage import join
 
 DATE = "2026-08-01"
 NEIGHBORHOOD = "VSMPE"
+#: A VSMPE cell of the cut: the tile the lot chain is partitioned on.
+TILE = "0302303330102"
 
 
 def gap_frame(rows: list[dict]) -> pd.DataFrame:
@@ -374,6 +376,14 @@ def store(tmp_path):
 
 @pytest.fixture(autouse=True)
 def published(monkeypatch):
+    # The tile's boroughs, which decide whose zone grids are read: one here.
+    from urban_rag import postgis
+
+    monkeypatch.setattr(
+        postgis,
+        "neighborhoods_of_tile",
+        lambda connection, *, tile, scrape_date: (NEIGHBORHOOD,),
+    )
     return stub_publish(monkeypatch, opportunity_assets)
 
 
@@ -429,7 +439,7 @@ def borough(store):
         gap,
         join(
             store.partition_dir(
-                lot_redevelopment_gap.key.path[-1], DATE, NEIGHBORHOOD
+                lot_redevelopment_gap.key.path[-1], DATE, TILE
             ),
             LOT_GAP_FILE,
         ),
@@ -447,7 +457,7 @@ def borough(store):
         ),
         join(
             store.partition_dir(
-                lot_highest_best_use.key.path[-1], DATE, NEIGHBORHOOD
+                lot_highest_best_use.key.path[-1], DATE, TILE
             ),
             LOT_HBU_FILE,
         ),
@@ -458,7 +468,7 @@ def borough(store):
         ),
         join(
             store.partition_dir(
-                lot_assessment_comparables.key.path[-1], DATE, NEIGHBORHOOD
+                lot_assessment_comparables.key.path[-1], DATE, TILE
             ),
             LOT_COMPARABLES_FILE,
         ),
@@ -469,7 +479,7 @@ def borough(store):
 def run(store, **config):
     return materialize(
         [lot_investment_opportunities],
-        partition_key=MultiPartitionKey({"date": DATE, "neighborhood": NEIGHBORHOOD}),
+        partition_key=MultiPartitionKey({"date": DATE, "tile": TILE}),
         resources={"store": store, "postgis": PostgisResource()},
         run_config=(
             {"ops": {"gold__lot_investment_opportunities": {"config": config}}}
@@ -483,7 +493,7 @@ def written(store) -> pd.DataFrame:
     return pd.read_parquet(
         Path(
             store.partition_dir(
-                lot_investment_opportunities.key.path[-1], DATE, NEIGHBORHOOD
+                lot_investment_opportunities.key.path[-1], DATE, TILE
             )
         )
         / LOT_OPPORTUNITIES_FILE

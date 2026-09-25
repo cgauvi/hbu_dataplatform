@@ -47,6 +47,9 @@ from urban_rag.warehouse import (
 )
 
 NEIGHBORHOOD = "VSMPE"
+#: A cell of the cut - the partition value on the tile axis, which is the
+#: axis `silver.neighborhood_streets` and the rest of the lot chain are on.
+TILE = "0302303330102"
 DATE = "2026-08-26"
 
 #: `silver.neighborhood_streets` as `_target_columns` reads it back, in catalog
@@ -56,6 +59,8 @@ DATE = "2026-08-26"
 #: other branch.
 STREET_COLUMNS = [
     "scrape_date",
+    "cell_key",
+    "cell_partition",
     "neighborhood",
     "cote_rue_id",
     "street_name",
@@ -162,11 +167,14 @@ class FakeConnection:
 
 
 def streets(**overrides) -> gpd.GeoDataFrame:
-    """One borough's street sides, as `neighborhood_streets` writes them.
+    """One cell's street sides, as `neighborhood_streets` writes them.
 
     Shouting column names, a couple of columns no target column matches, and
     the partition columns already filled in - all three of which the write path
-    has to handle without being told.
+    has to handle without being told. `neighborhood` is an attribute on this
+    table - the borough the side's midpoint fell in - and travels like any
+    other column; `cell_partition` is the partition and is stamped from the
+    key.
     """
     frame = {
         "COTE_RUE_ID": ["11", "22"],
@@ -174,6 +182,8 @@ def streets(**overrides) -> gpd.GeoDataFrame:
         "TYPE_F": ["rue", "ruelle"],
         "pct_in_borough": [100.0, 62.5],
         "length_m": [120.0, 80.0],
+        "cell_key": [TILE + "12312", TILE + "13210"],
+        "cell_partition": [TILE, TILE],
         "neighborhood": [NEIGHBORHOOD, NEIGHBORHOOD],
         "scrape_date": [DATE, DATE],
     }
@@ -190,7 +200,7 @@ def upsert(cursor, frame=None, dataset="neighborhood_streets", **kwargs):
         FakeConnection(cursor),
         dataset,
         streets() if frame is None else frame,
-        neighborhood=NEIGHBORHOOD,
+        partition=TILE,
         scrape_date=DATE,
         **kwargs,
     )
@@ -227,15 +237,54 @@ def test_the_registry_covers_every_silver_and_gold_asset_but_the_three_named():
     unit's point falls inside, assigned by `role_assets.assign_boroughs`, and
     one date partition publishes every borough through
     `publish_by_neighborhood`.
+
+    `neighborhood_cadastre` is the fourth, and a different kind of absence: it
+    writes to Postgres - `rag.lots`, `rag.buildings`, `rag.features`, the
+    working set the lot chain is computed over - but those are not published
+    datasets and are loaded by `postgis._replace_partition`, not by this
+    module. It has no silver table of its own because its product *is* the
+    working set.
     """
     published = {table.asset for table in warehouse.TABLES.values()}
     declared = set(assets_in(Layer.SILVER)) | set(assets_in(Layer.GOLD))
-    assert declared - published == {"document_embeddings", "document_index", "map_tiles"}
+    assert declared - published == {
+        "document_embeddings",
+        "document_index",
+        "map_tiles",
+        "neighborhood_cadastre",
+    }
 
 
 def test_the_conflict_target_is_the_partition_then_the_natural_key():
+    """Which partition column leads is the table's axis: the lot chain is on
+    the cut cell, what a publisher bounds is on the borough."""
     table = table_for("neighborhood_streets")
-    assert table.conflict_columns == ("scrape_date", "neighborhood", "cote_rue_id")
+    assert table.axis is warehouse.Axis.TILE
+    assert table.conflict_columns == ("scrape_date", "cell_partition", "cote_rue_id")
+
+    table = table_for("vacancy_rates")
+    assert table.axis is warehouse.Axis.NEIGHBORHOOD
+    assert table.conflict_columns == (
+        "scrape_date", "neighborhood", "dwelling_type", "bedroom_type"
+    )
+
+
+def test_the_lot_chain_is_on_the_tile_axis_and_the_publications_are_not():
+    """The split the plan draws, asserted so a new table has to choose."""
+    on_tile = {name for name, table in warehouse.TABLES.items() if table.axis is warehouse.Axis.TILE}
+    assert on_tile == {
+        "building_lot_intersections", "lot_features", "neighborhood_streets",
+        "lot_frontage", "lot_addresses", "lot_zone_pieces", "lot_zoning_envelopes",
+        "lot_buildable_setbacks", "lot_assessed_values", "lot_assessment_comparables",
+        "lot_development_programs", "lot_profiles", "lot_highest_best_use",
+        "lot_investment_opportunities", "lot_redevelopment_gap",
+        "lot_building_massing", "lot_surface_parking",
+    }
+    # No lot and no geometry to be placed by, so nothing to inherit a cell from.
+    for name in ("vacancy_rates", "average_rents", "commercial_rents",
+                 "zoning_grid_columns", "assessment_units", "document_chunks",
+                 "map_cell_aggregates"):
+        assert warehouse.TABLES[name].axis is warehouse.Axis.NEIGHBORHOOD, name
 
 
 def test_a_dataset_with_no_table_names_the_registry_to_add_it_to():
@@ -250,10 +299,10 @@ def test_a_dataset_with_no_table_names_the_registry_to_add_it_to():
 def test_the_conflict_clause_updates_everything_but_the_key():
     table = table_for("neighborhood_streets")
 
-    clause = conflict_clause(table, ["scrape_date", "neighborhood", "cote_rue_id", "geom"])
+    clause = conflict_clause(table, ["scrape_date", "cell_partition", "cote_rue_id", "geom"])
 
     assert clause.startswith(
-        "ON CONFLICT (scrape_date, neighborhood, cote_rue_id) DO UPDATE SET "
+        "ON CONFLICT (scrape_date, cell_partition, cote_rue_id) DO UPDATE SET "
     )
     assert "geom = EXCLUDED.geom" in clause
     # The key is what was matched on; overwriting it with itself is noise.
@@ -324,7 +373,7 @@ _ASSET_COLUMN_LISTS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
 def test_an_asset_column_list_covers_its_table_natural_key(dataset, layer, columns):
     """Whatever an asset writes must at least be keyable.
 
-    The partition columns are the asset's own - it stamps `neighborhood` and
+    The partition columns are the asset's own - it stamps the partition and
     `scrape_date` on every row - so what has to be in the list is the *natural*
     key: `lot_uid` and, since a development site became a piece of a lot rather
     than a lot, `feature_id` beside it.
@@ -377,7 +426,7 @@ def test_the_partition_is_created_before_anything_is_written():
     _, params = cursor.statements[
         next(i for i, (s, _) in enumerate(cursor.statements) if "ensure_partition" in s)
     ]
-    assert params == ["silver.neighborhood_streets", NEIGHBORHOOD, DATE]
+    assert params == ["silver.neighborhood_streets", TILE, DATE]
 
 
 def test_the_staging_table_is_shaped_like_the_target():
@@ -411,9 +460,9 @@ def test_the_upsert_deduplicates_on_the_conflict_target():
     upsert(cursor)
 
     insert = cursor.one("INSERT INTO silver.neighborhood_streets")
-    assert "SELECT DISTINCT ON (scrape_date, neighborhood, cote_rue_id)" in insert
-    assert "ORDER BY scrape_date, neighborhood, cote_rue_id" in insert
-    assert "ON CONFLICT (scrape_date, neighborhood, cote_rue_id) DO UPDATE SET" in insert
+    assert "SELECT DISTINCT ON (scrape_date, cell_partition, cote_rue_id)" in insert
+    assert "ORDER BY scrape_date, cell_partition, cote_rue_id" in insert
+    assert "ON CONFLICT (scrape_date, cell_partition, cote_rue_id) DO UPDATE SET" in insert
 
 
 def test_the_prune_is_scoped_to_the_partition():
@@ -429,7 +478,7 @@ def test_the_prune_is_scoped_to_the_partition():
     result = upsert(cursor)
 
     delete = cursor.one("DELETE FROM silver.neighborhood_streets")
-    assert "t.neighborhood = %s AND t.scrape_date = %s::date" in delete
+    assert "t.cell_partition = %s AND t.scrape_date = %s::date" in delete
     assert "NOT EXISTS (SELECT 1 FROM silver_neighborhood_streets_load s" in delete
     assert "s.cote_rue_id IS NOT DISTINCT FROM t.cote_rue_id" in delete
     assert result["pruned"] == 7
@@ -503,12 +552,14 @@ def test_the_partition_is_written_from_the_key_not_from_the_frame():
 
     upsert(
         cursor,
-        streets(neighborhood=["MHM", "MHM"], scrape_date=["2020-01-01"] * 2),
+        streets(cell_partition=["0000", "0000"], scrape_date=["2020-01-01"] * 2),
     )
 
     for row in copied(cursor):
-        assert row["neighborhood"] == NEIGHBORHOOD
+        assert row["cell_partition"] == TILE
         assert row["scrape_date"] == DATE
+        # An attribute, not the partition: it travels as the frame says.
+        assert row["neighborhood"] == NEIGHBORHOOD
 
 
 def test_geometry_travels_as_hex_ewkb():
@@ -664,15 +715,15 @@ def test_a_computed_partition_is_staged_before_it_is_merged():
     which keys this run produced and a bare `INSERT ... SELECT` leaves nothing
     behind to ask.
     """
-    cursor = FakeCursor(columns=["scrape_date", "neighborhood", "lot_number"])
+    cursor = FakeCursor(columns=["scrape_date", "cell_partition", "lot_number"])
 
     result = upsert_select(
         cursor,
         "lot_profiles",
-        ("scrape_date", "neighborhood", "lot_number"),
-        "SELECT l.scrape_date, l.neighborhood, l.lot_number FROM rag.lots l",
+        ("scrape_date", "cell_partition", "lot_number"),
+        "SELECT l.scrape_date, l.cell_partition, l.lot_number FROM rag.lots l",
         {"neighborhood": NEIGHBORHOOD},
-        neighborhood=NEIGHBORHOOD,
+        partition=TILE,
         scrape_date=DATE,
     )
 
@@ -684,7 +735,7 @@ def test_a_computed_partition_is_staged_before_it_is_merged():
         i for i, t in enumerate(issued) if t.startswith("INSERT INTO gold.lot_profiles")
     )
     assert staged < merged
-    assert "ON CONFLICT (scrape_date, neighborhood, lot_number) DO UPDATE SET" in (
+    assert "ON CONFLICT (scrape_date, cell_partition, lot_number) DO UPDATE SET" in (
         issued[merged]
     )
     assert result["copied"] == 0
@@ -851,7 +902,7 @@ def test_a_load_refreshes_the_statistics_it_invalidated():
         FakeConnection(cursor),
         "neighborhood_streets",
         streets(),
-        neighborhood=NEIGHBORHOOD,
+        partition=TILE,
         scrape_date=DATE,
     )
 
@@ -868,7 +919,7 @@ def test_the_analyze_is_of_the_leaf_and_not_the_partitioned_parent():
         FakeConnection(cursor),
         "neighborhood_streets",
         streets(),
-        neighborhood=NEIGHBORHOOD,
+        partition=TILE,
         scrape_date=DATE,
     )
 
@@ -887,7 +938,7 @@ def test_the_analyze_comes_after_the_prune_not_before_it():
         FakeConnection(cursor),
         "neighborhood_streets",
         streets(),
-        neighborhood=NEIGHBORHOOD,
+        partition=TILE,
         scrape_date=DATE,
     )
 
@@ -900,15 +951,15 @@ def test_the_analyze_comes_after_the_prune_not_before_it():
 def test_a_computed_partition_is_analyzed_too():
     """The three PostGIS joins reach their table by `upsert_select`, which has
     its own path into `_merge` and would otherwise miss this."""
-    cursor = FakeCursor(columns=["scrape_date", "neighborhood", "lot_number"])
+    cursor = FakeCursor(columns=["scrape_date", "cell_partition", "lot_number"])
 
     upsert_select(
         cursor,
         "lot_profiles",
-        ("scrape_date", "neighborhood", "lot_number"),
-        "SELECT l.scrape_date, l.neighborhood, l.lot_number FROM rag.lots l",
+        ("scrape_date", "cell_partition", "lot_number"),
+        "SELECT l.scrape_date, l.cell_partition, l.lot_number FROM rag.lots l",
         {"neighborhood": NEIGHBORHOOD},
-        neighborhood=NEIGHBORHOOD,
+        partition=TILE,
         scrape_date=DATE,
     )
 

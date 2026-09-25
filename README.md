@@ -2,10 +2,12 @@
 
 Dagster pipeline that snapshots Montreal's [Spectrum Spatial Feature
 Service](https://spectrum.montreal.ca/connect/analyst/controller/connectProxy/rest/Spatial/FeatureService)
-into local (geo)parquet, partitioned by neighborhood and scrape date, then joins
-it to the provincial cadastre, the assessment roll, CMHC's rental surveys and the
-zoning grids — so that what may be built on a lot, what that would cost, and what
-the ground is already worth read off one row.
+into local (geo)parquet, partitioned by scrape date and by the borough it was
+fetched for, then joins it to the provincial cadastre, the assessment roll,
+CMHC's rental surveys and the zoning grids — computed per cell of a fixed
+quadkey cut rather than per borough, so a boundary never cuts a computation —
+so that what may be built on a lot, what that would cost, and what the ground is
+already worth read off one row.
 
 Registered by default: **VSMPE** (Villeray–Saint-Michel–Parc-Extension, 24 Spectrum tables) and **CIL** (La Cité-Limoilou, Quebec City - its zoning layer and specification grid; see [docs/quebec-city.md](docs/quebec-city.md)). **SAG** (Ville de Saguenay, one key for the whole municipality - its zoning layer and a grid PDF per zone; see [docs/saguenay.md](docs/saguenay.md)) is known and is registered on request. The list lives in the Dagster instance: `make neighborhoods` shows it, `make neighborhood-add NEIGHBORHOOD=<key>` widens it.
 
@@ -25,7 +27,9 @@ the flags each target needs:
 ```bash
 make sync
 make dagster_run                                     # UI on :2500
-make materialize DATE=2026-09-01 NEIGHBORHOOD=VSMPE  # a full scrape of one partition
+make materialize DATE=2026-09-01 NEIGHBORHOOD=VSMPE  # a full scrape of one borough
+make cadastre DATE=2026-09-01 NEIGHBORHOOD=VSMPE     # land it in Postgres, addressed to the cut
+make frontage DATE=2026-09-01 TILE=0302303330102    # the lot chain runs per cell; `make tiles` lists them
 make help                                            # every target, with the variables it reads
 ```
 
@@ -47,22 +51,26 @@ under cannot drift apart:
 | **silver** | EPSG:4326, geometry valid, crosswalks applied, one row per declared grain |
 | **gold** | Named for the question, at the grain whoever asks it reads |
 
-Output lands under `<root>/<layer>/<asset>/<YYYY-MM-DD>[/<neighborhood>]/`,
-`<root>` being `data/` or `s3://$S3_BUCKET/`. Each partition is a full snapshot,
-and the tree — not the database — is the record: losing Postgres costs a reload
-rather than a re-scrape, which for a live municipal source no later run can undo.
+Output lands under `<root>/<layer>/<asset>/<YYYY-MM-DD>/<partition>/`, `<root>`
+being `data/` or `s3://$S3_BUCKET/` and `<partition>` a borough key for what a
+publisher bounds or a cell of the tile cut (`0302303330102`) for the lot chain —
+see [Two spatial axes](docs/architecture.md#two-spatial-axes). Each partition is
+a full snapshot, and the tree — not the database — is the record: losing
+Postgres costs a reload rather than a re-scrape, which for a live municipal
+source no later run can undo.
 
 Postgres is a **serving copy** of silver and gold, and the schema a table sits in
 is the layer its asset is in — `silver/vacancy_rates` in the tree is
 `silver.vacancy_rates` in the database. Every such table is partitioned by
-`(neighborhood, scrape_date)` and written by one upsert-then-prune.
+`(scrape_date, <its axis>)` — `neighborhood` or `cell_partition` — and written
+by one upsert-then-prune.
 
 The layer contracts in full, the single writer behind every table, and the output
 tree: [docs/architecture.md](docs/architecture.md).
 
 ## The assets
 
-41 assets, listed with their partitions and outputs in
+42 assets, listed with their partitions and outputs in
 [docs/assets.md](docs/assets.md).
 
 | Layer | |
@@ -71,10 +79,22 @@ tree: [docs/architecture.md](docs/architecture.md).
 | **silver** | `assessment_units` `lot_assessed_values` `lot_assessment_comparables` `commercial_rents` `vacancy_rates` `average_rents` `building_lot_intersections` `neighborhood_streets` `lot_addresses` `lot_frontage` `document_chunks` `document_embeddings` `zoning_grid_columns` `lot_zone_pieces` `lot_zoning_envelopes` `lot_buildable_setbacks` `lot_development_programs` |
 | **gold** | `lot_profiles` `lot_highest_best_use` `lot_redevelopment_gap` `lot_building_massing` `lot_investment_opportunities` `map_cell_aggregates` `map_tiles` `document_index` |
 
-They read eight publishers: Spectrum and the open-data portal (Ville de
-Montréal), Infolot, the assessment roll and Adresses Québec (Québec), BDOI,
-CMHC, and the Altus cost guide. Why each is read the way it is — and what each
-one gets wrong — is a page per source under [docs/](docs/README.md#the-data).
+They read publishers at four levels:
+
+- **the cities**: Montreal's Spectrum Feature Service and open-data portal;
+  Quebec City's ArcGIS zoning layer and grid workbook; Saguenay's zone lookup
+  and per-zone grid documents.
+- **the province**: the Registre foncier's Infolot cadastre; the MRNF's
+  Adresses Québec points and RQTT road network; the MAMH's assessment roll,
+  from its own open-data site, and its *richesse foncière uniformisée*, from
+  Données Québec, which also supplies the outlines of the two Quebec cities;
+  and the MEFQ's CUBF use-code list.
+- **federal**: CMHC's rental surveys, and two Statistics Canada products, the
+  Open Database of Buildings (BDOI) and the commercial rent index.
+- **private**: Cushman & Wakefield's MarketBeats and the Altus cost guide.
+
+Why each is read the way it is, and what each one gets wrong, is a page per
+source under [docs/](docs/README.md#the-data).
 
 `lot_development_programs` is where the highest-and-best-use question
 actually gets solved — one `urban_rag.program.solve_program` CP-SAT run per

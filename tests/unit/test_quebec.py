@@ -500,3 +500,143 @@ def test_the_sheet_link_column_is_montreals():
     assert GRID_URL_COLUMN == "LIEN_GRILLE"
     assert DOCUMENT_SOURCES[ZONING_SLUG] == GRID_URL_COLUMN
     assert "{zone}" in DEFAULT_SHEET_URL_TEMPLATE
+
+
+# -- heritage ------------------------------------------------------------------
+
+GRADE_DOMAIN = {
+    "fields": [
+        {"name": "NO_SEQ", "type": "esriFieldTypeInteger", "domain": None},
+        {
+            "name": "EVALUATION_VALEUR_PATRIMO_NO",
+            "type": "esriFieldTypeSmallInteger",
+            "domain": {
+                "type": "codedValue",
+                "codedValues": [
+                    {"name": "exceptionnel", "code": 1},
+                    {"name": "supérieur", "code": 2},
+                    {"name": "présumé", "code": 5},
+                ],
+            },
+        },
+    ]
+}
+
+
+def test_a_coded_field_gets_its_label_beside_the_code():
+    import pandas as pd
+
+    from urban_rag.quebec import coded_values, label_coded_values
+
+    labels = coded_values(GRADE_DOMAIN)
+    assert list(labels) == ["EVALUATION_VALEUR_PATRIMO_NO"]
+
+    frame = pd.DataFrame({"EVALUATION_VALEUR_PATRIMO_NO": [2, 5, 9]})
+    out = label_coded_values(frame, labels)
+    # The code stays as published; an unlisted one reads as missing.
+    assert out["EVALUATION_VALEUR_PATRIMO_NO"].tolist() == [2, 5, 9]
+    assert out["EVALUATION_VALEUR_PATRIMO_NO_LIBELLE"].tolist()[:2] == ["supérieur", "présumé"]
+    assert pd.isna(out["EVALUATION_VALEUR_PATRIMO_NO_LIBELLE"].iloc[2])
+
+
+def test_presume_and_confirme_are_not_grades():
+    from urban_rag.quebec import UNGRADED_CODES
+
+    assert UNGRADED_CODES == {5, 6}
+
+
+def test_a_fiche_url_is_built_from_the_fiche_number():
+    from urban_rag.quebec import fiche_url_for
+
+    assert fiche_url_for(353) == (
+        "https://www.ville.quebec.qc.ca/citoyens/patrimoine/bati/fiche.aspx?fiche=353"
+    )
+    assert fiche_url_for(353.0).endswith("=353")
+    assert fiche_url_for(None) is None
+    assert fiche_url_for(float("nan")) is None
+
+
+def test_every_heritage_layer_reaches_lot_features():
+    """A layer without one of `FEATURE_ID_COLUMNS` is skipped by the join -
+    which is how Saguenay's zoning once went missing."""
+    from urban_rag.cadastre_assets import FEATURE_ID_COLUMNS
+    from urban_rag.quebec import FICHE_URL_COLUMN, HERITAGE_ID_COLUMN, HERITAGE_LAYERS
+
+    assert HERITAGE_ID_COLUMN in FEATURE_ID_COLUMNS
+    # The fiche is not a by-law: the corpus must not download it.
+    assert FICHE_URL_COLUMN != GRID_URL_COLUMN
+    slugs = [layer.slug for layer in HERITAGE_LAYERS]
+    assert len(set(slugs)) == len(slugs) == 7
+    assert {layer.layer_id for layer in HERITAGE_LAYERS} == set(range(5, 12))
+
+
+class HeritageSession(FakeSession):
+    """Layer 11 holds two studied buildings, layer 6 fails, the rest are empty."""
+
+    def post(self, url, data=None, timeout=None):
+        self.posts.append({"url": url, **data})
+        layer = url.rsplit("/", 2)[-2]
+        if layer == "6":
+            return FakeResponse({"error": {"message": "boom"}})
+        if data.get("returnIdsOnly") == "true":
+            return FakeResponse({"objectIds": [1, 2] if layer == "11" else []})
+        ids = [int(i) for i in data["objectIds"].split(",")]
+        return FakeResponse(
+            {
+                "type": "FeatureCollection",
+                "features": [
+                    {
+                        "type": "Feature",
+                        "properties": {
+                            "OBJECTID": i,
+                            "NO_SEQ": 350 + i,
+                            "EVALUATION_VALEUR_PATRIMO_NO": {1: 2, 2: 5}[i],
+                        },
+                        "geometry": {
+                            "type": "Polygon",
+                            "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 0]]],
+                        },
+                    }
+                    for i in ids
+                ],
+            }
+        )
+
+    def get(self, url, params=None, timeout=None):
+        return FakeResponse(GRADE_DOMAIN)
+
+
+def test_the_heritage_layers_land_beside_the_zoning(tmp_path):
+    import logging
+    from types import SimpleNamespace
+
+    import pandas as pd
+
+    from urban_rag.assets import _quebec_heritage
+
+    session = HeritageSession()
+    service = QuebecZoningClient(
+        "https://example/FeatureServer/2", request_delay_seconds=0, session=session
+    ).on_layer("https://example/CI_COMMUNAUTE_CULTURE_PATRIMOINE/FeatureServer")
+    context = SimpleNamespace(log=logging.getLogger("test"))
+
+    result = _quebec_heritage(
+        context,
+        service,
+        {"rings": [[[0, 0], [1, 0], [1, 1], [0, 0]]], "spatialReference": {"wkid": 4326}},
+        str(tmp_path),
+        {"neighborhood": "CIL", "scrape_date": "2026-09-01"},
+    )
+
+    assert result["written"] == {"Patrimoine__BATIMENT_ETUDIE": 2}
+    assert list(result["failed"]) == ["Patrimoine__IMMEUBLE_CLASSE"]
+    # The one session carries every layer's requests.
+    assert all(p["url"].endswith("/query") for p in session.posts)
+
+    frame = pd.read_parquet(tmp_path / "Patrimoine__BATIMENT_ETUDIE.parquet")
+    assert frame["ID"].tolist() == ["351", "352"]
+    assert frame["EVALUATION_VALEUR_PATRIMO_NO_LIBELLE"].tolist() == ["supérieur", "présumé"]
+    assert frame["LIEN_FICHE"].iloc[0].endswith("fiche=351")
+    assert (frame["source_table"] == "Patrimoine__BATIMENT_ETUDIE").all()
+    # Only the layer that had rows was written.
+    assert [p.name for p in tmp_path.iterdir()] == ["Patrimoine__BATIMENT_ETUDIE.parquet"]

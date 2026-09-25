@@ -10,6 +10,16 @@ under, and why a "query by lot" is not something that service can be asked).
 parcel and, within it, on the zone piece this platform answers questions at —
 so an address is joinable to every gold table on `(lot_uid, feature_id)`.
 
+**The two run on two axes.** The fetch is a borough's, because the publisher
+is asked with a borough's outline. The join is a tile's - a cut cell's worth of
+points, `rag.addresses.cell_partition` - against every parcel in the snapshot,
+so a point two metres over a borough line still lands on the parcel it stands
+in front of. The tile's boroughs are read off its lots
+(`postgis.neighborhoods_of_tile`), and each one's bronze snapshot is parsed and
+loaded before the join runs; a tile spanning two boroughs loads both. A row
+belongs to the tile its *point* is in, not the tile of the lot it is placed on
+- see `postgis.load_addresses`.
+
 **Why the join has to exist.** The address layer publishes ten fields and not
 one of them is cadastral. There is no lot number, no matricule, nothing that
 points at a parcel. So the only way to say "2 784 705 is 7430 Rue Lajeunesse"
@@ -44,9 +54,12 @@ from dagster import (
     AssetDep,
     AssetExecutionContext,
     Config,
+    DimensionPartitionMapping,
     Failure,
+    IdentityPartitionMapping,
     MaterializeResult,
     MetadataValue,
+    MultiPartitionMapping,
     MultiToSingleDimensionPartitionMapping,
     asset,
 )
@@ -66,13 +79,18 @@ from urban_rag.frames import count_invalid_geometries, write_frame
 from urban_rag.guards import guard_current_scrape_month
 from urban_rag.layers import key_prefix
 from urban_rag.open_data_assets import borough_boundary, reference_neighborhoods
-from urban_rag.partitions import scrape_partitions
+from urban_rag.partitions import (
+    scrape_partitions,
+    tile_partition_of,
+    tile_scrape_partitions,
+)
 from urban_rag.postgis import (
     DEFAULT_ADDRESS_SNAP_M,
     MissingRelation,
     compute_lot_addresses,
     fetch_lot_addresses,
     load_addresses,
+    neighborhoods_of_tile,
 )
 from urban_rag.rag.pgvector import PostgresUnavailable
 from urban_rag.resources import AdressesQuebecResource, ParquetStore, PostgisResource
@@ -87,8 +105,17 @@ SILVER_GROUP = "silver_addresses"
 ADDRESSES_FILE = "addresses.parquet"
 
 #: The one file a silver partition is written to, under
-#: `silver/lot_addresses/<YYYY-MM-DD>/<neighborhood>/`.
+#: `silver/lot_addresses/<YYYY-MM-DD>/<tile>/`.
 LOT_ADDRESSES_FILE = "lot_addresses.parquet"
+
+#: How the tile-axis join depends on the borough-axis fetch: the date maps to
+#: itself and the borough dimension is left unlisted, which Dagster reads as
+#: "all of them". A tile does not know its boroughs until it reads its lots,
+#: so the dependency cannot name them. The same bridge `lot_zoning_envelopes`
+#: crosses to `zoning_grid_columns`.
+_BOROUGH_BRIDGE = MultiPartitionMapping(
+    {"date": DimensionPartitionMapping("date", IdentityPartitionMapping())}
+)
 
 #: https://www.donneesquebec.ca/recherche/dataset/adresses-quebec
 SOURCE_URL = "https://www.donneesquebec.ca/recherche/dataset/adresses-quebec"
@@ -292,8 +319,13 @@ class AddressJoinConfig(Config):
 
 @asset(
     key_prefix=key_prefix("lot_addresses"),
-    partitions_def=scrape_partitions,
-    deps=[neighborhood_addresses, building_lot_intersections, lot_zone_pieces],
+    partitions_def=tile_scrape_partitions,
+    deps=[
+        # The fetch is a borough's; the join is a tile's. See `_BOROUGH_BRIDGE`.
+        AssetDep(neighborhood_addresses, partition_mapping=_BOROUGH_BRIDGE),
+        building_lot_intersections,
+        lot_zone_pieces,
+    ],
     group_name=SILVER_GROUP,
     kinds={"postgres", "geoparquet"},
     description=(
@@ -308,9 +340,11 @@ class AddressJoinConfig(Config):
         "counted and not written. address_rank orders a site's addresses by "
         "civic number, so is_primary_address is the one a map labels it with, "
         "and num_piece_addresses (units) is reported beside "
-        "num_piece_civic_addresses (doors). Upserted into silver.lot_addresses "
-        "on (scrape_date, neighborhood, address_id) and written to "
-        f"silver/lot_addresses/<YYYY-MM-DD>/<neighborhood>/{LOT_ADDRESSES_FILE}."
+        "num_piece_civic_addresses (doors). Loads the bronze points of every "
+        "borough the tile's lots belong to, then joins the tile's own points "
+        "to every parcel in the snapshot. Upserted into silver.lot_addresses "
+        "on (scrape_date, cell_partition, address_id) and written to "
+        f"silver/lot_addresses/<YYYY-MM-DD>/<tile>/{LOT_ADDRESSES_FILE}."
     ),
 )
 def lot_addresses(
@@ -319,47 +353,41 @@ def lot_addresses(
     store: ParquetStore,
     postgis: PostgisResource,
 ) -> MaterializeResult:
-    dimensions = context.partition_key.keys_by_dimension
-    neighborhood = dimensions["neighborhood"]
-    scrape_date = dimensions["date"][:10]
-
-    bronze_path = join(
-        store.partition_dir(
-            neighborhood_addresses.key.path[-1], scrape_date, neighborhood
-        ),
-        ADDRESSES_FILE,
-    )
-    points = _read_addresses(bronze_path)
-    if points.empty:
-        raise Failure(f"{bronze_path} holds no address to join.")
-
-    parsed = parse_address_frame(points)
-    unparsed = int(parsed["street_name"].isna().sum())
-    if unparsed:
-        # Reported rather than failed: a street this parser has not seen is a
-        # row whose formatted address is still intact and whose point is still
-        # on the right lot. It loses only the parts, and how many there are is
-        # what says whether the parser needs widening.
-        context.log.warning(
-            "%s %s: %d of %d formatted address(es) did not parse; their "
-            "street, unit and municipality are null",
-            neighborhood,
-            scrape_date,
-            unparsed,
-            len(parsed),
-        )
+    tile, scrape_date = tile_partition_of(context)
 
     try:
         with postgis.connect() as connection:
-            loaded = load_addresses(
-                connection,
-                parsed,
-                neighborhood=neighborhood,
-                scrape_date=scrape_date,
+            # The boroughs this tile's lots were fetched under, which is where
+            # the address points were fetched too. Asked of the database
+            # rather than of the tree because nothing in the tree says which
+            # boroughs a cell holds - the lots do.
+            neighborhoods = neighborhoods_of_tile(
+                connection, tile=tile, scrape_date=scrape_date
             )
+            if not neighborhoods:
+                raise Failure(
+                    f"rag.lots holds no lot for tile {tile} {scrape_date}, so "
+                    "there is no borough to read address points for - "
+                    "materialize neighborhood_cadastre for the boroughs this "
+                    "tile covers first."
+                )
+            loaded = 0
+            for neighborhood in neighborhoods:
+                parsed = _parsed_points(context, store, neighborhood, scrape_date)
+                # Per borough, because the bronze snapshot and the table's
+                # replace are both per borough; a second tile of the same
+                # borough loads the same rows again, which the load resolves
+                # on the publisher's id. The rows are addressed by their own
+                # point on the way in - see `postgis.load_addresses`.
+                loaded += load_addresses(
+                    connection,
+                    parsed,
+                    neighborhood=neighborhood,
+                    scrape_date=scrape_date,
+                )
             result = compute_lot_addresses(
                 connection,
-                neighborhood=neighborhood,
+                tile=tile,
                 scrape_date=scrape_date,
                 max_snap_m=config.max_snap_m,
             )
@@ -368,22 +396,19 @@ def lot_addresses(
                 # than replacing a good partition with nothing - the posture
                 # `lot_zone_pieces` takes.
                 raise Failure(
-                    f"{neighborhood} {scrape_date}: none of the {loaded} "
-                    "address point(s) loaded falls on a parcel. Check that "
-                    "building_lot_intersections landed this partition's lots, "
-                    "and that the two layers are in the same CRS."
+                    f"tile {tile} {scrape_date}: none of the {loaded} address "
+                    f"point(s) loaded for {', '.join(neighborhoods)} falls on "
+                    "a parcel of this tile. Check that neighborhood_cadastre "
+                    "landed those boroughs' lots, and that the two layers are "
+                    "in the same CRS."
                 )
-            frame = fetch_lot_addresses(
-                connection, neighborhood=neighborhood, scrape_date=scrape_date
-            )
+            frame = fetch_lot_addresses(connection, tile=tile, scrape_date=scrape_date)
     except PostgresUnavailable as exc:
-        raise Failure(f"Postgres unreachable for {neighborhood} {scrape_date}: {exc}")
+        raise Failure(f"Postgres unreachable for tile {tile} {scrape_date}: {exc}")
     except MissingRelation as exc:
         raise Failure(str(exc))
 
-    output_dir = store.partition_dir(
-        context.asset_key.path[-1], scrape_date, neighborhood
-    )
+    output_dir = store.partition_dir(context.asset_key.path[-1], scrape_date, tile)
     removed = clear_parquet(output_dir)
     if removed:
         context.log.info("Removed %d file(s) from a previous run", len(removed))
@@ -395,7 +420,7 @@ def lot_addresses(
     context.log.info(
         "%s %s: %d address(es) on %d lot(s) over %d zone piece(s); %d of %d "
         "point(s) reached no parcel -> %s",
-        neighborhood,
+        tile,
         scrape_date,
         num_addresses,
         int(result["num_lots"]),
@@ -409,7 +434,7 @@ def lot_addresses(
             "%s %s: %d of %d address point(s) fall on no parcel within %g m "
             "and are not written - they sit in the right of way, or on ground "
             "the cadastre did not draw",
-            neighborhood,
+            tile,
             scrape_date,
             num_unmatched,
             num_points,
@@ -420,7 +445,7 @@ def lot_addresses(
         context.log.warning(
             "%s %s: %d address(es) stand on a lot no zoning layer governs and "
             "carry '-' for feature_id, so they join to no gold row",
-            neighborhood,
+            tile,
             scrape_date,
             num_no_piece,
         )
@@ -428,10 +453,16 @@ def lot_addresses(
     return MaterializeResult(
         metadata={
             "dagster/row_count": num_addresses,
+            "tile": tile,
+            # Whose points were loaded on the way to the join.
+            "neighborhoods": ", ".join(neighborhoods),
             "num_addresses": num_addresses,
             "num_lots": int(result["num_lots"]),
             "num_pieces": int(result["num_pieces"]),
+            # The tile's own points, which is what the join ran over. The
+            # boroughs' whole snapshots were loaded and are a larger number.
             "num_points_loaded": num_points,
+            "num_points_loaded_for_boroughs": loaded,
             # The number to watch, and the pair to read together: how many
             # points the cadastre could not place, and how many it placed only
             # by reaching for them.
@@ -500,6 +531,44 @@ def parse_address_frame(points: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
         )
     ]
     return out
+
+
+def _parsed_points(
+    context: AssetExecutionContext,
+    store: ParquetStore,
+    neighborhood: str,
+    scrape_date: str,
+) -> gpd.GeoDataFrame:
+    """One borough's bronze snapshot, parsed and ready for `load_addresses`.
+
+    The parse is silver's work - see the module docstring - and it happens
+    here, per borough, because the bronze file is a borough's. A snapshot that
+    did not parse a street is warned about and loaded anyway: the row's point
+    is still on the right lot, and how many there are is what says whether
+    the parser needs widening.
+    """
+    bronze_path = join(
+        store.partition_dir(
+            neighborhood_addresses.key.path[-1], scrape_date, neighborhood
+        ),
+        ADDRESSES_FILE,
+    )
+    points = _read_addresses(bronze_path)
+    if points.empty:
+        raise Failure(f"{bronze_path} holds no address to join.")
+
+    parsed = parse_address_frame(points)
+    unparsed = int(parsed["street_name"].isna().sum())
+    if unparsed:
+        context.log.warning(
+            "%s %s: %d of %d formatted address(es) did not parse; their "
+            "street, unit and municipality are null",
+            neighborhood,
+            scrape_date,
+            unparsed,
+            len(parsed),
+        )
+    return parsed
 
 
 def _address_id(feature: dict) -> str | None:

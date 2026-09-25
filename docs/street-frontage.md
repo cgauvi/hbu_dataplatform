@@ -42,25 +42,44 @@ primary keys, denormalised into `gold.lot_profiles` and read by the map's tile
 queries, and re-keying that lineage to win a better noun is the more expensive
 mistake.
 
-Three assets, and the borough axis appears in the middle one:
+Three assets, and the tile axis appears in the middle one:
 
 ```
-bronze/street_network        date            the province, bounded per city
-silver/neighborhood_streets  date × borough  clipped to one borough
-silver/lot_frontage          date × borough  the shared edges, in metres
+bronze/street_network        date          the province, bounded per city
+silver/neighborhood_streets  date × tile   the sides whose midpoint is in the cell, whole
+silver/lot_frontage          date × tile   the shared edges, in metres
 ```
 
 `street_network` is partitioned by date alone because one download serves every
-borough — and now every *city*. The cut to a borough happens in silver, from a
-file already on disk, since re-fetching 390 MB per partition would be work done
-for nothing. It is a real clip: a segment crossing the borough line is
-`ST_Intersection`-ed against the boundary, and what was published survives
-beside it in `segment_length_m`, `length_in_borough_m` and `pct_in_borough`.
+tile — and every *city*. The cut to a tile happens in silver, from a file
+already on disk, since re-fetching 390 MB per partition would be work done for
+nothing. It is a **selection, not a clip**: a segment belongs to the cell of the
+cut its midpoint falls in — half way along the line, taken to a zoom-19
+quadkey, and compared as a string range against the cell — and it is stored
+whole, wherever its ends reach. Nothing is `ST_Intersection`-ed against a cell
+edge, so there is no `length_in_borough_m` and no `pct_in_borough` any more:
+`segment_length_m` is the side's length, full stop. The cell is a claim on who
+writes the row, not a cutter.
+
+That is the edge effect this replaced. Under the borough axis a side crossing
+the borough line was clipped at it, while the cadastre — fetched by a boundary
+*query* — reached past the line and held the straddling lot whole. That lot's
+frontage was measured against the surviving piece of the side only, and was
+under-reported for it; `num_boundary_clipped` counted how many sides were
+involved (159 in VSMPE) so the size of the effect was at least readable. Now
+`lot_frontage` reads every side in the snapshot, whichever cell owns it, and a
+lot on the line measures against the whole side across it. There is no line
+to clip at and nothing to under-report against.
+
+`neighborhood` survives on the row as an attribute: the registered borough
+whose outline holds the midpoint, or NULL for a side out on the island past
+every borough the pipeline knows — which is still the tile's side. The map
+and its aggregates read the column; nothing is bounded by it.
 
 Bronze is bounded by a **bounding box per city**, not by an attribute filter:
 the RQTT publishes no municipality code, so there is nothing to push into OGR
 the way the assessment roll pushes `code_mun`. The box rides the GeoPackage's
-R-tree, and the real boundary does the rest in silver. The 2026-09-01 snapshot
+R-tree, and the midpoint does the rest in silver. The 2026-09-01 snapshot
 of the 2026-07-03 vintage: **125,177 segments** — Montreal 86,017, Quebec City
 26,789, Saguenay 13,418 — with 1,047 dropped as not roadway and no duplicate
 ids at all.
@@ -74,8 +93,9 @@ against the géobase double's first snapshot:
 | length | 445.8 km | **247.0 km** |
 | cut at the boundary | 170 | **159** |
 
-Both numbers roughly halve, which is the whole of the change: two lines per
-street became one. The length ratio (0.55) is a little above the row ratio
+(Measured under the borough clip, before the move to the tile axis; the last
+row counts something that no longer happens.) Both numbers roughly halve,
+which is the whole of the change: two lines per street became one. The length ratio (0.55) is a little above the row ratio
 (0.51) because a curb side runs the longer way around a corner. Nothing else
 moved — no unnamed segments, no duplicate ids, no invalid geometry, and **no
 segment named *Ruelle*** anywhere in the borough.
@@ -338,7 +358,7 @@ saying 0.
 parcels count as roadway:
 
 ```
-make frontage DATE=2026-08-18 NEIGHBORHOOD=VSMPE MIN_STREET_M=1.0
+make frontage DATE=2026-09-01 NEIGHBORHOOD=VSMPE MIN_STREET_M=1.0
 ```
 
 ## Lots that face no street
@@ -398,10 +418,10 @@ belongs to the question.
 ## What this asset does *not* load
 
 Anything. Both sides are already in Postgres when `lot_frontage` runs:
-`rag.lots` because `building_lot_intersections` put it there, and
+`rag.lots` because `neighborhood_cadastre` put it there, and
 `silver.neighborhood_streets` because that asset owns its own table. Each of
 those is loaded in exactly one place, which is not tidiness but the fix for a
-real race — `building_lot_intersections`'s docstring has the long version:
+real race — `neighborhood_cadastre`'s docstring has the long version:
 whoever commits second replaces the rows the first just computed against.
 
 So `lot_frontage` depends on both assets, guards on both partitions being

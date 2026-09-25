@@ -206,8 +206,13 @@ class PdfFetcher:
         return content, False
 
 
-def read_pdf(url: str, content: bytes) -> Document:
-    """Extract a PDF's text layer. No OCR: these are born-digital files."""
+def read_pdf(url: str, content: bytes, *, keep_hyphens: bool = False) -> Document:
+    """Extract a PDF's text layer. No OCR: these are born-digital files.
+
+    ``keep_hyphens`` is for prose rather than grids: a zoning grid's
+    line-end hyphen is a syllable break to undo, a minute's is as likely the
+    hyphen of *Cité-Limoilou* or *GT2025-233* to keep. See `normalize_text`.
+    """
     from pypdf import PdfReader
     from pypdf.errors import PdfReadError
 
@@ -217,7 +222,9 @@ def read_pdf(url: str, content: bytes) -> Document:
     except (PdfReadError, ValueError, OSError) as exc:
         raise DocumentError(f"{url}: unreadable PDF ({exc})") from exc
 
-    text = normalize_text("\n\n".join(page for page in pages if page.strip()))
+    text = normalize_text(
+        "\n\n".join(page for page in pages if page.strip()), keep_hyphens=keep_hyphens
+    )
     if not text:
         raise DocumentError(
             f"{url}: no text layer over {len(pages)} page(s); "
@@ -233,10 +240,20 @@ def read_pdf(url: str, content: bytes) -> Document:
     )
 
 
-def normalize_text(text: str) -> str:
-    """Undo the artefacts of PDF extraction while keeping paragraph breaks."""
-    text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\u00ad", "")
-    text = _LINE_BREAK_HYPHEN.sub(r"\1\2", text)  # word split across two lines
+def normalize_text(text: str, *, keep_hyphens: bool = False) -> str:
+    """Undo the artefacts of PDF extraction while keeping paragraph breaks.
+
+    A word split across two lines is joined. By default the hyphen goes with
+    the break, which is right for a grid's running text; ``keep_hyphens``
+    joins the two halves *with* it, for prose where the hyphen is the word's
+    own - proper nouns and file numbers - and a syllable break is the rarer
+    case.
+    """
+    # The soft hyphen and the NUL are both extraction artefacts, and a NUL
+    # is one Postgres refuses in a text column.
+    text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\u00ad", "").replace("\x00", "")
+    joined = r"\1-\2" if keep_hyphens else r"\1\2"
+    text = _LINE_BREAK_HYPHEN.sub(joined, text)  # word split across two lines
     text = _HORIZONTAL_SPACE.sub(" ", text)
     lines = [line.strip() for line in text.split("\n")]
     return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()

@@ -60,6 +60,8 @@ from urban_rag.storage import join
 
 DATE = "2026-08-01"
 NEIGHBORHOOD = "VSMPE"
+#: A VSMPE cell of the cut: the tile the lot chain is partitioned on.
+TILE = "0302303330102"
 ZONE_TABLE = "Reglement_urbanisme__VSP_REG_ZONE"
 
 #: One residential envelope of a real shape: six storeys, a density of 3, a
@@ -761,6 +763,168 @@ def test_a_sliver_never_reaches_here_at_all(economics):
     assert chosen.iloc[0]["num_zones"] == 1
 
 
+#: A house lot under each of the three ways a grid says "one dwelling": the
+#: class Montreal prints (H.1, with the count row left blank because the class
+#: carries it), the count Quebec City and Saguenay print against a bare H, and
+#: both at once.
+_SINGLE_FAMILY_COLUMNS = {
+    "montreal_class": {"usages": json.dumps(["H.1"]), "max_dwellings": None},
+    "printed_count": {"usages": json.dumps(["H"]), "max_dwellings": 1},
+    "both": {"usages": json.dumps(["H.1"]), "max_dwellings": 1},
+}
+
+
+def _house(**overrides) -> dict:
+    """A residential-only column: `ENVELOPE` without its C.2."""
+    house = {
+        "usage_commerce": None,
+        "permits_commercial": False,
+        "governs_commercial": False,
+        "floors_min": None,
+        "floors_max": 2,
+        "height_max_m": 10.0,
+        "density_max": None,
+    }
+    return envelope(**{**house, **overrides})
+
+
+@pytest.mark.parametrize("columns", _SINGLE_FAMILY_COLUMNS.values(), ids=list(_SINGLE_FAMILY_COLUMNS))
+def test_a_single_family_piece_is_not_solved_and_says_why(economics, columns):
+    """Lot 2 076 513 in zone 31234Ha: two storeys and 10 m allowed, one
+    dwelling. The rental proforma can only put one 1-bedroom on it, so it is
+    not asked - no program row, and a status saying which thesis is missing."""
+    frame = envelopes(_house(**columns))
+    programs = hbu.solve_envelopes(frame, economics)
+    assert programs.empty
+    assert hbu.single_family_zone_pieces(frame) == {(1, "C01-001")}
+    row = hbu.select_highest_best_use(programs, frame).iloc[0]
+    assert row["hbu_status"] == "single_family_zone"
+    assert row["num_candidates"] == 0
+    assert pd.isna(row["status"])
+    assert pd.isna(row["hbu_dominant_use"])
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        # A duplex cap still leaves the solver two units and two storeys.
+        {"usages": json.dumps(["H"]), "max_dwellings": 2},
+        {"usages": json.dumps(["H.2"]), "max_dwellings": None},
+        # A bare H with nothing printed carries no ceiling at all.
+        {"usages": json.dumps(["H"]), "max_dwellings": None},
+        # One dwelling over a shop is a mixed building the solver does price.
+        {
+            "usages": json.dumps(["H", "C.2"]),
+            "max_dwellings": 1,
+            "permits_commercial": True,
+            "governs_commercial": True,
+        },
+    ],
+    ids=["duplex", "h2_class", "no_ceiling", "house_over_a_shop"],
+)
+def test_a_piece_the_rental_thesis_can_use_is_still_solved(economics, overrides):
+    frame = envelopes(_house(**overrides))
+    assert hbu.single_family_zone_pieces(frame) == frozenset()
+    row = hbu.select_highest_best_use(hbu.solve_envelopes(frame, economics), frame).iloc[0]
+    assert row["hbu_status"] == "solved"
+
+
+def test_a_school_column_beside_a_house_column_is_still_a_house_lot(economics):
+    """Saguenay prints H and E together on ~20,000 rows, and Quebec City a
+    separate E column beside the H one (31234Ha does). Neither makes the piece
+    a park: the solver prices no E, so the house is what the piece is."""
+    frame = envelopes(
+        _house(usages=json.dumps(["H", "E"]), usage_equipements="E", max_dwellings=1),
+        _house(
+            column_index=1,
+            usages=json.dumps(["E"]),
+            usage_equipements="E",
+            permits_residential=False,
+            governs_residential=False,
+            max_dwellings=1,
+        ),
+    )
+    row = hbu.select_highest_best_use(hbu.solve_envelopes(frame, economics), frame).iloc[0]
+    assert row["hbu_status"] == "single_family_zone"
+
+
+def test_the_governing_column_decides_not_the_widest_one(economics):
+    """A grid printing H.1 for narrow lots and H.2 from 15 m of frontage: the
+    narrow lot may only build the house, the wide one may build the duplex.
+    What each may build is what `governs_residential` already says, so that is
+    what the gate reads."""
+    narrow_columns = [
+        _house(usages=json.dumps(["H.1"]), governs_residential=True),
+        _house(
+            column_index=1,
+            usages=json.dumps(["H.2"]),
+            min_lot_width_m=15.0,
+            governs_residential=False,
+        ),
+    ]
+    wide_columns = [
+        {**row, "lot_uid": 2, "lot_number": "2 216 002", "primary_frontage_m": 18.0}
+        for row in narrow_columns
+    ]
+    wide_columns[0]["governs_residential"] = False
+    wide_columns[1]["governs_residential"] = True
+    frame = envelopes(*narrow_columns, *wide_columns)
+
+    assert hbu.single_family_zone_pieces(frame) == {(1, "C01-001")}
+    chosen = hbu.select_highest_best_use(
+        hbu.solve_envelopes(frame, economics), frame
+    ).set_index("lot_uid")
+    assert chosen.loc[1, "hbu_status"] == "single_family_zone"
+    assert chosen.loc[2, "hbu_status"] == "solved"
+
+
+def test_a_house_zone_nothing_governs_is_still_a_house_zone(economics):
+    """No measured frontage under a grid stating a width minimum: nothing
+    governs, and the solve would fall back on the columns that merely permit.
+    Every one of them caps at one dwelling, so it is the house lot it would
+    be with a frontage - not `no_governing_column`, and not solved anyway."""
+    frame = envelopes(
+        _house(
+            usages=json.dumps(["H.1"]),
+            min_lot_width_m=12.0,
+            primary_frontage_m=None,
+            governs_residential=False,
+            meets_min_lot_width=False,
+        )
+    )
+    programs = hbu.solve_envelopes(frame, economics)
+    assert programs.empty
+    row = hbu.select_highest_best_use(programs, frame).iloc[0]
+    assert row["hbu_status"] == "single_family_zone"
+
+
+def test_a_split_lot_can_be_half_house_and_half_building(economics):
+    """The gate is per piece, like the equipment one, and for the same reason."""
+    frame = envelopes(
+        _house(
+            feature_id="H01-001",
+            usages=json.dumps(["H.1"]),
+            pct_of_lot=60.0,
+            piece_area_m2=300.0,
+            num_lot_zones=2,
+        ),
+        envelope(
+            feature_id="C01-002",
+            column_index=1,
+            pct_of_lot=40.0,
+            piece_area_m2=200.0,
+            num_lot_zones=2,
+            zone_rank=2,
+            is_primary_zone=False,
+        ),
+    )
+    chosen = hbu.select_highest_best_use(
+        hbu.solve_envelopes(frame, economics), frame
+    ).set_index("feature_id")
+    assert chosen.loc["H01-001", "hbu_status"] == "single_family_zone"
+    assert chosen.loc["C01-002", "hbu_status"] == "solved"
+
+
 def test_a_pure_commerce_zone_is_solved_not_skipped(economics):
     """The case the memory of this platform used to call no_residential_column."""
     frame = envelopes(
@@ -1439,14 +1603,14 @@ def stub_lots(monkeypatch):
     """
     import geopandas as gpd
 
-    def fetch_lot_polygons(connection, *, neighborhood, scrape_date):
+    def fetch_lot_polygons(connection, *, tile, scrape_date):
         return gpd.GeoDataFrame(
             {"lot_uid": [], "lot_number": [], "lot_area_m2": []},
             geometry=[],
             crs="EPSG:4326",
         )
 
-    def fetch_zone_piece_polygons(connection, *, neighborhood, scrape_date):
+    def fetch_zone_piece_polygons(connection, *, tile, scrape_date):
         return gpd.GeoDataFrame(
             {
                 "lot_uid": [],
@@ -1459,10 +1623,16 @@ def stub_lots(monkeypatch):
             crs="EPSG:4326",
         )
 
+    def neighborhoods_of_tile(connection, *, tile, scrape_date):
+        # The fixture tile holds one borough's lots, which is what makes the
+        # CMHC files below - written under that borough - the tile's rents.
+        return (NEIGHBORHOOD,)
+
     monkeypatch.setattr(postgis, "fetch_lot_polygons", fetch_lot_polygons)
     monkeypatch.setattr(
         postgis, "fetch_zone_piece_polygons", fetch_zone_piece_polygons
     )
+    monkeypatch.setattr(postgis, "neighborhoods_of_tile", neighborhoods_of_tile)
 
 
 def write_upstreams(
@@ -1485,7 +1655,7 @@ def write_upstreams(
         pd.DataFrame(rows or [ENVELOPE]),
         join(
             store.partition_dir(
-                lot_zoning_envelopes.key.path[-1], DATE, NEIGHBORHOOD
+                lot_zoning_envelopes.key.path[-1], DATE, TILE
             ),
             LOT_ENVELOPES_FILE,
         ),
@@ -1532,7 +1702,7 @@ def write_upstreams(
             setback_frame,
             join(
                 store.partition_dir(
-                    lot_buildable_setbacks.key.path[-1], DATE, NEIGHBORHOOD
+                    lot_buildable_setbacks.key.path[-1], DATE, TILE
                 ),
                 LOT_SETBACKS_FILE,
             ),
@@ -1541,7 +1711,7 @@ def write_upstreams(
         comparables_frame() if comparables is None else comparables,
         join(
             store.partition_dir(
-                lot_assessment_comparables.key.path[-1], DATE, NEIGHBORHOOD
+                lot_assessment_comparables.key.path[-1], DATE, TILE
             ),
             LOT_COMPARABLES_FILE,
         ),
@@ -1550,7 +1720,7 @@ def write_upstreams(
         write_frame(
             road_lots_frame().iloc[:0] if road_lots is None else road_lots,
             join(
-                store.partition_dir(lot_frontage.key.path[-1], DATE, NEIGHBORHOOD),
+                store.partition_dir(lot_frontage.key.path[-1], DATE, TILE),
                 ROAD_LOTS_FILE,
             ),
         )
@@ -1559,7 +1729,7 @@ def write_upstreams(
 def run(store, asset_def, run_config=None):
     return materialize(
         [asset_def],
-        partition_key=MultiPartitionKey({"date": DATE, "neighborhood": NEIGHBORHOOD}),
+        partition_key=MultiPartitionKey({"date": DATE, "tile": TILE}),
         resources={"store": store, "postgis": PostgisResource()},
         selection=[asset_def],
         run_config=run_config,
@@ -1574,7 +1744,7 @@ def test_programs_asset_writes_and_publishes(store, stub_publish):
     frame = pd.read_parquet(
         join(
             store.partition_dir(
-                lot_development_programs.key.path[-1], DATE, NEIGHBORHOOD
+                lot_development_programs.key.path[-1], DATE, TILE
             ),
             LOT_PROGRAMS_FILE,
         )
@@ -1587,12 +1757,69 @@ def test_programs_asset_writes_and_publishes(store, stub_publish):
     assert json.loads(frame.iloc[0]["program_assumptions"])["stalls_per_dwelling"] == 0.5
 
     assert stub_publish["datasets"].keys() == {"lot_development_programs"}
-    assert stub_publish["partition"] == (NEIGHBORHOOD, DATE)
+    assert stub_publish["partition"] == (TILE, DATE)
 
     metadata = materialization_metadata(result, lot_development_programs)
     assert metadata["num_candidates"].value == 1
     assert metadata["num_solved"].value == 1
     assert metadata["num_with_buildable_area"].value == 1
+
+
+def test_a_tile_of_house_lots_writes_an_empty_partition(store, stub_publish):
+    """Most of a suburb's cells. Nothing is solved, the tile still succeeds -
+    publishing the empty file is what prunes an earlier run's programs - and
+    the HBU downstream gives every piece its row and its reason."""
+    rows = [
+        _house(usages=json.dumps(["H.1"])),
+        _house(lot_uid=2, lot_number="2 216 002", usages=json.dumps(["H"]), max_dwellings=1),
+    ]
+    write_upstreams(store, rows=rows)
+    result = run(store, lot_development_programs)
+    assert result.success
+
+    frame = pd.read_parquet(
+        join(
+            store.partition_dir(lot_development_programs.key.path[-1], DATE, TILE),
+            LOT_PROGRAMS_FILE,
+        )
+    )
+    assert frame.empty
+    assert stub_publish["datasets"].keys() == {"lot_development_programs"}
+    metadata = materialization_metadata(result, lot_development_programs)
+    assert metadata["num_single_family_pieces"].value == 2
+    assert metadata["num_candidates"].value == 0
+
+    result = run(store, lot_highest_best_use)
+    assert result.success
+    hbu_frame = pd.read_parquet(
+        join(
+            store.partition_dir(lot_highest_best_use.key.path[-1], DATE, TILE),
+            LOT_HBU_FILE,
+        )
+    )
+    assert list(hbu_frame["hbu_status"]) == ["single_family_zone"] * 2
+    metadata = materialization_metadata(result, lot_highest_best_use)
+    assert metadata["num_single_family_zone"].value == 2
+
+
+def test_programs_asset_counts_the_house_lots_it_skipped(store, stub_publish):
+    write_upstreams(
+        store,
+        rows=[ENVELOPE, _house(lot_uid=2, lot_number="2 216 002", usages=json.dumps(["H.1"]))],
+    )
+    result = run(store, lot_development_programs)
+    assert result.success
+    frame = pd.read_parquet(
+        join(
+            store.partition_dir(lot_development_programs.key.path[-1], DATE, TILE),
+            LOT_PROGRAMS_FILE,
+        )
+    )
+    assert list(frame["lot_uid"]) == [1]
+    metadata = materialization_metadata(result, lot_development_programs)
+    assert metadata["num_single_family_pieces"].value == 1
+    assert metadata["num_envelopes"].value == 2
+    assert metadata["num_envelopes_not_candidates"].value == 1
 
 
 def _envelope_polygon(shape):
@@ -1634,7 +1861,7 @@ def test_the_envelope_shape_caps_the_footprint(store):
     frame = pd.read_parquet(
         join(
             store.partition_dir(
-                lot_development_programs.key.path[-1], DATE, NEIGHBORHOOD
+                lot_development_programs.key.path[-1], DATE, TILE
             ),
             LOT_PROGRAMS_FILE,
         )
@@ -1670,7 +1897,7 @@ def test_a_setbacks_file_with_no_geometry_warns_and_still_solves(store):
     frame = pd.read_parquet(
         join(
             store.partition_dir(
-                lot_development_programs.key.path[-1], DATE, NEIGHBORHOOD
+                lot_development_programs.key.path[-1], DATE, TILE
             ),
             LOT_PROGRAMS_FILE,
         )
@@ -1693,7 +1920,7 @@ def test_programs_asset_without_setbacks_warns_and_still_solves(store):
     frame = pd.read_parquet(
         join(
             store.partition_dir(
-                lot_development_programs.key.path[-1], DATE, NEIGHBORHOOD
+                lot_development_programs.key.path[-1], DATE, TILE
             ),
             LOT_PROGRAMS_FILE,
         )
@@ -1710,7 +1937,7 @@ def test_programs_asset_config_reaches_the_solver(store):
     priced = pd.read_parquet(
         join(
             store.partition_dir(
-                lot_development_programs.key.path[-1], DATE, NEIGHBORHOOD
+                lot_development_programs.key.path[-1], DATE, TILE
             ),
             LOT_PROGRAMS_FILE,
         )
@@ -1737,7 +1964,7 @@ def test_programs_asset_config_reaches_the_solver(store):
     free = pd.read_parquet(
         join(
             store.partition_dir(
-                lot_development_programs.key.path[-1], DATE, NEIGHBORHOOD
+                lot_development_programs.key.path[-1], DATE, TILE
             ),
             LOT_PROGRAMS_FILE,
         )
@@ -1766,7 +1993,7 @@ def test_programs_asset_config_reaches_the_solver(store):
     rented = pd.read_parquet(
         join(
             store.partition_dir(
-                lot_development_programs.key.path[-1], DATE, NEIGHBORHOOD
+                lot_development_programs.key.path[-1], DATE, TILE
             ),
             LOT_PROGRAMS_FILE,
         )
@@ -1830,7 +2057,7 @@ def test_hbu_asset_answers_every_lot(store, stub_publish):
 
     frame = pd.read_parquet(
         join(
-            store.partition_dir(lot_highest_best_use.key.path[-1], DATE, NEIGHBORHOOD),
+            store.partition_dir(lot_highest_best_use.key.path[-1], DATE, TILE),
             LOT_HBU_FILE,
         )
     )
@@ -1884,7 +2111,7 @@ def test_hbu_asset_gates_the_street_parcels_the_roll_never_reached(
 
     frame = pd.read_parquet(
         join(
-            store.partition_dir(lot_highest_best_use.key.path[-1], DATE, NEIGHBORHOOD),
+            store.partition_dir(lot_highest_best_use.key.path[-1], DATE, TILE),
             LOT_HBU_FILE,
         )
     ).set_index("lot_number")
@@ -1922,7 +2149,7 @@ def test_a_cadastral_street_parcel_reaches_neither_the_gap_nor_the_shortlist(
 
     gap = pd.read_parquet(
         join(
-            store.partition_dir(lot_redevelopment_gap.key.path[-1], DATE, NEIGHBORHOOD),
+            store.partition_dir(lot_redevelopment_gap.key.path[-1], DATE, TILE),
             LOT_GAP_FILE,
         )
     ).iloc[0]
@@ -1937,7 +2164,7 @@ def test_a_cadastral_street_parcel_reaches_neither_the_gap_nor_the_shortlist(
     shortlist = pd.read_parquet(
         join(
             store.partition_dir(
-                lot_investment_opportunities.key.path[-1], DATE, NEIGHBORHOOD
+                lot_investment_opportunities.key.path[-1], DATE, TILE
             ),
             LOT_OPPORTUNITIES_FILE,
         )
@@ -1964,7 +2191,7 @@ def test_hbu_asset_without_the_road_lots_file_warns_and_falls_back_to_the_roll(
 
     frame = pd.read_parquet(
         join(
-            store.partition_dir(lot_highest_best_use.key.path[-1], DATE, NEIGHBORHOOD),
+            store.partition_dir(lot_highest_best_use.key.path[-1], DATE, TILE),
             LOT_HBU_FILE,
         )
     )
@@ -1982,7 +2209,7 @@ def test_gap_asset_puts_the_two_buildings_side_by_side(store, stub_publish):
 
     frame = pd.read_parquet(
         join(
-            store.partition_dir(lot_redevelopment_gap.key.path[-1], DATE, NEIGHBORHOOD),
+            store.partition_dir(lot_redevelopment_gap.key.path[-1], DATE, TILE),
             LOT_GAP_FILE,
         )
     )
@@ -2164,7 +2391,7 @@ def test_a_road_parcel_is_never_under_built(store):
 
     frame = pd.read_parquet(
         join(
-            store.partition_dir(lot_redevelopment_gap.key.path[-1], DATE, NEIGHBORHOOD),
+            store.partition_dir(lot_redevelopment_gap.key.path[-1], DATE, TILE),
             LOT_GAP_FILE,
         )
     )

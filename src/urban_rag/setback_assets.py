@@ -34,12 +34,20 @@ column that failed to parse shows up as a number rather than as a quietly
 smaller envelope.
 
 **This asset loads nothing.** All three inputs are already in Postgres when it
-runs: `rag.lots` because `building_lot_intersections` put it there,
+runs: `rag.lots` because `neighborhood_cadastre` put it there,
 `silver.lot_frontage` and `silver.lot_zoning_envelopes` because those assets own
-their own tables. So the dependencies here are on those assets, and the only
-table this one writes is its own - the same posture `lot_frontage` takes, and
-for the same reason: two assets loading one table from one file in two
+their own tables. So the dependencies here are on those two assets, and the
+only table this one writes is its own - the same posture `lot_frontage` takes,
+and for the same reason: two assets loading one table from one file in two
 transactions is the race `building_lots_assets` describes.
+
+**A run is one tile, and the neighbours are the snapshot's.** The lots carved
+are the ones a cut cell owns, and their envelopes and frontages are same-tile
+by ownership. The parcels a boundary is sorted against - the abutting lots that
+say which edge is a party wall - are every lot in the snapshot, with no borough
+and no tile predicate: a lot on a borough line has a neighbour on the other
+side of it, and a borough-wide run read that side as open ground. See
+`urban_rag.partitions.tile_partitions`.
 
 **`silver.lot_buildable_setbacks` is owned by hbu_infra**, like every other
 table this repo writes into - sql/015_silver_lot_buildable_setbacks.sql. Until
@@ -63,7 +71,12 @@ from urban_rag.envelope_assets import lot_zoning_envelopes
 from urban_rag.frames import write_frame
 from urban_rag.frontage_assets import lot_frontage
 from urban_rag.layers import key_prefix
-from urban_rag.partitions import metric_srid_for, scrape_partitions
+from urban_rag.partitions import (
+    city_of_tile,
+    metric_srid_for_city,
+    tile_partition_of,
+    tile_scrape_partitions,
+)
 from urban_rag.postgis import (
     DEFAULT_SETBACK_BATCH_LOTS,
     DEFAULT_SETBACK_EDGE_TOLERANCE_M,
@@ -78,7 +91,7 @@ from urban_rag.storage import clear_parquet, join
 GROUP = "silver_zoning"
 
 #: The one file a partition is written to, under
-#: `silver/lot_buildable_setbacks/<YYYY-MM-DD>/<neighborhood>/`.
+#: `silver/lot_buildable_setbacks/<YYYY-MM-DD>/<tile>/`.
 LOT_SETBACKS_FILE = "lot_buildable_setbacks.parquet"
 
 
@@ -108,7 +121,7 @@ class SetbackConfig(Config):
     # Not a tuning knob for how fast this runs - the work is the same either
     # way - but for how much of it a dropped connection costs. See
     # `postgis.DEFAULT_SETBACK_BATCH_LOTS`; over an SSM tunnel the unbatched
-    # version could not finish a borough at all.
+    # version could not finish a borough's worth of lots at all.
     batch_lots: int = Field(
         default=DEFAULT_SETBACK_BATCH_LOTS,
         ge=0,
@@ -129,7 +142,7 @@ class SetbackConfig(Config):
 
 @asset(
     key_prefix=key_prefix("lot_buildable_setbacks"),
-    partitions_def=scrape_partitions,
+    partitions_def=tile_scrape_partitions,
     deps=[lot_frontage, lot_zoning_envelopes],
     group_name=GROUP,
     kinds={"postgres", "geoparquet"},
@@ -145,10 +158,11 @@ class SetbackConfig(Config):
         "read. footprint_cap_m2 is the lesser of the buildable envelope and "
         "Taux d'implantation au sol max x lot area, with "
         "footprint_cap_binding naming which one bound. A lot with no frontage "
-        "row has no front edge to sort against and gets no row. Upserted into "
-        "silver.lot_buildable_setbacks on (scrape_date, neighborhood, "
-        "lot_uid, feature_id, column_index) and written to "
-        "silver/lot_buildable_setbacks/<YYYY-MM-DD>/<neighborhood>/"
+        "row has no front edge to sort against and gets no row. Computed for "
+        "the lots one tile owns, sorted against every abutting parcel in the "
+        "snapshot. Upserted into silver.lot_buildable_setbacks on "
+        "(scrape_date, cell_partition, lot_uid, feature_id, column_index) and "
+        f"written to silver/lot_buildable_setbacks/<YYYY-MM-DD>/<tile>/"
         f"{LOT_SETBACKS_FILE}."
     ),
 )
@@ -158,21 +172,19 @@ def lot_buildable_setbacks(
     store: ParquetStore,
     postgis: PostgisResource,
 ) -> MaterializeResult:
-    dimensions = context.partition_key.keys_by_dimension
-    neighborhood = dimensions["neighborhood"]
-    scrape_date = dimensions["date"][:10]
+    tile, scrape_date = tile_partition_of(context)
 
     try:
         with postgis.connect() as connection:
             result = compute_lot_buildable_setbacks(
                 connection,
-                neighborhood=neighborhood,
+                tile=tile,
                 scrape_date=scrape_date,
-                metric_srid=metric_srid_for(neighborhood),
+                metric_srid=metric_srid_for_city(city_of_tile(tile)),
                 edge_tolerance_m=config.edge_tolerance_m,
                 batch_lots=config.batch_lots,
                 resume=config.resume,
-                # A borough is tens of batches over the better part of an hour,
+                # A tile is tens of batches over the better part of an hour,
                 # and each one is a commit. Logging them is what makes a run
                 # that dies halfway legible as "it kept 14 of 13,000 lots"
                 # rather than as silence.
@@ -180,13 +192,13 @@ def lot_buildable_setbacks(
             )
             num_lots = int(result["num_lots"])
             if num_lots == 0:
-                # Not "the borough has no lots": the partition was never
-                # loaded. Raised inside the transaction so the upsert rolls
-                # back with it rather than leaving a partition half replaced.
+                # Not "the tile has no lots": the cadastre was never loaded.
+                # Raised inside the transaction so the upsert rolls back with
+                # it rather than leaving a partition half replaced.
                 raise Failure(
-                    f"rag.lots holds no lot for {neighborhood} {scrape_date} - "
-                    "materialize building_lot_intersections for this partition "
-                    "first."
+                    f"rag.lots holds no lot for tile {tile} {scrape_date} - "
+                    "materialize neighborhood_cadastre for the boroughs this "
+                    "tile covers first."
                 )
             if int(result["num_envelopes"]) == 0:
                 # A different gap from the one above and with a different fix,
@@ -194,21 +206,19 @@ def lot_buildable_setbacks(
                 # table of zero rows. Nothing here can be computed without the
                 # margins, and the margins are the envelope asset's.
                 raise Failure(
-                    f"silver.lot_zoning_envelopes holds no row for "
-                    f"{neighborhood} {scrape_date} - materialize "
+                    f"silver.lot_zoning_envelopes holds no row for tile "
+                    f"{tile} {scrape_date} - materialize "
                     "lot_zoning_envelopes for this partition first."
                 )
             # Inside the transaction that computed it, so the file is that
             # answer rather than whatever a concurrent run leaves behind.
             frame = fetch_lot_buildable_setbacks(
-                connection, neighborhood=neighborhood, scrape_date=scrape_date
+                connection, tile=tile, scrape_date=scrape_date
             )
     except (PostgresUnavailable, MissingRelation) as exc:
         raise Failure(str(exc)) from exc
 
-    output_dir = store.partition_dir(
-        context.asset_key.path[-1], scrape_date, neighborhood
-    )
+    output_dir = store.partition_dir(context.asset_key.path[-1], scrape_date, tile)
     removed = clear_parquet(output_dir)
     if removed:
         context.log.info("Removed %d file(s) from a previous run", len(removed))
@@ -222,7 +232,7 @@ def lot_buildable_setbacks(
         "%s %s: %d envelope(s) across %d lot(s) -> %d row(s), %.1f ha "
         "buildable, mean %.1f pct of lot; %d bound by margins, %d by "
         "coverage -> %s",
-        neighborhood,
+        tile,
         scrape_date,
         int(result["num_envelopes"]),
         lots_measured,
@@ -237,14 +247,14 @@ def lot_buildable_setbacks(
     # A lot whose boundary could not be sorted has no front edge, which for a
     # Montreal parcel means its frontage row is missing rather than that it is
     # interior. A warning and not a Failure, the posture `lot_frontage` takes
-    # towards the same lots: a borough measuring badly is a number to read.
+    # towards the same lots: a tile measuring badly is a number to read.
     unsorted = num_lots - int(result["num_lots_sorted"])
     if unsorted:
         context.log.warning(
             "%s %s: %d of %d lot(s) (%.1f pct) have no measured frontage, so "
             "no front edge to sort a boundary against, and are absent from "
             "this table - re-materialize lot_frontage if the share is large",
-            neighborhood,
+            tile,
             scrape_date,
             unsorted,
             num_lots,
@@ -255,12 +265,12 @@ def lot_buildable_setbacks(
     if not by_rule.get("contigu") and not by_rule.get("jumele"):
         # Every column read as isolated or unknown. Possible in principle and
         # wrong in VSMPE, whose grids print I-J and I-J-C throughout, so it is
-        # surfaced rather than left to look like a borough of detached houses.
+        # surfaced rather than left to look like a tile of detached houses.
         context.log.warning(
             "%s %s: no column read as contiguous or semi-detached - every "
             "side margin was subtracted from both sides. Check "
             "implantation_mode on silver.zoning_grid_columns: %s",
-            neighborhood,
+            tile,
             scrape_date,
             by_rule or "no rows",
         )
@@ -268,6 +278,7 @@ def lot_buildable_setbacks(
     return MaterializeResult(
         metadata={
             "dagster/row_count": rows,
+            "tile": tile,
             "num_rows": rows,
             "num_lots": num_lots,
             "num_lots_measured": lots_measured,
@@ -278,7 +289,7 @@ def lot_buildable_setbacks(
             "num_lots_without_frontage": int(result["lots_without_frontage"]),
             "num_lots_with_envelopes": int(result["num_lots_with_envelopes"]),
             "num_envelopes": int(result["num_envelopes"]),
-            # The headline: which norm actually shapes this borough.
+            # The headline: which norm actually shapes this tile.
             "num_bound_by_setbacks": bound_by_setbacks,
             "num_bound_by_site_coverage": bound_by_coverage,
             "pct_bound_by_setbacks": round(100.0 * bound_by_setbacks / rows, 1)
@@ -293,7 +304,7 @@ def lot_buildable_setbacks(
             "mean_buildable_pct_of_lot": round(
                 result["mean_buildable_pct_of_lot"], 1
             ),
-            # How the borough read under each *Mode d'implantation*. The number
+            # How the tile read under each *Mode d'implantation*. The number
             # that says whether the side rule did what it should - see the
             # warning above.
             "by_side_setback_rule": MetadataValue.json(by_rule),

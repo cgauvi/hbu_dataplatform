@@ -37,6 +37,8 @@ from urban_rag.storage import join
 
 DATE = "2026-08-01"
 NEIGHBORHOOD = "VSMPE"
+#: A VSMPE cell of the cut: the tile the lot chain is partitioned on.
+TILE = "0302303330102"
 
 #: A spread of buildable envelopes, each a shape worth covering rather than a
 #: borough worth sampling. The areas are in square metres and the geometry is
@@ -378,7 +380,7 @@ def write_upstreams(store, *, hbu_rows=None, setback_rows=None, setbacks=True):
     write_frame(
         pd.DataFrame(hbu_rows or [hbu_row(1)]),
         join(
-            store.partition_dir(lot_highest_best_use.key.path[-1], DATE, NEIGHBORHOOD),
+            store.partition_dir(lot_highest_best_use.key.path[-1], DATE, TILE),
             LOT_HBU_FILE,
         ),
     )
@@ -388,7 +390,7 @@ def write_upstreams(store, *, hbu_rows=None, setback_rows=None, setbacks=True):
             envelopes_gdf(rows),
             join(
                 store.partition_dir(
-                    lot_buildable_setbacks.key.path[-1], DATE, NEIGHBORHOOD
+                    lot_buildable_setbacks.key.path[-1], DATE, TILE
                 ),
                 LOT_SETBACKS_FILE,
             ),
@@ -398,7 +400,7 @@ def write_upstreams(store, *, hbu_rows=None, setback_rows=None, setbacks=True):
 def run(store, run_config=None):
     return materialize(
         [lot_building_massing],
-        partition_key=MultiPartitionKey({"date": DATE, "neighborhood": NEIGHBORHOOD}),
+        partition_key=MultiPartitionKey({"date": DATE, "tile": TILE}),
         resources={"store": store, "postgis": PostgisResource()},
         selection=[lot_building_massing],
         run_config=run_config,
@@ -408,7 +410,7 @@ def run(store, run_config=None):
 def read_output(store):
     return gpd.read_parquet(
         join(
-            store.partition_dir(lot_building_massing.key.path[-1], DATE, NEIGHBORHOOD),
+            store.partition_dir(lot_building_massing.key.path[-1], DATE, TILE),
             LOT_MASSING_FILE,
         )
     )
@@ -1104,12 +1106,12 @@ def stub_lots(monkeypatch):
         crs="EPSG:4326",
     )
 
-    def fetch_zone_piece_polygons(connection, *, neighborhood, scrape_date):
+    def fetch_zone_piece_polygons(connection, *, tile, scrape_date):
         if not _PARCELS_FOR_RUN:
             return empty
         return parcels_gdf(_PARCELS_FOR_RUN)
 
-    def fetch_lot_polygons(connection, *, neighborhood, scrape_date):
+    def fetch_lot_polygons(connection, *, tile, scrape_date):
         return empty
 
     monkeypatch.setattr(postgis, "fetch_lot_polygons", fetch_lot_polygons)

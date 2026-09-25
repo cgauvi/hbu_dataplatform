@@ -65,6 +65,8 @@ from urban_rag.storage import join
 
 DATE = "2026-08-01"
 NEIGHBORHOOD = "VSMPE"
+#: A VSMPE cell of the cut: the tile the lot chain is partitioned on.
+TILE = "0302303330102"
 
 
 @pytest.fixture
@@ -109,7 +111,7 @@ def write_envelopes(store, *, lot_numbers=("1", "2"), pct_of_lot=(92.0, 100.0)):
         frame,
         join(
             store.partition_dir(
-                lot_zoning_envelopes.key.path[-1], DATE, NEIGHBORHOOD
+                lot_zoning_envelopes.key.path[-1], DATE, TILE
             ),
             LOT_ENVELOPES_FILE,
         ),
@@ -309,7 +311,7 @@ def stub_postgis(
     def compute_lot_profiles(
         connection,
         *,
-        neighborhood,
+        tile,
         scrape_date,
         max_built_area_m2,
         vacancy_rates=None,
@@ -317,7 +319,7 @@ def stub_postgis(
         construction_costs=None,
         zoning_envelopes=(),
     ):
-        calls["compute"] = (neighborhood, scrape_date, max_built_area_m2)
+        calls["compute"] = (tile, scrape_date, max_built_area_m2)
         calls["vacancy_rates"] = vacancy_rates
         calls["average_rents"] = average_rents
         calls["construction_costs"] = construction_costs
@@ -361,12 +363,14 @@ def stub_postgis(
             "mean_buildable_pct_of_lot": 41.5,
             "has_vacancy_rates": bool(vacancy_rates),
             "has_average_rents": bool(average_rents),
-            "overall_vacancy_rate_pct": (vacancy_rates or {}).get(
-                "overall_vacancy_rate_pct"
-            ),
-            "overall_average_rent_cad": (average_rents or {}).get(
-                "overall_average_rent_cad"
-            ),
+            # Keyed by borough now; the fixture tile holds one, and the real
+            # function flattens the lot's own borough's figure the same way.
+            "overall_vacancy_rate_pct": (
+                (vacancy_rates or {}).get(NEIGHBORHOOD) or {}
+            ).get("overall_vacancy_rate_pct"),
+            "overall_average_rent_cad": (
+                (average_rents or {}).get(NEIGHBORHOOD) or {}
+            ).get("overall_average_rent_cad"),
             "has_construction_costs": bool(construction_costs),
             # Read back out of the table by the real function, so the stub
             # answers from the payload the way the table would: a key the
@@ -417,14 +421,14 @@ def stub_postgis(
             "mean_primary_frontage_m": 12.34,
         }
 
-    def fetch_lot_profiles(connection, *, neighborhood, scrape_date):
-        calls["fetch"] = (neighborhood, scrape_date)
+    def fetch_lot_profiles(connection, *, tile, scrape_date):
+        calls["fetch"] = (tile, scrape_date)
         built = [index < with_building for index in range(num_lots)]
         return gpd.GeoDataFrame(
             {
                 "lot_uid": list(range(1, num_lots + 1)),
                 "lot_number": [str(index) for index in range(1, num_lots + 1)],
-                "neighborhood": [neighborhood] * num_lots,
+                "neighborhood": [NEIGHBORHOOD] * num_lots,
                 "scrape_date": [scrape_date] * num_lots,
                 "lot_area_m2": [400.0] * num_lots,
                 "has_building": built,
@@ -464,7 +468,16 @@ def stub_postgis(
             crs="EPSG:4326",
         )
 
+    def neighborhoods_of_tile(connection, *, tile, scrape_date):
+        # The boroughs the tile's lots belong to: one, the fixture's, which is
+        # where the CMHC files above were written.
+        calls["neighborhoods_of_tile"] = (tile, scrape_date)
+        return (NEIGHBORHOOD,)
+
     monkeypatch.setattr(PostgisResource, "connect", connect)
+    monkeypatch.setattr(
+        lot_profiles_assets, "neighborhoods_of_tile", neighborhoods_of_tile
+    )
     monkeypatch.setattr(
         lot_profiles_assets, "compute_lot_profiles", compute_lot_profiles
     )
@@ -483,7 +496,7 @@ def run(store, **config):
     """
     return materialize(
         [lot_profiles],
-        partition_key=MultiPartitionKey({"date": DATE, "neighborhood": NEIGHBORHOOD}),
+        partition_key=MultiPartitionKey({"date": DATE, "tile": TILE}),
         resources={"store": store, "postgis": PostgisResource()},
         selection=[lot_profiles],
         run_config=(
@@ -498,12 +511,14 @@ def test_the_answer_lands_as_geoparquet_under_gold(store, monkeypatch):
 
     assert run(store).success
 
-    assert calls["compute"] == (NEIGHBORHOOD, DATE, DEFAULT_MAX_BUILT_AREA_M2)
+    assert calls["compute"] == (TILE, DATE, DEFAULT_MAX_BUILT_AREA_M2)
     # Read back out of the same transaction that computed it.
-    assert calls["fetch"] == (NEIGHBORHOOD, DATE)
+    assert calls["fetch"] == (TILE, DATE)
+    # And the boroughs asked for by the tile, before either.
+    assert calls["neighborhoods_of_tile"] == (TILE, DATE)
 
     path = join(
-        store.partition_dir(lot_profiles.key.path[-1], DATE, NEIGHBORHOOD),
+        store.partition_dir(lot_profiles.key.path[-1], DATE, TILE),
         LOT_PROFILES_FILE,
     )
     assert "/gold/lot_profiles/" in path
@@ -527,7 +542,7 @@ def test_every_lot_is_kept_and_the_vacant_ones_are_a_filter(store, monkeypatch):
     assert run(store).success
 
     path = join(
-        store.partition_dir(lot_profiles.key.path[-1], DATE, NEIGHBORHOOD),
+        store.partition_dir(lot_profiles.key.path[-1], DATE, TILE),
         LOT_PROFILES_FILE,
     )
     frame = gpd.read_parquet(path)
@@ -552,7 +567,7 @@ def test_the_lot_carries_its_two_frontages_its_neighborhood_and_its_pdf(
     assert run(store).success
 
     path = join(
-        store.partition_dir(lot_profiles.key.path[-1], DATE, NEIGHBORHOOD),
+        store.partition_dir(lot_profiles.key.path[-1], DATE, TILE),
         LOT_PROFILES_FILE,
     )
     frame = gpd.read_parquet(path)
@@ -625,7 +640,7 @@ def test_the_configured_threshold_reaches_the_query_and_the_metadata(
 
     result = run(store, max_built_area_m2=60.0)
 
-    assert calls["compute"] == (NEIGHBORHOOD, DATE, 60.0)
+    assert calls["compute"] == (TILE, DATE, 60.0)
     metadata = materialization_metadata(result, lot_profiles)
     assert metadata["max_built_area_m2"].value == 60.0
 
@@ -747,13 +762,16 @@ def test_the_cmhc_grid_becomes_one_object_per_borough_not_one_per_lot(
     store, monkeypatch
 ):
     """CMHC surveys neighborhoods and publishes no geometry, so there is
-    nothing per-lot about these and nothing to join them on."""
+    nothing per-lot about these and the one thing to join them on is the
+    lot's own borough: the tile hands over one object per borough it holds."""
     write_partition(store)
     calls = stub_postgis(monkeypatch)
 
     assert run(store).success
 
-    vacancy = calls["vacancy_rates"]
+    assert set(calls["vacancy_rates"]) == {NEIGHBORHOOD}
+    assert set(calls["average_rents"]) == {NEIGHBORHOOD}
+    vacancy = calls["vacancy_rates"][NEIGHBORHOOD]
     assert vacancy["survey_year"] == 2023
     assert vacancy["survey_period"] == "octobre 2023"
     assert vacancy["num_quartiers_mapped"] == 3
@@ -765,7 +783,7 @@ def test_the_cmhc_grid_becomes_one_object_per_borough_not_one_per_lot(
     suppressed = next(c for c in vacancy["cells"] if c["bedroom_type"] == "2_bedroom")
     assert suppressed["vacancy_rate_pct"] is None
 
-    rents = calls["average_rents"]
+    rents = calls["average_rents"][NEIGHBORHOOD]
     assert rents["overall_average_rent_cad"] == pytest.approx(1_275.0)
     assert rents["num_published_cells"] == 1
     assert len(rents["cells"]) == 2
@@ -825,7 +843,7 @@ def test_the_borough_figures_and_the_envelope_counts_reach_the_metadata(
     assert metadata["num_with_zoning_envelopes"].value == 2
     # The symptom worth seeing: a lot no readable grid reaches.
     assert metadata["num_without_zoning_envelopes"].value == 8
-    assert metadata["cmhc_survey_year"].value == 2023
+    assert metadata["cmhc_survey_year"].value == {NEIGHBORHOOD: 2023}
     assert metadata["overall_vacancy_rate_pct"].value == pytest.approx(0.5)
     assert metadata["overall_average_rent_cad"].value == pytest.approx(1_275.0)
     assert metadata["num_cmhc_vacancy_cells"].value == 2

@@ -220,8 +220,9 @@ SQL anti-joins `gold.lot_highest_best_use`, which has every lot and an
 `num_drawn` side by side so the gap is never a surprise.
 
 Nothing is drawn on a street or on a park, and this asset does not decide that:
-`lot_highest_best_use` gives a `road_parcel` and an `equipment_zone` lot no
-program, so both arrive here as `no_program` and never reach a rectangle. The
+`lot_highest_best_use` gives a `road_parcel`, an `equipment_zone` and a
+`single_family_zone` lot no program, so all three arrive here as `no_program`
+and never reach a rectangle. The
 gate is one asset upstream on purpose — a parcel nobody may build on should be
 excluded once, where the reason can be stated, rather than in each of the four
 tables that read the answer.
@@ -229,7 +230,7 @@ tables that read the answer.
 ## Looking at it
 
 ```bash
-make massing DATE=2026-08-24 NEIGHBORHOOD=VSMPE
+make massing DATE=2026-09-01 NEIGHBORHOOD=VSMPE
 ```
 
 needs `hbu` and `setbacks` for the same partition, and the ground the parking

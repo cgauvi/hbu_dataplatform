@@ -58,9 +58,14 @@ from urban_rag.adresses_quebec import (
 from urban_rag.quebec import (
     DEFAULT_BATCH_SIZE as QUEBEC_BATCH_SIZE,
     DEFAULT_GRID_URL as QUEBEC_GRID_URL,
+    DEFAULT_HERITAGE_SERVICE_URL as QUEBEC_HERITAGE_SERVICE_URL,
     DEFAULT_SHEET_URL_TEMPLATE as QUEBEC_SHEET_URL_TEMPLATE,
     DEFAULT_ZONING_LAYER_URL as QUEBEC_ZONING_LAYER_URL,
     QuebecZoningClient,
+)
+from urban_rag.quebec_council import (
+    DEFAULT_LISTING_URL_TEMPLATE as COUNCIL_LISTING_URL_TEMPLATE,
+    CouncilFetcher,
 )
 from urban_rag.saguenay import (
     GRID_PDF_URL as SAGUENAY_GRID_PDF_URL,
@@ -129,12 +134,13 @@ class SpectrumResource(ConfigurableResource):
 
 class ParquetStore(ConfigurableResource):
     """The output tree: medallion layer, then asset, then scrape date, then
-    borough.
+    the spatial partition - a borough on the borough axis, a cut cell on the
+    tile axis (see `urban_rag.partitions`).
 
         <root>/bronze/spectrum_table_catalog/2026-08-20/
         <root>/bronze/neighborhood_features/2026-08-20/VSMPE/
-        <root>/silver/building_lot_intersections/2026-08-20/VSMPE/
-        <root>/gold/lot_profiles/2026-08-20/VSMPE/
+        <root>/silver/building_lot_intersections/2026-08-20/0302303330102/
+        <root>/gold/lot_profiles/2026-08-20/0302303330102/
 
     ``root_dir`` is `output_root()` in the real code location, so the same
     keys address a directory on disk or an ``s3://<S3_BUCKET>/`` prefix.
@@ -149,19 +155,22 @@ class ParquetStore(ConfigurableResource):
     Below the layer, keyed by asset name rather than by source system so that
     every asset owns one prefix: a partition can be listed, copied or dropped
     without touching what another asset wrote for the same day. The keys are
-    bare values rather than hive ``key=value`` pairs, so `neighborhood` and
-    `scrape_date` are written as columns instead of being recovered from the
-    path.
+    bare values rather than hive ``key=value`` pairs, so the partition value
+    and `scrape_date` are written as columns instead of being recovered from
+    the path - which is also why a borough key and a cut cell can share the
+    slot: the file says which it is.
     """
 
     root_dir: str
 
     def partition_dir(
-        self, asset: str, scrape_date: str, neighborhood: str | None = None
+        self, asset: str, scrape_date: str, partition: str | None = None
     ) -> str:
+        """``asset``'s directory for ``scrape_date``, and ``partition`` when
+        the asset has a spatial axis - the borough key or the tile."""
         parts = [str(layer_of(asset)), asset, scrape_date]
-        if neighborhood is not None:
-            parts.append(neighborhood)
+        if partition is not None:
+            parts.append(partition)
         return join(self.root_dir, *parts)
 
     def layer_dir(self, layer: Layer) -> str:
@@ -226,6 +235,13 @@ class QuebecZoningResource(ConfigurableResource):
 
     layer_url: str = QUEBEC_ZONING_LAYER_URL
     grid_url: str = QUEBEC_GRID_URL
+    heritage_service_url: str = Field(
+        default=QUEBEC_HERITAGE_SERVICE_URL,
+        description=(
+            "The heritage feature service; each layer in "
+            "`quebec.HERITAGE_LAYERS` is read as `<url>/<layer id>`."
+        ),
+    )
     sheet_url_template: str = Field(
         default=QUEBEC_SHEET_URL_TEMPLATE,
         description=(
@@ -846,6 +862,42 @@ class PdfCache(ConfigurableResource):
             request_delay_seconds=self.request_delay_seconds,
             max_retries=self.max_retries,
             ca_bundle=self.ca_bundle,
+        )
+
+
+class CouncilMinutesResource(ConfigurableResource):
+    """Quebec City's conseils de quartier: the host that lists their minutes
+    and the pages on the trail from a minute to its decision.
+
+    The PDFs themselves go through `PdfCache`, whose fetcher this one wraps -
+    a filed minute or a sommaire never changes, so it is cached by URL and
+    shared across scrape dates like every other published document. The
+    listing and the consultation fiches are HTML and are read live every
+    time: a fiche gains its report and its adoption date after the assembly.
+    """
+
+    listing_url_template: str = COUNCIL_LISTING_URL_TEMPLATE
+    timeout_seconds: float = 60.0
+    request_delay_seconds: float = Field(
+        default=0.25, description="Pause before every page or download, in seconds."
+    )
+    max_retries: int = 3
+    ca_bundle: str | None = Field(
+        default=None,
+        description=(
+            "PEM bundle to verify TLS against. Defaults to REQUESTS_CA_BUNDLE, "
+            "CURL_CA_BUNDLE or SSL_CERT_FILE, whichever is set."
+        ),
+    )
+
+    def fetcher(self, pdf_fetcher: PdfFetcher) -> CouncilFetcher:
+        return CouncilFetcher(
+            pdf_fetcher,
+            timeout_seconds=self.timeout_seconds,
+            request_delay_seconds=self.request_delay_seconds,
+            max_retries=self.max_retries,
+            ca_bundle=self.ca_bundle,
+            listing_url_template=self.listing_url_template,
         )
 
 

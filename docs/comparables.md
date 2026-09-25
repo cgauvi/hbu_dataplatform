@@ -14,8 +14,8 @@ money for this lot*, and there are exactly two ways to ask:
 `gold.lot_profiles`.
 
 ```bash
-make comparables DATE=2026-08-26 NEIGHBORHOOD=VSMPE
-make comparables DATE=2026-08-26 NEIGHBORHOOD=VSMPE OPEX=0.40 K_COMPARABLES=12
+make comparables DATE=2026-09-01 NEIGHBORHOOD=VSMPE
+make comparables DATE=2026-09-01 NEIGHBORHOOD=VSMPE OPEX=0.40 K_COMPARABLES=12
 ```
 
 The arithmetic is in [`urban_rag.comparables`](../src/urban_rag/comparables.py),
@@ -211,11 +211,16 @@ That asymmetry is the point: it is what values a vacant parcel off the built
 ones around it. `num_candidates` is reported per run, so a thin pool is visible
 rather than inferred.
 
-**The pool is this borough.** `lot_assessed_values` is partitioned by borough,
-so the valued lots available as comparables are the ones in the same partition,
-and a parcel on the boundary draws its neighbours from its own side of it. That
-is a limitation of how the upstream is partitioned rather than a modelling
-choice.
+**The pool is the snapshot.** The asset runs per cell of the tile cut, and
+its candidates are every valued lot of the scrape date within reach of the
+cell: the cell's own lots plus the `silver.lot_assessed_values` rows inside
+the cell's envelope widened by `max_distance_m` - the one bound that cannot
+change the answer, since a comparable further than that is never scored. A
+parcel on a borough line draws its neighbours from both sides of it, which it
+could not while the upstream was partitioned by borough. `num_halo_candidates`
+counts the ones from outside the cell. It follows that `lot_assessed_values`
+has to have run for every cell in reach before this one runs; the schedule
+leaves forty minutes between them for that reason.
 
 **The search is exact and quadratic, in chunks.** No tree and no spatial
 pre-filter: the composite metric is not the one a KD-tree would index, and

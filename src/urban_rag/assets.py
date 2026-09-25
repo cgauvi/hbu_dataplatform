@@ -47,13 +47,20 @@ from urban_rag.partitions import (
 from urban_rag import saguenay
 from urban_rag.saguenay import SaguenayZoningError
 from urban_rag.quebec import (
+    FICHE_URL_COLUMN,
     GRID_SLUG,
     GRID_URL_COLUMN,
     GRID_ZONE_COLUMN,
+    HERITAGE_ID_COLUMN,
+    HERITAGE_LAYERS,
     ZONE_CODE_FIELD,
     ZONING_SLUG,
+    QuebecZoningClient,
     QuebecZoningError,
     borough_prefix,
+    coded_values,
+    fiche_url_for,
+    label_coded_values,
     read_zoning_grid,
 )
 from urban_rag.resources import (
@@ -154,8 +161,11 @@ def spectrum_table_catalog(
         "reprojected to EPSG:4326 by the service; tables without geometry land "
         "as plain parquet. A Montreal borough is every table under its "
         "Spectrum namespace; a Quebec City borough is the city's 'Zonage en "
-        f"vigueur' layer clipped to its outline ({ZONING_SLUG}) and the "
-        f"specification-grid rows for those zones ({GRID_SLUG})."
+        f"vigueur' layer clipped to its outline ({ZONING_SLUG}), the "
+        f"specification-grid rows for those zones ({GRID_SLUG}) and the city's "
+        "heritage layers (Patrimoine__*): studied buildings with their grade, "
+        "the cited, classified and designated immovables, the heritage sites "
+        "and their protection areas."
     ),
 )
 @guard_current_scrape_month
@@ -393,10 +403,34 @@ def _quebec_features(
         basename(grid_path),
     )
 
+    heritage = _quebec_heritage(
+        context,
+        client.on_layer(quebec_zoning.heritage_service_url),
+        esri_polygon(boundary),
+        output_dir,
+        provenance,
+    )
+    invalid += heritage["invalid"]
+
     return MaterializeResult(
         metadata={
             "dagster/row_count": len(zones),
-            "num_tables_written": 2,
+            "num_tables_written": 2 + len(heritage["written"]),
+            "num_heritage_tables_written": len(heritage["written"]),
+            "num_heritage_tables_failed": len(heritage["failed"]),
+            "heritage_rows_per_table": MetadataValue.md(
+                _markdown_table(
+                    f"Heritage rows per table — {neighborhood} {scrape_date}",
+                    ("table", "rows"),
+                    [(t, str(n)) for t, n in heritage["written"].items()],
+                )
+            ),
+            **(
+                {"heritage_failures": MetadataValue.json(heritage["failed"])}
+                if heritage["failed"]
+                else {}
+            ),
+            "heritage_url": MetadataValue.url(quebec_zoning.heritage_service_url),
             "num_zones": len(zones),
             "num_zone_codes": len(codes),
             "num_grid_rows": len(borough_grid),
@@ -420,6 +454,65 @@ def _quebec_features(
             "sheet_url_template": quebec_zoning.sheet_url_template,
         }
     )
+
+
+def _quebec_heritage(
+    context: AssetExecutionContext,
+    service: QuebecZoningClient,
+    boundary: dict,
+    output_dir: str,
+    provenance: dict,
+) -> dict:
+    """Quebec City's heritage layers inside one borough, one parquet each.
+
+    Bounded by the outline the way the zones are, so a building on the line
+    is in both partitions. Each row keeps the layer's fields as published and
+    gains three things: the coded fields' labels beside their codes (the grade
+    is a code, and two of its six codes are not grades - see
+    `quebec.UNGRADED_CODES`), the row's id under `quebec.HERITAGE_ID_COLUMN`
+    so the layer reaches `silver.lot_features`, and for a studied building the
+    fiche it is described on.
+
+    One unreadable layer is skipped and reported rather than costing the
+    borough its zoning, as a Montreal borough skips an unreadable Spectrum
+    table.
+    """
+    written: dict[str, int] = {}
+    failed: dict[str, str] = {}
+    invalid_total = 0
+    for layer in HERITAGE_LAYERS:
+        reader = service.on_layer(f"{service.layer_url}/{layer.layer_id}")
+        try:
+            labels = coded_values(reader.layer_metadata())
+            features = list(reader.fetch_zones(reader.zone_ids(boundary)))
+        except QuebecZoningError as exc:
+            failed[layer.slug] = str(exc)
+            context.log.warning("%s: skipped (%s)", layer.slug, exc)
+            continue
+        if not features:
+            context.log.info("%s: no rows inside the borough", layer.slug)
+            continue
+
+        frame = features_to_frame(
+            features, extra_columns={"source_table": layer.slug, **provenance}
+        )
+        if layer.id_field not in frame.columns:
+            failed[layer.slug] = f"no {layer.id_field} field"
+            context.log.warning("%s: skipped (no %s)", layer.slug, layer.id_field)
+            continue
+        frame = label_coded_values(frame, labels)
+        frame[HERITAGE_ID_COLUMN] = frame[layer.id_field].astype("Int64").astype(str)
+        if layer.id_field == "NO_SEQ":
+            frame[FICHE_URL_COLUMN] = [fiche_url_for(v) for v in frame["NO_SEQ"]]
+
+        path = write_frame(frame, join(output_dir, f"{layer.slug}.parquet"))
+        written[layer.slug] = len(frame)
+        invalid = count_invalid_geometries(frame)
+        if invalid:
+            invalid_total += invalid
+            context.log.warning("%s: %d invalid geometr(ies)", layer.slug, invalid)
+        context.log.info("%s: %d rows -> %s", layer.slug, len(frame), basename(path))
+    return {"written": written, "failed": failed, "invalid": invalid_total}
 
 
 def _saguenay_features(

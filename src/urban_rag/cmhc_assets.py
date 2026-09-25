@@ -62,7 +62,14 @@ from urban_rag.cmhc import (
 )
 from urban_rag.frames import write_frame
 from urban_rag.layers import key_prefix
-from urban_rag.partitions import CMHC_CENTRES, cmhc_centre_for, date_partitions, quartiers_for, scrape_partitions
+from urban_rag.partitions import (
+    CMHC_CENTRES,
+    borough_partition_of,
+    cmhc_centre_for,
+    date_partitions,
+    quartiers_for,
+    scrape_partitions,
+)
 from urban_rag.rag.pgvector import PostgresUnavailable
 from urban_rag.resources import CmhcResource, ParquetStore, PostgisResource
 from urban_rag.storage import clear_parquet, filesystem, join, storage_options
@@ -349,7 +356,7 @@ def vacancy_rates(
     store: ParquetStore,
     postgis: PostgisResource,
 ) -> MaterializeResult:
-    neighborhood, scrape_date = _borough_partition(context)
+    neighborhood, scrape_date = borough_partition_of(context)
     quartiers = quartiers_for(neighborhood)
 
     survey = _read_bronze(
@@ -457,7 +464,7 @@ def average_rents(
     store: ParquetStore,
     postgis: PostgisResource,
 ) -> MaterializeResult:
-    neighborhood, scrape_date = _borough_partition(context)
+    neighborhood, scrape_date = borough_partition_of(context)
     quartiers = quartiers_for(neighborhood)
 
     survey = _read_bronze(
@@ -538,11 +545,6 @@ def average_rents(
 # --------------------------------------------------------------------------
 
 
-def _borough_partition(context: AssetExecutionContext) -> tuple[str, str]:
-    dimensions = context.partition_key.keys_by_dimension
-    return dimensions["neighborhood"], dimensions["date"][:10]
-
-
 def _partition_dir(
     context: AssetExecutionContext,
     store: ParquetStore,
@@ -582,7 +584,7 @@ def _publish(
         return publish(
             postgis.connect,
             datasets,
-            neighborhood=neighborhood,
+            partition=neighborhood,
             scrape_date=scrape_date,
         )
     except (PostgresUnavailable, MissingRelation) as exc:
@@ -647,6 +649,24 @@ def _borough_rows(
     # here. None of the mapped names is "Total" anyway, so this only guards
     # against a future one that is.
     published_rows = survey[survey["quartier"] != TOTAL_LABEL]
+
+    # A centre this snapshot does not carry *at all* is not a drifted
+    # crosswalk. HMIP serves no average-rent table for Saguenay - see
+    # `cmhc.CMHC_GEOGRAPHY_IDS`, which walked every id and found 21 published
+    # metropolitan areas without it - so `cmhc_rent_survey` skips that centre
+    # with a warning and none of its rows reach here. Its boroughs price their
+    # dwellings off the vacancy survey and the roll instead, which is what
+    # that comment says they do; failing here would make an absence the
+    # pipeline already decided to tolerate fatal one layer later, and would
+    # block the partition over a rent nothing downstream requires -
+    # `lot_assessment_comparables` reads a missing rent as None by design.
+    # Bronze being empty outright is still a `Failure`, raised in
+    # `_read_bronze` before this. A centre that publishes *some* of its
+    # quartiers and not others falls through to the rename guard below.
+    if published_rows.empty:
+        empty = published_rows.copy()
+        empty["quartier"] = empty["quartier"].astype("string")
+        return empty
 
     keys = {normalize_quartier(q): q for q in quartiers}
     published_keys = published_rows["quartier"].map(normalize_quartier)

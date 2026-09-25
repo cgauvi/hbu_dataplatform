@@ -26,6 +26,7 @@ from urban_rag.aggregate_assets import map_cell_aggregates
 from urban_rag.assets import neighborhood_features, spectrum_table_catalog
 from urban_rag.bdoi_assets import neighborhood_buildings
 from urban_rag.building_lots_assets import building_lot_intersections
+from urban_rag.cadastre_assets import neighborhood_cadastre
 from urban_rag.cmhc_assets import (
     average_rents,
     cmhc_rent_survey,
@@ -59,9 +60,17 @@ from urban_rag.lot_profiles_assets import lot_profiles
 from urban_rag.massing_assets import lot_building_massing
 from urban_rag.open_data_assets import reference_neighborhoods, street_network
 from urban_rag.partitions import (
+    TILE_DIMENSION,
     date_partitions,
     enabled_neighborhoods,
     scrape_partitions,
+    tile_partitions,
+    tile_scrape_partitions,
+)
+from urban_rag.council_assets import (
+    council_minutes,
+    council_minutes_documents,
+    council_planning_items,
 )
 from urban_rag.rag_assets import (
     document_chunks,
@@ -73,6 +82,7 @@ from urban_rag.resources import (
     AdressesQuebecResource,
     BdoiResource,
     CmhcResource,
+    CouncilMinutesResource,
     CrspiResource,
     CubfResource,
     EmbeddingModel,
@@ -119,6 +129,8 @@ ASSETS = [
     street_network,
     neighborhood_addresses,
     linked_documents,
+    council_minutes,
+    council_minutes_documents,
     montreal_residential_costs,
     montreal_nonresidential_costs,
     property_assessment_roll,
@@ -133,12 +145,14 @@ ASSETS = [
     commercial_rents,
     vacancy_rates,
     average_rents,
+    neighborhood_cadastre,
     building_lot_intersections,
     neighborhood_streets,
     lot_addresses,
     lot_frontage,
     document_chunks,
     document_embeddings,
+    council_planning_items,
     zoning_grid_columns,
     lot_zone_pieces,
     lot_zoning_envelopes,
@@ -240,21 +254,37 @@ buildings_job = define_asset_job(
     partitions_def=scrape_partitions,
 )
 
+# The hop from the borough axis to the tile axis. A borough is what a
+# publisher answers for, so the three bronze snapshots above are per borough;
+# a tile is what a computation is run over, so everything from
+# `building_lot_intersections` down is per cell of the cut. This is the one
+# job on the borough axis that writes to Postgres: it lands the borough's
+# cadastre in `rag.*` with each row's `cell_key` and `cell_partition`, and
+# reports which tiles it touched - which is the list of tile runs that have
+# to follow it, because a reload remints `lot_uid` and cascades into every
+# one of them.
+cadastre_job = define_asset_job(
+    "neighborhood_cadastre_job",
+    selection=AssetSelection.assets(neighborhood_cadastre),
+    partitions_def=scrape_partitions,
+)
+
 building_lots_job = define_asset_job(
     "building_lot_intersections_job",
     selection=AssetSelection.assets(building_lot_intersections),
-    partitions_def=scrape_partitions,
+    partitions_def=tile_scrape_partitions,
 )
 
 lot_profiles_job = define_asset_job(
     "lot_profiles_job",
     selection=AssetSelection.assets(lot_profiles),
-    partitions_def=scrape_partitions,
+    partitions_def=tile_scrape_partitions,
 )
 
 # The RQTT is one 390 MB download for the whole province, so DATE only -
-# same posture as reference_neighborhoods and the two CMHC surveys. The borough
-# axis appears one asset later, in neighborhood_streets.
+# same posture as reference_neighborhoods and the two CMHC surveys. The tile
+# axis appears one asset later, in neighborhood_streets, which keeps the
+# sides whose midpoint falls in the cell - whole, not clipped.
 street_network_job = define_asset_job(
     "street_network_job",
     selection=AssetSelection.assets(street_network),
@@ -264,7 +294,7 @@ street_network_job = define_asset_job(
 neighborhood_streets_job = define_asset_job(
     "neighborhood_streets_job",
     selection=AssetSelection.assets(neighborhood_streets),
-    partitions_def=scrape_partitions,
+    partitions_def=tile_scrape_partitions,
 )
 
 # The assessment roll is one 572 MB download for the whole province, so DATE
@@ -272,7 +302,8 @@ neighborhood_streets_job = define_asset_job(
 # snapshot and the merge that makes it usable share a run: neither is
 # borough-shaped, the merge is a few seconds over a file the snapshot has just
 # written, and a day whose points landed without their characteristics is a day
-# with a table nothing can read. The borough axis appears one asset later, in
+# with a table nothing can read. The borough axis appears in the same run, in
+# `assessment_units`' per-borough partitions; the tile axis one asset later, in
 # lot_assessed_values.
 #
 # `cubf_use_codes` rides along for the same reason rather than getting a
@@ -293,7 +324,7 @@ assessment_roll_job = define_asset_job(
 lot_assessed_values_job = define_asset_job(
     "lot_assessed_values_job",
     selection=AssetSelection.assets(lot_assessed_values),
-    partitions_def=scrape_partitions,
+    partitions_def=tile_scrape_partitions,
 )
 
 # Both commercial-rent snapshots in one run, for the reason the two CMHC
@@ -315,20 +346,20 @@ commercial_rents_job = define_asset_job(
 
 # Its own job rather than a place in `lot_assessed_values_job`, though it reads
 # that job's output and re-derives the placement behind it: the neighbour
-# search is a borough-wide pass whose whole shape is set by config nothing
-# upstream shares - k, the radius, the weights - and re-scoring the borough
+# search is a pass over the cell whose whole shape is set by config nothing
+# upstream shares - k, the radius, the weights - and re-scoring the cell
 # after a change to those should not re-total the roll to do it. The same split
 # `lot_buildable_setbacks_job` makes behind `zoning_envelopes_job`.
 lot_assessment_comparables_job = define_asset_job(
     "lot_assessment_comparables_job",
     selection=AssetSelection.assets(lot_assessment_comparables),
-    partitions_def=scrape_partitions,
+    partitions_def=tile_scrape_partitions,
 )
 
 lot_frontage_job = define_asset_job(
     "lot_frontage_job",
     selection=AssetSelection.assets(lot_frontage),
-    partitions_def=scrape_partitions,
+    partitions_def=tile_scrape_partitions,
 )
 
 # Its own job rather than a place in `zoning_envelopes_job`, though it reads
@@ -340,7 +371,7 @@ lot_frontage_job = define_asset_job(
 lot_buildable_setbacks_job = define_asset_job(
     "lot_buildable_setbacks_job",
     selection=AssetSelection.assets(lot_buildable_setbacks),
-    partitions_def=scrape_partitions,
+    partitions_def=tile_scrape_partitions,
 )
 
 # The two CMHC surveys are read once per scrape date, not once per borough:
@@ -397,7 +428,7 @@ average_rents_job = define_asset_job(
 lot_zone_pieces_job = define_asset_job(
     "lot_zone_pieces_job",
     selection=AssetSelection.assets(lot_zone_pieces),
-    partitions_def=scrape_partitions,
+    partitions_def=tile_scrape_partitions,
 )
 
 # The addresses, in two jobs rather than one. The fetch is a few minutes of
@@ -414,17 +445,27 @@ neighborhood_addresses_job = define_asset_job(
 lot_addresses_job = define_asset_job(
     "lot_addresses_job",
     selection=AssetSelection.assets(lot_addresses),
+    partitions_def=tile_scrape_partitions,
+)
+
+# The grids, kept off the corpus job: they are parsed from the PDFs that job
+# already downloaded, and re-reading them as tables is cheap enough to re-run
+# on its own whenever the parser changes - which it will, for as long as the
+# boroughs keep publishing their own templates. On the borough axis, because a
+# grid is a property of a by-law and a by-law is a borough's.
+zoning_grid_columns_job = define_asset_job(
+    "zoning_grid_columns_job",
+    selection=AssetSelection.assets(zoning_grid_columns),
     partitions_def=scrape_partitions,
 )
 
-# The envelope pair, kept off the corpus job: the grids are parsed from the
-# PDFs that job already downloaded, and re-reading them as tables is cheap
-# enough to re-run on its own whenever the parser changes - which it will, for
-# as long as the boroughs keep publishing their own templates.
+# The envelopes, on the tile axis behind them: a join of the cell's zone pieces
+# to whichever boroughs' grids those pieces fall under. Two jobs where there
+# was one because the two assets no longer share a partition key.
 zoning_envelopes_job = define_asset_job(
     "zoning_envelopes_job",
-    selection=AssetSelection.assets(zoning_grid_columns, lot_zoning_envelopes),
-    partitions_def=scrape_partitions,
+    selection=AssetSelection.assets(lot_zoning_envelopes),
+    partitions_def=tile_scrape_partitions,
 )
 
 
@@ -438,7 +479,7 @@ zoning_envelopes_job = define_asset_job(
 lot_development_programs_job = define_asset_job(
     "lot_development_programs_job",
     selection=AssetSelection.assets(lot_development_programs),
-    partitions_def=scrape_partitions,
+    partitions_def=tile_scrape_partitions,
 )
 
 # The two gold assets in one run, and not with the solve above: choosing among
@@ -451,7 +492,7 @@ lot_development_programs_job = define_asset_job(
 lot_hbu_job = define_asset_job(
     "lot_hbu_job",
     selection=AssetSelection.assets(lot_highest_best_use, lot_redevelopment_gap),
-    partitions_def=scrape_partitions,
+    partitions_def=tile_scrape_partitions,
 )
 
 # Its own job rather than a place in `lot_hbu_job`, though it reads that job's
@@ -464,7 +505,7 @@ lot_hbu_job = define_asset_job(
 lot_massing_job = define_asset_job(
     "lot_massing_job",
     selection=AssetSelection.assets(lot_building_massing),
-    partitions_def=scrape_partitions,
+    partitions_def=tile_scrape_partitions,
 )
 
 # Its own job rather than a place in `lot_hbu_job`, though it reads that
@@ -501,13 +542,25 @@ map_tiles_job = define_asset_job(
 lot_opportunities_job = define_asset_job(
     "lot_opportunities_job",
     selection=AssetSelection.assets(lot_investment_opportunities),
-    partitions_def=scrape_partitions,
+    partitions_def=tile_scrape_partitions,
 )
 
 rag_corpus_job = define_asset_job(
     "rag_corpus_job",
     selection=AssetSelection.assets(
         linked_documents, document_chunks, document_embeddings
+    ),
+    partitions_def=scrape_partitions,
+)
+
+# The conseils de quartier minutes, the documents they trail to, and the
+# planning items read out of both. Its own job rather than part of the corpus:
+# it reads a Quebec City institution the other two cities do not have, and
+# nothing downstream of the corpus depends on it yet.
+council_minutes_job = define_asset_job(
+    "council_minutes_job",
+    selection=AssetSelection.assets(
+        council_minutes, council_minutes_documents, council_planning_items
     ),
     partitions_def=scrape_partitions,
 )
@@ -532,6 +585,24 @@ def _scrape_month(context: ScheduleEvaluationContext) -> str:
     has to land on the same partition, and `.replace(day=1)` is what says so.
     """
     return context.scheduled_execution_time.replace(day=1).strftime("%Y-%m-%d")
+
+
+def _tile_requests(prefix: str, scrape_date: str):
+    """One `RunRequest` per cell of the cut, for a job on the tile axis.
+
+    The tile axis is static - every cell of `urban_rag.tile_cut.CUT` - so
+    there is no instance to ask, unlike `enabled_neighborhoods`. A cell no
+    borough has been loaded into yet runs and computes over nothing, which is
+    a cheap run rather than a wrong one; the cut only ever holds cells that
+    had lots when it was seeded.
+    """
+    for tile in tile_partitions.get_partition_keys():
+        yield RunRequest(
+            run_key=f"{prefix}-{tile}-{scrape_date}",
+            partition_key=MultiPartitionKey(
+                {"date": scrape_date, TILE_DIMENSION: tile}
+            ),
+        )
 
 
 @schedule(
@@ -620,29 +691,22 @@ def monthly_assessment_roll_schedule(context: ScheduleEvaluationContext) -> RunR
 
 @schedule(
     job=lot_assessed_values_job,
-    # After assessment_units (52 4) and neighborhood_lots (40 5), which supply
-    # the two sides of the join. Behind the cadastre rather than beside it: the
-    # lots are what the units are placed on, and a borough whose cadastre has
-    # not landed would value nothing.
+    # After assessment_units (52 4) and neighborhood_cadastre (0 7), which
+    # supply the two sides of the join. Behind the cadastre rather than beside
+    # it: the lots are read out of rag.lots now, not out of a borough's
+    # parquet, and a cell whose boroughs have not landed would value nothing.
     #
     # Scheduled, unlike `lot_frontage` and `lot_profiles`: this asset also
     # upserts into silver.lot_assessed_values, but hbu_infra's
     # sql/013_silver_lot_assessed_values.sql carries no `-- requires:` header,
     # so it lands on the *first* `db.py init` - the same footing
     # `neighborhood_streets` and the CMHC pair are on.
-    cron_schedule="30 6 1 * *",
+    cron_schedule="40 7 1 * *",
     execution_timezone=TIMEZONE,
-    description="Total this month's assessment roll onto every enabled borough's lots.",
+    description="Total this month's assessment roll onto the lots of every cell of the cut.",
 )
 def monthly_lot_assessed_values_schedule(context: ScheduleEvaluationContext):
-    scrape_date = _scrape_month(context)
-    for neighborhood in enabled_neighborhoods(context.instance):
-        yield RunRequest(
-            run_key=f"lot-assessed-values-{neighborhood}-{scrape_date}",
-            partition_key=MultiPartitionKey(
-                {"date": scrape_date, "neighborhood": neighborhood}
-            ),
-        )
+    yield from _tile_requests("lot-assessed-values", _scrape_month(context))
 
 
 @schedule(
@@ -686,31 +750,28 @@ def monthly_commercial_rents_schedule(context: ScheduleEvaluationContext):
 
 @schedule(
     job=lot_assessment_comparables_job,
-    # Ten minutes behind lot_assessed_values (30 6), which supplies the lot
-    # geometry and the two totals, and well behind the CMHC pair (55 5, 58 5),
-    # which supplies the rent and the vacancy the income is priced at. Last of
-    # the assessment lineage, and the one gold reads after it.
+    # Forty minutes behind lot_assessed_values (40 7), which supplies the lot
+    # geometry and the two totals - and not ten, as it used to be: the pool a
+    # cell's comparables are drawn from is every valued lot of the snapshot in
+    # reach, which is other cells' runs of that job, so all of them have to
+    # have landed rather than just this cell's. Well behind the CMHC pair
+    # (55 5, 58 5), which supplies the rent and the vacancy the income is
+    # priced at. Last of the assessment lineage, and the one gold reads after
+    # it.
     #
     # Scheduled for the reason lot_assessed_values is: hbu_infra's
     # sql/016_silver_lot_assessment_comparables.sql carries no `-- requires:`
     # header, so the table lands on the first `db.py init` rather than waiting
     # on a corpus the way sql/006 does.
-    cron_schedule="40 6 1 * *",
+    cron_schedule="20 8 1 * *",
     execution_timezone=TIMEZONE,
     description=(
-        "Price this month's roll onto every enabled borough's lots and find each "
-        "lot's comparables."
+        "Price this month's roll onto the lots of every cell of the cut and find "
+        "each lot's comparables."
     ),
 )
 def monthly_lot_assessment_comparables_schedule(context: ScheduleEvaluationContext):
-    scrape_date = _scrape_month(context)
-    for neighborhood in enabled_neighborhoods(context.instance):
-        yield RunRequest(
-            run_key=f"lot-comparables-{neighborhood}-{scrape_date}",
-            partition_key=MultiPartitionKey(
-                {"date": scrape_date, "neighborhood": neighborhood}
-            ),
-        )
+    yield from _tile_requests("lot-comparables", _scrape_month(context))
 
 
 @schedule(
@@ -752,25 +813,42 @@ def monthly_buildings_schedule(context: ScheduleEvaluationContext):
 
 
 @schedule(
-    job=building_lots_job,
+    job=cadastre_job,
     # An hour behind lots/buildings/features, which it depends on for the same
     # partition - long enough for all three to clear a borough's worth of rows.
     cron_schedule="0 7 1 * *",
     execution_timezone=TIMEZONE,
     description=(
-        "Recompute the building x lot and lot x feature joins for every "
-        "enabled neighborhood."
+        "Land every enabled borough's cadastre in rag.lots/buildings/features, "
+        "addressed to the cells of the cut."
     ),
 )
-def monthly_building_lots_schedule(context: ScheduleEvaluationContext):
+def monthly_cadastre_schedule(context: ScheduleEvaluationContext):
     scrape_date = _scrape_month(context)
     for neighborhood in enabled_neighborhoods(context.instance):
         yield RunRequest(
-            run_key=f"building-lots-{neighborhood}-{scrape_date}",
+            run_key=f"cadastre-{neighborhood}-{scrape_date}",
             partition_key=MultiPartitionKey(
                 {"date": scrape_date, "neighborhood": neighborhood}
             ),
         )
+
+
+@schedule(
+    job=building_lots_job,
+    # Twenty minutes behind the cadastre (0 7): the joins read rag.lots, and a
+    # cell straddling two boroughs needs both of them landed. The first job on
+    # the tile axis, so the first that runs once per cell of the cut rather
+    # than once per borough.
+    cron_schedule="20 7 1 * *",
+    execution_timezone=TIMEZONE,
+    description=(
+        "Recompute the building x lot and lot x feature joins for every cell "
+        "of the cut."
+    ),
+)
+def monthly_building_lots_schedule(context: ScheduleEvaluationContext):
+    yield from _tile_requests("building-lots", _scrape_month(context))
 
 
 @schedule(
@@ -868,22 +946,15 @@ def monthly_average_rents_schedule(context: ScheduleEvaluationContext):
 @schedule(
     job=neighborhood_streets_job,
     # After street_network (50 4) and reference_neighborhoods (40 4), which
-    # supply the island-wide layer and the boundary it is cut with. Ahead of
-    # monthly_building_lots_schedule rather than behind the cadastre: the two
-    # share no input.
+    # supply the province-wide layer and the outlines a side's borough is read
+    # off. Ahead of monthly_building_lots_schedule rather than behind the
+    # cadastre: the two share no input.
     cron_schedule="20 6 1 * *",
     execution_timezone=TIMEZONE,
-    description="Cut this month's road network into every enabled borough.",
+    description="Keep this month's road network, whole, per cell of the cut.",
 )
 def monthly_neighborhood_streets_schedule(context: ScheduleEvaluationContext):
-    scrape_date = _scrape_month(context)
-    for neighborhood in enabled_neighborhoods(context.instance):
-        yield RunRequest(
-            run_key=f"neighborhood-streets-{neighborhood}-{scrape_date}",
-            partition_key=MultiPartitionKey(
-                {"date": scrape_date, "neighborhood": neighborhood}
-            ),
-        )
+    yield from _tile_requests("neighborhood-streets", _scrape_month(context))
 
 
 # Every scheduled silver asset above now publishes to Postgres as well as to
@@ -985,6 +1056,7 @@ defs = Definitions(
         reference_neighborhoods_job,
         lots_job,
         buildings_job,
+        cadastre_job,
         building_lots_job,
         lot_profiles_job,
         street_network_job,
@@ -998,6 +1070,7 @@ defs = Definitions(
         neighborhood_addresses_job,
         lot_addresses_job,
         lot_zone_pieces_job,
+        zoning_grid_columns_job,
         zoning_envelopes_job,
         lot_buildable_setbacks_job,
         lot_development_programs_job,
@@ -1026,6 +1099,7 @@ defs = Definitions(
         monthly_commercial_rents_schedule,
         monthly_lots_schedule,
         monthly_buildings_schedule,
+        monthly_cadastre_schedule,
         monthly_building_lots_schedule,
         monthly_cmhc_survey_schedule,
         monthly_construction_costs_schedule,
@@ -1060,6 +1134,9 @@ defs = Definitions(
             # Always local: it is a cache keyed by URL, not pipeline output.
             cache_dir=str(DATA_ROOT / "cache" / "pdf"),
         ),
+        # The conseils de quartier listing host and the fiche pages; its PDFs
+        # share `pdf_cache` above, since a filed minute never changes either.
+        "council_minutes_source": CouncilMinutesResource(),
         "bdoi": BdoiResource(
             # Same posture as pdf_cache: a published BDOI extract never
             # changes, so it is cached once, outside the partition tree, and

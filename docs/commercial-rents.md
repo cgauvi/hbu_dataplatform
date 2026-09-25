@@ -17,9 +17,9 @@ overstated a Villeray dépanneur by roughly three times, straight into every
 `cap_rate_pct` in [comparables.md](comparables.md).
 
 ```bash
-make rent-sources DATE=2026-08-26
-make commercial-rents DATE=2026-08-26 NEIGHBORHOOD=VSMPE
-make commercial-rents DATE=2026-08-26 NEIGHBORHOOD=VSMPE RETAIL_BASE=24.0
+make rent-sources DATE=2026-09-01
+make commercial-rents DATE=2026-09-01 NEIGHBORHOOD=VSMPE
+make commercial-rents DATE=2026-09-01 NEIGHBORHOOD=VSMPE RETAIL_BASE=24.0
 ```
 
 ## Two publishers, because neither is enough alone

@@ -87,6 +87,7 @@ from urban_rag.storage import join
 
 DATE = "2026-08-01"
 NEIGHBORHOOD = "VSMPE"
+TILE = "0302303330102"
 ROLL_YEAR = 2026
 
 
@@ -846,6 +847,26 @@ def published(monkeypatch):
     return stub_publish(monkeypatch, comparables_assets)
 
 
+@pytest.fixture(autouse=True)
+def halo(monkeypatch):
+    """The lots in reach the tile does not own, as the table would return them.
+
+    Empty unless a test fills `halo["lots"]`. Records the envelope it was
+    asked for, so a test can check the read is bounded by the radius.
+    """
+    record: dict[str, object] = {"lots": None, "calls": []}
+
+    def fetch(connection, *, tile, scrape_date, radius_m):
+        record["calls"].append((tile, scrape_date, radius_m))
+        lots = record["lots"]
+        if lots is None:
+            return gpd.GeoDataFrame({"NO_LOT": []}, geometry=[], crs="EPSG:4326")
+        return lots
+
+    monkeypatch.setattr(comparables_assets, "_fetch_candidates", fetch)
+    return record
+
+
 #: The five lots the asset fixtures are built from, each the only one
 #: exercising its case:
 #:
@@ -906,6 +927,9 @@ def write_lot_values(store, *, lots=None) -> None:
             "total_assessed_value": [totals.get(lot) for lot in lots],
             "total_assessed_value_apportioned": [totals.get(lot) for lot in lots],
             "roll_year": [ROLL_YEAR] * len(lots),
+            "neighborhood": [NEIGHBORHOOD] * len(lots),
+            "cell_key": [TILE + "00000"] * len(lots),
+            "cell_partition": [TILE] * len(lots),
         },
         geometry=[_cell(lot) for lot in lots],
         crs="EPSG:4326",
@@ -914,7 +938,7 @@ def write_lot_values(store, *, lots=None) -> None:
         frame,
         join(
             store.partition_dir(
-                lot_assessed_values.key.path[-1], DATE, NEIGHBORHOOD
+                lot_assessed_values.key.path[-1], DATE, TILE
             ),
             LOT_VALUES_FILE,
         ),
@@ -1053,7 +1077,7 @@ def borough(store):
 def run(store, **config):
     return materialize(
         [lot_assessment_comparables],
-        partition_key=MultiPartitionKey({"date": DATE, "neighborhood": NEIGHBORHOOD}),
+        partition_key=MultiPartitionKey({"date": DATE, "tile": TILE}),
         resources={"store": store, "postgis": PostgisResource()},
         run_config=(
             {"ops": {"silver__lot_assessment_comparables": {"config": config}}}
@@ -1067,7 +1091,7 @@ def written(store) -> gpd.GeoDataFrame:
     return gpd.read_parquet(
         Path(
             store.partition_dir(
-                lot_assessment_comparables.key.path[-1], DATE, NEIGHBORHOOD
+                lot_assessment_comparables.key.path[-1], DATE, TILE
             )
         )
         / LOT_COMPARABLES_FILE
@@ -1208,7 +1232,7 @@ def test_the_frame_that_was_written_is_the_frame_that_is_published(borough, publ
     run(borough)
 
     assert published["calls"] == 1
-    assert published["partition"] == (NEIGHBORHOOD, DATE)
+    assert published["partition"] == (TILE, DATE)
     assert set(published["datasets"]) == {"lot_assessment_comparables"}
     assert len(published["datasets"]["lot_assessment_comparables"]) == len(_LOTS)
 
@@ -1339,3 +1363,115 @@ def test_the_curve_and_the_age_travel_in_the_assumptions():
 def test_a_negative_premium_is_refused_by_the_assumptions():
     with pytest.raises(ValueError, match="maintenance_premium_per_year"):
         IncomeAssumptions(maintenance_premium_per_year=-0.01)
+
+
+# -- the tile axis: the pool is the snapshot --------------------------------
+
+#: A valued triplex just east of the fixture tile's lots, written by another
+#: tile - or another borough. Nearer to LOT_TRIPLEX_B than LOT_TRIPLEX_A is,
+#: and identical to it, so it is the one to prove the halo is searched.
+LOT_HALO = "2 000 001"
+
+
+def halo_lots() -> gpd.GeoDataFrame:
+    """The halo as `silver.lot_assessed_values` hands it back."""
+    x, y = -73.59945, 45.5000
+    return gpd.GeoDataFrame(
+        {
+            "NO_LOT": [LOT_HALO],
+            "neighborhood": ["RPP"],
+            "cell_key": ["0302303330102200000"],
+            "cell_partition": ["03023033301022"],
+            "num_assessment_units": [0],
+            "num_shared_units": [0],
+            "num_units_by_point": [0],
+            "total_assessed_value": pd.array([1_000_000.0], dtype="Float64"),
+            "total_assessed_value_apportioned": pd.array(
+                [1_000_000.0], dtype="Float64"
+            ),
+            "roll_year": [ROLL_YEAR],
+        },
+        geometry=[box(x - 0.0001, y - 0.0001, x + 0.0001, y + 0.0001)],
+        crs="EPSG:4326",
+    )
+
+
+def test_a_lot_in_reach_but_outside_the_tile_is_a_candidate_and_not_a_row(
+    borough, halo
+):
+    """The pool no longer stops at the partition: a lot across a cell edge or
+    a borough line is compared against, and is not this tile's to write."""
+    halo["lots"] = halo_lots()
+
+    result = run(borough)
+
+    frame = written(borough)
+    assert LOT_HALO not in frame.index
+    names = [
+        entry["lot_number"]
+        for entry in json.loads(frame.loc[LOT_TRIPLEX_B, "comparables"])["neighbors"]
+    ]
+    assert LOT_HALO in names
+    metadata = materialization_metadata(result, lot_assessment_comparables)
+    # The tile's four valued lots and the halo's one.
+    assert metadata["num_candidates"].value == 5
+    assert metadata["num_halo_candidates"].value == 1
+    assert metadata["num_lots"].value == len(_LOTS)
+
+
+def test_the_pool_read_is_bounded_by_the_search_radius(borough, halo):
+    run(borough, max_distance_m=750.0)
+
+    assert halo["calls"] == [(TILE, DATE, 750.0)]
+
+
+def test_the_tile_envelope_widened_by_the_radius_contains_the_reach():
+    """At least the radius on every side, so no comparable can fall outside."""
+    from urban_rag import tile_grid
+
+    west, south, east, north = tile_grid.tile_bounds(
+        *tile_grid.cell_of_quadkey(TILE)
+    )
+    w, s, e, n = comparables_assets.tile_envelope(TILE, 2_000.0)
+    assert s == pytest.approx(south - 2_000.0 / 111_320.0)
+    assert n == pytest.approx(north + 2_000.0 / 111_320.0)
+    # A degree of longitude is under 111 km off the equator, so the east-west
+    # margin is wider than the north-south one.
+    assert west - w > south - s
+    assert e - east > n - north
+
+
+def test_a_lot_is_priced_by_its_own_boroughs_rents(borough, store):
+    """A tile holding two boroughs charges each lot its own CMHC rent."""
+    lots_path = Path(
+        store.partition_dir(lot_assessed_values.key.path[-1], DATE, TILE)
+    ) / LOT_VALUES_FILE
+    lots = gpd.read_parquet(lots_path)
+    lots.loc[lots["NO_LOT"] == LOT_TRIPLEX_B, "neighborhood"] = "RPP"
+    write_frame(lots, str(lots_path))
+    for asset, name in (
+        (average_rents, AVERAGE_RENTS_FILE),
+        (vacancy_rates, VACANCY_FILE),
+        (commercial_rents, COMMERCIAL_RENTS_FILE),
+    ):
+        source = Path(store.partition_dir(asset.key.path[-1], DATE, NEIGHBORHOOD))
+        frame = pd.read_parquet(source / name)
+        if asset is average_rents:
+            frame.loc[frame["bedroom_type"] == "all", "average_rent_cad"] = 2_000.0
+        write_frame(
+            frame, join(store.partition_dir(asset.key.path[-1], DATE, "RPP"), name)
+        )
+
+    result = run(borough)
+
+    frame = written(borough)
+    assert json.loads(frame.loc[LOT_TRIPLEX_A, "income_assumptions"])[
+        "average_rent_cad"
+    ] == 1_200.0
+    assert json.loads(frame.loc[LOT_TRIPLEX_B, "income_assumptions"])[
+        "average_rent_cad"
+    ] == 2_000.0
+    assert frame.loc[LOT_TRIPLEX_B, "neighborhood"] == "RPP"
+    metadata = materialization_metadata(result, lot_assessment_comparables)
+    assert metadata["neighborhoods"].value == f"RPP, {NEIGHBORHOOD}"
+    assert metadata["tile"].value == TILE

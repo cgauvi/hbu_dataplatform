@@ -103,12 +103,11 @@ dollars per square metre, which is the only thing a neighbour is consulted for.
 That asymmetry is the point - it is what lets a vacant parcel be valued off the
 built ones around it.
 
-**The pool is this borough.** `lot_assessed_values` is partitioned by borough,
-so the lots with values attached are the ones in the partition being computed,
-and a parcel on the boundary draws its comparables from its own side of it.
-That is a limitation of how the upstream is partitioned rather than a modelling
-choice, and `num_candidates` travels in the metadata so a thin pool is visible
-rather than inferred.
+**The pool is whatever the caller hands in.** The asset hands in the valued
+lots of its cell plus every valued lot within the search radius of it, read
+from the whole snapshot, so a parcel on a borough line draws its comparables
+from both sides of it - see `urban_rag.comparables_assets`. `num_candidates`
+travels in the metadata so a thin pool is visible rather than inferred.
 
 **The search is exact and quadratic, in chunks.** No tree and no spatial
 pre-filter: the composite metric is not the one a KD-tree would index, and

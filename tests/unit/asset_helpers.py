@@ -19,7 +19,8 @@ def stub_publish(monkeypatch, module, *, pruned: int = 0) -> dict[str, object]:
     checking offline is which datasets it publishes and what it hands over, so
     the call is recorded and the counts are made up.
 
-    Returns the record: `{"datasets": {name: frame}, "partition": (nb, date)}`,
+    Returns the record: `{"datasets": {name: frame}, "partition": (key, date)}`
+    - the key being the borough or the tile the asset published under -
     filled in when the asset calls through. `PostgisResource.connect` is
     patched on the class rather than on an instance because Dagster rebuilds
     the resource before the run.
@@ -30,10 +31,10 @@ def stub_publish(monkeypatch, module, *, pruned: int = 0) -> dict[str, object]:
     def connect(self):
         yield object()
 
-    def publish(connect_fn, datasets, *, neighborhood, scrape_date):
+    def publish(connect_fn, datasets, *, partition, scrape_date):
         seen["calls"] += 1
         seen["datasets"] = dict(datasets)
-        seen["partition"] = (neighborhood, scrape_date)
+        seen["partition"] = (partition, scrape_date)
         return {
             name: {
                 "copied": len(frame),

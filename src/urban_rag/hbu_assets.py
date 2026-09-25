@@ -2,9 +2,10 @@
 
 Three assets over one question. `urban_rag.program` has been able to answer it
 for one parcel since it was written; what was missing was anything that asked
-it for a borough, and anything that put the answer beside what is standing on
-the ground today. `urban_rag.hbu` is the arithmetic, free of Dagster the way
-`comparables` and `role_foncier` are; this module is the partition handling.
+it for a tile of the cut, and anything that put the answer beside what is
+standing on the ground today. `urban_rag.hbu` is the arithmetic, free of
+Dagster the way `comparables` and `role_foncier` are; this module is the
+partition handling.
 
 **`lot_development_programs`** solves. One row per (lot, grid column) that
 authorises dwellings and that `zoning_grid_columns` could turn into a
@@ -20,17 +21,20 @@ a maximisation over the candidates: the maximisation is inside `solve_program`,
 over the mix, and picking the highest-earning *column* would be reporting a
 building under rules the parcel may not be built to. Every lot the envelopes
 reach keeps a row, and `hbu_status` says why the ones without a program have
-none - including the two kinds of parcel that are not development sites at
-all: `road_parcel`, which the roll files under a CUBF road code, and
+none - including the kinds of parcel that are not development sites at all:
+`road_parcel`, which the roll files under a CUBF road code, and
 `equipment_zone`, whose governing zone authorises only *Équipements
-collectifs*.
+collectifs*. And one kind that is a site, just not a rental one:
+`single_family_zone`, zoned for one dwelling, which `lot_development_programs`
+leaves out of the solve rather than price a house as a one-unit rental - so
+unlike a road parcel it costs no CP-SAT run at all.
 
 It is the road gate that gives this asset its one non-zoning input,
 `lot_assessment_comparables`, and reading the roll here rather than one asset
 earlier is the whole of the reason the gate is a *choice* and not a filter on
 the solve. `dominant_use_code` is a column of the comparables lineage, and
 putting it upstream would make `ComparablesConfig.operating_expense_ratio`
-re-solve a borough - exactly what the split below exists to prevent. A road
+re-solve a tile - exactly what the split below exists to prevent. A road
 parcel is therefore solved and then not chosen, which costs one CP-SAT run per
 street and keeps the two lineages apart.
 
@@ -43,18 +47,25 @@ and the reconciliation between a monthly development objective and an annual
 stabilised income is the whole substance of `hbu.use_gap`.
 
 **Why three assets and not one.** They cost different things and change for
-different reasons. Solving a borough is tens of thousands of CP-SAT models and
+different reasons. Solving a tile is tens of thousands of CP-SAT models and
 is the expensive step; choosing among the answers is a sort; comparing them
 against the roll is a join. A change to `ComparablesConfig.operating_expense_ratio`
-should not re-solve a borough to see its effect, and a change to
+should not re-solve a tile to see its effect, and a change to
 `stalls_per_dwelling` should re-solve without touching the assessment lineage.
 It is the same split `lot_assessment_comparables` makes behind
 `lot_assessed_values`, and `lot_buildable_setbacks` behind `zoning_envelopes_job`.
 
-**What none of them read is Postgres.** Every input is a parquet partition this
-platform already writes - the envelopes, the setbacks, the two CMHC grids, the
-comparables - so the work here is five reads, a solve and two joins. The three
-tables they *write* are hbu_infra's (sql/017, sql/018, sql/019), and until
+**Two axes meet here, and the join between them is the lot's borough.** The
+three assets run per tile of the cut, and so does everything in the lot chain
+they read - the envelopes, the setbacks, the comparables, the road lots - each
+from its parquet at the same tile. CMHC's two grids and Cushman & Wakefield's
+rents are published per borough and stay on that axis, so a tile reads them
+once per borough its lots belong to and prices each lot at its own borough's
+rows: a tile straddling a borough line solves its two sides at two rent lists,
+and `program_assumptions` says which on every row. Which boroughs those are is
+the one thing asked of Postgres before the solve - `neighborhoods_of_tile`, off
+`rag.lots` - beside the parcel shapes the yard is measured on. The three tables
+the assets *write* are hbu_infra's (sql/017, sql/018, sql/019), and until
 `db.py init` has applied them the assets fail naming the file, the same way
 `lot_frontage` and `lot_profiles` do. The parquet is written before the publish,
 so a database that is down costs a re-run of the load rather than of the solve.
@@ -66,11 +77,15 @@ from datetime import datetime, timezone
 
 import pandas as pd
 from dagster import (
+    AssetDep,
     AssetExecutionContext,
     Config,
+    DimensionPartitionMapping,
     Failure,
+    IdentityPartitionMapping,
     MaterializeResult,
     MetadataValue,
+    MultiPartitionMapping,
     asset,
 )
 from pydantic import Field
@@ -92,7 +107,11 @@ from urban_rag.hbu import (
     ENHANCEMENT_COLUMNS,
     FUTURE_COLUMNS,
     HBU_STATUSES,
+    PRICED_BEDROOM_TYPES,
+    CANDIDATE_COLUMNS,
+    PROGRAM_COLUMNS,
     cadastral_road_lots,
+    candidate_envelopes,
     EnhancementRules,
     investment_assumptions_of,
     operating_expense_ratio_of,
@@ -100,14 +119,16 @@ from urban_rag.hbu import (
     ProgramAssumptions,
     road_parcel_lots,
     select_highest_best_use,
+    single_family_zone_pieces,
     solve_enhancements,
     solve_envelopes,
     three_futures,
+    UnitEconomics,
     unit_economics,
     use_gap,
 )
 from urban_rag.layers import key_prefix
-from urban_rag.partitions import scrape_partitions
+from urban_rag.partitions import tile_partition_of, tile_scrape_partitions
 from urban_rag.program import (
     ConstructionCosts,
     InvestmentAssumptions,
@@ -126,16 +147,26 @@ SILVER_GROUP = "silver_hbu"
 GOLD_GROUP = "gold_hbu"
 
 #: One file per partition, under
-#: `silver/lot_development_programs/<YYYY-MM-DD>/<neighborhood>/`.
+#: `silver/lot_development_programs/<YYYY-MM-DD>/<tile>/`.
 LOT_PROGRAMS_FILE = "lot_development_programs.parquet"
 
 #: One file per partition, under
-#: `gold/lot_highest_best_use/<YYYY-MM-DD>/<neighborhood>/`.
+#: `gold/lot_highest_best_use/<YYYY-MM-DD>/<tile>/`.
 LOT_HBU_FILE = "lot_highest_best_use.parquet"
 
 #: One file per partition, under
-#: `gold/lot_redevelopment_gap/<YYYY-MM-DD>/<neighborhood>/`.
+#: `gold/lot_redevelopment_gap/<YYYY-MM-DD>/<tile>/`.
 LOT_GAP_FILE = "lot_redevelopment_gap.parquet"
+
+#: How a tile asset depends on a borough-axis one. The `date` dimension maps
+#: one to one and the borough dimension is left unlisted, which Dagster reads
+#: as every partition of it - the bridge between the two axes: a tile's rents
+#: are its boroughs' rents, and which boroughs those are is not something a
+#: partition mapping can know. `neighborhoods_of_tile` is what does, at run
+#: time, and every read of a borough-axis input goes through it.
+_BOROUGH_BRIDGE = MultiPartitionMapping(
+    {"date": DimensionPartitionMapping("date", IdentityPartitionMapping())}
+)
 
 #: The columns of `lot_buildable_setbacks` this reads: the grain, and the one
 #: measurement. `footprint_cap_m2` is deliberately *not* among them -
@@ -171,6 +202,10 @@ _GAP_OUTPUT_COLUMNS = (
     "feature_id",
     "lot_number",
     "neighborhood",
+    # The lot's cell and cut cell, off the HBU row: the table is partitioned
+    # on the second, and the frame has to carry the lot's own.
+    "cell_key",
+    "cell_partition",
     "scrape_date",
     "lot_area_m2",
     "piece_area_m2",
@@ -391,10 +426,10 @@ class ProgramConfig(Config):
             "Asking rent per square foot per YEAR, gross. Annual because that "
             "is how commercial leasing is quoted; the dwelling rent beside it "
             "is monthly because that is how CMHC surveys one. None - the "
-            "default - reads the borough's own surveyed retail rate off "
-            "silver/commercial_rents for the partition, falling back to "
-            "urban_rag.program's stated constant where that asset has not "
-            "run; a number here overrides both."
+            "default - reads each lot's own borough's surveyed retail rate "
+            "off silver/commercial_rents, falling back to urban_rag.program's "
+            "stated constant where that asset has not run for the borough; a "
+            "number here overrides both, on every borough of the tile."
         ),
     )
     industrial_rent_per_sqft_year_cad: float | None = Field(
@@ -558,12 +593,13 @@ class ProgramConfig(Config):
         upstream distinguishes. That is `urban_rag.program`'s own default,
         stated here rather than silently inherited.
 
-        ``surveyed_rents`` is the borough's `commercial_rents` partition as a
-        ``{rent_class: rent_psf_cad}`` map. Retail stands in for the solver's
-        one commercial rate - the ground-floor space a mixed-use column in
-        this borough actually means, not an office tower - and industrial for
-        industrial. A rate stated in the config wins over the survey; the
-        module constant is the floor under both.
+        ``surveyed_rents`` is one borough's `commercial_rents` partition as a
+        ``{rent_class: rent_psf_cad}`` map, so this is called once per borough
+        of the tile and the object it returns is that borough's. Retail
+        stands in for the solver's one commercial rate - the ground-floor
+        space a mixed-use column in the borough actually means, not an office
+        tower - and industrial for industrial. A rate stated in the config
+        wins over the survey; the module constant is the floor under both.
         """
         commercial_rent = self.commercial_rent_per_sqft_year_cad
         if commercial_rent is None:
@@ -622,21 +658,28 @@ class ProgramConfig(Config):
 
 @asset(
     key_prefix=key_prefix("lot_development_programs"),
-    partitions_def=scrape_partitions,
+    partitions_def=tile_scrape_partitions,
     deps=[
         lot_zoning_envelopes,
         lot_buildable_setbacks,
-        vacancy_rates,
-        average_rents,
-        commercial_rents,
+        # The three rent inputs are published per borough and read per
+        # borough of the tile - see `_BOROUGH_BRIDGE`.
+        AssetDep(vacancy_rates, partition_mapping=_BOROUGH_BRIDGE),
+        AssetDep(average_rents, partition_mapping=_BOROUGH_BRIDGE),
+        AssetDep(commercial_rents, partition_mapping=_BOROUGH_BRIDGE),
     ],
     group_name=SILVER_GROUP,
     kinds={"ortools", "postgres", "parquet"},
     description=(
         "What may profitably be built under every zoning envelope of one "
-        "borough: one row per (lot, grid column) that authorises dwellings, "
+        "tile of the cut: one row per (lot, grid column) that authorises dwellings, "
         "commerce or industry and that the grid parser could turn into a "
         "solver input, each the answer to one urban_rag.program CP-SAT run. "
+        "A piece zoned for one dwelling and nothing else priced - Montreal's "
+        "H.1, a Quebec grid printing one logement - is not solved at all "
+        "(num_single_family_pieces): the objective is a rental building's and "
+        "under that cap can only propose one rental unit, so "
+        "lot_highest_best_use reports those pieces single_family_zone. "
         "Carries the mix of dwellings by CMHC bedroom class, the storeys "
         "split into residential, commercial and industrial, the underground "
         "levels and the plate they are dug at (underground_plate_m2, bounded "
@@ -661,15 +704,17 @@ class ProgramConfig(Config):
         "build, and the discounted net profit (npv_cad) that is the "
         "objective - the stabilised NOI discounted over the hold plus the "
         "discounted sale, less the capital - with the legacy monthly NOI "
-        "restated beside it. Commerce and industry are priced at the "
-        "borough's surveyed rents (silver/commercial_rents) where that "
-        "partition exists. binding names the caps the answer is pressed "
+        "restated beside it. Commerce and industry are priced at the lot's "
+        "own borough's surveyed rents (silver/commercial_rents) where that "
+        "borough's partition exists, and the dwellings at its CMHC rent - a "
+        "tile straddling a borough line solves each side at its own rates. "
+        "binding names the caps the answer is pressed "
         "against and unpriced_types the bedroom classes CMHC suppressed. A "
         "candidate the solver refuses keeps its row with its status; one "
         "whose model could not be built keeps its row with solve_error. "
         "Written to silver/lot_development_programs/"
-        f"<YYYY-MM-DD>/<neighborhood>/{LOT_PROGRAMS_FILE} and upserted into "
-        "silver.lot_development_programs on (scrape_date, neighborhood, "
+        f"<YYYY-MM-DD>/<tile>/{LOT_PROGRAMS_FILE} and upserted into "
+        "silver.lot_development_programs on (scrape_date, cell_partition, "
         "lot_uid, feature_id, column_index)."
     ),
 )
@@ -679,90 +724,83 @@ def lot_development_programs(
     store: ParquetStore,
     postgis: PostgisResource,
 ) -> MaterializeResult:
-    neighborhood, scrape_date = _partition(context)
+    tile, scrape_date = tile_partition_of(context)
     envelopes = _read(
         store,
         lot_zoning_envelopes,
         LOT_ENVELOPES_FILE,
-        neighborhood=neighborhood,
+        partition=tile,
         scrape_date=scrape_date,
     )
     if envelopes.empty:
         raise Failure(
-            f"{lot_zoning_envelopes.key.path[-1]} holds no envelope for "
-            f"{neighborhood} {scrape_date}; there is nothing to solve."
+            f"{lot_zoning_envelopes.key.path[-1]} holds no envelope for tile "
+            f"{tile} {scrape_date}; there is nothing to solve."
         )
-    envelopes = _with_buildable_area(context, store, envelopes, neighborhood, scrape_date)
-    envelopes, plates = _with_placeable_area(
-        context, store, envelopes, neighborhood, scrape_date
-    )
-    envelopes = _with_parkable_area(
-        context, postgis, envelopes, neighborhood, scrape_date, plates=plates
-    )
-
-    economics, suppressed = unit_economics(
-        _read(
+    # Narrowed to what will be solved *before* the three measurements below,
+    # which are this asset's setup cost - a rectangle fitted per envelope and a
+    # yard opened per piece - and were being paid on every house lot of a
+    # suburb only for `solve_envelopes` to discard it. See
+    # `hbu.single_family_zone_pieces` for which pieces those are.
+    num_envelopes = len(envelopes)
+    single_family = single_family_zone_pieces(envelopes)
+    envelopes = candidate_envelopes(envelopes)
+    if envelopes.empty and single_family:
+        # A tile of nothing but house lots - most of a suburb's cells. Its
+        # partition is written empty rather than failed, so the HBU downstream
+        # still gives every piece its row and its reason.
+        return _no_programs(
+            context,
             store,
-            average_rents,
-            AVERAGE_RENTS_FILE,
-            neighborhood=neighborhood,
+            postgis,
+            tile=tile,
             scrape_date=scrape_date,
-        ),
-        _read(
-            store,
-            vacancy_rates,
-            VACANCY_FILE,
-            neighborhood=neighborhood,
-            scrape_date=scrape_date,
-        ),
-    )
-    if len(suppressed) == len(("studio", "1_bedroom", "2_bedroom", "3_bedroom_plus")):
-        # Not raised: a borough CMHC published nothing for is a fact about the
-        # survey, and the envelopes are still worth solving - every program
-        # comes back empty with all four classes in `unpriced_types`, which is
-        # an answer a reader can act on. Warned once, here, rather than left to
-        # be inferred from a borough of zeros.
-        context.log.warning(
-            "%s %s: CMHC published no rent for any bedroom class, so every "
-            "program will be empty - see unpriced_types on each row",
-            neighborhood,
-            scrape_date,
+            num_envelopes=num_envelopes,
+            num_single_family=len(single_family),
         )
-    elif suppressed:
-        context.log.info(
-            "%s %s: CMHC suppressed %s; the solver will not build %s",
-            neighborhood,
-            scrape_date,
-            ", ".join(suppressed),
-            "them" if len(suppressed) > 1 else "it",
-        )
-
-    surveyed = _surveyed_commercial_rents(context, store, neighborhood, scrape_date)
-    assumptions = config.assumptions(surveyed_rents=surveyed)
-    frame = solve_envelopes(envelopes, economics, assumptions=assumptions)
-    if frame.empty:
+    if envelopes.empty:
         raise Failure(
-            f"{neighborhood} {scrape_date}: none of the {len(envelopes)} "
+            f"tile {tile} {scrape_date}: none of the {num_envelopes} "
             "envelope row(s) authorises a dwelling and parses into a solver "
             "input, so no program can be stated. Check "
             "num_residential_not_solver_ready on zoning_grid_columns."
         )
-    # The assumptions travel with the answer, the rule every stated assumption
-    # in this platform follows: a program means nothing without the building it
-    # was designed as, and a table written at one set of rates cannot be read
-    # back against another.
-    frame["program_assumptions"] = json.dumps(
-        assumptions.as_metadata(), ensure_ascii=False
+    envelopes = _with_buildable_area(context, store, envelopes, tile, scrape_date)
+    envelopes, plates = _with_placeable_area(context, store, envelopes, tile, scrape_date)
+    envelopes = _with_parkable_area(
+        context, postgis, envelopes, tile, scrape_date, plates=plates
     )
-    frame["neighborhood"] = neighborhood
+
+    # The rents are per borough, and a tile may hold several: each lot is
+    # priced at its own borough's rows, which is what the grouping in
+    # `_solve_by_borough` is for. Asked of Postgres before the solve rather
+    # than read off the envelopes, because `rag.lots` is what the tile's rows
+    # were fetched under and a set that disagrees with the file is a stale
+    # file worth hearing about.
+    neighborhoods = _neighborhoods_of_tile(postgis, tile, scrape_date)
+    priced = _borough_economics(context, store, neighborhoods, scrape_date)
+    surveyed = {
+        neighborhood: _surveyed_commercial_rents(context, store, neighborhood, scrape_date)
+        for neighborhood in neighborhoods
+    }
+    frame, assumptions = _solve_by_borough(
+        context, envelopes, priced, surveyed, config, scrape_date=scrape_date
+    )
+    if frame.empty:
+        raise Failure(
+            f"tile {tile} {scrape_date}: none of the {num_envelopes} "
+            "envelope row(s) authorises a dwelling and parses into a solver "
+            "input, so no program can be stated. Check "
+            "num_residential_not_solver_ready on zoning_grid_columns."
+        )
     frame["scrape_date"] = scrape_date
     frame["computed_at"] = datetime.now(timezone.utc).isoformat()
 
-    path = _write(context, store, frame, LOT_PROGRAMS_FILE, neighborhood, scrape_date)
+    path = _write(context, store, frame, LOT_PROGRAMS_FILE, tile, scrape_date)
     loaded = _publish(
         postgis,
         {"lot_development_programs": frame},
-        neighborhood=neighborhood,
+        partition=tile,
         scrape_date=scrape_date,
         path=path,
     )
@@ -770,12 +808,14 @@ def lot_development_programs(
     solved = frame[frame["solved"]]
     optimal = int((frame["status"] == "OPTIMAL").sum())
     context.log.info(
-        "%s %s: %d of %d envelope row(s) solvable -> %d program(s) on %d "
-        "lot(s), %d solved (%d optimal), %d dwelling(s), %.1f ha of floor -> %s",
-        neighborhood,
+        "tile %s %s: %d of %d envelope row(s) solvable (%d single-family "
+        "piece(s) not solved) -> %d program(s) on %d lot(s), %d solved (%d "
+        "optimal), %d dwelling(s), %.1f ha of floor -> %s",
+        tile,
         scrape_date,
-        len(frame),
         len(envelopes),
+        num_envelopes,
+        len(single_family),
         len(frame),
         int(frame["lot_uid"].nunique()),
         len(solved),
@@ -788,18 +828,25 @@ def lot_development_programs(
     return MaterializeResult(
         metadata={
             "dagster/row_count": len(frame),
-            "num_envelopes": len(envelopes),
+            "tile": tile,
+            "neighborhoods": ", ".join(neighborhoods),
+            "num_envelopes": num_envelopes,
             "num_candidates": len(frame),
-            # An envelope row that is not a candidate authorises no dwelling or
-            # did not parse. The first is ordinary - a Commerce column - and the
-            # second is the symptom worth seeing, which zoning_grid_columns
-            # reports from its own side.
-            "num_envelopes_not_candidates": len(envelopes) - len(frame),
+            # An envelope row that is not a candidate authorises nothing the
+            # solver prices, did not parse, or belongs to a single-family
+            # piece. The first is ordinary - an Equipements column - the second
+            # is the symptom worth seeing, which zoning_grid_columns reports
+            # from its own side, and the third is counted on its own below.
+            "num_envelopes_not_candidates": num_envelopes - len(envelopes),
+            # Pieces zoned for one dwelling and nothing else priced, left out
+            # of the solve on purpose - `hbu.single_family_zone_pieces`. The
+            # count of work this run did not do.
+            "num_single_family_pieces": len(single_family),
             "num_lots": int(frame["lot_uid"].nunique()),
             "num_solved": len(solved),
             "num_optimal": optimal,
             # Feasible-but-not-optimal, or unknown: both mean max_seconds was
-            # reached. A handful is fine, a third of the borough is a time
+            # reached. A handful is fine, a third of the tile is a time
             # limit set too low.
             "num_not_optimal": len(solved) - optimal,
             "num_infeasible": int(
@@ -813,7 +860,7 @@ def lot_development_programs(
             "num_parking_waived": int(
                 solved["parking_waived"].fillna(False).astype(bool).sum()
             ),
-            # What the parking earns over the borough.
+            # What the parking earns over the tile.
             "total_rented_stalls": int(solved["rented_stalls"].sum()),
             "annual_parking_revenue_millions": round(
                 float(solved["annual_parking_gross_revenue_cad"].sum()) / 1e6, 3
@@ -831,7 +878,7 @@ def lot_development_programs(
             # almost entirely - a dwelling may only cellar where the grid marks
             # *Inferieurs au RDC* (91 of Villeray's 1 555 columns) and even
             # there does not pay for itself at the module's own rates, so a
-            # borough reporting `total_basement_dwellings` above zero is one
+            # tile reporting `total_basement_dwellings` above zero is one
             # where a rent or a cost moved. See
             # `program.BELOW_GRADE_RENT_DISCOUNT_PCT` for how close that call
             # is and `program.BASEMENT_LEVELS` for the permission.
@@ -843,7 +890,7 @@ def lot_development_programs(
             "num_with_buildable_area": int(frame["buildable_area_m2"].notna().sum()),
             # Rows the setbacks asset has not measured are capped on Taux
             # d'implantation alone, which overstates a shallow parcel. Under a
-            # few percent is ordinary; the whole borough means that asset has
+            # few percent is ordinary; the whole tile means that asset has
             # not run for this partition.
             "num_without_buildable_area": int(frame["buildable_area_m2"].isna().sum()),
             # The yard's *shape*, measured off the cadastre. A row without it
@@ -877,9 +924,86 @@ def lot_development_programs(
             "total_monthly_noi_millions": round(
                 float(solved["monthly_net_operating_income_cad"].sum()) / 1e6, 2
             ),
-            "unpriced_bedroom_types": MetadataValue.json(list(suppressed)),
+            # Both keyed by borough, because both are: a tile on a borough
+            # line was solved at two rent lists, and one flat object would
+            # have to pick one of them to report.
+            "unpriced_bedroom_types": MetadataValue.json(
+                {
+                    neighborhood: list(suppressed)
+                    for neighborhood, (_, suppressed) in priced.items()
+                }
+            ),
             "binding_caps": MetadataValue.json(_binding_counts(solved)),
-            "program_assumptions": MetadataValue.json(assumptions.as_metadata()),
+            "program_assumptions": MetadataValue.json(
+                {
+                    neighborhood: stated.as_metadata()
+                    for neighborhood, stated in assumptions.items()
+                }
+            ),
+            "output_path": MetadataValue.path(str(path)),
+            **published_metadata(loaded),
+        }
+    )
+
+
+def _no_programs(
+    context: AssetExecutionContext,
+    store: ParquetStore,
+    postgis: PostgisResource,
+    *,
+    tile: str,
+    scrape_date: str,
+    num_envelopes: int,
+    num_single_family: int,
+) -> MaterializeResult:
+    """An empty partition for a tile whose every candidate piece is a house lot.
+
+    Written and published rather than skipped: the file is what
+    `lot_highest_best_use` reads, and the publish is what prunes the programs
+    an earlier run solved on these pieces out of the warehouse. What the empty
+    file costs is `program_assumptions` - there is no row to stamp it on - so
+    the tile's HBU rows carry none and the gap prices the standing buildings at
+    `InvestmentAssumptions`' module defaults, which are the config's defaults.
+    """
+    frame = pd.DataFrame(
+        columns=list(
+            dict.fromkeys(
+                [
+                    *CANDIDATE_COLUMNS,
+                    *PROGRAM_COLUMNS,
+                    "program_assumptions",
+                    "scrape_date",
+                    "computed_at",
+                ]
+            )
+        )
+    )
+    path = _write(context, store, frame, LOT_PROGRAMS_FILE, tile, scrape_date)
+    loaded = _publish(
+        postgis,
+        {"lot_development_programs": frame},
+        partition=tile,
+        scrape_date=scrape_date,
+        path=path,
+    )
+    context.log.info(
+        "tile %s %s: all %d candidate piece(s) are single-family, so nothing "
+        "was solved -> %s",
+        tile,
+        scrape_date,
+        num_single_family,
+        path,
+    )
+    return MaterializeResult(
+        metadata={
+            "dagster/row_count": 0,
+            "tile": tile,
+            "num_envelopes": num_envelopes,
+            "num_candidates": 0,
+            "num_envelopes_not_candidates": num_envelopes,
+            "num_single_family_pieces": num_single_family,
+            "num_lots": 0,
+            "num_solved": 0,
             "output_path": MetadataValue.path(str(path)),
             **published_metadata(loaded),
         }
@@ -888,7 +1012,7 @@ def lot_development_programs(
 
 @asset(
     key_prefix=key_prefix("lot_highest_best_use"),
-    partitions_def=scrape_partitions,
+    partitions_def=tile_scrape_partitions,
     deps=[
         lot_development_programs,
         lot_zoning_envelopes,
@@ -896,7 +1020,7 @@ def lot_development_programs(
         # says a parcel is a street rather than a site. It is a dependency of
         # the *choice* and not of the solve on purpose - see the module
         # docstring - so a change to ComparablesConfig re-runs a join and a
-        # sort here rather than a borough of CP-SAT models upstream.
+        # sort here rather than a tile of CP-SAT models upstream.
         lot_assessment_comparables,
         # The other half of that same question, and the half the roll cannot
         # answer: the parcels a geobase double side runs inside, which is what
@@ -908,7 +1032,8 @@ def lot_development_programs(
     group_name=GOLD_GROUP,
     kinds={"parquet", "postgres"},
     description=(
-        "The highest and best use of every piece of ground in one borough: "
+        "The highest and best use of every piece of ground in one tile of "
+        "the cut: "
         "one row per (lot, zone), because a zoning boundary crossing a large "
         "parcel makes two sites of it and both are solved - over their own "
         "area, against their own street, under their own margins. "
@@ -933,18 +1058,21 @@ def lot_development_programs(
         "monthly and annual net operating income, and the footprint_share "
         "that divides the lot's assessment between its pieces downstream, "
         "plus num_candidates so a real choice of column is distinguishable "
-        "from none. Two kinds of ground keep their row and get no program: a "
+        "from none. Three kinds of ground keep their row and get no program: a "
         "parcel that is the road - either the roll files it under a CUBF road "
         "code (4510-4599) or a "
         "geobase double street side runs down the inside of it, which is how "
         "Montreal's own street lots are found, since the roll never records "
-        "them - and a piece whose zone authorises only Equipements "
+        "them - a piece whose zone authorises only Equipements "
         "collectifs (a park, a school, a cemetery), which is now decided per "
-        "piece so a parcel half park and half housing reports both. Every "
+        "piece so a parcel half park and half housing reports both, and a "
+        "piece zoned for a single dwelling (single_family_zone), which the "
+        "rental proforma does not price and lot_development_programs no "
+        "longer solves. Every "
         "piece the envelopes reach keeps a row: hbu_status is one of "
         f"{', '.join(HBU_STATUSES)}. Written to gold/lot_highest_best_use/"
-        f"<YYYY-MM-DD>/<neighborhood>/{LOT_HBU_FILE} and upserted into "
-        "gold.lot_highest_best_use on (scrape_date, neighborhood, lot_uid, "
+        f"<YYYY-MM-DD>/<tile>/{LOT_HBU_FILE} and upserted into "
+        "gold.lot_highest_best_use on (scrape_date, cell_partition, lot_uid, "
         "feature_id)."
     ),
 )
@@ -953,51 +1081,55 @@ def lot_highest_best_use(
     store: ParquetStore,
     postgis: PostgisResource,
 ) -> MaterializeResult:
-    neighborhood, scrape_date = _partition(context)
+    tile, scrape_date = tile_partition_of(context)
     envelopes = _read(
         store,
         lot_zoning_envelopes,
         LOT_ENVELOPES_FILE,
-        neighborhood=neighborhood,
+        partition=tile,
         scrape_date=scrape_date,
     )
     programs = _read(
         store,
         lot_development_programs,
         LOT_PROGRAMS_FILE,
-        neighborhood=neighborhood,
+        partition=tile,
         scrape_date=scrape_date,
     )
     if envelopes.empty:
         raise Failure(
-            f"{lot_zoning_envelopes.key.path[-1]} holds no envelope for "
-            f"{neighborhood} {scrape_date}; there is no lot to answer for."
+            f"{lot_zoning_envelopes.key.path[-1]} holds no envelope for tile "
+            f"{tile} {scrape_date}; there is no lot to answer for."
         )
     assessments = _read(
         store,
         lot_assessment_comparables,
         LOT_COMPARABLES_FILE,
-        neighborhood=neighborhood,
+        partition=tile,
         scrape_date=scrape_date,
     )
-    road_lots = _road_lots(context, store, neighborhood, scrape_date)
+    road_lots = _road_lots(context, store, tile, scrape_date)
 
     frame = select_highest_best_use(
         programs, envelopes, assessments=assessments, road_lots=road_lots
     )
     # Carried from the programs rather than recomputed: the assumptions that
     # produced a chosen program are the ones that produced the candidate it was
-    # chosen from, and a second copy would be the one that goes stale.
-    frame["program_assumptions"] = _first(programs, "program_assumptions")
-    frame["neighborhood"] = neighborhood
+    # chosen from, and a second copy would be the one that goes stale. Per
+    # borough, because that is the grain they vary at - the surveyed rents in
+    # them are the lot's borough's - and every piece of a borough carries its
+    # borough's object, the ones with no program included.
+    frame["program_assumptions"] = _by_borough(
+        frame, _first_by_borough(programs, "program_assumptions")
+    )
     frame["scrape_date"] = scrape_date
     frame["computed_at"] = datetime.now(timezone.utc).isoformat()
 
-    path = _write(context, store, frame, LOT_HBU_FILE, neighborhood, scrape_date)
+    path = _write(context, store, frame, LOT_HBU_FILE, tile, scrape_date)
     loaded = _publish(
         postgis,
         {"lot_highest_best_use": frame},
-        neighborhood=neighborhood,
+        partition=tile,
         scrape_date=scrape_date,
         path=path,
     )
@@ -1008,10 +1140,10 @@ def lot_highest_best_use(
     answered = frame[frame["hbu_status"] == "solved"]
     split = frame[frame["num_zones"] > 1]
     context.log.info(
-        "%s %s: %d piece(s) over %d lot(s) with an envelope -> %s; "
+        "tile %s %s: %d piece(s) over %d lot(s) with an envelope -> %s; "
         "%d dwelling(s), %.1f ha of floor; %d piece(s) on %d lot(s) the "
         "zoning cuts in more than one -> %s",
-        neighborhood,
+        tile,
         scrape_date,
         len(frame),
         int(frame["lot_uid"].nunique()),
@@ -1026,6 +1158,7 @@ def lot_highest_best_use(
     return MaterializeResult(
         metadata={
             "dagster/row_count": len(frame),
+            "tile": tile,
             # The row count is pieces now, so the lot count is stated beside it
             # rather than left to be read off the rows. A reader comparing this
             # partition with one written before the grain changed wants both.
@@ -1061,15 +1194,15 @@ def lot_highest_best_use(
             # What the road gate actually took away rather than what it merely
             # labelled: parcels the roll calls a street that the solver had
             # produced a building for. Zero means the roll reached no roadway
-            # in this borough, which is a fact about the roll worth seeing.
+            # in this tile, which is a fact about the roll worth seeing.
             "num_road_programs_withheld": _road_programs_withheld(
                 programs, assessments, road_lots
             ),
             # The two road predicates, side by side. They are not alternatives
             # and neither contains the other: the roll knows a right of way it
             # assessed, the cadastre knows every street Montreal never put on
-            # the roll. A borough where the second collapses to near zero is a
-            # lot_frontage partition that did not land, not a borough of
+            # the roll. A tile where the second collapses to near zero is a
+            # lot_frontage partition that did not land, not a tile of
             # roadless blocks - which is exactly the failure this gate had
             # before, silently.
             "num_road_parcels_on_the_roll": len(road_parcel_lots(assessments)),
@@ -1104,8 +1237,8 @@ def lot_highest_best_use(
                 float(answered["industrial_area_m2"].sum()) / 10_000.0, 2
             ),
             "total_npv_millions": round(float(answered["npv_cad"].sum()) / 1e6, 2),
-            # What kind of building the borough's answers are, at a glance: a
-            # borough of `residential` rows and one of `mixed` rows are two
+            # What kind of building the tile's answers are, at a glance: a
+            # tile of `residential` rows and one of `mixed` rows are two
             # different findings about the by-law and the rents together.
             "dominant_use_counts": MetadataValue.json(
                 {
@@ -1197,21 +1330,23 @@ class GapConfig(Config):
 
 @asset(
     key_prefix=key_prefix("lot_redevelopment_gap"),
-    partitions_def=scrape_partitions,
+    partitions_def=tile_scrape_partitions,
     deps=[
         lot_highest_best_use,
         lot_assessment_comparables,
         # The enhancement is solved here, against the zone's own rule-set and
-        # the borough's rents - the same three inputs the rebuild was solved
-        # on, read again so the two futures are priced on one footing.
+        # the lot's borough's rents - the same three inputs the rebuild was
+        # solved on, read again so the two futures are priced on one footing.
+        # The rents are per borough, bridged as on the programs.
         lot_zoning_envelopes,
-        average_rents,
-        vacancy_rates,
+        AssetDep(average_rents, partition_mapping=_BOROUGH_BRIDGE),
+        AssetDep(vacancy_rates, partition_mapping=_BOROUGH_BRIDGE),
     ],
     group_name=GOLD_GROUP,
     kinds={"parquet", "postgres"},
     description=(
-        "How far each lot is from its highest and best use, one row per lot. "
+        "How far each lot of one tile is from its highest and best use, one "
+        "row per lot. "
         "The floor area standing on it - the assessment roll's, split into "
         "residential, commercial and industrial by each unit's own CUBF use "
         "code by lot_assessment_comparables - against the floor area its "
@@ -1233,9 +1368,9 @@ class GapConfig(Config):
         "This table is the comparison and not a second copy of the envelope: "
         "the floors, stalls, binding caps and dollar figures of the program "
         "itself are gold.lot_highest_best_use's, one join away on lot_uid. "
-        f"Written to gold/lot_redevelopment_gap/<YYYY-MM-DD>/<neighborhood>/"
+        f"Written to gold/lot_redevelopment_gap/<YYYY-MM-DD>/<tile>/"
         f"{LOT_GAP_FILE} and upserted into gold.lot_redevelopment_gap on "
-        "(scrape_date, neighborhood, lot_uid)."
+        "(scrape_date, cell_partition, lot_uid, feature_id)."
     ),
 )
 def lot_redevelopment_gap(
@@ -1244,24 +1379,24 @@ def lot_redevelopment_gap(
     store: ParquetStore,
     postgis: PostgisResource,
 ) -> MaterializeResult:
-    neighborhood, scrape_date = _partition(context)
+    tile, scrape_date = tile_partition_of(context)
     hbu = _read(
         store,
         lot_highest_best_use,
         LOT_HBU_FILE,
-        neighborhood=neighborhood,
+        partition=tile,
         scrape_date=scrape_date,
     )
     if hbu.empty:
         raise Failure(
-            f"{lot_highest_best_use.key.path[-1]} holds no lot for "
-            f"{neighborhood} {scrape_date}; there is nothing to compare."
+            f"{lot_highest_best_use.key.path[-1]} holds no lot for tile "
+            f"{tile} {scrape_date}; there is nothing to compare."
         )
     existing = _read(
         store,
         lot_assessment_comparables,
         LOT_COMPARABLES_FILE,
-        neighborhood=neighborhood,
+        partition=tile,
         scrape_date=scrape_date,
     )
 
@@ -1281,38 +1416,21 @@ def lot_redevelopment_gap(
     # addition's own timing from this run's config - see `hbu.solve_
     # enhancements`. Then the three futures side by side and the owner's
     # verdict among them, before the site's own costs, which the shortlist
-    # adds when it prices the buyer.
+    # adds when it prices the buyer. Per borough, as the rebuild was: the
+    # rents are the lot's borough's, and so are the assumptions read back.
     envelopes = _read(
         store,
         lot_zoning_envelopes,
         LOT_ENVELOPES_FILE,
-        neighborhood=neighborhood,
+        partition=tile,
         scrape_date=scrape_date,
     )
-    economics, _suppressed = unit_economics(
-        _read(
-            store,
-            average_rents,
-            AVERAGE_RENTS_FILE,
-            neighborhood=neighborhood,
-            scrape_date=scrape_date,
-        ),
-        _read(
-            store,
-            vacancy_rates,
-            VACANCY_FILE,
-            neighborhood=neighborhood,
-            scrape_date=scrape_date,
-        ),
-    )
+    neighborhoods = _neighborhoods_of_tile(postgis, tile, scrape_date)
+    priced = _borough_economics(context, store, neighborhoods, scrape_date)
     rules = config.rules()
-    enhancements = solve_enhancements(
-        computed,
-        existing,
-        envelopes,
-        economics,
-        assumptions=program_assumptions_of(hbu),
-        rules=rules,
+    enhancements = _enhance_by_borough(
+        context, computed, existing, envelopes, priced, rules=rules,
+        scrape_date=scrape_date,
     )
     computed = pd.concat([computed, enhancements], axis=1)
     computed = pd.concat([computed, three_futures(computed)], axis=1)
@@ -1324,11 +1442,11 @@ def lot_redevelopment_gap(
     frame = computed[list(_GAP_OUTPUT_COLUMNS)].copy()
     frame["computed_at"] = datetime.now(timezone.utc).isoformat()
 
-    path = _write(context, store, frame, LOT_GAP_FILE, neighborhood, scrape_date)
+    path = _write(context, store, frame, LOT_GAP_FILE, tile, scrape_date)
     loaded = _publish(
         postgis,
         {"lot_redevelopment_gap": frame},
-        neighborhood=neighborhood,
+        partition=tile,
         scrape_date=scrape_date,
         path=path,
     )
@@ -1336,10 +1454,10 @@ def lot_redevelopment_gap(
     matched = int(frame["has_assessment"].sum())
     underbuilt = int(frame["is_underbuilt"].sum())
     context.log.info(
-        "%s %s: %d lot(s), %d matched to the roll, %d under-built; "
+        "tile %s %s: %d lot(s), %d matched to the roll, %d under-built; "
         "%.1f ha of floor gap, $%.1fM of annual stabilised NOI gap "
         "at an expense ratio of %.2f -> %s",
-        neighborhood,
+        tile,
         scrape_date,
         len(frame),
         matched,
@@ -1353,10 +1471,12 @@ def lot_redevelopment_gap(
     return MaterializeResult(
         metadata={
             "dagster/row_count": len(frame),
+            "tile": tile,
+            "neighborhoods": ", ".join(neighborhoods),
             "num_lots": len(frame),
             # The join, from this side. A lane, a park or a city parcel has no
             # assessment unit on it and a few percent is the honest reading; a
-            # third of the borough means the roll and the cadastre disagree
+            # third of the tile means the roll and the cadastre disagree
             # about where the ground is, which lot_assessed_values reports as
             # num_lots_unvalued from its own side.
             "num_with_assessment": matched,
@@ -1423,8 +1543,8 @@ def lot_redevelopment_gap(
             ),
             # The solver's own objective, which nets the build rather than the
             # operating expenses. Reported beside the stabilised pair rather
-            # than instead of it, because a borough where this is negative and
-            # the gap above is positive is a borough where redevelopment earns
+            # than instead of it, because a tile where this is negative and
+            # the gap above is positive is a tile where redevelopment earns
             # more and does not pay for itself.
             "hbu_annual_noi_after_construction_millions": _sum_millions(
                 frame, "hbu_annual_noi_after_construction_cad"
@@ -1465,16 +1585,227 @@ def lot_redevelopment_gap(
 # --------------------------------------------------------------------------
 
 
+def _neighborhoods_of_tile(
+    postgis: PostgisResource, tile: str, scrape_date: str
+) -> tuple[str, ...]:
+    """The boroughs whose lots this tile holds, off `rag.lots`.
+
+    The bridge to every borough-axis input the three assets read: CMHC's two
+    grids and the commercial rents are published per borough, and a tile is
+    priced at the rows of the boroughs its ground was fetched under. Asked of
+    Postgres rather than read off the frame in hand because `rag.lots` is the
+    record of what was loaded, and it is asked *first* - a tile no cadastre
+    was loaded for is cheaper to learn about before the solve than after it,
+    and the publish at the end needs the database anyway.
+    """
+    from urban_rag.postgis import neighborhoods_of_tile
+
+    try:
+        with postgis.connect() as connection:
+            neighborhoods = neighborhoods_of_tile(
+                connection, tile=tile, scrape_date=scrape_date
+            )
+    except (PostgresUnavailable, MissingRelation) as exc:
+        raise Failure(
+            f"the boroughs of tile {tile} {scrape_date} could not be read off "
+            f"rag.lots: {exc}"
+        ) from exc
+    if not neighborhoods:
+        raise Failure(
+            f"rag.lots holds no lot for tile {tile} {scrape_date}; load the "
+            "cadastre (neighborhood_cadastre) for the boroughs it covers first."
+        )
+    return tuple(neighborhoods)
+
+
+def _borough_economics(
+    context: AssetExecutionContext,
+    store: ParquetStore,
+    neighborhoods: tuple[str, ...],
+    scrape_date: str,
+) -> dict[str, tuple[UnitEconomics, tuple[str, ...]]]:
+    """CMHC's rent list for each borough of the tile, keyed by borough.
+
+    One `unit_economics` per borough rather than one for the tile, because
+    the survey is per borough and a tile on a borough line holds lots of two:
+    each is priced at its own borough's rows, joined on the lot's
+    `neighborhood` by `_solve_by_borough` and `_enhance_by_borough`. What
+    travels with each list is the classes CMHC suppressed for that borough,
+    which the run reports per borough for the same reason.
+    """
+    priced: dict[str, tuple[UnitEconomics, tuple[str, ...]]] = {}
+    for neighborhood in neighborhoods:
+        economics, suppressed = unit_economics(
+            _read(
+                store,
+                average_rents,
+                AVERAGE_RENTS_FILE,
+                partition=neighborhood,
+                scrape_date=scrape_date,
+            ),
+            _read(
+                store,
+                vacancy_rates,
+                VACANCY_FILE,
+                partition=neighborhood,
+                scrape_date=scrape_date,
+            ),
+        )
+        if len(suppressed) == len(PRICED_BEDROOM_TYPES):
+            # Not raised: a borough CMHC published nothing for is a fact about
+            # the survey, and the envelopes are still worth solving - every
+            # program comes back empty with all four classes in
+            # `unpriced_types`, which is an answer a reader can act on. Warned
+            # once, here, rather than left to be inferred from a borough of
+            # zeros.
+            context.log.warning(
+                "%s %s: CMHC published no rent for any bedroom class, so every "
+                "program on its lots will be empty - see unpriced_types on "
+                "each row",
+                neighborhood,
+                scrape_date,
+            )
+        elif suppressed:
+            context.log.info(
+                "%s %s: CMHC suppressed %s; the solver will not build %s",
+                neighborhood,
+                scrape_date,
+                ", ".join(suppressed),
+                "them" if len(suppressed) > 1 else "it",
+            )
+        priced[neighborhood] = (economics, suppressed)
+    return priced
+
+
+def _economics_for(
+    context: AssetExecutionContext,
+    neighborhood,
+    priced: Mapping[str, tuple[UnitEconomics, tuple[str, ...]]],
+    scrape_date: str,
+) -> UnitEconomics:
+    """One borough's rent list out of `_borough_economics`, or none at all.
+
+    A lot whose borough is not among the tile's in `rag.lots` is a lot the
+    file in hand knows and the cadastre no longer does - a reload since the
+    upstream was written, most likely. It is solved rather than dropped, at
+    a rent list with every class suppressed, so it keeps its row with an
+    empty program and `unpriced_types` naming all four - the same answer a
+    borough CMHC never surveyed gets, and the honest one: nothing here can
+    say what its dwellings would earn.
+    """
+    found = priced.get(neighborhood)
+    if found is not None:
+        return found[0]
+    context.log.warning(
+        "%s: lots of borough %r are in the file and not among the tile's "
+        "boroughs in rag.lots, so they are priced at no rent at all - "
+        "re-materialize the upstream for this tile after the reload",
+        scrape_date,
+        neighborhood,
+    )
+    return unit_economics(pd.DataFrame(), pd.DataFrame())[0]
+
+
+def _solve_by_borough(
+    context: AssetExecutionContext,
+    envelopes: pd.DataFrame,
+    priced: Mapping[str, tuple[UnitEconomics, tuple[str, ...]]],
+    surveyed: Mapping[str, dict[str, float]],
+    config: ProgramConfig,
+    *,
+    scrape_date: str,
+) -> tuple[pd.DataFrame, dict[str, ProgramAssumptions]]:
+    """Every envelope of the tile solved at its own borough's rents.
+
+    The join between the two axes, in one place: the envelopes are grouped on
+    the lot's `neighborhood`, each group is solved with that borough's CMHC
+    list and that borough's surveyed commercial rents, and the rows come back
+    in the order `solve_envelopes` would have given the whole tile. The
+    assumptions each group was solved on are written onto its rows - the rule
+    every stated assumption in this platform follows, and here a rule with
+    teeth, since two boroughs of one tile may state two retail rents - and
+    returned keyed by borough for the run's metadata.
+    """
+    if "neighborhood" not in envelopes.columns:
+        raise Failure(
+            f"{lot_zoning_envelopes.key.path[-1]} carries no neighborhood "
+            "column, so its lots cannot be priced at their borough's rents; "
+            "re-materialize it for this tile."
+        )
+    frames: list[pd.DataFrame] = []
+    assumptions: dict[str, ProgramAssumptions] = {}
+    for neighborhood, group in envelopes.groupby("neighborhood", sort=True, dropna=False):
+        economics = _economics_for(context, neighborhood, priced, scrape_date)
+        stated = config.assumptions(surveyed_rents=surveyed.get(neighborhood))
+        assumptions[neighborhood] = stated
+        solved = solve_envelopes(group, economics, assumptions=stated)
+        solved["program_assumptions"] = json.dumps(
+            stated.as_metadata(), ensure_ascii=False
+        )
+        frames.append(solved)
+    frame = pd.concat(frames, ignore_index=True)
+    return (
+        frame.sort_values(["lot_uid", "feature_id", "column_index"], kind="stable")
+        .reset_index(drop=True),
+        assumptions,
+    )
+
+
+def _enhance_by_borough(
+    context: AssetExecutionContext,
+    computed: pd.DataFrame,
+    existing: pd.DataFrame,
+    envelopes: pd.DataFrame,
+    priced: Mapping[str, tuple[UnitEconomics, tuple[str, ...]]],
+    *,
+    rules: EnhancementRules,
+    scrape_date: str,
+) -> pd.DataFrame:
+    """`solve_enhancements` over the tile, one borough at a time.
+
+    The gap's twin of `_solve_by_borough`, and for the same reason: the
+    addition is priced at the rebuild's own rates, and the rebuild was priced
+    at the lot's borough's. So each group is handed its borough's rent list
+    and the `program_assumptions` read back off its own rows - which
+    `lot_highest_best_use` wrote per borough - rather than the first row of
+    the tile's. Returns `ENHANCEMENT_COLUMNS` indexed like ``computed``.
+    """
+    if "neighborhood" not in computed.columns:
+        raise Failure(
+            f"{lot_highest_best_use.key.path[-1]} carries no neighborhood "
+            "column, so its lots cannot be priced at their borough's rents; "
+            "re-materialize it for this tile."
+        )
+    parts: list[pd.DataFrame] = []
+    for neighborhood, group in computed.groupby("neighborhood", sort=True, dropna=False):
+        economics = _economics_for(context, neighborhood, priced, scrape_date)
+        parts.append(
+            solve_enhancements(
+                group,
+                existing,
+                envelopes,
+                economics,
+                assumptions=program_assumptions_of(group),
+                rules=rules,
+            )
+        )
+    if not parts:
+        return pd.DataFrame(columns=list(ENHANCEMENT_COLUMNS), index=computed.index)
+    return pd.concat(parts).reindex(computed.index)
+
+
 def _surveyed_commercial_rents(
     context: AssetExecutionContext,
     store: ParquetStore,
     neighborhood: str,
     scrape_date: str,
 ) -> dict[str, float]:
-    """The borough's resolved commercial rents, as `{rent_class: rent_psf_cad}`.
+    """One borough's resolved commercial rents, as `{rent_class: rent_psf_cad}`.
 
+    Read per borough of the tile, since that is the grain the rents are
+    published at, and handed to `_solve_by_borough` keyed by borough.
     Optional the way the setbacks are: `commercial_rents` has its own chain
-    (the MarketBeats and the rent index) and a partition without it is
+    (the MarketBeats and the rent index) and a borough without it is
     ordinary rather than broken. What it costs is the rates - the solver then
     prices commerce and industry at `urban_rag.program`'s stated constants,
     which flatter retail by a factor of three - so the fallback is warned
@@ -1487,10 +1818,11 @@ def _surveyed_commercial_rents(
     path = join(partition_dir, COMMERCIAL_RENTS_FILE)
     if not filesystem(path).exists(path):
         context.log.warning(
-            "%s is missing, so commerce and industry are priced at the stated "
-            "module constants - materialize %s for this partition to price "
-            "them at the borough's surveyed rents",
+            "%s is missing, so commerce and industry on %s's lots are priced "
+            "at the stated module constants - materialize %s for that borough "
+            "to price them at its surveyed rents",
             path,
+            neighborhood,
             commercial_rents.key.path[-1],
         )
         return {}
@@ -1516,7 +1848,7 @@ def _with_buildable_area(
     context: AssetExecutionContext,
     store: ParquetStore,
     envelopes: pd.DataFrame,
-    neighborhood: str,
+    tile: str,
     scrape_date: str,
 ) -> pd.DataFrame:
     """The envelopes, plus what each column's own margins leave buildable.
@@ -1533,7 +1865,7 @@ def _with_buildable_area(
     the frontage gap must not also cost the program.
     """
     partition_dir = store.partition_dir(
-        lot_buildable_setbacks.key.path[-1], scrape_date, neighborhood
+        lot_buildable_setbacks.key.path[-1], scrape_date, tile
     )
     path = join(partition_dir, LOT_SETBACKS_FILE)
     if not filesystem(path).exists(path):
@@ -1564,7 +1896,7 @@ def _with_placeable_area(
     context: AssetExecutionContext,
     store: ParquetStore,
     envelopes: pd.DataFrame,
-    neighborhood: str,
+    tile: str,
     scrape_date: str,
 ) -> pd.DataFrame:
     """The envelopes, plus the largest building each column's margins hold.
@@ -1597,7 +1929,7 @@ def _with_placeable_area(
     from urban_rag.massing import fit_rectangle, to_metric
 
     partition_dir = store.partition_dir(
-        lot_buildable_setbacks.key.path[-1], scrape_date, neighborhood
+        lot_buildable_setbacks.key.path[-1], scrape_date, tile
     )
     path = join(partition_dir, LOT_SETBACKS_FILE)
     if not filesystem(path).exists(path):
@@ -1636,13 +1968,20 @@ def _with_placeable_area(
             f"by {lot_buildable_setbacks.key.path[-1]}."
         )
 
-    # In metres once, for the whole borough: a rectangle fitted in square
+    # In metres once, for the whole tile: a rectangle fitted in square
     # degrees is not a rectangle, and is not the one the massing will draw.
     projected = to_metric(setbacks)
+    keys = pd.MultiIndex.from_frame(envelopes[list(_ENVELOPE_KEYS)])
+    # The setbacks file carves every column of every lot; only the envelopes
+    # handed in are going to be solved, and the fit is the expensive step.
+    wanted = set(keys)
     cache: dict[bytes, object] = {}
     measured: dict[tuple, float] = {}
     plates: dict[tuple, object] = {}
     for row in projected.itertuples(index=False):
+        envelope_key = (row.lot_uid, row.feature_id, row.column_index)
+        if envelope_key not in wanted:
+            continue
         geometry = row.geometry
         if geometry is None or geometry.is_empty:
             continue
@@ -1651,12 +1990,10 @@ def _with_placeable_area(
         if fitted is None:
             fitted = fit_rectangle(geometry, geometry.area)
             cache[key] = fitted
-        envelope_key = (row.lot_uid, row.feature_id, row.column_index)
         measured[envelope_key] = float(fitted.placed_footprint_m2)
         if fitted.geometry is not None and not fitted.geometry.is_empty:
             plates[envelope_key] = fitted.geometry
 
-    keys = pd.MultiIndex.from_frame(envelopes[list(_ENVELOPE_KEYS)])
     placeable = pd.Series(
         [measured.get(key) for key in keys], index=envelopes.index, dtype="float64"
     )
@@ -1666,9 +2003,9 @@ def _with_placeable_area(
     # searches agreeing to the metre would still be two searches.
     unbuildable = int((placeable == 0).sum())
     context.log.info(
-        "%s %s: envelope shape measured on %d of %d row(s) from %d distinct "
+        "tile %s %s: envelope shape measured on %d of %d row(s) from %d distinct "
         "polygon(s); %d row(s) sit in margins that hold no building at all",
-        neighborhood,
+        tile,
         scrape_date,
         int(placeable.notna().sum()),
         len(envelopes),
@@ -1701,7 +2038,7 @@ def _with_parkable_area(
     context: AssetExecutionContext,
     postgis: PostgisResource,
     envelopes: pd.DataFrame,
-    neighborhood: str,
+    tile: str,
     scrape_date: str,
     plates: Mapping[tuple, object] | None = None,
 ) -> pd.DataFrame:
@@ -1743,11 +2080,13 @@ def _with_parkable_area(
 
     Read from Postgres rather than from a parquet because that is where a shape
     keyed on `lot_uid` lives: `bronze/neighborhood_lots` is the Infolot scrape,
-    which predates the uid and cannot be joined to an envelope.
+    which predates the uid and cannot be joined to an envelope - and is per
+    borough besides, which a tile asset does not read at all. The tile's own
+    rows are what is asked for, by the `cell_partition` the loader stamped.
 
     Optional the way `_with_buildable_area` is optional, and for a stronger
     reason. Failing the partition when the cadastre is unreachable would cost
-    a borough its programs over one bound; leaving the column absent restores
+    a tile its programs over one bound; leaving the column absent restores
     exactly the behaviour every run had before this existed - surface stalls
     bounded on area alone - and says so in the log. What it costs is named
     there too, because "the yard was never measured" and "the yard measured
@@ -1763,7 +2102,7 @@ def _with_parkable_area(
         with postgis.connect() as connection:
             try:
                 lots = fetch_zone_piece_polygons(
-                    connection, neighborhood=neighborhood, scrape_date=scrape_date
+                    connection, tile=tile, scrape_date=scrape_date
                 )
             except MissingRelation:
                 # The pieces have not been created for this database yet. The
@@ -1780,15 +2119,16 @@ def _with_parkable_area(
                 )
                 by_piece = False
                 lots = fetch_lot_polygons(
-                    connection, neighborhood=neighborhood, scrape_date=scrape_date
+                    connection, tile=tile, scrape_date=scrape_date
                 )
     except (PostgresUnavailable, MissingRelation) as exc:
         context.log.warning(
-            "no parcel geometry could be read for %s %s (%s), so every "
+            "no parcel geometry could be read for tile %s %s (%s), so every "
             "surface stall is bounded on the yard's *area* alone - a "
             "four-metre parcel will still be allowed to park on it. Load the "
-            "cadastre for this partition to bound it on the yard's shape too.",
-            neighborhood,
+            "cadastre for this tile's boroughs to bound it on the yard's "
+            "shape too.",
+            tile,
             scrape_date,
             exc,
         )
@@ -1796,14 +2136,14 @@ def _with_parkable_area(
 
     if lots.empty:
         context.log.warning(
-            "no parcel geometry for %s %s, so no yard shape was measured and "
-            "every surface stall is bounded on area alone",
-            neighborhood,
+            "no parcel geometry for tile %s %s, so no yard shape was measured "
+            "and every surface stall is bounded on area alone",
+            tile,
             scrape_date,
         )
         return envelopes
 
-    # In metres once, for the whole borough: the opening is a buffer against a
+    # In metres once, for the whole tile: the opening is a buffer against a
     # boundary, and a buffer in square degrees is not a buffer.
     projected = to_metric(lots)
     # Keyed on the piece where there is one, on the lot where there is not, and
@@ -1842,11 +2182,11 @@ def _with_parkable_area(
     measured = pd.Series(values, index=envelopes.index, dtype="float64")
     unparkable = int((measured == 0).sum())
     context.log.info(
-        "%s %s: yard shape measured on %d of %d envelope row(s) from %d "
+        "tile %s %s: yard shape measured on %d of %d envelope row(s) from %d "
         "distinct yard(s); %d row(s) had no plate to subtract and were "
         "measured on the bare parcel; %d row(s) sit on a yard that holds no "
         "surface stall at all",
-        neighborhood,
+        tile,
         scrape_date,
         int(measured.notna().sum()),
         len(envelopes),
@@ -1860,8 +2200,8 @@ def _with_parkable_area(
 def _binding_counts(programs: pd.DataFrame) -> dict[str, int]:
     """How many solved programs each cap stopped, most common first.
 
-    The borough-level answer to "why is nothing bigger than this", and worth a
-    line of metadata rather than a query: a borough bound by `density_max` and
+    The tile-level answer to "why is nothing bigger than this", and worth a
+    line of metadata rather than a query: a tile bound by `density_max` and
     one bound by `site_coverage_max` are two different planning arguments.
     """
     if programs.empty or "binding" not in programs.columns:
@@ -1883,12 +2223,39 @@ def _json_list(value) -> list:
     return decoded if isinstance(decoded, list) else []
 
 
-def _first(frame: pd.DataFrame, column: str):
-    """The partition-wide value of a column identical on every row."""
-    if frame.empty or column not in frame.columns:
-        return None
-    values = frame[column].dropna()
-    return values.iloc[0] if len(values) else None
+def _first_by_borough(frame: pd.DataFrame, column: str) -> dict[str, object]:
+    """The borough-wide value of a column identical on every row of a borough.
+
+    What `_first` used to be for the whole partition, at the grain the value
+    now varies at: `program_assumptions` is stamped per borough by
+    `_solve_by_borough`, so the tile has one object per borough and the
+    first row of any borough is that borough's. A borough with no row that
+    carries the column is absent from the result rather than defaulted.
+    """
+    if (
+        frame.empty
+        or column not in frame.columns
+        or "neighborhood" not in frame.columns
+    ):
+        return {}
+    carried = frame.dropna(subset=[column])
+    if carried.empty:
+        return {}
+    return carried.groupby("neighborhood", sort=False)[column].first().to_dict()
+
+
+def _by_borough(frame: pd.DataFrame, values: Mapping[str, object]) -> pd.Series:
+    """``values`` looked up on each row's `neighborhood`, None where absent.
+
+    Object-typed with a real None rather than a float NaN, so a column of
+    JSON strings stays a column of JSON strings on the rows that have one
+    and a null on the rows that do not - which is what the parquet, the
+    jsonb and `investment_assumptions_of` each expect of it.
+    """
+    if "neighborhood" not in frame.columns:
+        return pd.Series([None] * len(frame), index=frame.index, dtype="object")
+    looked_up = frame["neighborhood"].map(dict(values))
+    return looked_up.astype("object").where(looked_up.notna(), None)
 
 
 def _median(frame: pd.DataFrame, column: str) -> float:
@@ -1926,7 +2293,7 @@ def _road_programs_withheld(
 def _road_lots(
     context: AssetExecutionContext,
     store: ParquetStore,
-    neighborhood: str,
+    tile: str,
     scrape_date: str,
 ) -> pd.DataFrame | None:
     """The parcels `lot_frontage` identified as the roadway, if it has run.
@@ -1936,11 +2303,11 @@ def _road_lots(
     to create, so a partition without it must answer as it did before rather
     than fail. What it costs is much larger here, though, and the warning says
     so - without this file the road gate is the assessment roll alone, and the
-    roll does not reach Montreal's street lots at all, so a borough's roadways
+    roll does not reach Montreal's street lots at all, so a tile's roadways
     come back through the solver as development sites.
     """
     path = join(
-        store.partition_dir(lot_frontage.key.path[-1], scrape_date, neighborhood),
+        store.partition_dir(lot_frontage.key.path[-1], scrape_date, tile),
         ROAD_LOTS_FILE,
     )
     if not filesystem(path).exists(path):
@@ -1966,31 +2333,28 @@ def _sum_int(frame: pd.DataFrame, column: str) -> int:
     return int(total) if pd.notna(total) else 0
 
 
-def _partition(context: AssetExecutionContext) -> tuple[str, str]:
-    dimensions = context.partition_key.keys_by_dimension
-    return dimensions["neighborhood"], dimensions["date"][:10]
-
-
 def _read(
     store: ParquetStore,
     asset_def,
     name: str,
     *,
-    neighborhood: str,
+    partition: str,
     scrape_date: str,
 ) -> pd.DataFrame:
     """One upstream partition, named by its asset rather than by its path.
 
-    Fails naming what to materialize rather than letting pandas raise on a path
-    a reader would have to decode - the same posture `envelope_assets._read` and
-    `lot_profiles_assets._read` take.
+    ``partition`` is the tile for a lot-chain upstream and the borough for a
+    CMHC one - the same slot of `partition_dir`, filled by whichever axis the
+    upstream is on. Fails naming what to materialize rather than letting
+    pandas raise on a path a reader would have to decode - the same posture
+    `envelope_assets._read` and `lot_profiles_assets._read` take.
     """
     asset_name = asset_def.key.path[-1]
-    path = join(store.partition_dir(asset_name, scrape_date, neighborhood), name)
+    path = join(store.partition_dir(asset_name, scrape_date, partition), name)
     if not filesystem(path).exists(path):
         raise Failure(
             f"{path} is missing; materialize {asset_name} for "
-            f"{neighborhood} {scrape_date} first."
+            f"{partition} {scrape_date} first."
         )
     return pd.read_parquet(path, storage_options=storage_options(path))
 
@@ -2000,13 +2364,11 @@ def _write(
     store: ParquetStore,
     frame: pd.DataFrame,
     name: str,
-    neighborhood: str,
+    tile: str,
     scrape_date: str,
 ) -> str:
     """This partition's one file, replacing whatever a previous run left."""
-    output_dir = store.partition_dir(
-        context.asset_key.path[-1], scrape_date, neighborhood
-    )
+    output_dir = store.partition_dir(context.asset_key.path[-1], scrape_date, tile)
     removed = clear_parquet(output_dir)
     if removed:
         context.log.info("Removed %d file(s) from a previous run", len(removed))
@@ -2017,25 +2379,26 @@ def _publish(
     postgis: PostgisResource,
     datasets: dict[str, pd.DataFrame],
     *,
-    neighborhood: str,
+    partition: str,
     scrape_date: str,
     path: str,
 ) -> dict[str, dict[str, int]]:
     """Upsert what was just written, naming the file already on disk if not.
 
-    After the parquet, deliberately: solving a borough is tens of thousands of
+    After the parquet, deliberately: solving a tile is tens of thousands of
     CP-SAT models, and a database that is down should cost the load rather than
-    the solve.
+    the solve. ``partition`` is the tile - the value of `cell_partition` the
+    loader stamps on every row.
     """
     try:
         return publish(
             postgis.connect,
             datasets,
-            neighborhood=neighborhood,
+            partition=partition,
             scrape_date=scrape_date,
         )
     except (PostgresUnavailable, MissingRelation) as exc:
         raise Failure(
             f"{path} was written, but {', '.join(datasets)} could not be "
-            f"published for {neighborhood} {scrape_date}: {exc}"
+            f"published for tile {partition} {scrape_date}: {exc}"
         ) from exc

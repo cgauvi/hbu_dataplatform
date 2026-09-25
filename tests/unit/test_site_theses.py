@@ -59,6 +59,8 @@ from urban_rag.storage import join
 
 DATE = "2026-09-01"
 NEIGHBORHOOD = "VSMPE"
+#: A VSMPE cell of the cut: the tile the lot chain is partitioned on.
+TILE = "0302303330102"
 
 
 def lot(**overrides) -> dict:
@@ -642,6 +644,15 @@ def store(tmp_path):
 
 @pytest.fixture(autouse=True)
 def published(monkeypatch):
+    # The tile's boroughs, which decide whose zone grids are read: one here,
+    # and the zone file below is written under it.
+    from urban_rag import postgis
+
+    monkeypatch.setattr(
+        postgis,
+        "neighborhoods_of_tile",
+        lambda connection, *, tile, scrape_date: (NEIGHBORHOOD,),
+    )
     return stub_publish(monkeypatch, opportunity_assets)
 
 
@@ -686,7 +697,7 @@ def borough(store):
     write_frame(
         gap,
         join(
-            store.partition_dir(lot_redevelopment_gap.key.path[-1], DATE, NEIGHBORHOOD),
+            store.partition_dir(lot_redevelopment_gap.key.path[-1], DATE, TILE),
             LOT_GAP_FILE,
         ),
     )
@@ -710,7 +721,7 @@ def borough(store):
     write_frame(
         hbu,
         join(
-            store.partition_dir(lot_highest_best_use.key.path[-1], DATE, NEIGHBORHOOD),
+            store.partition_dir(lot_highest_best_use.key.path[-1], DATE, TILE),
             LOT_HBU_FILE,
         ),
     )
@@ -725,7 +736,7 @@ def borough(store):
         comparables,
         join(
             store.partition_dir(
-                lot_assessment_comparables.key.path[-1], DATE, NEIGHBORHOOD
+                lot_assessment_comparables.key.path[-1], DATE, TILE
             ),
             LOT_COMPARABLES_FILE,
         ),
@@ -752,7 +763,7 @@ def borough(store):
 def _materialize(store):
     return materialize(
         [lot_investment_opportunities],
-        partition_key=MultiPartitionKey({"date": DATE, "neighborhood": NEIGHBORHOOD}),
+        partition_key=MultiPartitionKey({"date": DATE, "tile": TILE}),
         resources={"store": store, "postgis": PostgisResource(dsn="postgresql://x")},
     )
 
@@ -763,7 +774,7 @@ def test_the_asset_joins_the_three_inputs_and_files_every_lot(borough):
     frame_out = pd.read_parquet(
         join(
             borough.partition_dir(
-                lot_investment_opportunities.key.path[-1], DATE, NEIGHBORHOOD
+                lot_investment_opportunities.key.path[-1], DATE, TILE
             ),
             LOT_OPPORTUNITIES_FILE,
         )
@@ -823,7 +834,7 @@ def test_the_asset_joins_the_three_inputs_and_files_every_lot(borough):
 def test_the_asset_carries_the_config_into_the_rules(borough):
     result = materialize(
         [lot_investment_opportunities],
-        partition_key=MultiPartitionKey({"date": DATE, "neighborhood": NEIGHBORHOOD}),
+        partition_key=MultiPartitionKey({"date": DATE, "tile": TILE}),
         resources={"store": borough, "postgis": PostgisResource(dsn="postgresql://x")},
         run_config={
             "ops": {
@@ -842,7 +853,7 @@ def test_the_asset_carries_the_config_into_the_rules(borough):
     frame_out = pd.read_parquet(
         join(
             borough.partition_dir(
-                lot_investment_opportunities.key.path[-1], DATE, NEIGHBORHOOD
+                lot_investment_opportunities.key.path[-1], DATE, TILE
             ),
             LOT_OPPORTUNITIES_FILE,
         )
@@ -864,7 +875,7 @@ def test_a_zone_file_without_the_heritage_rows_screens_nothing_and_says_so(store
     write_frame(
         gap,
         join(
-            store.partition_dir(lot_redevelopment_gap.key.path[-1], DATE, NEIGHBORHOOD),
+            store.partition_dir(lot_redevelopment_gap.key.path[-1], DATE, TILE),
             LOT_GAP_FILE,
         ),
     )
@@ -880,7 +891,7 @@ def test_a_zone_file_without_the_heritage_rows_screens_nothing_and_says_so(store
             }
         ),
         join(
-            store.partition_dir(lot_highest_best_use.key.path[-1], DATE, NEIGHBORHOOD),
+            store.partition_dir(lot_highest_best_use.key.path[-1], DATE, TILE),
             LOT_HBU_FILE,
         ),
     )
@@ -890,7 +901,7 @@ def test_a_zone_file_without_the_heritage_rows_screens_nothing_and_says_so(store
         ),
         join(
             store.partition_dir(
-                lot_assessment_comparables.key.path[-1], DATE, NEIGHBORHOOD
+                lot_assessment_comparables.key.path[-1], DATE, TILE
             ),
             LOT_COMPARABLES_FILE,
         ),
@@ -913,7 +924,7 @@ def test_a_zone_file_without_the_heritage_rows_screens_nothing_and_says_so(store
     frame_out = pd.read_parquet(
         join(
             store.partition_dir(
-                lot_investment_opportunities.key.path[-1], DATE, NEIGHBORHOOD
+                lot_investment_opportunities.key.path[-1], DATE, TILE
             ),
             LOT_OPPORTUNITIES_FILE,
         )

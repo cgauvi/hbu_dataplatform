@@ -36,7 +36,7 @@ from urban_rag.resources import ParquetStore, PostgisResource
 from urban_rag.setback_assets import LOT_SETBACKS_FILE, lot_buildable_setbacks
 
 DATE = "2026-08-01"
-NEIGHBORHOOD = "VSMPE"
+TILE = "0302303330102"
 
 
 @pytest.fixture
@@ -70,7 +70,7 @@ def stub_postgis(
     def compute_lot_buildable_setbacks(
         connection,
         *,
-        neighborhood,
+        tile,
         scrape_date,
         edge_tolerance_m,
         batch_lots=None,
@@ -79,7 +79,7 @@ def stub_postgis(
         metric_srid=None,
     ):
         calls["compute"] = (
-            neighborhood,
+            tile,
             scrape_date,
             edge_tolerance_m,
             batch_lots,
@@ -110,18 +110,18 @@ def stub_postgis(
             "segment_m": 1.0,
         }
 
-    def fetch_lot_buildable_setbacks(connection, *, neighborhood, scrape_date):
+    def fetch_lot_buildable_setbacks(connection, *, tile, scrape_date):
         """What the real one reads back: `rows` buildable envelopes.
 
         Shaped like `silver.lot_buildable_setbacks` rather than faithful to it -
         what the asset itself touches is the row count and the geometry.
         """
-        calls["fetch"] = (neighborhood, scrape_date)
+        calls["fetch"] = (tile, scrape_date)
         return gpd.GeoDataFrame(
             {
                 "lot_uid": list(range(1, rows + 1)),
                 "lot_number": [str(index) for index in range(1, rows + 1)],
-                "neighborhood": [neighborhood] * rows,
+                "neighborhood": ["VSMPE"] * rows,
                 "scrape_date": [scrape_date] * rows,
                 "feature_id": ["H01-001"] * rows,
                 "column_index": [0] * rows,
@@ -150,7 +150,7 @@ def materialize_partition(store, *, run_config=None):
     return materialize(
         [lot_buildable_setbacks],
         partition_key=MultiPartitionKey(
-            {"date": DATE, "neighborhood": NEIGHBORHOOD}
+            {"date": DATE, "tile": TILE}
         ),
         resources={"store": store, "postgis": PostgisResource()},
         run_config=run_config,
@@ -172,12 +172,12 @@ def test_the_partition_is_measured_and_written(store, monkeypatch, tmp_path):
 
     assert materialize_partition(store).success
 
-    assert calls["compute"][:2] == (NEIGHBORHOOD, DATE)
-    assert calls["fetch"] == (NEIGHBORHOOD, DATE)
+    assert calls["compute"][:2] == (TILE, DATE)
+    assert calls["fetch"] == (TILE, DATE)
 
     path = (
         tmp_path / "store" / "silver" / "lot_buildable_setbacks" / DATE
-        / NEIGHBORHOOD / LOT_SETBACKS_FILE
+        / TILE / LOT_SETBACKS_FILE
     )
     frame = gpd.read_parquet(path)
     assert len(frame) == 6
@@ -317,7 +317,7 @@ def test_a_previous_run_is_cleared_before_the_new_file_lands(
 
     output_dir = (
         tmp_path / "store" / "silver" / "lot_buildable_setbacks" / DATE
-        / NEIGHBORHOOD
+        / TILE
     )
     files = sorted(path.name for path in output_dir.glob("*.parquet"))
     assert files == [LOT_SETBACKS_FILE]

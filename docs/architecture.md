@@ -23,7 +23,8 @@ Postgres is a **serving copy** of silver and gold, never the only copy, and
 **the schema a table is in is the layer its asset is in**: `silver/vacancy_rates`
 in the tree is `silver.vacancy_rates` in the database, and `gold/lot_profiles`
 is `gold.lot_profiles`. Every one of those tables is partitioned by
-`(neighborhood, scrape_date)` and written by one upsert — see [The silver and
+`scrape_date` and one of two spatial columns — see [Two spatial
+axes](#two-spatial-axes) — and written by one upsert — see [The silver and
 gold tables](#the-silver-and-gold-tables).
 
 Two things in Postgres sit outside that rule and are not exceptions to it.
@@ -34,6 +35,67 @@ is a silver or gold dataset's own table.
 
 The tree is the record — losing the database costs a reload rather than a
 re-scrape, which for a live municipal source no later run can undo.
+
+## Two spatial axes
+
+Every partitioned table has `scrape_date` as one key. Which spatial column is
+the other is the table's *axis* (`urban_rag.warehouse.Axis`), and there are two.
+
+**The borough axis** — `neighborhood`, a key from
+[partitions.py](../src/urban_rag/partitions.py): `VSMPE`, `CIL`, `SAG` — is the
+**publisher's** unit. Bronze is fetched per borough because that is what a
+publisher answers for: a Spectrum namespace, an arrondissement outline handed
+to Infolot, a grid PDF per by-law. What stays borough-shaped downstream is what
+a publisher bounds — the CMHC and C&W tables, `zoning_grid_columns`,
+`assessment_units`, the corpus, and the map's aggregates and tiles.
+
+**The tile axis** — `cell_partition`, a cell of the *tile cut* — is the
+**computation's** unit, and the whole lot chain runs on it: the seventeen
+tables from `silver.building_lot_intersections` to `gold.lot_building_massing`.
+A cell is a Web Mercator tile named by its quadkey — `0302303330102` is
+thirteen digits, so zoom 13 — and the cut
+([tile_cut.py](../src/urban_rag/tile_cut.py)) is a checked-in set of cells at
+whatever depth holds about 20,000 lots: z13 over Montreal, z10–z12 over Quebec
+City, seeded from the cadastre by `scripts/seed_tile_cut.py` and never
+re-derived, because a Dagster partition key that moved would orphan everything
+under it. Every row of `rag.lots`, `rag.buildings`, `rag.features` and
+`rag.addresses` carries `cell_key`, the zoom-19 quadkey of its interior point,
+written on load; `cell_partition` is the cut cell that prefixes it. A row of
+the lot chain inherits its lot's; a street side is placed by its midpoint and
+an address by its own point.
+
+Why a cell and not a borough: boroughs get redrawn (Montreal's in 2002 and
+2006, Quebec City's in 2009) and range from VSMPE's 17 km² to Saguenay's
+1,150; a cell is permanent, about one run's worth of lots wherever it is, and
+the cells run in parallel. And a re-cut, when a cell outgrows its budget, is a
+string operation — the new partition is a longer prefix of a `cell_key` the
+row already has, and four children sum exactly to their parent — where a
+borough redraw is a point-in-polygon over the province and no arithmetic
+reconciles the before and after.
+
+**Reads go global.** A tile run *writes* only rows whose cell is its own, but
+*reads* the whole snapshot — `scrape_date` alone, no spatial predicate:
+neighbouring lots for adjacency and slivers, every building for the clip,
+every street side for frontage, every address for the snap. Nothing spatial
+is cut by a cell edge; the cell is a write-ownership claim, not a scope. That
+is what removed the artefacts the old `WHERE neighborhood = X` reads left along
+every borough line — frontage under-measured against a clipped street side, a
+comparables pool that stopped at the boundary, false slivers along it, an
+address 2 m over the line that never snapped.
+
+**The hop between the axes** is `neighborhood_cadastre` (silver, borough axis):
+it lands a borough's three bronze snapshots in `rag.*` with their cell
+addresses, fails on ground the cut does not cover (`num_rows_outside_cut` —
+the cut only covers what has been loaded, so a fourth city is a re-seed before
+a load), and reports `tiles_touched`: the tile runs that have to follow,
+because a reload remints `lot_uid` and cascades into every one of them. A tile
+asset that reads a borough-axis upstream — the CMHC rents, the C&W rents, the
+grids — asks which boroughs its lots came from (`postgis.neighborhoods_of_tile`)
+and joins each lot on its own `neighborhood`, which every moved row still
+carries as an indexed attribute: the map, `map_cell_aggregates` and `map_tiles`
+read by borough and are untouched. In Dagster that dependency is a
+`MultiPartitionMapping` — identity on `date`, every partition on the spatial
+dimension.
 
 ## The silver and gold tables
 
@@ -50,17 +112,18 @@ Three rules hold for every one of those tables.
 written down twice, so moving an asset between layers moves its table with it
 instead of leaving the two disagreeing.
 
-**The grain is `(neighborhood, scrape_date, natural key)`.** Each table is
-partitioned `PARTITION BY LIST (neighborhood)` and then `PARTITION BY RANGE
-(scrape_date)` by month, so a borough's month is a leaf a reader's `WHERE`
-prunes to. Postgres requires a partitioned table's unique constraint to contain
-its partition keys, which is not a tax here but the grain restated — and it is
-exactly what a write conflicts on:
+**The grain is `(partition, scrape_date, natural key)`.** Each table is
+partitioned `PARTITION BY LIST (<its axis>)` — `cell_partition` for the lot
+chain, `neighborhood` for what a publisher bounds — and then `PARTITION BY
+RANGE (scrape_date)` by month, so a partition's month is a leaf a reader's
+`WHERE` prunes to. Postgres requires a partitioned table's unique constraint
+to contain its partition keys, which is not a tax here but the grain restated
+— and it is exactly what a write conflicts on:
 
 ```sql
-INSERT INTO silver.neighborhood_streets (...)
+INSERT INTO silver.lot_frontage (...)
 VALUES (...)
-ON CONFLICT (scrape_date, neighborhood, cote_rue_id)
+ON CONFLICT (scrape_date, cell_partition, lot_uid, cote_rue_id)
 DO UPDATE SET ...
 ```
 
@@ -110,10 +173,11 @@ table needs. The mechanism is one; what changes per table is only which columns
 are the key.
 
 Partitions are created on demand by hbu_infra's `warehouse.ensure_partition`,
-called with the partition about to be written, so a borough enabled for the
-first time and the first load of a new month both just work. It is deliberately
-not a `DEFAULT` partition: rows that land in a default cannot be moved by
-attaching the partition they belong in.
+called with the partition about to be written — a borough key or a cut cell,
+the function does not care which — so a borough enabled for the first time, a
+cell first written to and the first load of a new month all just work. It is
+deliberately not a `DEFAULT` partition: rows that land in a default cannot be
+moved by attaching the partition they belong in.
 
 Every asset reports what it published in its run metadata: the parquet-first
 ones as `<dataset>_rows_upserted` (and `<dataset>_rows_pruned` when the prune
@@ -183,11 +247,12 @@ as wrong about it.
 
 ## Output layout
 
-Layer first, then one prefix per asset, keyed by scrape date and then by
-borough:
+Layer first, then one prefix per asset, keyed by scrape date and then by the
+spatial partition — a borough key for what a publisher bounds, a cell of the
+tile cut for the lot chain (see [Two spatial axes](#two-spatial-axes)):
 
 ```
-<root>/<layer>/<asset>/<YYYY-MM-DD>[/<neighborhood>]/
+<root>/<layer>/<asset>/<YYYY-MM-DD>[/<neighborhood> | /<tile>]/
 ```
 
 ```
@@ -225,7 +290,7 @@ data/
 ├── silver/
 │   ├── assessment_units/2026-09-01/
 │   │   └── assessment_units.parquet
-│   ├── lot_assessed_values/2026-09-01/VSMPE/
+│   ├── lot_assessed_values/2026-09-01/0302303330102/
 │   │   └── lot_assessed_values.parquet
 │   ├── vacancy_rates/2026-09-01/VSMPE/
 │   │   ├── vacancy_rates.parquet
@@ -233,39 +298,41 @@ data/
 │   ├── average_rents/2026-09-01/VSMPE/
 │   │   ├── average_rents.parquet
 │   │   └── quartier_average_rents.parquet
-│   ├── building_lot_intersections/2026-09-01/VSMPE/
+│   ├── neighborhood_cadastre/2026-09-01/VSMPE/
+│   │   └── cadastre.json               # what landed in rag.*, and which cells
+│   ├── building_lot_intersections/2026-09-01/0302303330102/
 │   │   ├── building_lots.parquet
 │   │   └── lot_features.parquet
-│   ├── neighborhood_streets/2026-09-01/VSMPE/
+│   ├── neighborhood_streets/2026-09-01/0302303330102/
 │   │   └── neighborhood_streets.parquet
-│   ├── lot_frontage/2026-09-01/VSMPE/
+│   ├── lot_frontage/2026-09-01/0302303330102/
 │   │   └── lot_frontage.parquet
 │   ├── zoning_grid_columns/2026-09-01/VSMPE/
 │   │   └── zone_columns.parquet
-│   ├── lot_zoning_envelopes/2026-09-01/VSMPE/
+│   ├── lot_zoning_envelopes/2026-09-01/0302303330102/
 │   │   └── lot_zoning_envelopes.parquet
 │   ├── document_chunks/2026-09-01/VSMPE/
 │   │   └── chunks.parquet
 │   ├── document_embeddings/2026-09-01/VSMPE/
 │   │   └── embeddings.parquet
-│   ├── lot_zone_pieces/2026-09-01/VSMPE/
+│   ├── lot_zone_pieces/2026-09-01/0302303330102/
 │   │   └── lot_zone_pieces.parquet
-│   ├── lot_addresses/2026-09-01/VSMPE/
+│   ├── lot_addresses/2026-09-01/0302303330102/
 │   │   └── lot_addresses.parquet
-│   ├── lot_buildable_setbacks/2026-09-01/VSMPE/
+│   ├── lot_buildable_setbacks/2026-09-01/0302303330102/
 │   │   └── lot_buildable_setbacks.parquet
-│   └── lot_development_programs/2026-09-01/VSMPE/
+│   └── lot_development_programs/2026-09-01/0302303330102/
 │       └── lot_development_programs.parquet
 └── gold/
-    ├── lot_profiles/2026-09-01/VSMPE/
+    ├── lot_profiles/2026-09-01/0302303330102/
     │   └── lot_profiles.parquet
-    ├── lot_highest_best_use/2026-09-01/VSMPE/
+    ├── lot_highest_best_use/2026-09-01/0302303330102/
     │   └── lot_highest_best_use.parquet
-    ├── lot_redevelopment_gap/2026-09-01/VSMPE/
+    ├── lot_redevelopment_gap/2026-09-01/0302303330102/
     │   └── lot_redevelopment_gap.parquet
-    ├── lot_investment_opportunities/2026-09-01/VSMPE/
+    ├── lot_investment_opportunities/2026-09-01/0302303330102/
     │   └── lot_investment_opportunities.parquet
-    ├── lot_building_massing/2026-09-01/VSMPE/
+    ├── lot_building_massing/2026-09-01/0302303330102/
     │   └── lot_building_massing.parquet   # two geometry columns:
     │                                      #   the building and its asphalt
     ├── map_cell_aggregates/2026-09-01/VSMPE/
@@ -288,9 +355,10 @@ Nothing reads a layer name off a hard-coded string. `ParquetStore.partition_dir`
 takes an asset name and finds the layer itself, so an asset reading its
 upstream's output does not have to know which layer that upstream is in.
 
-The keys are bare values, not hive `key=value` pairs, so `neighborhood` and
-`scrape_date` are written as **columns** instead of being recovered from the
-path. A file that is copied out of the tree still knows which snapshot it
+The keys are bare values, not hive `key=value` pairs, so the partition —
+`neighborhood` or `cell_partition` — and `scrape_date` are written as
+**columns** instead of being recovered from the path, which is also why a
+borough key and a cell can share the slot: the file says which it is. A file that is copied out of the tree still knows which snapshot it
 belongs to:
 
 ```python

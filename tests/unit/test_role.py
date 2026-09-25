@@ -36,7 +36,6 @@ from urban_rag import role_assets
 from urban_rag.cubf import USE_DESCRIPTION_COLUMN
 from urban_rag.cubf_assets import CUBF_FILE, cubf_use_codes
 from urban_rag.frames import write_frame
-from urban_rag.infolot_assets import LOTS_FILE, neighborhood_lots
 from urban_rag.open_data_assets import QUARTIERS_FILE, reference_neighborhoods
 from urban_rag.partitions import borough_code_for
 from urban_rag.resources import ParquetStore, PostgisResource, RoleResource
@@ -73,6 +72,7 @@ from urban_rag.storage import join
 
 DATE = "2026-08-01"
 NEIGHBORHOOD = "VSMPE"
+TILE = "0302303330102"
 ROLL_YEAR = 2026
 ARCHIVE = filename_for(ROLL_YEAR)
 
@@ -593,17 +593,47 @@ def run_units(store, *, quartiers: bool = True, codebook: bool = True):
     )
 
 
-def write_lots(store, lots: gpd.GeoDataFrame) -> None:
-    """The upstream cadastre `lot_assessed_values` totals the roll onto."""
-    write_frame(
-        lots,
-        join(
-            store.partition_dir(
-                neighborhood_lots.key.path[-1], DATE, NEIGHBORHOOD
+#: What `postgis.fetch_lots` hands the asset, per test. The cadastre is in
+#: `rag.lots` once `neighborhood_cadastre` has run, and a tile reads it by
+#: cell - so the fixture is the rows that read returns, not a bronze file.
+_LOADED_LOTS: dict[str, gpd.GeoDataFrame] = {}
+
+
+@pytest.fixture(autouse=True)
+def fetched_lots(monkeypatch):
+    """Stand in for `rag.lots`: `fetch_lots` returns what `write_lots` set."""
+    _LOADED_LOTS.clear()
+    calls: list[tuple[str, str]] = []
+
+    def fetch_lots(connection, *, tile, scrape_date):
+        calls.append((tile, scrape_date))
+        return _LOADED_LOTS.get(
+            "lots",
+            gpd.GeoDataFrame(
+                {"lot_uid": [], "lot_number": [], "neighborhood": []},
+                geometry=[],
+                crs="EPSG:4326",
             ),
-            LOTS_FILE,
-        ),
+        )
+
+    monkeypatch.setattr(role_assets, "fetch_lots", fetch_lots)
+    return calls
+
+
+def write_lots(store, lots: gpd.GeoDataFrame) -> None:
+    """The cadastre `lot_assessed_values` totals the roll onto, as `rag.lots`
+    returns it: `lot_number` rather than Infolot's `NO_LOT`, the lot's own
+    borough and cell, and the rest of what Infolot published in `attributes`.
+    """
+    frame = lots.rename(columns={"NO_LOT": "lot_number"}).reset_index(drop=True)
+    frame = frame.assign(
+        lot_uid=range(1, len(frame) + 1),
+        neighborhood=NEIGHBORHOOD,
+        cell_key=TILE + "00000",
+        cell_partition=TILE,
+        attributes=[{"STATUT": "actif"}] * len(frame),
     )
+    _LOADED_LOTS["lots"] = frame
 
 
 @pytest.fixture
@@ -615,7 +645,7 @@ def published(monkeypatch):
 def run_lot_values(store, *, by_point: bool = True):
     return materialize(
         [lot_assessed_values],
-        partition_key=MultiPartitionKey({"date": DATE, "neighborhood": NEIGHBORHOOD}),
+        partition_key=MultiPartitionKey({"date": DATE, "tile": TILE}),
         resources={"store": store, "postgis": PostgisResource()},
         run_config={
             "ops": {
@@ -631,7 +661,7 @@ def lot_values(store) -> gpd.GeoDataFrame:
     """The partition `lot_assessed_values` just wrote, indexed by lot number."""
     return gpd.read_parquet(
         Path(
-            store.partition_dir(lot_assessed_values.key.path[-1], DATE, NEIGHBORHOOD)
+            store.partition_dir(lot_assessed_values.key.path[-1], DATE, TILE)
         )
         / LOT_VALUES_FILE
     ).set_index("NO_LOT")
@@ -1137,7 +1167,7 @@ def test_lot_values_publish_the_frame_they_wrote(store, role, published):
     result = run_lot_values(store)
 
     assert published["calls"] == 1
-    assert published["partition"] == (NEIGHBORHOOD, DATE)
+    assert published["partition"] == (TILE, DATE)
     assert set(published["datasets"]) == {"lot_assessed_values"}
     assert len(published["datasets"]["lot_assessed_values"]) == 5
     metadata = materialization_metadata(result, lot_assessed_values)
@@ -1184,3 +1214,38 @@ def test_lot_values_report_units_the_borough_holds_none_of(store, role, publishe
     # U_SPLIT and U_CONDO are elsewhere in the snapshot, and this partition
     # attributes them to nobody.
     assert metadata["num_units_unmatched_in_snapshot"].value == 2
+
+
+def test_lot_values_read_the_tiles_lots_out_of_rag_lots(
+    store, role, published, fetched_lots
+):
+    """The bronze cadastre is a borough's; a tile reads its cell of `rag.lots`.
+
+    Infolot's own columns come back out of `attributes` so the file keeps the
+    shape the bronze read gave it, and the lot's borough is its own rather
+    than a partition stamp.
+    """
+    run_roll(store)
+    run_units(store)
+    write_lots(store, borough_lots())
+
+    result = run_lot_values(store)
+
+    assert fetched_lots == [(TILE, DATE)]
+    values = lot_values(store)
+    assert set(values["cell_partition"]) == {TILE}
+    assert set(values["STATUT"]) == {"actif"}
+    assert "attributes" not in values.columns
+    metadata = materialization_metadata(result, lot_assessed_values)
+    assert metadata["tile"].value == TILE
+    assert metadata["neighborhoods"].value == NEIGHBORHOOD
+
+
+def test_lot_values_name_the_cadastre_when_the_tile_holds_no_lot(
+    store, role, published
+):
+    run_roll(store)
+    run_units(store)
+
+    with pytest.raises(Failure, match="neighborhood_cadastre"):
+        run_lot_values(store)

@@ -56,7 +56,7 @@ from urban_rag.frames import write_frame
 from urban_rag.hbu_assets import lot_redevelopment_gap
 from urban_rag.layers import key_prefix
 from urban_rag.massing_assets import lot_building_massing
-from urban_rag.partitions import scrape_partitions
+from urban_rag.partitions import borough_partition_of, scrape_partitions
 from urban_rag.postgis import (
     compute_map_cell_aggregates,
     fetch_map_cell_aggregates,
@@ -138,7 +138,7 @@ def map_cell_aggregates(
     store: ParquetStore,
     postgis: PostgisResource,
 ) -> MaterializeResult:
-    neighborhood, scrape_date = _partition(context)
+    neighborhood, scrape_date = borough_partition_of(context)
 
     unknown = sorted(set(config.layers) - set(tile_grid.LAYERS))
     if unknown:
@@ -252,8 +252,3 @@ def map_cell_aggregates(
             **published_metadata({"map_cell_aggregates": result["published"]}),
         }
     )
-
-
-def _partition(context: AssetExecutionContext) -> tuple[str, str]:
-    dimensions = context.partition_key.keys_by_dimension
-    return dimensions["neighborhood"], dimensions["date"][:10]

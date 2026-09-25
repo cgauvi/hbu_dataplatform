@@ -30,7 +30,10 @@ from dagster import (
     DynamicPartitionsDefinition,
     MonthlyPartitionsDefinition,
     MultiPartitionsDefinition,
+    StaticPartitionsDefinition,
 )
+
+from urban_rag import tile_cut
 
 
 class City(str, Enum):
@@ -354,6 +357,52 @@ scrape_partitions = MultiPartitionsDefinition(
     {"date": date_partitions, "neighborhood": neighborhood_partitions}
 )
 
+#: The name of the second spatial axis: a cell of the tile cut. `tile` rather
+#: than `cell` because Dagster prints a multi-partition key with its
+#: dimensions in name order, and `date` < `tile` keeps the key reading
+#: ``2026-09-01|0302303330102`` - date first, the way the borough keys do.
+#: `cell_key`/`cell_partition` stay the *column* vocabulary; this is the
+#: partition's.
+TILE_DIMENSION = "tile"
+
+#: The tile axis. Static, from the cut, because the cut *is* the checked-in
+#: constant (`urban_rag.tile_cut` says why it is not derived): a registry
+#: beside it could only drift from it, and a city is added by seeding the
+#: cut, which is a deploy. There is no `make tile-add`.
+#:
+#: What lives on this axis is the lot chain - every silver and gold table
+#: whose rows have a lot, a street side or an address point to be placed by.
+#: What stays on the borough axis is what a *publisher* bounds: the bronze
+#: fetches, the CMHC and C&W tables, the zoning grid, the corpus.
+tile_partitions = StaticPartitionsDefinition(sorted(tile_cut.CUT))
+
+tile_scrape_partitions = MultiPartitionsDefinition(
+    {"date": date_partitions, TILE_DIMENSION: tile_partitions}
+)
+
+
+def borough_partition_of(context) -> tuple[str, str]:
+    """``(neighborhood, scrape_date)`` of a run on the borough axis.
+
+    ``context`` is the `AssetExecutionContext` in hand. The date is cut to
+    its ``YYYY-MM-DD`` because a `MultiPartitionKey` carries the date
+    dimension as Dagster's own string, which is the same ten characters
+    today and need not stay so.
+    """
+    dimensions = context.partition_key.keys_by_dimension
+    return dimensions[NEIGHBORHOOD_PARTITIONS_NAME], dimensions["date"][:10]
+
+
+def tile_partition_of(context) -> tuple[str, str]:
+    """``(tile, scrape_date)`` of a run on the tile axis."""
+    dimensions = context.partition_key.keys_by_dimension
+    return dimensions[TILE_DIMENSION], dimensions["date"][:10]
+
+
+def city_of_tile(tile: str) -> City:
+    """Which city's publishers a cut cell's ground belongs to."""
+    return City(tile_cut.city_value_of(tile))
+
 
 def known_neighborhoods() -> tuple[str, ...]:
     """Every key this module can resolve into its sources, both cities."""
@@ -371,14 +420,24 @@ def city_of(neighborhood: str) -> City:
         ) from None
 
 
+def metric_crs_for_city(city: City) -> str:
+    """The projected CRS a city's lengths and areas are measured in."""
+    return METRIC_CRS_BY_CITY[city]
+
+
+def metric_srid_for_city(city: City) -> int:
+    """`metric_crs_for_city`, as the integer SRID PostGIS takes."""
+    return int(metric_crs_for_city(city).split(":")[1])
+
+
 def metric_crs_for(neighborhood: str) -> str:
     """The projected CRS a neighborhood's lengths and areas are measured in."""
-    return METRIC_CRS_BY_CITY[city_of(neighborhood)]
+    return metric_crs_for_city(city_of(neighborhood))
 
 
 def metric_srid_for(neighborhood: str) -> int:
     """`metric_crs_for`, as the integer SRID PostGIS takes."""
-    return int(metric_crs_for(neighborhood).split(":")[1])
+    return metric_srid_for_city(city_of(neighborhood))
 
 
 def municipality_code_for(city: City) -> str:
@@ -386,9 +445,14 @@ def municipality_code_for(city: City) -> str:
     return MUNICIPALITY_CODES[city]
 
 
+def cmhc_centre_for_city(city: City) -> str:
+    """The CMHC survey centre a city's quartiers are printed under."""
+    return CMHC_CENTRES[city]
+
+
 def cmhc_centre_for(neighborhood: str) -> str:
     """The CMHC survey centre a neighborhood's quartiers are printed under."""
-    return CMHC_CENTRES[city_of(neighborhood)]
+    return cmhc_centre_for_city(city_of(neighborhood))
 
 
 def enabled_neighborhoods(instance=None) -> tuple[str, ...]:

@@ -3,7 +3,7 @@ thesis - and filed under a site thesis that says why the parcel is acquirable.
 
 One gold asset over the HBU chain. `lot_redevelopment_gap` already answers
 *how far is this lot from its highest and best use* for every parcel in the
-borough, which is the right question and the wrong shape to act on: twenty-odd
+tile, which is the right question and the wrong shape to act on: twenty-odd
 thousand rows, most of them uninteresting, sorted by nothing and faceted by
 nothing.
 
@@ -21,7 +21,7 @@ travels beside `investment_thesis` so a conversion play is still visible as one
 
 **The rank is yield on cost, and the NOI gap is only the tiebreak.** Ranking on
 the raw gap sorts on parcel size almost regardless of what a building costs, so
-every facet's top ten becomes the ten biggest lots in the borough. Yield on
+every facet's top ten becomes the ten biggest lots in the tile. Yield on
 cost is what a developer compares two sites on, and it lets a small cheap parcel
 beat a large dear one. The land is in the denominator at its assessed value,
 which is the one judgement in the formula - see `urban_rag.opportunities`.
@@ -39,7 +39,12 @@ three things the gap table does not carry, and this asset joins them in:
 * the governing zone's *Secteur d'interet patrimonial* and *PIIA (secteur)*
   rows, from `zoning_grid_columns`, on the zone - so a building in a heritage
   sector or a PIIA sector is kept out of the two theses that demolish, and
-  falls to `improvement`, where the building stays.
+  falls to `improvement`, where the building stays. The grids are parsed per
+  borough and stay on that axis, so a tile reads the file of every borough
+  its lots belong to (`neighborhoods_of_tile`) and joins on the zone's own
+  identity - the layer slug and the feature - rather than on the lot's
+  borough, since the zone governing a lot at a borough line may be the
+  neighbour's.
 
 Each site thesis carries its own costs into its own yield - demolition,
 characterisation and remediation, or the premium an addition pays over new
@@ -51,7 +56,7 @@ wrote, so this is a classification, a few divisions and four sorts over four
 parquet files. That is the whole reason it is its own asset rather than more
 columns on the gap table: changing what counts as "mixed-use", or the
 demolition rate, or how many lots make the shortlist, should cost seconds
-rather than a borough of CP-SAT models.
+rather than a tile of CP-SAT models.
 
 **Every lot keeps its row.** A lot that is not under-built, one the solver found
 no program for, and one the roll never assessed all keep a row with a null rank
@@ -71,11 +76,15 @@ from datetime import datetime, timezone
 
 import pandas as pd
 from dagster import (
+    AssetDep,
     AssetExecutionContext,
     Config,
+    DimensionPartitionMapping,
     Failure,
+    IdentityPartitionMapping,
     MaterializeResult,
     MetadataValue,
+    MultiPartitionMapping,
     asset,
 )
 from pydantic import Field
@@ -112,7 +121,7 @@ from urban_rag.opportunities import (
     site_thesis_summary,
     thesis_summary,
 )
-from urban_rag.partitions import scrape_partitions
+from urban_rag.partitions import tile_partition_of, tile_scrape_partitions
 from urban_rag.proforma import ProformaAssumptions, Timing
 from urban_rag.rag.pgvector import PostgresUnavailable
 from urban_rag.resources import ParquetStore, PostgisResource
@@ -120,8 +129,16 @@ from urban_rag.storage import clear_parquet, filesystem, join, storage_options
 from urban_rag.warehouse import MissingRelation, publish, published_metadata
 
 #: The one file a partition writes, under
-#: `gold/lot_investment_opportunities/<YYYY-MM-DD>/<neighborhood>/`.
+#: `gold/lot_investment_opportunities/<YYYY-MM-DD>/<tile>/`.
 LOT_OPPORTUNITIES_FILE = "lot_investment_opportunities.parquet"
+
+#: How this tile asset depends on the one borough-axis input it reads: the
+#: date one to one, the borough dimension unlisted, which Dagster reads as all
+#: of them. Which boroughs matter is `neighborhoods_of_tile`'s answer at run
+#: time.
+_BOROUGH_BRIDGE = MultiPartitionMapping(
+    {"date": DimensionPartitionMapping("date", IdentityPartitionMapping())}
+)
 
 #: What this asset carries forward from `lot_redevelopment_gap`, in the order
 #: the table lists it. A curated subset rather than the whole gap row: this is a
@@ -138,6 +155,10 @@ _CARRIED: tuple[str, ...] = (
     "feature_id",
     "lot_number",
     "neighborhood",
+    # The lot's cell and the cut cell it resolves to, off the gap row: the
+    # table is partitioned on the second, and the value is the lot's own.
+    "cell_key",
+    "cell_partition",
     "scrape_date",
     # The parcel, then the ground this row was solved over, then how many
     # pieces the parcel has and whether this is the biggest - the three a
@@ -610,17 +631,19 @@ class OpportunityConfig(Config):
 
 @asset(
     key_prefix=key_prefix("lot_investment_opportunities"),
-    partitions_def=scrape_partitions,
+    partitions_def=tile_scrape_partitions,
     deps=[
         lot_redevelopment_gap,
         lot_highest_best_use,
         lot_assessment_comparables,
-        zoning_grid_columns,
+        # Parsed per borough and read per borough of the tile - the bridge.
+        AssetDep(zoning_grid_columns, partition_mapping=_BOROUGH_BRIDGE),
     ],
     group_name=GOLD_GROUP,
     kinds={"parquet", "postgres"},
     description=(
-        "The under-built lots worth looking at first, one row per lot, faceted "
+        "The under-built lots of one tile worth looking at first, one row per "
+        "lot, faceted "
         "by investment thesis and ranked within it. investment_thesis is read "
         "off the *proposed* program - the mix of residential, commercial and "
         "industrial floor the highest-and-best-use solver would build - so a "
@@ -648,9 +671,9 @@ class OpportunityConfig(Config):
         "income's worth, as buyer_npv_*, buyer_yield_*, residual_price_* and "
         "buyer_best_future. Every lot keeps its row. Written to "
         "gold/lot_investment_opportunities/"
-        f"<YYYY-MM-DD>/<neighborhood>/{LOT_OPPORTUNITIES_FILE} and upserted "
-        "into gold.lot_investment_opportunities on (scrape_date, neighborhood, "
-        "lot_uid)."
+        f"<YYYY-MM-DD>/<tile>/{LOT_OPPORTUNITIES_FILE} and upserted "
+        "into gold.lot_investment_opportunities on (scrape_date, "
+        "cell_partition, lot_uid, feature_id)."
     ),
 )
 def lot_investment_opportunities(
@@ -659,38 +682,36 @@ def lot_investment_opportunities(
     store: ParquetStore,
     postgis: PostgisResource,
 ) -> MaterializeResult:
-    dimensions = context.partition_key.keys_by_dimension
-    neighborhood = dimensions["neighborhood"]
-    scrape_date = dimensions["date"][:10]
+    tile, scrape_date = tile_partition_of(context)
 
     gap = _read(
         store, lot_redevelopment_gap, LOT_GAP_FILE,
-        neighborhood=neighborhood, scrape_date=scrape_date,
+        partition=tile, scrape_date=scrape_date,
     )
     if gap.empty:
-        # Not "the borough has no opportunities": the partition upstream was
+        # Not "the tile has no opportunities": the partition upstream was
         # never computed. Distinguishing the two is why this fails rather than
         # writing a well-formed empty shortlist.
         raise Failure(
-            f"{lot_redevelopment_gap.key.path[-1]} holds no lot for "
-            f"{neighborhood} {scrape_date}; there is nothing to rank."
+            f"{lot_redevelopment_gap.key.path[-1]} holds no lot for tile "
+            f"{tile} {scrape_date}; there is nothing to rank."
         )
     hbu = _read(
         store, lot_highest_best_use, LOT_HBU_FILE,
-        neighborhood=neighborhood, scrape_date=scrape_date,
+        partition=tile, scrape_date=scrape_date,
     )
     existing = _read(
         store, lot_assessment_comparables, LOT_COMPARABLES_FILE,
-        neighborhood=neighborhood, scrape_date=scrape_date,
+        partition=tile, scrape_date=scrape_date,
     )
-    # The one optional input: a partition whose grids were parsed before the
-    # zone-level rows were read has a zone columns file with no heritage in
-    # it, and one materialized by hand may have none at all. Either way the
-    # honest answer is "unknown", which screens nothing and is counted.
-    zones = _read(
-        store, zoning_grid_columns, ZONE_COLUMNS_FILE,
-        neighborhood=neighborhood, scrape_date=scrape_date, optional=True,
-    )
+    # The one optional input, and the one on the borough axis: read for every
+    # borough the tile's lots belong to and joined on the zone's identity. A
+    # borough whose grids were parsed before the zone-level rows were read
+    # has a zone columns file with no heritage in it, and one materialized by
+    # hand may have none at all. Either way the honest answer is "unknown",
+    # which screens nothing and is counted.
+    neighborhoods = _neighborhoods_of_tile(postgis, tile, scrape_date)
+    zones = _zone_columns(store, neighborhoods, scrape_date)
 
     inputs = gap.copy()
     _join_program(inputs, hbu)
@@ -771,13 +792,12 @@ def lot_investment_opportunities(
         },
         ensure_ascii=False,
     )
-    frame["neighborhood"] = neighborhood
+    # `neighborhood`, `cell_key` and `cell_partition` are the lot's own and
+    # come through `_CARRIED` from the gap row; only the date is the run's.
     frame["scrape_date"] = scrape_date
     frame["computed_at"] = datetime.now(timezone.utc).isoformat()
 
-    output_dir = store.partition_dir(
-        context.asset_key.path[-1], scrape_date, neighborhood
-    )
+    output_dir = store.partition_dir(context.asset_key.path[-1], scrape_date, tile)
     removed = clear_parquet(output_dir)
     if removed:
         context.log.info("Removed %d file(s) from a previous run", len(removed))
@@ -789,13 +809,13 @@ def lot_investment_opportunities(
         loaded = publish(
             postgis.connect,
             {"lot_investment_opportunities": frame},
-            neighborhood=neighborhood,
+            partition=tile,
             scrape_date=scrape_date,
         )
     except (PostgresUnavailable, MissingRelation) as exc:
         raise Failure(
             f"{path} was written, but gold.lot_investment_opportunities could "
-            f"not be updated for {neighborhood} {scrape_date}: {exc}"
+            f"not be updated for tile {tile} {scrape_date}: {exc}"
         ) from exc
 
     summary = thesis_summary(frame)
@@ -804,8 +824,8 @@ def lot_investment_opportunities(
     ranked_rows = int(frame["thesis_rank"].notna().sum())
     site_ranked_rows = int(frame["site_thesis_rank"].notna().sum())
     context.log.info(
-        "%s %s: %d lot(s), %d ranked, %d shortlisted - %s; site theses %s -> %s",
-        neighborhood,
+        "tile %s %s: %d lot(s), %d ranked, %d shortlisted - %s; site theses %s -> %s",
+        tile,
         scrape_date,
         len(frame),
         ranked_rows,
@@ -825,6 +845,8 @@ def lot_investment_opportunities(
     return MaterializeResult(
         metadata={
             "dagster/row_count": len(frame),
+            "tile": tile,
+            "neighborhoods": ", ".join(neighborhoods),
             "num_lots": len(frame),
             "num_ranked": ranked_rows,
             # A lot with a thesis but no rank is one that is not under-built,
@@ -859,7 +881,7 @@ def lot_investment_opportunities(
                 for row in summary.itertuples()
             },
             # What the whole shortlist would add and what it would take, as one
-            # pair of numbers per run. The borough-scale read this asset is for.
+            # pair of numbers per run. The tile-scale read this asset is for.
             "shortlist_noi_gap_millions": round(
                 sum(row.top_noi_gap_cad or 0.0 for row in summary.itertuples())
                 / 1e6,
@@ -897,9 +919,10 @@ def lot_investment_opportunities(
                 for row in site_summary.itertuples()
             },
             # The heritage screen, by the numbers: how many lots it kept out,
-            # and how many it could not judge. A borough where the last is most
+            # and how many it could not judge. A tile where the last is most
             # of the rows has a zone columns partition parsed before the
-            # *Patrimoine* rows were read - re-run `zoning_grid_columns`.
+            # *Patrimoine* rows were read - re-run `zoning_grid_columns` for
+            # its boroughs.
             "num_heritage_sector_lots": int(frame["is_heritage_sector"].sum()),
             "num_piia_review_lots": int(frame["has_piia_review"].sum()),
             "num_demolition_review_lots": int(
@@ -911,7 +934,7 @@ def lot_investment_opportunities(
             # The lane screen: ground the roll never listed with under
             # `unassessed_vacant_max_coverage` of it under a measured
             # building, kept out of infill. 594 of VSMPE 2026-09-01's 1,051
-            # infill pieces; a borough where this is most of the infills was
+            # infill pieces; a tile where this is most of the infills was
             # filing its ruelles.
             "num_unassessed_vacant_lots": int(frame["is_unassessed_vacant"].sum()),
             # A grid printing ``-`` against the heritage row is a known
@@ -928,7 +951,7 @@ def lot_investment_opportunities(
             # The returns, by the numbers: how many lots clear the cap rate,
             # how many the hurdle, on their own thesis - a good candidate
             # clears either - and what the IRRs look like where they exist.
-            # A borough with few good candidates is priced above what its
+            # A tile with few good candidates is priced above what its
             # envelopes earn, which is a finding rather than a fault.
             "num_good_candidates": int(frame["is_good_candidate"].sum()),
             "num_clearing_cap_rate": int(frame["clears_cap_rate"].sum()),
@@ -951,9 +974,9 @@ def lot_investment_opportunities(
                 site_summary.to_markdown(index=False)
             ),
             # The three futures, twice: which wins for the owner and which for
-            # a buyer at the run's market factor. A borough where the owner's
+            # a buyer at the run's market factor. A tile where the owner's
             # answer is `hold` almost everywhere and the buyer's `rebuild`
-            # nowhere is a borough priced above what its envelopes earn.
+            # nowhere is a tile priced above what its envelopes earn.
             **{
                 f"num_owner_best_{row.future}": row.owner_wins
                 for row in futures.itertuples()
@@ -1098,10 +1121,13 @@ def _join_zones(
 
     Zone-level rather than column-level, so the zone columns are collapsed to
     one row per ``(source_table, feature_id)`` before the join - every column
-    of one grid carries the same four values. Returns whether the zone file
+    of one grid carries the same four values. On the zone's identity and not
+    on the lot's borough, deliberately: ``zones`` is the concatenation of
+    every borough's file the tile holds, and the zone governing a lot at a
+    borough line may be the neighbour's. Returns whether the zone file
     carried the heritage columns at all, and how many lots named a zone the
     file had no row for - a lot with no solved program names none, and is
-    counted - so the run can say how much of the borough the screen could
+    counted - so the run can say how much of the tile the screen could
     judge.
 
     **`source_table` is dropped afterwards and `feature_id` is not**, which is
@@ -1153,12 +1179,67 @@ def _drop_join_keys(inputs: pd.DataFrame, keys: list[str]) -> None:
     )
 
 
+def _neighborhoods_of_tile(
+    postgis: PostgisResource, tile: str, scrape_date: str
+) -> tuple[str, ...]:
+    """The boroughs whose lots this tile holds, off `rag.lots`.
+
+    What decides which boroughs' zone files are read. Asked of Postgres
+    rather than read off the gap rows because `rag.lots` is the record of
+    what was loaded; a tile no cadastre was loaded for fails here, naming it,
+    rather than later in the publish.
+    """
+    from urban_rag.postgis import neighborhoods_of_tile
+
+    try:
+        with postgis.connect() as connection:
+            neighborhoods = neighborhoods_of_tile(
+                connection, tile=tile, scrape_date=scrape_date
+            )
+    except (PostgresUnavailable, MissingRelation) as exc:
+        raise Failure(
+            f"the boroughs of tile {tile} {scrape_date} could not be read off "
+            f"rag.lots: {exc}"
+        ) from exc
+    if not neighborhoods:
+        raise Failure(
+            f"rag.lots holds no lot for tile {tile} {scrape_date}; load the "
+            "cadastre (neighborhood_cadastre) for the boroughs it covers first."
+        )
+    return tuple(neighborhoods)
+
+
+def _zone_columns(
+    store: ParquetStore, neighborhoods: tuple[str, ...], scrape_date: str
+) -> pd.DataFrame:
+    """`zoning_grid_columns` for every borough of the tile, in one frame.
+
+    Concatenated as read, borough after borough: `_join_zones` collapses the
+    result on the zone's identity, and a zone two boroughs both parsed - one
+    city-wide layer, as Quebec City and Saguenay publish - carries the same
+    heritage rows under each. A borough without the file contributes nothing
+    and is not a failure; every borough without it is the empty frame the
+    single-borough read used to return, and screens nothing.
+    """
+    frames = [
+        _read(
+            store, zoning_grid_columns, ZONE_COLUMNS_FILE,
+            partition=neighborhood, scrape_date=scrape_date, optional=True,
+        )
+        for neighborhood in neighborhoods
+    ]
+    present = [frame for frame in frames if not frame.empty]
+    if not present:
+        return pd.DataFrame()
+    return pd.concat(present, ignore_index=True)
+
+
 def _read(
     store: ParquetStore,
     asset_def,
     name: str,
     *,
-    neighborhood: str,
+    partition: str,
     scrape_date: str,
     optional: bool = False,
 ) -> pd.DataFrame:
@@ -1166,16 +1247,17 @@ def _read(
 
     The same shape `hbu_assets._read` takes, and for the same reason: the
     message that helps names the asset to run rather than the path that was
-    absent. ``optional`` returns an empty frame instead, for the one input a
-    partition can honestly lack.
+    absent. ``partition`` is the tile for a lot-chain upstream and the borough
+    for the zone columns. ``optional`` returns an empty frame instead, for the
+    one input a partition can honestly lack.
     """
     asset_name = asset_def.key.path[-1]
-    path = join(store.partition_dir(asset_name, scrape_date, neighborhood), name)
+    path = join(store.partition_dir(asset_name, scrape_date, partition), name)
     if not filesystem(path).exists(path):
         if optional:
             return pd.DataFrame()
         raise Failure(
             f"{path} is missing; materialize {asset_name} for "
-            f"{neighborhood} {scrape_date} first."
+            f"{partition} {scrape_date} first."
         )
     return pd.read_parquet(path, storage_options=storage_options(path))

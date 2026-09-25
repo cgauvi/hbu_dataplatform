@@ -36,7 +36,7 @@ from urban_rag.postgis import (
     compute_lot_buildable_setbacks,
 )
 
-NEIGHBORHOOD = "VSMPE"
+TILE = "0302303330102"
 DATE = "2026-08-20"
 
 
@@ -90,7 +90,7 @@ class FakeCursor:
             (name,) = params
             self._result = (None if name in self.missing else name,)
         elif "warehouse.ensure_partition" in text:
-            self._result = ("silver.lot_buildable_setbacks_vsmpe_202608",)
+            self._result = ("silver.lot_buildable_setbacks_03023033301021_202608",)
         elif text.startswith("DROP TABLE") or text.startswith("CREATE INDEX"):
             pass
         elif text.startswith("ANALYZE"):
@@ -155,7 +155,7 @@ def run(cursor, **kwargs):
     connection = FakeConnection(cursor)
     result = compute_lot_buildable_setbacks(
         connection,
-        neighborhood=NEIGHBORHOOD,
+        tile=TILE,
         scrape_date=DATE,
         **kwargs,
     )
@@ -312,6 +312,54 @@ def test_the_default_is_the_shipped_constant():
     result = compute(cursor)
 
     assert result["edge_tolerance_m"] == DEFAULT_SETBACK_EDGE_TOLERANCE_M
+
+
+# -- the cell ---------------------------------------------------------------
+
+
+def test_every_read_is_the_cells_own_and_none_names_a_borough():
+    """Every input here is keyed on the lot, so every read is the lot's cell.
+
+    The parcels, the frontage rows, the envelopes and the zone pieces are all
+    read at `cell_partition = tile`; nothing is read by borough, and the row
+    written carries the lot's own borough and cell rather than a literal.
+    """
+    cursor = FakeCursor(num_lots=4)
+
+    compute(cursor, batch_lots=4)
+
+    sort_statement, sort_params = next(
+        (statement, params)
+        for statement, params in cursor.statements
+        if statement.strip().startswith("CREATE TEMP TABLE _setback_edges")
+    )
+    assert sort_params["tile"] == TILE
+    assert "neighborhood" not in sort_params
+    # `rag.lots` and `silver.lot_frontage`, both at the cell.
+    assert sort_statement.count("cell_partition = %(tile)s") == 2
+    assert "%(neighborhood)s" not in sort_statement
+    assert "neighborhood = %" not in sort_statement
+    # The sort carries the three the carve stamps.
+    assert "p.neighborhood" in sort_statement
+    assert "p.cell_key" in sort_statement
+    assert "p.cell_partition" in sort_statement
+
+    carve = _insert(cursor)
+    assert "%(neighborhood)s" not in carve
+    assert "neighborhood = %" not in carve
+    assert "e.cell_partition = %(tile)s" in carve
+    assert "m.neighborhood," in carve
+    assert "m.cell_key," in carve
+    assert "m.cell_partition," in carve
+
+    for statement, params in cursor.statements:
+        text = " ".join(statement.split())
+        if text.startswith("DELETE FROM silver.lot_buildable_setbacks"):
+            assert "WHERE cell_partition = %s" in text
+            assert params[0] == TILE
+        if text.startswith("SELECT lot_uid FROM rag.lots"):
+            assert "WHERE cell_partition = %s" in text
+            assert params == [TILE, DATE]
 
 
 # -- the boundary sort -----------------------------------------------------

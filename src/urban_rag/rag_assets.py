@@ -51,7 +51,7 @@ from urban_rag.rag.documents import (
 )
 from urban_rag.frames import write_vectors
 from urban_rag.layers import key_prefix
-from urban_rag.partitions import scrape_partitions
+from urban_rag.partitions import borough_partition_of, scrape_partitions
 from urban_rag.rag.pgvector import PostgresUnavailable
 from urban_rag.rag.results import IndexMismatch
 from urban_rag.resources import (
@@ -109,7 +109,7 @@ def linked_documents(
     store: ParquetStore,
     pdf_cache: PdfCache,
 ) -> MaterializeResult:
-    neighborhood, scrape_date = _partition(context)
+    neighborhood, scrape_date = borough_partition_of(context)
     source_dir = store.partition_dir(
         neighborhood_features.key.path[-1], scrape_date, neighborhood
     )
@@ -218,7 +218,7 @@ def document_chunks(
     embedding_model: EmbeddingModel,
     postgis: PostgisResource,
 ) -> MaterializeResult:
-    neighborhood, scrape_date = _partition(context)
+    neighborhood, scrape_date = borough_partition_of(context)
     frame = _read(
         store.partition_dir(
             linked_documents.key.path[-1], scrape_date, neighborhood
@@ -264,7 +264,7 @@ def document_chunks(
         loaded = publish(
             postgis.connect,
             {"document_chunks": chunks_frame},
-            neighborhood=neighborhood,
+            partition=neighborhood,
             scrape_date=scrape_date,
         )
     except (PostgresUnavailable, MissingRelation) as exc:
@@ -309,7 +309,7 @@ def document_embeddings(
     store: ParquetStore,
     embedding_model: EmbeddingModel,
 ) -> MaterializeResult:
-    neighborhood, scrape_date = _partition(context)
+    neighborhood, scrape_date = borough_partition_of(context)
     frame = _read(
         store.partition_dir(
             document_chunks.key.path[-1], scrape_date, neighborhood
@@ -368,7 +368,7 @@ def document_index(
     replacing it, and the borough's superseded scrape dates are dropped after
     the new one has landed. See `urban_rag.rag.pgvector`.
     """
-    neighborhood, scrape_date = _partition(context)
+    neighborhood, scrape_date = borough_partition_of(context)
     path = join(
         store.partition_dir(
             document_embeddings.key.path[-1], scrape_date, neighborhood
@@ -417,11 +417,6 @@ def document_index(
     )
 
 
-def _partition(context: AssetExecutionContext) -> tuple[str, str]:
-    dimensions = context.partition_key.keys_by_dimension
-    return dimensions["neighborhood"], dimensions["date"][:10]
-
-
 def _partition_dir(context: AssetExecutionContext, store: ParquetStore) -> str:
     """Where the running asset writes.
 
@@ -429,7 +424,7 @@ def _partition_dir(context: AssetExecutionContext, store: ParquetStore) -> str:
     `urban_rag.layers`, so this is the same call whichever layer the asset is
     in.
     """
-    neighborhood, scrape_date = _partition(context)
+    neighborhood, scrape_date = borough_partition_of(context)
     return store.partition_dir(
         context.asset_key.path[-1], scrape_date, neighborhood
     )

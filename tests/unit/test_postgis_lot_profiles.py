@@ -29,7 +29,7 @@ from urban_rag.postgis import (
     compute_lot_profiles,
 )
 
-NEIGHBORHOOD = "VSMPE"
+TILE = "0302303330102"
 DATE = "2026-08-20"
 
 
@@ -111,7 +111,7 @@ class FakeCursor:
         elif "warehouse.ensure_partition" in text:
             # The partition is created on demand before every write - see
             # hbu_infra's sql/003_warehouse.sql. Nothing to answer here.
-            self._result = ("gold.lot_profiles_vsmpe_202608",)
+            self._result = ("gold.lot_profiles_03023033301021_202608",)
         elif text.startswith("CREATE TEMP TABLE") or text.startswith("DROP TABLE"):
             pass
         elif "INSERT INTO gold_lot_profiles_load" in text:
@@ -181,7 +181,7 @@ class FakeConnection:
 def compute(cursor, **kwargs):
     return compute_lot_profiles(
         FakeConnection(cursor),
-        neighborhood=NEIGHBORHOOD,
+        tile=TILE,
         scrape_date=DATE,
         **kwargs,
     )
@@ -278,12 +278,65 @@ def test_the_assessment_table_is_joined_on_the_lot_number_not_the_uid():
 
     insert = _statement_containing(cursor, "silver.lot_assessed_values")
     assert "assessed.lot_number = l.lot_number" in insert
-    # Scoped to the partition as well - the table holds every borough-day -
-    # and by the parameters rather than by equality with `l`, so the partition
-    # prunes at plan time.
-    assert "assessed.neighborhood = %(neighborhood)s" in insert
+    # Scoped to the partition as well - the table holds every cell-day - and
+    # by the parameters rather than by equality with `l`, so the partition
+    # prunes at plan time. The cell, because a row keyed on a lot lives in the
+    # lot's cell.
+    assert "assessed.cell_partition = %(tile)s" in insert
     assert "assessed.scrape_date = %(scrape_date)s::date" in insert
     assert "assessed.lot_uid" not in insert
+
+
+def test_the_profile_is_the_cells_lots_stamped_with_their_own_borough():
+    """The owned set is `rag.lots` at the cell, and no read names a borough.
+
+    Every lot-keyed input is read at `cell_partition = tile` - that is where
+    a row keyed on a lot lives - and the row carries the lot's own
+    `neighborhood`, `cell_key` and `cell_partition`, never a literal the
+    caller passed. A cell that straddles two boroughs writes each lot under
+    its own.
+    """
+    cursor = FakeCursor()
+
+    compute(cursor)
+
+    statement, params = next(
+        (statement, params)
+        for statement, params in cursor.statements
+        if "INSERT INTO gold_lot_profiles_load" in statement
+    )
+    assert params["tile"] == TILE
+    assert "neighborhood" not in params
+    assert "%(neighborhood)s" not in statement
+    assert "neighborhood = %" not in statement
+    assert "l.cell_partition = %(tile)s" in statement
+    for table in ("bl", "f", "b", "comparables"):
+        assert f"{table}.cell_partition = %(tile)s" in statement, table
+        assert f"{table}.neighborhood = " not in statement, table
+    # The lot's own three, in the select list.
+    assert "l.neighborhood," in statement
+    assert "l.cell_key," in statement
+    assert "l.cell_partition," in statement
+
+
+def test_the_documents_are_joined_to_the_cells_lots_and_not_to_a_borough():
+    """The corpus stays per borough; the lot does not care which one.
+
+    `rag.lot_documents` is one row per (lot, feature, document) and carries
+    the borough the document was indexed under. It is joined to the owned
+    lots by `lot_uid` alone, and that borough rides along inside each
+    `documents` entry rather than narrowing the read - a `C01-001` cited from
+    two boroughs' grids is told apart by it, not filtered by it.
+    """
+    cursor = FakeCursor()
+
+    compute(cursor)
+
+    insert = _statement_containing(cursor, "rag.lot_documents")
+    assert "owned.lot_uid = ld.lot_uid" in insert
+    assert "owned.cell_partition = %(tile)s" in insert
+    assert "ld.neighborhood = " not in insert
+    assert "'neighborhood', a.neighborhood" in insert
 
 
 def test_a_lot_with_no_assessment_unit_keeps_a_null_total_and_a_zero_count():
@@ -347,7 +400,7 @@ def test_the_threshold_reaches_the_statement():
         if "INSERT INTO gold_lot_profiles_load" in statement
     )
     assert insert["threshold"] == 60.0
-    assert insert["neighborhood"] == NEIGHBORHOOD
+    assert insert["tile"] == TILE
     assert insert["scrape_date"] == DATE
 
 
@@ -563,14 +616,14 @@ def test_staged_and_landed_are_reported_separately():
 
 
 def test_the_cmhc_objects_reach_the_statement_as_jsonb_parameters():
-    """One object each for the whole borough - CMHC publishes no geometry, so
-    there is nothing per-lot about them and nothing to join on."""
+    """One object per borough the cell holds, keyed by it - CMHC publishes no
+    geometry, so the lot's own `neighborhood` is the only thing to join on."""
     cursor = FakeCursor()
 
     result = compute(
         cursor,
-        vacancy_rates={"survey_year": 2023, "overall_vacancy_rate_pct": 0.5},
-        average_rents={"survey_year": 2023, "overall_average_rent_cad": 1_275.0},
+        vacancy_rates={"VSMPE": {"survey_year": 2023, "overall_vacancy_rate_pct": 0.5}},
+        average_rents={"VSMPE": {"survey_year": 2023, "overall_average_rent_cad": 1_275.0}},
     )
 
     insert = next(
@@ -578,8 +631,15 @@ def test_the_cmhc_objects_reach_the_statement_as_jsonb_parameters():
         for statement, params in cursor.statements
         if "INSERT INTO gold_lot_profiles_load" in statement
     )
-    assert insert["vacancy_rates"].obj["survey_year"] == 2023
-    assert insert["average_rents"].obj["overall_average_rent_cad"] == 1_275.0
+    assert insert["vacancy_rates"].obj["VSMPE"]["survey_year"] == 2023
+    assert insert["average_rents"].obj["VSMPE"]["overall_average_rent_cad"] == 1_275.0
+    # Each lot reads its own borough's object, not one for the whole call.
+    statement = next(
+        " ".join(s.split()) for s, _ in cursor.statements
+        if "INSERT INTO gold_lot_profiles_load" in s
+    )
+    assert "%(vacancy_rates)s::jsonb -> l.neighborhood" in statement
+    assert "%(average_rents)s::jsonb -> l.neighborhood" in statement
     assert result["has_vacancy_rates"] is True
     assert result["has_average_rents"] is True
     # Read back out of the table rather than echoed from what went in.

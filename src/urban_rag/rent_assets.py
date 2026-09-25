@@ -103,7 +103,14 @@ from urban_rag.marketbeat import (
     market_total,
     parse_submarkets,
 )
-from urban_rag.partitions import City, city_of, date_partitions, scrape_partitions, submarket_for
+from urban_rag.partitions import (
+    City,
+    borough_partition_of,
+    city_of,
+    date_partitions,
+    scrape_partitions,
+    submarket_for,
+)
 from urban_rag.rag.pgvector import PostgresUnavailable
 from urban_rag.resources import (
     CrspiResource,
@@ -392,9 +399,7 @@ def commercial_rents(
     store: ParquetStore,
     postgis: PostgisResource,
 ) -> MaterializeResult:
-    dimensions = context.partition_key.keys_by_dimension
-    neighborhood = dimensions["neighborhood"]
-    scrape_date = dimensions["date"][:10]
+    neighborhood, scrape_date = borough_partition_of(context)
 
     submarkets = _read(
         store.partition_dir(montreal_commercial_rents.key.path[-1], scrape_date),
@@ -446,7 +451,7 @@ def commercial_rents(
         loaded = publish(
             postgis.connect,
             {"commercial_rents": frame},
-            neighborhood=neighborhood,
+            partition=neighborhood,
             scrape_date=scrape_date,
         )
     except (PostgresUnavailable, MissingRelation) as exc:

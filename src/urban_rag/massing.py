@@ -289,6 +289,11 @@ MASSING_COLUMNS: tuple[str, ...] = (
     "lot_uid",
     "lot_number",
     "neighborhood",
+    # The lot's cell and the cut cell it resolves to, carried off the HBU row:
+    # both tables this frame feeds are partitioned on `cell_partition`, and
+    # the value is the lot's own rather than the run's.
+    "cell_key",
+    "cell_partition",
     "scrape_date",
     "feature_id",
     "column_index",
@@ -345,6 +350,8 @@ PARKING_COLUMNS: tuple[str, ...] = (
     "lot_uid",
     "lot_number",
     "neighborhood",
+    "cell_key",
+    "cell_partition",
     "scrape_date",
     "feature_id",
     "column_index",

@@ -71,16 +71,21 @@ MODULE := urban_rag.definitions
 # earlier month from bronze already on disk: `make hbu DATE=2026-08-01`.
 #
 # That override is for the silver and gold targets only. The targets that
-# reach a bronze asset - `catalog`, `cmhc`, `corpus`, `costs`, `features`,
-# `quartiers`, `rent-sources`, `roll`, `streets` - fetch from a live publisher,
-# so an earlier DATE would write today's data under an earlier month's key.
-# They refuse it; see urban_rag.guards and docs/running.md.
+# reach a bronze asset - `addresses`, `buildings`, `catalog`, `cmhc`, `corpus`,
+# `costs`, `features`, `lots`, `quartiers`, `rent-sources`, `roll`, `streets`
+# - fetch from a live publisher, so an earlier DATE would write today's data
+# under an earlier month's key. They refuse it; see urban_rag.guards and
+# docs/running.md.
 DATE ?= $(shell date +%Y-%m-01)
 # A key from urban_rag.partitions.known_neighborhoods(): a Montreal borough
 # (VSMPE, RPP, ...) or a Quebec City arrondissement (CIL, RIV, ...). It has to
 # be registered on the partition axis first - `make neighborhood-add` - since
 # the axis is dynamic and lives in the Dagster instance, not in code.
 NEIGHBORHOOD ?= VSMPE
+# A cell of the tile cut - the partition value on the tile axis, which the lot
+# chain (building-lots and everything after it) runs on. `make tiles` lists
+# them; the default is the Villeray cell 1 740 794 and 7430 Lajeunesse sit in.
+TILE ?= 0302303330102
 PORT ?= 2500
 K ?= 5
 # Which vector store the retrieval targets act on: the local DuckDB file, or
@@ -159,7 +164,10 @@ ASSUMED_AGE ?= 50
 # Scales the assessed value into the cap rate's denominator. 1.0 reports the
 # yield on the roll, which is the honest default: Quebec's *facteur comparatif*
 # is not in the published roll. Set it to the year's factor for a market rate.
-MARKET_FACTOR ?= 1.0
+# `opportunities` reads the same factor, and LAND_FACTOR below - the name it
+# had there - still sets it; 1.0 either way by default. Deferred on purpose: a
+# literal default here would be fixed before LAND_FACTOR is ever consulted.
+MARKET_FACTOR ?= $(LAND_FACTOR)
 # The Montreal retail rent `make commercial-rents` states, gross per square
 # foot per year, and the quarter it is stated for. The one rate in the chain
 # with no survey behind it: C&W publish a Montreal office and industrial
@@ -208,11 +216,11 @@ TILE_LAYERS ?= ["zones","land_use","capacity","opportunities","streets","lots","
 # costs the land at the roll. TOP_N is the shortlist length per thesis.
 DOMINANT_SHARE ?= 0.85
 MIXED_MIN_SHARE ?= 0.15
-LAND_FACTOR ?= 1.0
 # The factor scales the whole assessed value (land and building) into the
-# yield's denominator and the buyer's price; MARKET_FACTOR is its name and
-# LAND_FACTOR the one it had.
-MARKET_FACTOR ?= $(LAND_FACTOR)
+# yield's denominator and the buyer's price; MARKET_FACTOR above is its name
+# and LAND_FACTOR the one it had, which only reaches it when MARKET_FACTOR is
+# not given itself.
+LAND_FACTOR ?= 1.0
 TOP_N ?= 25
 # The second axis of the same asset - why the site is acquirable: the
 # teardown screen, the heritage switches, the lane screen (ground the roll
@@ -288,8 +296,8 @@ DOCKER_RUN := docker run --rm -it \
 
 .PHONY: help sync dagster_run daemon test materialize catalog features \
 	neighborhoods neighborhood-add neighborhood-remove lots buildings building-lots \
-	quartiers cmhc costs vacancy rents envelopes setbacks lot-profiles \
-	programs hbu massing map_cells \
+	quartiers cmhc costs vacancy rents zone-pieces addresses envelopes setbacks \
+	lot-profiles programs hbu opportunities massing map_cells map_tiles \
 	streets borough-streets roll lot-values comparables \
 	rent-sources commercial-rents \
 	frontage corpus publish index search ask status \
@@ -341,7 +349,7 @@ daemon: | $(UV_SYNC_STAMP) ## Run the daemon alone (what the schedules need)
 	$(DAGSTER_DAEMON) run -m $(MODULE)
 
 validate_defs: | $(UV_SYNC_STAMP)
-	$(DAGSTER) definitions validate -m urban_rag.definitions
+	$(DAGSTER) definitions validate -m $(MODULE)
 
 catalog: | $(UV_SYNC_STAMP) ## Materialize spectrum_table_catalog for DATE
 	$(DAGSTER) asset materialize --select bronze/spectrum_table_catalog --partition $(DATE) -m $(MODULE)
@@ -349,7 +357,7 @@ catalog: | $(UV_SYNC_STAMP) ## Materialize spectrum_table_catalog for DATE
 features: | $(UV_SYNC_STAMP) ## Materialize neighborhood_features for DATE x NEIGHBORHOOD
 	$(DAGSTER) asset materialize --select bronze/neighborhood_features --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
 
-quartiers: | $(UV_SYNC_STAMP) ## Materialize reference_neighborhoods for DATE (both cities' outlines)
+quartiers: | $(UV_SYNC_STAMP) ## Materialize reference_neighborhoods for DATE (every city's outlines)
 	$(DAGSTER) asset materialize --select bronze/reference_neighborhoods --partition $(DATE) -m $(MODULE)
 
 # The neighborhood axis is a DynamicPartitionsDefinition: its keys are held in
@@ -365,19 +373,41 @@ neighborhood-add: | $(UV_SYNC_STAMP) ## Register NEIGHBORHOOD on the partition a
 neighborhood-remove: | $(UV_SYNC_STAMP) ## Take NEIGHBORHOOD off the axis; its partitions stay on disk
 	$(URBAN_RAG_PYTHON) -m urban_rag.neighborhoods remove $(NEIGHBORHOOD)
 
-# The three borough-scoped loads that feed building_lot_intersections. Each
-# needs `quartiers` for the same DATE; `lots` and `buildings` read province-wide
-# services bounded by the borough outline, `building-lots` joins them in
-# Postgres and reloads rag.lots (see docs/cadastre.md for what that reminting
-# costs downstream).
+# The two borough-scoped loads beside `features`, and the hop to the tile axis.
+# Each needs `quartiers` for the same DATE; `lots` and `buildings` read
+# province-wide services bounded by the borough outline. `cadastre` lands the
+# three snapshots in rag.lots/buildings/features with each row's cell address,
+# and reloads rag.lots on the way (see docs/cadastre.md for what that reminting
+# costs downstream) - it prints the cells the borough touched, which are the
+# tile runs that have to follow. Everything from `building-lots` down is
+# DATE x TILE: one cell of the cut, `make tiles` lists them.
 lots: | $(UV_SYNC_STAMP) ## Materialize neighborhood_lots (Infolot cadastre) for DATE x NEIGHBORHOOD
 	$(DAGSTER) asset materialize --select bronze/neighborhood_lots --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
 
 buildings: | $(UV_SYNC_STAMP) ## Materialize neighborhood_buildings (BDOI footprints) for DATE x NEIGHBORHOOD
 	$(DAGSTER) asset materialize --select bronze/neighborhood_buildings --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
 
-building-lots: | $(UV_SYNC_STAMP) ## Materialize building_lot_intersections (loads rag.lots/buildings/features) for DATE x NEIGHBORHOOD
-	$(DAGSTER) asset materialize --select silver/building_lot_intersections --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
+cadastre: | $(UV_SYNC_STAMP) ## Land NEIGHBORHOOD's lots/buildings/features in rag.* for DATE, addressed to the cut
+	$(DAGSTER) asset materialize --select silver/neighborhood_cadastre --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
+
+# The tile axis is static - every cell of urban_rag.tile_cut.CUT, checked in
+# with its city - so there is nothing to register. `tiles` lists them;
+# `tiles-of` asks Postgres which cells a borough's loaded lots fall in, which
+# is the list to run after that borough is reloaded.
+tiles: | $(UV_SYNC_STAMP) ## List the cells of the tile cut, by city
+	$(URBAN_RAG_PYTHON) -m urban_rag.tiles list
+
+tiles-of: | $(UV_SYNC_STAMP) ## The cells NEIGHBORHOOD's loaded lots fall in for DATE (needs the database)
+	$(URBAN_RAG_PYTHON) -m urban_rag.tiles of $(NEIGHBORHOOD) $(DATE)
+
+# Before running cells side by side: creating a partition mid-run takes an
+# exclusive lock on the parent, which deadlocks two cells or stalls every
+# other one behind the first. See urban_rag.tiles.
+tiles-ensure: | $(UV_SYNC_STAMP) ## Create every tile table's partition for every cell of DATE
+	$(URBAN_RAG_PYTHON) -m urban_rag.tiles ensure $(DATE)
+
+building-lots: | $(UV_SYNC_STAMP) ## Materialize building_lot_intersections for DATE x TILE
+	$(DAGSTER) asset materialize --select silver/building_lot_intersections --partition "$(DATE)|$(TILE)" -m $(MODULE)
 
 # Bronze: one workbook read for the whole island, so DATE only.
 cmhc: | $(UV_SYNC_STAMP) ## Snapshot both CMHC surveys for DATE
@@ -404,8 +434,8 @@ rents: | $(UV_SYNC_STAMP) ## Materialize average_rents for DATE x NEIGHBORHOOD
 # clip and the buildings come from the first, the street edges from the second.
 # `envelopes` reads it, so this runs ahead of the whole zoning chain. One
 # PostGIS pass, about five seconds on a borough.
-zone-pieces: | $(UV_SYNC_STAMP) ## Materialize lot_zone_pieces for DATE x NEIGHBORHOOD
-	$(DAGSTER) asset materialize --select silver/lot_zone_pieces --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
+zone-pieces: | $(UV_SYNC_STAMP) ## Materialize lot_zone_pieces for DATE x TILE
+	$(DAGSTER) asset materialize --select silver/lot_zone_pieces --partition "$(DATE)|$(TILE)" -m $(MODULE)
 
 # Adresses Quebec's civic address points, and the join that puts them on the
 # cadastre. Needs rag.addresses and silver.lot_addresses (hbu_infra sql/026)
@@ -414,18 +444,29 @@ zone-pieces: | $(UV_SYNC_STAMP) ## Materialize lot_zone_pieces for DATE x NEIGHB
 # the pieces there is nothing to key it to. The bronze half is a few minutes of
 # paging against a provincial server; re-running only the join is
 # `--select silver/lot_addresses`.
-addresses: | $(UV_SYNC_STAMP) ## Materialize the address points and their lot join for DATE x NEIGHBORHOOD
-	$(DAGSTER) asset materialize --select "bronze/neighborhood_addresses,silver/lot_addresses" --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE) \
+addresses: | $(UV_SYNC_STAMP) ## Snapshot NEIGHBORHOOD's address points for DATE (the bronze half)
+	$(DAGSTER) asset materialize --select bronze/neighborhood_addresses --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
+
+# The join, per cell: an address point belongs to the cell it stands in, and
+# the lot it snaps to may be over the cell edge - which is fine, the lots are
+# read snapshot-wide.
+lot-addresses: | $(UV_SYNC_STAMP) ## Put DATE x TILE's address points on their lots
+	$(DAGSTER) asset materialize --select silver/lot_addresses --partition "$(DATE)|$(TILE)" -m $(MODULE) \
 		--config-json '{"ops":{"silver__lot_addresses":{"config":{"max_snap_m":$(ADDRESS_SNAP_M)}}}}'
 
-# The two envelope assets, which lot_profiles now reads: the grids are
-# parsed from the PDFs the corpus already downloaded. Both also upsert into
-# silver.zoning_grid_columns / silver.lot_zoning_envelopes (hbu_infra sql/012).
-# `zone-pieces` has to have run for the same partition - the envelope is a join
-# of the pieces to the parsed grids, and takes its area and its frontage from
-# the piece rather than from the lot.
-envelopes: | $(UV_SYNC_STAMP) ## Materialize the zoning envelopes for DATE x NEIGHBORHOOD
-	$(DAGSTER) asset materialize --select silver/zoning_grid_columns,silver/lot_zoning_envelopes --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
+# The grids, parsed from the PDFs the corpus already downloaded, per borough -
+# a grid is a property of a by-law and a by-law is a borough's. Upserts into
+# silver.zoning_grid_columns (hbu_infra sql/012).
+grid-columns: | $(UV_SYNC_STAMP) ## Parse NEIGHBORHOOD's zoning grids for DATE
+	$(DAGSTER) asset materialize --select silver/zoning_grid_columns --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
+
+# The envelopes, per cell: a join of the cell's zone pieces to whichever
+# boroughs' grids those pieces fall under, taking area and frontage from the
+# piece rather than from the lot. `zone-pieces` for the same DATE x TILE and
+# `grid-columns` for every borough the cell holds have to have run. Upserts
+# into silver.lot_zoning_envelopes (hbu_infra sql/012).
+envelopes: | $(UV_SYNC_STAMP) ## Materialize the zoning envelopes for DATE x TILE
+	$(DAGSTER) asset materialize --select silver/lot_zoning_envelopes --partition "$(DATE)|$(TILE)" -m $(MODULE)
 
 # Subtracts the four margins those envelopes carry from the parcels `frontage`
 # measured, leaving what may actually be built on. Needs
@@ -433,8 +474,8 @@ envelopes: | $(UV_SYNC_STAMP) ## Materialize the zoning envelopes for DATE x NEI
 # `frontage` and `envelopes` run first for the same partition - the first
 # supplies the street edge a boundary is sorted against, the second the margins
 # to subtract. TOLERANCE_M overrides the 0.05 m default.
-setbacks: | $(UV_SYNC_STAMP) ## Materialize lot_buildable_setbacks for DATE x NEIGHBORHOOD
-	$(DAGSTER) asset materialize --select silver/lot_buildable_setbacks --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE) \
+setbacks: | $(UV_SYNC_STAMP) ## Materialize lot_buildable_setbacks for DATE x TILE
+	$(DAGSTER) asset materialize --select silver/lot_buildable_setbacks --partition "$(DATE)|$(TILE)" -m $(MODULE) \
 		--config-json '{"ops":{"silver__lot_buildable_setbacks":{"config":{"edge_tolerance_m":$(TOLERANCE_M),"batch_lots":$(SETBACK_BATCH),"resume":$(SETBACK_RESUME)}}}}'
 
 # Needs gold.lot_profiles and the rag.lot_documents view (hbu_infra sql/009,
@@ -442,8 +483,8 @@ setbacks: | $(UV_SYNC_STAMP) ## Materialize lot_buildable_setbacks for DATE x NE
 # been indexed - see urban_rag.lot_profiles_assets. Also reads three silver
 # parquet partitions the database knows nothing about: `envelopes`, `vacancy`
 # and `rents` for the same DATE x NEIGHBORHOOD.
-lot-profiles: | $(UV_SYNC_STAMP) ## Materialize lot_profiles for DATE x NEIGHBORHOOD
-	$(DAGSTER) asset materialize --select gold/lot_profiles --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
+lot-profiles: | $(UV_SYNC_STAMP) ## Materialize lot_profiles for DATE x TILE
+	$(DAGSTER) asset materialize --select gold/lot_profiles --partition "$(DATE)|$(TILE)" -m $(MODULE)
 
 # Needs silver.lot_development_programs (hbu_infra sql/017) applied, and
 # `envelopes` run first for the same partition - the CP-SAT model in
@@ -456,16 +497,17 @@ lot-profiles: | $(UV_SYNC_STAMP) ## Materialize lot_profiles for DATE x NEIGHBOR
 # TERMINAL_CAP_PCT / OPEX / RENT_PREMIUM_PCT above are its levers, and
 # STALLS_PER_DWELLING and RES_COST_SQFT remain the heaviest two on the cost
 # side; see urban_rag.hbu_assets.ProgramConfig for the rest.
-programs: | $(UV_SYNC_STAMP) ## Materialize lot_development_programs for DATE x NEIGHBORHOOD
-	$(DAGSTER) asset materialize --select silver/lot_development_programs --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE) \
+programs: | $(UV_SYNC_STAMP) ## Materialize lot_development_programs for DATE x TILE
+	$(DAGSTER) asset materialize --select silver/lot_development_programs --partition "$(DATE)|$(TILE)" -m $(MODULE) \
 		--config-json '{"ops":{"silver__lot_development_programs":{"config":{"stalls_per_dwelling":$(STALLS_PER_DWELLING),"residential_cost_per_sqft_cad":$(RES_COST_SQFT),"operating_expense_ratio":$(OPEX),"discount_rate_pct":$(DISCOUNT_PCT),"hold_years":$(HOLD_YEARS),"terminal_cap_rate_pct":$(TERMINAL_CAP_PCT),"new_build_rent_premium_pct":$(RENT_PREMIUM_PCT),"construction_months":$(CONSTRUCTION_MONTHS),"lease_up_months":$(LEASE_UP_MONTHS)}}}}'
 
 # Needs gold.lot_highest_best_use and gold.lot_redevelopment_gap (hbu_infra
 # sql/018, sql/019) applied, and `programs` run first for the same partition.
 # lot_redevelopment_gap also needs `comparables` for the same partition - the
 # assessment side it compares against.
-hbu: | $(UV_SYNC_STAMP) ## Materialize lot_highest_best_use and lot_redevelopment_gap (with the enhancement solve) for DATE x NEIGHBORHOOD
-	$(DAGSTER) asset materialize --select gold/lot_highest_best_use,gold/lot_redevelopment_gap --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE) 		--config-json '{"ops":{"gold__lot_redevelopment_gap":{"config":{"enhance_construction_months":$(ENHANCE_MONTHS),"enhance_lease_up_months":$(ENHANCE_LEASE_UP),"enhance_disruption_share":$(DISRUPTION_SHARE),"addition_cost_premium":$(ADDITION_PREMIUM),"max_added_storeys":$(MAX_ADDED_STOREYS)}}}}'
+hbu: | $(UV_SYNC_STAMP) ## Materialize lot_highest_best_use and lot_redevelopment_gap (with the enhancement solve) for DATE x TILE
+	$(DAGSTER) asset materialize --select gold/lot_highest_best_use,gold/lot_redevelopment_gap --partition "$(DATE)|$(TILE)" -m $(MODULE) \
+		--config-json '{"ops":{"gold__lot_redevelopment_gap":{"config":{"enhance_construction_months":$(ENHANCE_MONTHS),"enhance_lease_up_months":$(ENHANCE_LEASE_UP),"enhance_disruption_share":$(DISRUPTION_SHARE),"addition_cost_premium":$(ADDITION_PREMIUM),"max_added_storeys":$(MAX_ADDED_STOREYS)}}}}'
 
 # Needs gold.lot_investment_opportunities (hbu_infra sql/021) applied and
 # `hbu` run first for the same partition. Ranks the under-built lots within
@@ -473,8 +515,8 @@ hbu: | $(UV_SYNC_STAMP) ## Materialize lot_highest_best_use and lot_redevelopmen
 # over one parquet, so it is cheap to re-run at a different threshold.
 # DOMINANT_SHARE / MIXED_MIN_SHARE move the facet lines, LAND_FACTOR costs
 # the land at something other than the roll, TOP_N sets the shortlist length.
-opportunities: | $(UV_SYNC_STAMP) ## Rank DATE x NEIGHBORHOOD's under-built lots by thesis, and file each under its site thesis
-	$(DAGSTER) asset materialize --select gold/lot_investment_opportunities --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE) \
+opportunities: | $(UV_SYNC_STAMP) ## Rank DATE x TILE's under-built lots by thesis, and file each under its site thesis
+	$(DAGSTER) asset materialize --select gold/lot_investment_opportunities --partition "$(DATE)|$(TILE)" -m $(MODULE) \
 		--config-json '{"ops":{"gold__lot_investment_opportunities":{"config":{"dominant_share":$(DOMINANT_SHARE),"mixed_min_share":$(MIXED_MIN_SHARE),"market_value_factor":$(MARKET_FACTOR),"top_n":$(TOP_N),"teardown_max_year_built":$(TEARDOWN_MAX_YEAR),"teardown_max_built_share":$(TEARDOWN_MAX_BUILT_SHARE),"min_storey_headroom":$(MIN_STOREY_HEADROOM),"exclude_heritage_sectors":$(EXCLUDE_HERITAGE_SECTORS),"exclude_piia_sectors":$(EXCLUDE_PIIA_SECTORS),"demolition_cost_cad_per_m2":$(DEMOLITION_COST_M2),"demolition_cost_cad_per_m2_nonresidential":$(DEMOLITION_COST_NONRES_M2),"site_assessment_cost_cad":$(SITE_ASSESSMENT_COST),"remediation_cost_cad_per_m2_residential":$(REMEDIATION_RES_M2),"remediation_cost_cad_per_m2_nonresidential":$(REMEDIATION_NONRES_M2),"addition_cost_premium":$(ADDITION_PREMIUM),"unassessed_vacant_max_coverage":$(UNASSESSED_VACANT_MAX_COVERAGE),"require_positive_npv":$(REQUIRE_POSITIVE_NPV),"site_top_n":$(SITE_TOP_N),"soft_cost_pct":$(SOFT_COST_PCT),"contingency_pct":$(CONTINGENCY_PCT),"builders_risk_pct":$(BUILDERS_RISK_PCT),"selling_cost_pct":$(SELLING_COST_PCT),"absorption_units_per_month":$(ABSORPTION_PER_MONTH),"commercial_absorption_sqft_per_month":$(COMMERCIAL_ABSORPTION_SQFT),"industrial_absorption_sqft_per_month":$(INDUSTRIAL_ABSORPTION_SQFT),"market_cap_rate_pct":$(MARKET_CAP_RATE),"commercial_cap_rate_spread_bps":$(COMMERCIAL_CAP_SPREAD_BPS),"industrial_cap_rate_spread_bps":$(INDUSTRIAL_CAP_SPREAD_BPS),"min_yoc_spread_bps":$(MIN_YOC_SPREAD_BPS),"hurdle_irr_spread_bps":$(HURDLE_SPREAD_BPS),"hurdle_irr_pct":$(HURDLE_IRR)}}}}'
 
 # Needs gold.lot_building_massing (hbu_infra sql/022) and gold.lot_surface_parking
@@ -490,8 +532,8 @@ opportunities: | $(UV_SYNC_STAMP) ## Rank DATE x NEIGHBORHOOD's under-built lots
 # drawn regardless. RATIOS is the aspect ratios to try, squarest first, as a JSON
 # list; footprint_fit_pct below 100 is the column to sort on, and
 # surface_parking_fit_pct is the same question about the yard.
-massing: | $(UV_SYNC_STAMP) ## Draw DATE x NEIGHBORHOOD's HBU buildings as map polygons
-	$(DAGSTER) asset materialize --select gold/lot_building_massing --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE) \
+massing: | $(UV_SYNC_STAMP) ## Draw DATE x TILE's HBU buildings as map polygons
+	$(DAGSTER) asset materialize --select gold/lot_building_massing --partition "$(DATE)|$(TILE)" -m $(MODULE) \
 		--config-json '{"ops":{"gold__lot_building_massing":{"config":{"aspect_ratios":$(RATIOS)}}}}'
 
 # Needs gold.map_cell_aggregates (hbu_infra sql/023) applied, and runs last:
@@ -540,9 +582,10 @@ streets: | $(UV_SYNC_STAMP) ## Snapshot the province-wide RQTT road network for 
 
 # Owns silver.neighborhood_streets (hbu_infra sql/007), which `frontage` below
 # measures against - it used to load that table on its way past, which left it
-# with a writer that was not the asset it is named for.
-borough-streets: | $(UV_SYNC_STAMP) ## Materialize neighborhood_streets for DATE x NEIGHBORHOOD
-	$(DAGSTER) asset materialize --select silver/neighborhood_streets --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
+# with a writer that was not the asset it is named for. Per cell: the sides
+# whose midpoint falls in it, stored whole rather than clipped to an outline.
+tile-streets: | $(UV_SYNC_STAMP) ## Materialize neighborhood_streets for DATE x TILE
+	$(DAGSTER) asset materialize --select silver/neighborhood_streets --partition "$(DATE)|$(TILE)" -m $(MODULE)
 
 # Bronze plus the merge that makes it readable, in one run: the roll has no
 # borough axis, so DATE only. The first run of a roll year downloads 572 MB and
@@ -571,8 +614,8 @@ roll: | $(UV_SYNC_STAMP) ## Snapshot the property assessment roll for DATE, its 
 # sql/013), which lands on the first `db.py init` - the file has no
 # `-- requires:` header. The parquet is written first, so a database that is
 # down costs a re-run of the load rather than of the join.
-lot-values: | $(UV_SYNC_STAMP) ## Total DATE's assessment roll onto NEIGHBORHOOD's lots
-	$(DAGSTER) asset materialize --select silver/lot_assessed_values --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE) \
+lot-values: | $(UV_SYNC_STAMP) ## Total DATE's assessment roll onto TILE's lots
+	$(DAGSTER) asset materialize --select silver/lot_assessed_values --partition "$(DATE)|$(TILE)" -m $(MODULE) \
 		--config-json '{"ops":{"silver__lot_assessed_values":{"config":{"place_unmatched_by_point":$(BY_POINT)}}}}'
 
 # The two commercial-rent publishers, both DATE-only: Cushman & Wakefield's
@@ -606,8 +649,8 @@ commercial-rents: | $(UV_SYNC_STAMP) ## Resolve NEIGHBORHOOD's retail, office an
 # would otherwise be over a different set of units than the totals there.
 # OPEX is the single largest lever on every cap rate; MARKET_FACTOR is 1.0 by
 # default, which reports the yield on the roll. See docs/comparables.md.
-comparables: | $(UV_SYNC_STAMP) ## Price DATE's roll onto NEIGHBORHOOD's lots and find each lot's comparables
-	$(DAGSTER) asset materialize --select silver/lot_assessment_comparables --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE) \
+comparables: | $(UV_SYNC_STAMP) ## Price DATE's roll onto TILE's lots and find each lot's comparables
+	$(DAGSTER) asset materialize --select silver/lot_assessment_comparables --partition "$(DATE)|$(TILE)" -m $(MODULE) \
 		--config-json '{"ops":{"silver__lot_assessment_comparables":{"config":{"k":$(K_COMPARABLES),"max_distance_m":$(MAX_DISTANCE_M),"operating_expense_ratio":$(OPEX),"maintenance_premium_per_year":$(MAINTENANCE_PER_YEAR),"max_maintenance_premium":$(MAX_MAINTENANCE),"assumed_building_age_years":$(ASSUMED_AGE),"market_value_factor":$(MARKET_FACTOR),"place_unmatched_by_point":$(BY_POINT)}}}}'
 
 # Needs silver.neighborhood_streets and silver.lot_frontage (hbu_infra sql/007, sql/008) applied,
@@ -616,8 +659,8 @@ comparables: | $(UV_SYNC_STAMP) ## Price DATE's roll onto NEIGHBORHOOD's lots an
 # default, and moving it does not move any frontage: it only changes which
 # parcels are read as roadway, and the fixture separates those from every other
 # parcel by two orders of magnitude.
-frontage: | $(UV_SYNC_STAMP) ## Materialize lot_frontage for DATE x NEIGHBORHOOD
-	$(DAGSTER) asset materialize --select silver/lot_frontage --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE) \
+frontage: | $(UV_SYNC_STAMP) ## Materialize lot_frontage for DATE x TILE
+	$(DAGSTER) asset materialize --select silver/lot_frontage --partition "$(DATE)|$(TILE)" -m $(MODULE) \
 		--config-json '{"ops":{"silver__lot_frontage":{"config":{"min_street_m":$(MIN_STREET_M)}}}}'
 
 # document_chunks also upserts into silver.document_chunks (hbu_infra sql/011);
@@ -625,6 +668,17 @@ frontage: | $(UV_SYNC_STAMP) ## Materialize lot_frontage for DATE x NEIGHBORHOOD
 # `publish` below writes.
 corpus: | $(UV_SYNC_STAMP) ## Fetch, chunk and embed the PDFs linked from DATE x NEIGHBORHOOD
 	$(DAGSTER) asset materialize --select "bronze/linked_documents,silver/document_chunks,silver/document_embeddings" --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
+
+# The minutes of a Quebec City borough's conseils de quartier, the fiches,
+# sommaires and resolutions they trail to, and the planning items read out of
+# both (silver.council_planning_items, hbu_infra sql/030). COUNCILS narrows a
+# run to some council ids on the listing host - `12` is Montcalm - and empty
+# takes every council of the borough. A Montreal or Saguenay key has none and
+# writes an empty file. See docs/council-minutes.md.
+COUNCILS ?=
+council-minutes: | $(UV_SYNC_STAMP) ## Fetch the conseils de quartier minutes + their trail, read the planning items (COUNCILS=12)
+	$(DAGSTER) asset materialize --select "bronze/council_minutes,bronze/council_minutes_documents,silver/council_planning_items" --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE) \
+		--config-json '{"ops":{"bronze__council_minutes":{"config":{"council_ids":[$(COUNCILS)]}},"bronze__council_minutes_documents":{"config":{"council_ids":[$(COUNCILS)]}}}}'
 
 materialize: catalog features ## Full scrape for DATE x NEIGHBORHOOD
 

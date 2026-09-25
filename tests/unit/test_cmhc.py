@@ -492,9 +492,9 @@ def stub_publish(monkeypatch):
     """
     seen: dict[str, object] = {"datasets": {}, "partition": None}
 
-    def publish(connect, datasets, *, neighborhood, scrape_date):
+    def publish(connect, datasets, *, partition, scrape_date):
         seen["datasets"] = dict(datasets)
-        seen["partition"] = (neighborhood, scrape_date)
+        seen["partition"] = (partition, scrape_date)
         return {
             name: {
                 "copied": len(frame),
@@ -802,3 +802,58 @@ def test_an_average_rent_rerun_replaces_the_partition(store, cache, monkeypatch)
     run_rents(store, cache, monkeypatch)
 
     assert not Path(stale).exists()
+
+
+def test_a_centre_the_survey_omits_entirely_is_empty_not_a_failure():
+    """Saguenay has no HMIP average-rent table, and that is not a rename.
+
+    `cmhc_rent_survey` skips a centre with no `CMHC_GEOGRAPHY_IDS` entry, so
+    none of its rows reach silver. Failing there would make an absence the
+    pipeline deliberately tolerates fatal one layer later and block the whole
+    partition over a rent nothing downstream requires - comparables reads a
+    missing rent as None by design. The borough prices off the vacancy survey
+    and the roll instead.
+    """
+    from urban_rag.cmhc_assets import _borough_rows
+
+    # A snapshot that carries Montreal and nothing else.
+    survey = pd.DataFrame(
+        {
+            "centre": ["Montréal", "Montréal"],
+            "quartier": ["Parc-Extension", "Villeray"],
+            "bedroom_type": ["all", "all"],
+            "average_rent_cad": [900.0, 950.0],
+        }
+    )
+
+    rows = _borough_rows(
+        survey, "SAG", quartiers_for("SAG"), sort_by=["quartier", "bedroom_type"]
+    )
+
+    assert rows.empty
+    assert list(rows.columns) == list(survey.columns)
+
+
+def test_a_centre_that_publishes_only_some_of_its_quartiers_still_fails():
+    """The rename guard the empty-centre path must not weaken.
+
+    Half a centre is a crosswalk that drifted, and a silently shorter average
+    would quietly change what the borough figure means - which is the whole
+    reason this is a `Failure` and not a warning.
+    """
+    from urban_rag.cmhc_assets import _borough_rows
+
+    quartiers = quartiers_for(NEIGHBORHOOD)
+    survey = pd.DataFrame(
+        {
+            "centre": ["Montréal"],
+            "quartier": [quartiers[0]],
+            "bedroom_type": ["all"],
+            "average_rent_cad": [900.0],
+        }
+    )
+
+    with pytest.raises(Failure, match="publishes no quartier named"):
+        _borough_rows(
+            survey, NEIGHBORHOOD, quartiers, sort_by=["quartier", "bedroom_type"]
+        )

@@ -64,11 +64,11 @@ anti-joining `gold.lot_highest_best_use`, which has every lot and its
 surprise.
 
 **Why an asset and not a notebook.** The fit is deterministic, it is partitioned
-like everything else, and its answer changes whenever the program does - a
-different `stalls_per_dwelling` is a different footprint is a different
-rectangle. Keeping it in the lineage is what makes "re-materialize the borough
-and look at the map" one command rather than a script somebody has to remember
-to re-run.
+like everything else - per tile of the cut, as the whole lot chain is - and its
+answer changes whenever the program does - a different `stalls_per_dwelling` is
+a different footprint is a different rectangle. Keeping it in the lineage is
+what makes "re-materialize the tile and look at the map" one command rather
+than a script somebody has to remember to re-run.
 """
 
 from datetime import datetime, timezone
@@ -101,7 +101,12 @@ from urban_rag.massing import (
     SHRINK_STEPS,
     massing_frame,
 )
-from urban_rag.partitions import metric_crs_for, scrape_partitions
+from urban_rag.partitions import (
+    city_of_tile,
+    metric_crs_for_city,
+    tile_partition_of,
+    tile_scrape_partitions,
+)
 from urban_rag.rag.pgvector import PostgresUnavailable
 from urban_rag.resources import ParquetStore, PostgisResource
 from urban_rag.setback_assets import LOT_SETBACKS_FILE, lot_buildable_setbacks
@@ -111,7 +116,7 @@ from urban_rag.warehouse import MissingRelation, publish, published_metadata
 GROUP = "gold_hbu"
 
 #: One file per partition, under
-#: `gold/lot_building_massing/<YYYY-MM-DD>/<neighborhood>/`.
+#: `gold/lot_building_massing/<YYYY-MM-DD>/<tile>/`.
 LOT_MASSING_FILE = "lot_building_massing.parquet"
 
 
@@ -199,12 +204,13 @@ class MassingConfig(Config):
 
 @asset(
     key_prefix=key_prefix("lot_building_massing"),
-    partitions_def=scrape_partitions,
+    partitions_def=tile_scrape_partitions,
     deps=[lot_highest_best_use, lot_buildable_setbacks],
     group_name=GROUP,
     kinds={"shapely", "postgres", "geoparquet"},
     description=(
-        "The highest-and-best-use building of every lot, as a rectangle on the "
+        "The highest-and-best-use building of every lot of one tile, as a "
+        "rectangle on the "
         "ground: one row per lot, with a polygon in EPSG:4326 fitted inside "
         "that lot's buildable envelope so the zone's four margins are "
         "respected by construction. A few aspect ratios are tried at the "
@@ -232,8 +238,9 @@ class MassingConfig(Config):
         "gold.lot_building_massing, and only the lots that park on the ground "
         "reach gold.lot_surface_parking, since a row with no shape is not a "
         "row of a spatial table. Written to gold/lot_building_massing/"
-        f"<YYYY-MM-DD>/<neighborhood>/{LOT_MASSING_FILE} - one file carrying "
-        "both polygons - and upserted on (scrape_date, neighborhood, lot_uid)."
+        f"<YYYY-MM-DD>/<tile>/{LOT_MASSING_FILE} - one file carrying "
+        "both polygons - and upserted on (scrape_date, cell_partition, "
+        "lot_uid, feature_id)."
     ),
 )
 def lot_building_massing(
@@ -242,21 +249,21 @@ def lot_building_massing(
     store: ParquetStore,
     postgis: PostgisResource,
 ) -> MaterializeResult:
-    neighborhood, scrape_date = _partition(context)
+    tile, scrape_date = tile_partition_of(context)
     hbu = _read(
         store,
         lot_highest_best_use,
         LOT_HBU_FILE,
-        neighborhood=neighborhood,
+        partition=tile,
         scrape_date=scrape_date,
     )
     if hbu.empty:
         raise Failure(
-            f"{lot_highest_best_use.key.path[-1]} holds no lot for "
-            f"{neighborhood} {scrape_date}; there is nothing to draw."
+            f"{lot_highest_best_use.key.path[-1]} holds no lot for tile "
+            f"{tile} {scrape_date}; there is nothing to draw."
         )
-    setbacks = _read_setbacks(context, store, neighborhood, scrape_date)
-    lots = _read_lots(context, postgis, neighborhood, scrape_date)
+    setbacks = _read_setbacks(context, store, tile, scrape_date)
+    lots = _read_lots(context, postgis, tile, scrape_date)
 
     frame = massing_frame(
         hbu,
@@ -268,15 +275,16 @@ def lot_building_massing(
         min_footprint_m2=config.min_footprint_m2,
         min_parking_depth_m=config.min_parking_depth_m,
         parking_max_bays=config.parking_max_bays,
-        metric_crs=metric_crs_for(neighborhood),
+        # The tile's city's survey zone: a cut cell lies in one city by
+        # construction, whichever of its boroughs a lot belongs to.
+        metric_crs=metric_crs_for_city(city_of_tile(tile)),
     )
-    frame["neighborhood"] = neighborhood
+    # `neighborhood`, `cell_key` and `cell_partition` are the lot's own and
+    # come through the HBU row; only the date is the run's.
     frame["scrape_date"] = scrape_date
     frame["computed_at"] = datetime.now(timezone.utc).isoformat()
 
-    output_dir = store.partition_dir(
-        context.asset_key.path[-1], scrape_date, neighborhood
-    )
+    output_dir = store.partition_dir(context.asset_key.path[-1], scrape_date, tile)
     removed = clear_parquet(output_dir)
     if removed:
         context.log.info("Removed %d file(s) from a previous run", len(removed))
@@ -291,14 +299,14 @@ def lot_building_massing(
                 "lot_building_massing": _massing_only(frame),
                 "lot_surface_parking": parking,
             },
-            neighborhood=neighborhood,
+            partition=tile,
             scrape_date=scrape_date,
         )
     except (PostgresUnavailable, MissingRelation) as exc:
         raise Failure(
             f"{path} was written, but gold.lot_building_massing and "
-            f"gold.lot_surface_parking could not be updated for "
-            f"{neighborhood} {scrape_date}: {exc}"
+            f"gold.lot_surface_parking could not be updated for tile "
+            f"{tile} {scrape_date}: {exc}"
         ) from exc
 
     by_status = {
@@ -312,9 +320,9 @@ def lot_building_massing(
     fit = pd.to_numeric(frame["footprint_fit_pct"], errors="coerce")
     parking_fit = pd.to_numeric(frame["surface_parking_fit_pct"], errors="coerce")
     context.log.info(
-        "%s %s: %d lot(s) -> %s; %.1f ha of footprint drawn of %.1f ha "
+        "tile %s %s: %d lot(s) -> %s; %.1f ha of footprint drawn of %.1f ha "
         "solved, median fit %.1f%% -> %s",
-        neighborhood,
+        tile,
         scrape_date,
         len(frame),
         ", ".join(f"{name}={count}" for name, count in by_status.items()),
@@ -324,9 +332,9 @@ def lot_building_massing(
         path,
     )
     context.log.info(
-        "%s %s: surface parking -> %s; %.2f ha drawn of %.2f ha reserved, "
+        "tile %s %s: surface parking -> %s; %.2f ha drawn of %.2f ha reserved, "
         "%d of %d stall(s) standing on ground that holds them",
-        neighborhood,
+        tile,
         scrape_date,
         ", ".join(f"{name}={count}" for name, count in by_parking_status.items()),
         _sum(frame, "placed_surface_parking_m2") / 10_000.0,
@@ -338,6 +346,7 @@ def lot_building_massing(
     return MaterializeResult(
         metadata={
             "dagster/row_count": len(frame),
+            "tile": tile,
             "num_lots": len(frame),
             # What reaches the database, and what does not. The gap is every
             # lot with no polygon - see the module docstring on why the tree
@@ -345,8 +354,8 @@ def lot_building_massing(
             "num_drawn": len(drawn),
             "num_not_drawn": len(frame) - len(drawn),
             **{f"num_{name}": count for name, count in by_status.items()},
-            # The sanity check, as one number. A borough where this is well
-            # under 100 is a borough whose footprints are being capped on an
+            # The sanity check, as one number. A tile where this is well
+            # under 100 is a tile whose footprints are being capped on an
             # area that its parcels cannot take in any rectangle - which is a
             # finding about `solve_program`, not about this asset.
             "median_footprint_fit_pct": round(float(fit.median()), 1)
@@ -369,7 +378,7 @@ def lot_building_massing(
             "placed_gross_floor_area_ha": round(
                 _sum(frame, "placed_gross_floor_area_m2") / 10_000.0, 2
             ),
-            # Which rectangle the borough actually takes. A borough that is all
+            # Which rectangle the tile actually takes. A tile that is all
             # 3.0 is one whose parcels are long and thin, which is Villeray;
             # one that is all 1.0 has room to spare everywhere.
             "aspect_ratios_used": MetadataValue.json(
@@ -384,12 +393,12 @@ def lot_building_massing(
             # -- the parking, which is the other polygon and the other check --
             #
             # `num_parked` is what reaches gold.lot_surface_parking; the rest
-            # of the borough parked underground, in a ground floor bay, or
+            # of the tile parked underground, in a ground floor bay, or
             # owes no stall at all.
             "num_parked": len(parking[parking["geometry"].notna()]),
             **{f"num_parking_{name}": count for name, count in by_parking_status.items()},
-            # The sanity check applied to the yard. A borough well under 100
-            # is a borough whose surface stalls are standing on ground that
+            # The sanity check applied to the yard. A tile well under 100
+            # is a tile whose surface stalls are standing on ground that
             # cannot hold them once the building is on it - which, like its
             # footprint counterpart, is a finding about the answer upstream.
             "median_surface_parking_fit_pct": round(float(parking_fit.median()), 1)
@@ -423,7 +432,7 @@ def lot_building_massing(
 def _read_setbacks(
     context: AssetExecutionContext,
     store: ParquetStore,
-    neighborhood: str,
+    tile: str,
     scrape_date: str,
 ) -> gpd.GeoDataFrame:
     """The buildable envelopes, or an empty frame with a warning.
@@ -437,14 +446,14 @@ def _read_setbacks(
     look entirely plausible on a map.
     """
     partition_dir = store.partition_dir(
-        lot_buildable_setbacks.key.path[-1], scrape_date, neighborhood
+        lot_buildable_setbacks.key.path[-1], scrape_date, tile
     )
     path = join(partition_dir, LOT_SETBACKS_FILE)
     if not filesystem(path).exists(path):
         context.log.warning(
             "%s is missing, so no lot has a buildable envelope to fit a "
             "building into and every row will be no_buildable_geometry - "
-            "materialize %s for this partition first",
+            "materialize %s for this tile first",
             path,
             lot_buildable_setbacks.key.path[-1],
         )
@@ -499,7 +508,7 @@ def _parking_frame(frame: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
 def _read_lots(
     context: AssetExecutionContext,
     postgis: PostgisResource,
-    neighborhood: str,
+    tile: str,
     scrape_date: str,
 ) -> gpd.GeoDataFrame:
     """The ground a surface stall may stand on, or an empty frame with a warning.
@@ -528,7 +537,7 @@ def _read_lots(
         with postgis.connect() as connection:
             try:
                 lots = fetch_zone_piece_polygons(
-                    connection, neighborhood=neighborhood, scrape_date=scrape_date
+                    connection, tile=tile, scrape_date=scrape_date
                 )
             except MissingRelation:
                 context.log.warning(
@@ -536,17 +545,17 @@ def _read_lots(
                     "is checked against the whole parcel: on a lot two zones "
                     "cover, each program is offered ground the other has "
                     "built on. Apply hbu_infra's sql/025 and materialize "
-                    "lot_zone_pieces for this partition."
+                    "lot_zone_pieces for this tile."
                 )
                 lots = fetch_lot_polygons(
-                    connection, neighborhood=neighborhood, scrape_date=scrape_date
+                    connection, tile=tile, scrape_date=scrape_date
                 )
     except (PostgresUnavailable, MissingRelation) as exc:
         context.log.warning(
-            "no parcel geometry could be read for %s %s (%s), so no surface "
-            "parking is checked or drawn and every row will be "
+            "no parcel geometry could be read for tile %s %s (%s), so no "
+            "surface parking is checked or drawn and every row will be "
             "no_lot_geometry - the buildings are unaffected",
-            neighborhood,
+            tile,
             scrape_date,
             exc,
         )
@@ -555,9 +564,9 @@ def _read_lots(
         )
     if lots.empty:
         context.log.warning(
-            "no parcel geometry for %s %s, so no surface parking is checked "
-            "or drawn",
-            neighborhood,
+            "no parcel geometry for tile %s %s, so no surface parking is "
+            "checked or drawn",
+            tile,
             scrape_date,
         )
     return lots
@@ -570,25 +579,20 @@ def _sum(frame: pd.DataFrame, column: str) -> float:
     return float(total) if pd.notna(total) else 0.0
 
 
-def _partition(context: AssetExecutionContext) -> tuple[str, str]:
-    dimensions = context.partition_key.keys_by_dimension
-    return dimensions["neighborhood"], dimensions["date"][:10]
-
-
 def _read(
     store: ParquetStore,
     asset_def,
     name: str,
     *,
-    neighborhood: str,
+    partition: str,
     scrape_date: str,
 ) -> pd.DataFrame:
     """One upstream partition, named by its asset rather than by its path."""
     asset_name = asset_def.key.path[-1]
-    path = join(store.partition_dir(asset_name, scrape_date, neighborhood), name)
+    path = join(store.partition_dir(asset_name, scrape_date, partition), name)
     if not filesystem(path).exists(path):
         raise Failure(
             f"{path} is missing; materialize {asset_name} for "
-            f"{neighborhood} {scrape_date} first."
+            f"{partition} {scrape_date} first."
         )
     return pd.read_parquet(path, storage_options=storage_options(path))

@@ -176,6 +176,30 @@ Villeray-Saint-Michel-Parc-Extension partition the two together remove 343
 answers that were a neighbour's grid, 206 of them on Équipements parcels, Parc
 Jarry among them.
 
+**A piece zoned for a single dwelling.** The solver's objective is a rental
+building's: rent is earned per dwelling, by CMHC bedroom class, and floor is
+charged per square foot. Under a grid capping the dwellings at one - Montreal's
+``H.1``, a Quebec City or Saguenay column printing *Nombre de logements max.*
+``1`` - that objective can only ever build the most profitable *single*
+rental unit, which is a one-storey 600 sq ft one-bedroom whatever the storeys
+and the height allow: a second storey adds cost and no rent. Lot 2 076 513 in
+zone 31234Ha (two storeys, 10 m) is the case that showed it. A house is bought
+and sold, not leased by the unit, and its value grows with its floor area, so
+none of that is an answer - it is the wrong thesis applied.
+
+So these pieces are not solved at all. `single_family_zone_pieces` names them
+off the envelopes before the solve, `candidate_envelopes` leaves them out, and
+`_hbu_status` reports them as `single_family_zone`. The pricing that would suit
+them - sale-price comparables, owner-occupier value, the teardown-and-rebuild
+for sale - is not built yet; docs/single-family.md is what it would take. Beyond
+the honesty of the answer this is much of the pipeline's work on the suburban
+boroughs. Measured on the 2026-09-01 envelopes: 14,388 of SSC's 36,660 pieces
+(43% of the pieces it solved), 24,969 of Saguenay's 78,479 (32%), 2,195 of
+VSMPE's 27,923 and 151 of CIL's 25,569 no longer reach a solver, a rectangle
+fit, a yard or a massing. What they had been getting was the point: SSC's were
+9,166 one-dwelling programs, mostly a single storey; Saguenay's were 21,399
+`infeasible`, its CMHC grid pricing no dwelling at all.
+
 The road gate and the equipment gate are independent of each other, and of the
 two road predicates the roll is much the narrower: it reaches 21,862 of the
 borough's 24,952 parcels, and among those it calls 48 a road. The cadastral
@@ -306,6 +330,7 @@ from urban_rag.program import (
     UnitEconomics,
     ZoneColumn,
     ZoneEnvelope,
+    class_max_dwellings,
     floor_stack,
     is_commercial_usage,
     is_equipment_usage,
@@ -365,6 +390,12 @@ HBU_STATUSES: tuple[str, ...] = (
     # are different facts - this is a grid that was read and says the parcel is
     # not for sale as floor area, that one is a grid that named no usage at all.
     "equipment_zone",
+    # The zone lets this piece hold one dwelling and nothing else the solver
+    # prices - no commerce, no industry. Not solved on purpose: the solve is a
+    # rental building's proforma, and under a one-dwelling cap it can only
+    # propose the single most profitable rental unit, which is not what a
+    # house lot is worth. See `single_family_zone_pieces`.
+    "single_family_zone",
     # Every envelope covering the lot authorises none of the usages the
     # solver prices - Habitation, Commerce or Industrie - and none of them is
     # an Équipements column either: a grid with no usage row this parser
@@ -543,6 +574,12 @@ CANDIDATE_COLUMNS: tuple[str, ...] = (
     "lot_uid",
     "lot_number",
     "neighborhood",
+    # The lot's address on the tile cut - `rag.lots.cell_key`, and the cut
+    # cell it resolves to. Carried from the envelope row rather than stamped
+    # by the asset, because a tile table's rows are keyed on `cell_partition`
+    # and the value is the lot's own, not the run's.
+    "cell_key",
+    "cell_partition",
     "scrape_date",
     "feature_id",
     "source_table",
@@ -607,6 +644,11 @@ _HBU_PIECE_COLUMNS: tuple[str, ...] = (
     "feature_id",
     "lot_number",
     "neighborhood",
+    # The lot's cell and cut cell, as on `CANDIDATE_COLUMNS` and for the same
+    # reason: the table is partitioned on the second and the frame has to
+    # carry it per lot.
+    "cell_key",
+    "cell_partition",
     "scrape_date",
     # The parcel and the piece of it, always both: a reader has to be able to
     # tell a whole lot from a tenth of one.
@@ -1273,8 +1315,31 @@ def candidate_envelopes(envelopes: pd.DataFrame) -> pd.DataFrame:
     An Équipements piece still stays one, and by the gate it always had rather
     than by this: its columns are not candidates because `program` prices no
     ``E`` family, and `equipment_zone_pieces` is what says so in `hbu_status`.
+
+    **A single-family piece is not a candidate either**, and this is the one
+    place a whole piece is left out on purpose: every row of every piece
+    `single_family_zone_pieces` names. Per piece rather than per row, because
+    dropping only the governing ``H.1`` column would leave a wider-lot column
+    beside it to be solved as the fallback and reported `no_governing_column`.
     """
     envelopes = ensure_use_flags(envelopes)
+    mask = _candidate_mask(envelopes)
+    single_family = single_family_zone_pieces(envelopes)
+    if single_family:
+        pieces = pd.MultiIndex.from_frame(envelopes[["lot_uid", "feature_id"]])
+        mask &= ~pd.Series(
+            pieces.isin(list(single_family)), index=envelopes.index
+        )
+    return envelopes[mask]
+
+
+def _candidate_mask(envelopes: pd.DataFrame) -> pd.Series:
+    """The rows authorising a priced family and parsing into a solver input.
+
+    `candidate_envelopes` before the single-family gate, which needs it to
+    decide which rows it is looking at. ``envelopes`` has been through
+    `ensure_use_flags` already.
+    """
     permits = [
         envelopes[f"permits_{family}"].fillna(False).astype(bool)
         for family in USE_FAMILIES
@@ -1288,7 +1353,7 @@ def candidate_envelopes(envelopes: pd.DataFrame) -> pd.DataFrame:
         mask = pd.Series(True, index=envelopes.index)
     if "solver_ready" in envelopes.columns:
         mask &= envelopes["solver_ready"].fillna(False).astype(bool)
-    return envelopes[mask]
+    return mask
 
 
 def ensure_use_flags(envelopes: pd.DataFrame) -> pd.DataFrame:
@@ -1658,6 +1723,7 @@ def select_highest_best_use(
         frame,
         programs,
         equipment_pieces=equipment_zone_pieces(envelopes),
+        single_family_pieces=single_family_zone_pieces(envelopes),
         road_pieces=road_keys,
     )
     frame["hbu_dominant_use"] = _dominant_use(frame)
@@ -1763,6 +1829,8 @@ def _dominant_use(frame: pd.DataFrame) -> pd.Series:
 _PIECE_PASSTHROUGH: tuple[str, ...] = (
     "lot_number",
     "neighborhood",
+    "cell_key",
+    "cell_partition",
     "scrape_date",
     "lot_area_m2",
     "piece_area_m2",
@@ -1895,6 +1963,115 @@ def equipment_zone_pieces(envelopes: pd.DataFrame) -> frozenset:
     permits = _permits_equipment(envelopes)
     marked = envelopes.loc[permits, ["lot_uid", "feature_id"]]
     return frozenset(map(tuple, marked.to_numpy()))
+
+
+#: The most dwellings a piece's zoning may allow and still be read as a
+#: single-family site - see `single_family_zone_pieces`. One, because that is
+#: what the gate is about: a cap of one is where the rental objective collapses
+#: to a single unit whatever the envelope. A duplex cap still leaves the solver
+#: something to build - two units, two storeys - and stays solved.
+SINGLE_FAMILY_MAX_DWELLINGS = 1
+
+
+def single_family_zone_pieces(envelopes: pd.DataFrame) -> frozenset:
+    """The **(lot, zone) pieces** zoned for one dwelling and nothing else priced.
+
+    A piece is single-family when the building the solver would be asked about
+    holds at most `SINGLE_FAMILY_MAX_DWELLINGS` dwellings and no commerce or
+    industry. "The building the solver would be asked about" is read the way
+    `_envelope_row` reads it, so the gate and the solve cannot disagree:
+
+    * the piece's **governing** columns - the rows marked ``governs_<family>``
+      for a family they also permit - where it has any. A zone printing an
+      ``H.1`` column for narrow lots and an ``H.2`` one from 12 m of frontage
+      is single-family on the narrow lot and not on the wide one, because that
+      is what each may build;
+    * every candidate column where nothing governs, which is the fallback
+      `_envelope_row` solves too.
+
+    Among those, at least one must permit housing, none may permit commerce or
+    industry, and every one permitting housing must cap it at one. The cap is
+    `ZoneColumn.effective_max_dwellings`'s: the smaller of the printed
+    *Nombre de logements maximal* and the ceiling the usage class implies, so
+    Montreal's ``H.1`` (printed blank) and Quebec City's ``H`` with ``1``
+    printed both count, and a bare ``H`` with nothing printed does not.
+
+    Équipements columns are neither here nor there: `program` prices no ``E``,
+    so a zone printing a school column beside a house column is a house zone
+    as far as the solve goes - Saguenay prints ``H`` and ``E`` in one column on
+    some 20,000 rows.
+    """
+    keys = ["lot_uid", "feature_id"]
+    if envelopes.empty or not set(keys) <= set(envelopes.columns):
+        return frozenset()
+    frame = ensure_use_flags(envelopes)
+    if "permits_residential" not in frame.columns:
+        return frozenset()
+    rows = frame[_candidate_mask(frame)]
+    if rows.empty:
+        return frozenset()
+
+    residential = _flags(rows, "permits_residential")
+    non_residential = _flags(rows, "permits_commercial") | _flags(
+        rows, "permits_industrial"
+    )
+    governs = pd.Series(False, index=rows.index)
+    for family in USE_FAMILIES:
+        governs |= _flags(rows, f"governs_{family}") & _flags(rows, f"permits_{family}")
+    governed_piece = governs.groupby(
+        [rows["lot_uid"], rows["feature_id"]], sort=False
+    ).transform("any")
+    considered = governs | ~governed_piece
+    single = (_max_dwellings(rows) <= SINGLE_FAMILY_MAX_DWELLINGS).fillna(False)
+
+    per_piece = (
+        pd.DataFrame(
+            {
+                "lot_uid": rows["lot_uid"],
+                "feature_id": rows["feature_id"],
+                "houses": residential & considered,
+                "trades": non_residential & considered,
+                "multiple": residential & considered & ~single,
+            }
+        )
+        .groupby(keys, sort=False)[["houses", "trades", "multiple"]]
+        .any()
+    )
+    marked = per_piece[
+        per_piece["houses"] & ~per_piece["trades"] & ~per_piece["multiple"]
+    ]
+    return frozenset(marked.index.to_list())
+
+
+def _flags(frame: pd.DataFrame, name: str) -> pd.Series:
+    """One boolean column, nulls False, all False where the column is absent."""
+    if name not in frame.columns:
+        return pd.Series(False, index=frame.index)
+    return frame[name].fillna(False).astype(bool)
+
+
+def _max_dwellings(rows: pd.DataFrame) -> pd.Series:
+    """Each row's dwelling ceiling - `ZoneColumn.effective_max_dwellings`.
+
+    Computed off the two columns rather than by building a `ZoneColumn` per
+    row, which would parse every norm of every column to read one. NaN where
+    neither the grid nor the class states a ceiling.
+    """
+    printed = (
+        pd.to_numeric(rows["max_dwellings"], errors="coerce")
+        if "max_dwellings" in rows.columns
+        else pd.Series(np.nan, index=rows.index)
+    )
+    implied = (
+        pd.Series(
+            [class_max_dwellings(map(str, _json_list(value))) for value in rows["usages"]],
+            index=rows.index,
+            dtype="float64",
+        )
+        if "usages" in rows.columns
+        else pd.Series(np.nan, index=rows.index)
+    )
+    return pd.concat([printed, implied], axis=1).min(axis=1)
 
 
 def cadastral_road_lots(
@@ -2033,6 +2210,7 @@ def _hbu_status(
     programs: pd.DataFrame,
     *,
     equipment_pieces: frozenset = frozenset(),
+    single_family_pieces: frozenset = frozenset(),
     road_pieces: frozenset = frozenset(),
 ) -> pd.Series:
     """Why each piece has the row it has - one of `HBU_STATUSES`.
@@ -2048,9 +2226,13 @@ def _hbu_status(
     side and `solved` on the housing side is the ordinary case, and a per-lot
     answer would have to pick one of them.
 
-    The two exclusions read in opposite directions and that is deliberate.
+    The exclusions read in opposite directions and that is deliberate.
     `equipment_zone` *refines* the answer, splitting `no_candidate_column` in
     two, because it explains an absence the envelopes had already produced.
+    `single_family_zone` refines it the same way - `candidate_envelopes` is
+    what left those pieces with no candidate - and is applied after the
+    equipment one, so a Saguenay column printing ``H`` and ``E`` together
+    reads as the house lot it is rather than as a park.
     `road_parcel` *overrides* it, applied last and regardless of what the
     envelopes said, because it is a fact about the ground rather than about the
     grid: the zone polygon over a roadway describes the block it serves.
@@ -2068,6 +2250,9 @@ def _hbu_status(
     status[
         unsolved & (frame["num_candidates"] == 0) & pieces.isin(equipment_pieces)
     ] = "equipment_zone"
+    status[
+        unsolved & (frame["num_candidates"] == 0) & pieces.isin(single_family_pieces)
+    ] = "single_family_zone"
     if not programs.empty:
         governing = programs[_governs_any(programs)]
         infeasible = set(
@@ -2846,6 +3031,10 @@ ENHANCEMENT_STATUSES: tuple[str, ...] = (
     "not_underbuilt",  # the envelope holds no more than what stands
     "no_program",  # the rebuild was not solved, so there is nothing to grow toward
     "no_envelope",  # the governing zone's columns could not be rebuilt
+    # The piece is `single_family_zone`: the addition would be priced as rental
+    # floor, which is the thesis that piece is kept out of. Split from
+    # `no_program` so the reason reads as a choice rather than a failed solve.
+    "single_family_zone",
 )
 
 #: What `solve_enhancements` writes, in reading order. Every money figure is
@@ -3176,6 +3365,9 @@ def solve_enhancements(
 
     rows: list[dict] = []
     for record in hbu.to_dict("records"):
+        if record.get("hbu_status") == "single_family_zone":
+            rows.append({**_NO_ENHANCEMENT, "enhance_status": "single_family_zone"})
+            continue
         if record.get("hbu_status") != "solved" or not record.get("solved", True):
             rows.append({**_NO_ENHANCEMENT, "enhance_status": "no_program"})
             continue

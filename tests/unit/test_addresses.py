@@ -558,3 +558,129 @@ def test_the_parsed_frame_carries_every_name_the_join_reads():
     # gets to disagree with it.
     assert parsed["civic_number"].tolist() == [7390, 7430]
     assert parsed.crs == "EPSG:4326"
+
+
+# -- the silver join, on the tile axis ------------------------------------------
+
+TILE = "0302303330102"
+
+
+def write_bronze(store, neighborhood, features):
+    """One borough's bronze snapshot, as `neighborhood_addresses` writes it."""
+    frame = features_to_frame(features)
+    points = gpd.GeoDataFrame(
+        frame.drop(columns=["longitude", "latitude"]),
+        geometry=gpd.points_from_xy(frame["longitude"], frame["latitude"]),
+        crs="EPSG:4326",
+    ).assign(neighborhood=neighborhood, scrape_date=DATE)
+    write_frame(
+        points,
+        join(store.partition_dir("neighborhood_addresses", DATE, neighborhood), ADDRESSES_FILE),
+    )
+
+
+def stub_join(monkeypatch, *, boroughs=(NEIGHBORHOOD,), num_addresses=2):
+    """Patch the four Postgres calls `lot_addresses` makes, recording each."""
+    from contextlib import contextmanager
+
+    from urban_rag import address_assets
+    from urban_rag.resources import PostgisResource
+
+    calls: dict[str, list] = {"loaded": [], "compute": [], "fetch": [], "boroughs": []}
+
+    @contextmanager
+    def connect(self):
+        yield object()
+
+    def neighborhoods_of_tile(connection, *, tile, scrape_date):
+        calls["boroughs"].append((tile, scrape_date))
+        return tuple(boroughs)
+
+    def load_addresses(connection, frame, *, neighborhood, scrape_date):
+        calls["loaded"].append((neighborhood, len(frame), "street_name" in frame))
+        return len(frame)
+
+    def compute_lot_addresses(connection, *, tile, scrape_date, max_snap_m):
+        calls["compute"].append((tile, scrape_date, max_snap_m))
+        return {
+            "num_addresses": num_addresses, "num_points": 3, "num_unmatched": 1,
+            "num_lots": 2, "num_pieces": 2, "num_no_piece": 0, "num_snapped": 0,
+            "num_unit_addresses": 0, "num_primary_piece": 2, "num_unparsed": 0,
+        }
+
+    def fetch_lot_addresses(connection, *, tile, scrape_date):
+        calls["fetch"].append((tile, scrape_date))
+        return gpd.GeoDataFrame(
+            {"address_id": ["id-1"], "cell_partition": [tile]},
+            geometry=[Point(-73.6, 45.5)],
+            crs="EPSG:4326",
+        )
+
+    monkeypatch.setattr(PostgisResource, "connect", connect)
+    for name, value in {
+        "neighborhoods_of_tile": neighborhoods_of_tile,
+        "load_addresses": load_addresses,
+        "compute_lot_addresses": compute_lot_addresses,
+        "fetch_lot_addresses": fetch_lot_addresses,
+    }.items():
+        monkeypatch.setattr(address_assets, name, value)
+    return calls
+
+
+def run_join(store):
+    from urban_rag.address_assets import lot_addresses
+    from urban_rag.resources import PostgisResource
+
+    return materialize(
+        [lot_addresses],
+        partition_key=MultiPartitionKey({"date": DATE, "tile": TILE}),
+        resources={"store": store, "postgis": PostgisResource()},
+    )
+
+
+def test_the_join_loads_every_borough_of_the_tile_then_joins_the_tile(
+    store, monkeypatch
+):
+    """The fetch is a borough's and the join a tile's: a tile spanning two
+    boroughs loads both snapshots, parsed, then joins its own points."""
+    calls = stub_join(monkeypatch, boroughs=(NEIGHBORHOOD, "RPP"))
+    write_bronze(store, NEIGHBORHOOD, [address_feature(1, "7430 Rue Lajeunesse, Montréal H2R2H8")])
+    write_bronze(
+        store,
+        "RPP",
+        [
+            address_feature(2, "6700 Rue Boyer, Montréal H2S2J7"),
+            address_feature(3, "6702 Rue Boyer, Montréal H2S2J7"),
+        ],
+    )
+
+    result = run_join(store)
+
+    assert result.success
+    assert calls["boroughs"] == [(TILE, DATE)]
+    assert calls["loaded"] == [(NEIGHBORHOOD, 1, True), ("RPP", 2, True)]
+    assert calls["compute"][0][:2] == (TILE, DATE)
+    assert calls["fetch"] == [(TILE, DATE)]
+    written = gpd.read_parquet(
+        join(store.partition_dir("lot_addresses", DATE, TILE), "lot_addresses.parquet")
+    )
+    assert written["address_id"].tolist() == ["id-1"]
+    metadata = result.asset_materializations_for_node("silver__lot_addresses")[0].metadata
+    assert metadata["tile"].value == TILE
+    assert metadata["neighborhoods"].value == f"{NEIGHBORHOOD}, RPP"
+    assert metadata["num_points_loaded_for_boroughs"].value == 3
+
+
+def test_a_tile_with_no_lots_names_the_cadastre(store, monkeypatch):
+    stub_join(monkeypatch, boroughs=())
+
+    with pytest.raises(Failure, match="neighborhood_cadastre"):
+        run_join(store)
+
+
+def test_a_join_that_places_nothing_fails_inside_the_transaction(store, monkeypatch):
+    stub_join(monkeypatch, num_addresses=0)
+    write_bronze(store, NEIGHBORHOOD, [address_feature(1, "7430 Rue Lajeunesse, Montréal H2R2H8")])
+
+    with pytest.raises(Failure, match="falls on a parcel"):
+        run_join(store)

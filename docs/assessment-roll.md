@@ -66,8 +66,8 @@ municipalities — Westmount, Mont-Royal, Côte-Saint-Luc and the rest file thei
 own rolls and are not boroughs:
 
 ```bash
-make roll DATE=2026-08-26                    # Ville de Montréal, the default
-make roll DATE=2026-08-26 CODE_MUN='[]'      # the province
+make roll DATE=2026-09-01                    # Montréal, Québec and Saguenay, the default
+make roll DATE=2026-09-01 CODE_MUN='[]'      # the province
 ```
 
 Geometry is reprojected to EPSG:4326 on the way in, the way BDOI's is. NAD83 is
@@ -202,8 +202,8 @@ approximated: 21 862 lots valued instead of 22 443, and $24.26 B instead of
 $27.24 B.
 
 ```bash
-make lot-values DATE=2026-08-26                  # crosswalk + point fallback
-make lot-values DATE=2026-08-26 BY_POINT=false   # crosswalk only
+make lot-values DATE=2026-09-01                  # crosswalk + point fallback
+make lot-values DATE=2026-09-01 BY_POINT=false   # crosswalk only
 ```
 
 The two routes are genuinely complementary on real data — neither finds what

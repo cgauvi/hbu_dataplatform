@@ -47,7 +47,7 @@ from urban_rag.storage import join
 from urban_rag.street_assets import STREETS_FILE_OUT, neighborhood_streets
 
 DATE = "2026-08-01"
-NEIGHBORHOOD = "VSMPE"
+TILE = "0302303330102"
 
 
 @pytest.fixture
@@ -61,7 +61,7 @@ def write_streets(store, *, street_ids=(1, 2), names=("Jarry", "Papineau")):
         {
             "COTE_RUE_ID": list(street_ids),
             "NOM_VOIE": list(names),
-            "neighborhood": [NEIGHBORHOOD] * len(street_ids),
+            "neighborhood": ["VSMPE"] * len(street_ids),
             "scrape_date": [DATE] * len(street_ids),
             "length_in_borough_m": [100.0] * len(street_ids),
         },
@@ -75,7 +75,7 @@ def write_streets(store, *, street_ids=(1, 2), names=("Jarry", "Papineau")):
         frame,
         join(
             store.partition_dir(
-                neighborhood_streets.key.path[-1], DATE, NEIGHBORHOOD
+                neighborhood_streets.key.path[-1], DATE, TILE
             ),
             STREETS_FILE_OUT,
         ),
@@ -132,7 +132,7 @@ def stub_postgis(
     def compute_lot_frontage(
         connection,
         *,
-        neighborhood,
+        tile,
         scrape_date,
         min_street_m,
         fallback_buffers_m=(),
@@ -142,7 +142,7 @@ def stub_postgis(
         # `test_nothing_is_loaded_here` reads `set(calls)` to prove this asset
         # loads nothing, and an argument recorded is not a call made.
         calls["compute"] = (
-            neighborhood,
+            tile,
             scrape_date,
             min_street_m,
             tuple(fallback_buffers_m),
@@ -183,21 +183,21 @@ def stub_postgis(
             "pruned": 0,
         }
 
-    def fetch_lot_frontage(connection, *, neighborhood, scrape_date):
+    def fetch_lot_frontage(connection, *, tile, scrape_date):
         """What the real one reads back out: `frontages` measured pairs.
 
         Shaped like `rag.lot_frontage` rather than faithful to it - the columns
         the asset itself touches are the row count and the geometry, and the
         SQL behind the real function needs PostGIS to mean anything.
         """
-        calls["fetch"] = (neighborhood, scrape_date)
+        calls["fetch"] = (tile, scrape_date)
         return gpd.GeoDataFrame(
             {
                 "lot_uid": list(range(1, frontages + 1)),
                 "lot_number": [str(i) for i in range(1, frontages + 1)],
                 "cote_rue_id": ["1"] * frontages,
                 "street_name": ["Jarry"] * frontages,
-                "neighborhood": [neighborhood] * frontages,
+                "neighborhood": ["VSMPE"] * frontages,
                 "scrape_date": [scrape_date] * frontages,
                 # Always 0 now: there is no buffer, and the column says so.
                 "buffer_m": [FRONTAGE_NO_BUFFER] * frontages,
@@ -222,7 +222,7 @@ def materialize_partition(store, *, run_config=None):
     return materialize(
         [lot_frontage],
         partition_key=MultiPartitionKey(
-            {"date": DATE, "neighborhood": NEIGHBORHOOD}
+            {"date": DATE, "tile": TILE}
         ),
         resources={"store": store, "postgis": PostgisResource()},
         run_config=run_config,
@@ -242,11 +242,11 @@ def test_the_partition_is_loaded_measured_and_written(store, monkeypatch, tmp_pa
 
     assert materialize_partition(store).success
 
-    assert calls["compute"][:2] == (NEIGHBORHOOD, DATE)
-    assert calls["fetch"] == (NEIGHBORHOOD, DATE)
+    assert calls["compute"][:2] == (TILE, DATE)
+    assert calls["fetch"] == (TILE, DATE)
 
     path = (
-        tmp_path / "store" / "silver" / "lot_frontage" / DATE / NEIGHBORHOOD
+        tmp_path / "store" / "silver" / "lot_frontage" / DATE / TILE
         / LOT_FRONTAGE_FILE
     )
     frame = gpd.read_parquet(path)
@@ -281,7 +281,7 @@ def test_the_written_rows_are_ordered_longest_frontage_first(
     materialize_partition(store)
 
     frame = gpd.read_parquet(
-        tmp_path / "store" / "silver" / "lot_frontage" / DATE / NEIGHBORHOOD
+        tmp_path / "store" / "silver" / "lot_frontage" / DATE / TILE
         / LOT_FRONTAGE_FILE
     )
     assert frame["frontage_m"].is_monotonic_decreasing
@@ -303,7 +303,7 @@ def test_the_road_lots_are_written_beside_the_frontages(
     assert materialize_partition(store).success
 
     frame = pd.read_parquet(
-        tmp_path / "store" / "silver" / "lot_frontage" / DATE / NEIGHBORHOOD
+        tmp_path / "store" / "silver" / "lot_frontage" / DATE / TILE
         / ROAD_LOTS_FILE
     )
     assert list(frame["lot_number"]) == list(ROAD_LOT_NUMBERS)
@@ -312,7 +312,7 @@ def test_the_road_lots_are_written_beside_the_frontages(
     assert not frame[ROAD_LOT_FLAG_COLUMN].any()
     # The partition travels as columns, because the path carries bare keys
     # rather than hive `key=value` pairs.
-    assert set(frame["neighborhood"]) == {NEIGHBORHOOD}
+    assert set(frame["tile"]) == {TILE}
     assert set(frame["scrape_date"]) == {DATE}
     # What the identification actually rested on, per parcel, so the cutoff is
     # auditable rather than asserted.
@@ -332,7 +332,7 @@ def test_a_borough_with_no_road_lot_writes_an_empty_file_not_no_file(
     assert materialize_partition(store).success
 
     frame = pd.read_parquet(
-        tmp_path / "store" / "silver" / "lot_frontage" / DATE / NEIGHBORHOOD
+        tmp_path / "store" / "silver" / "lot_frontage" / DATE / TILE
         / ROAD_LOTS_FILE
     )
     assert frame.empty
@@ -393,7 +393,7 @@ def test_the_marginal_road_lots_are_flagged_for_the_roll_to_overturn(
     assert materialize_partition(store).success
 
     frame = pd.read_parquet(
-        tmp_path / "store" / "silver" / "lot_frontage" / DATE / NEIGHBORHOOD
+        tmp_path / "store" / "silver" / "lot_frontage" / DATE / TILE
         / ROAD_LOTS_FILE
     ).set_index("street_m_inside")
     assert frame.loc[1.5, ROAD_LOT_FLAG_COLUMN]
@@ -413,7 +413,7 @@ def test_the_flag_moves_with_the_configured_cutoff(store, monkeypatch, tmp_path)
     materialize_partition(store, run_config=config_for(5.0))
 
     frame = pd.read_parquet(
-        tmp_path / "store" / "silver" / "lot_frontage" / DATE / NEIGHBORHOOD
+        tmp_path / "store" / "silver" / "lot_frontage" / DATE / TILE
         / ROAD_LOTS_FILE
     )
     # 30 m clears a 1 m cutoff comfortably; against a 5 m one it does not.
@@ -518,7 +518,7 @@ def test_the_rows_record_that_no_buffer_was_used(store, monkeypatch, tmp_path):
     materialize_partition(store, run_config=config_for(5.0))
 
     frame = gpd.read_parquet(
-        tmp_path / "store" / "silver" / "lot_frontage" / DATE / NEIGHBORHOOD
+        tmp_path / "store" / "silver" / "lot_frontage" / DATE / TILE
         / LOT_FRONTAGE_FILE
     )
     assert set(frame["buffer_m"]) == {0.0}
@@ -568,7 +568,7 @@ def test_a_borough_with_no_lots_loaded_is_a_failure(store, monkeypatch):
     stub_postgis(monkeypatch, num_lots=0)
     write_streets(store)
 
-    with pytest.raises(Failure, match="materialize building_lot_intersections"):
+    with pytest.raises(Failure, match="materialize neighborhood_cadastre"):
         materialize_partition(store)
 
 
@@ -633,7 +633,7 @@ def test_a_missing_street_partition_names_the_asset_to_run(store, monkeypatch):
 def test_a_rerun_replaces_the_previous_partition(store, monkeypatch, tmp_path):
     stub_postgis(monkeypatch)
     write_streets(store)
-    partition = tmp_path / "store" / "silver" / "lot_frontage" / DATE / NEIGHBORHOOD
+    partition = tmp_path / "store" / "silver" / "lot_frontage" / DATE / TILE
     partition.mkdir(parents=True)
     stale = partition / "lot_frontage_retired.parquet"
     gpd.GeoDataFrame(

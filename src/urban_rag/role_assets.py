@@ -84,12 +84,16 @@ rolls.
 
 **Both silver assets have a Postgres table, and one of them fills several
 partitions at once.** `lot_assessed_values` owns `silver.lot_assessed_values`
-(hbu_infra's sql/013), and is borough-partitioned the ordinary way: it is
-materialized per borough and publishes the borough it was asked for.
-`assessment_units` owns `silver.assessment_units` (sql/014) and is not. The
-roll has no borough axis to be partitioned on - it is one publication for the
-province, merged once - so the asset stays date-partitioned and its parquet
-stays province-wide, and the borough each unit belongs to is read off the map:
+(hbu_infra's sql/013), and is on the tile axis like the rest of the lot chain:
+it is materialized per cut cell, reads that cell's lots out of `rag.lots`
+(`postgis.fetch_lots` - the bronze cadastre parquet is a borough's, and a tile
+is not a borough) and publishes the cell it was asked for. The roll it places
+on them is the whole snapshot, which is what "apportioned over the lots the
+unit covers *in the snapshot*" always meant. `assessment_units` owns
+`silver.assessment_units` (sql/014) and is on neither axis. The roll has no
+borough to be partitioned on - it is one publication for the province, merged
+once - so the asset stays date-partitioned and its parquet stays
+province-wide, and the borough each unit belongs to is read off the map:
 `assign_boroughs` puts every unit in the borough whose `reference_neighborhoods`
 boundary its point falls inside, and `warehouse.publish_by_neighborhood` upserts
 all of them in one transaction.
@@ -119,14 +123,18 @@ from dagster import (
     AssetDep,
     AssetExecutionContext,
     Config,
+    DimensionPartitionMapping,
     Failure,
+    IdentityPartitionMapping,
     MaterializeResult,
     MetadataValue,
+    MultiPartitionMapping,
     MultiToSingleDimensionPartitionMapping,
     asset,
 )
 from pydantic import Field
 
+from urban_rag.cadastre_assets import neighborhood_cadastre
 from urban_rag.guards import guard_current_scrape_month
 from urban_rag.cubf import (
     USE_DESCRIPTION_COLUMN,
@@ -136,7 +144,6 @@ from urban_rag.cubf import (
 )
 from urban_rag.cubf_assets import CUBF_FILE, cubf_use_codes
 from urban_rag.frames import count_invalid_geometries, write_frame
-from urban_rag.infolot_assets import LOTS_FILE, neighborhood_lots
 from urban_rag.layers import key_prefix
 from urban_rag.open_data_assets import GROUP as OPEN_DATA_GROUP
 from urban_rag.open_data_assets import borough_boundary, reference_neighborhoods
@@ -147,8 +154,10 @@ from urban_rag.partitions import (
     city_of,
     date_partitions,
     enabled_neighborhoods,
-    scrape_partitions,
+    tile_partition_of,
+    tile_scrape_partitions,
 )
+from urban_rag.postgis import fetch_lots
 from urban_rag.rag.pgvector import PostgresUnavailable
 from urban_rag.resources import ParquetStore, PostgisResource, RoleResource
 from urban_rag.role_foncier import (
@@ -201,11 +210,22 @@ ASSESSMENT_UNITS_FILE = "assessment_units.parquet"
 
 
 #: The one file `lot_assessed_values` writes, under
-#: `silver/lot_assessed_values/<YYYY-MM-DD>/<neighborhood>/`.
+#: `silver/lot_assessed_values/<YYYY-MM-DD>/<tile>/`.
 LOT_VALUES_FILE = "lot_assessed_values.parquet"
 
-#: Infolot's lot number, and the grain `lot_assessed_values` groups at.
+#: Infolot's lot number, and the grain `lot_assessed_values` groups at. The
+#: lots come out of `rag.lots` as `lot_number` now and are put back under
+#: this name, because it is the name every reader of the file - and
+#: `warehouse.TABLES`' column map - has always joined on.
 LOT_NUMBER_COLUMN = "NO_LOT"
+
+#: How a tile asset depends on a borough one: the date maps to itself and the
+#: borough dimension is left unlisted, which Dagster reads as "all of them".
+#: `neighborhood_cadastre` is what puts a tile's lots in `rag.lots`, and a
+#: tile does not know which boroughs those came from until it reads them.
+_BOROUGH_BRIDGE = MultiPartitionMapping(
+    {"date": DimensionPartitionMapping("date", IdentityPartitionMapping())}
+)
 
 #: Columns the characteristics table repeats from the point layer verbatim -
 #: the same fact keyed by the same `id_provinc`, published twice. Dropped from
@@ -626,9 +646,14 @@ def assessment_units(
 
 @asset(
     key_prefix=key_prefix("lot_assessed_values"),
-    partitions_def=scrape_partitions,
+    partitions_def=tile_scrape_partitions,
     deps=[
-        neighborhood_lots,
+        # The lots are in rag.lots once the borough's cadastre has landed,
+        # and a tile reads them by cell. A borough-axis upstream of a tile
+        # asset - see `_BOROUGH_BRIDGE`.
+        AssetDep(neighborhood_cadastre, partition_mapping=_BOROUGH_BRIDGE),
+        # Partitioned by date alone: the roll is one publication for the
+        # province.
         AssetDep(
             assessment_units,
             partition_mapping=MultiToSingleDimensionPartitionMapping(
@@ -645,17 +670,18 @@ def assessment_units(
     group_name=SILVER_GROUP,
     kinds={"postgres", "geoparquet"},
     description=(
-        "What every lot in one borough is assessed at. Units are placed on "
+        "What every lot in one tile is assessed at. Units are placed on "
         "lots by the roll's own cadastre crosswalk - b05v_lot_cadst, joined to "
         "Infolot on the lot number - and, for the units it cannot place, by "
         "where their point falls. One row per NO_LOT with the lot's geometry, "
         f"the units on it, the total {VALUE_COLUMN} (VALEUR IMMEUBLE) they "
         "carry and that total apportioned across the lots each unit spans. A "
         "lot with no unit keeps its row with a null total, since no assessed "
-        "property is not a property worth zero. Written to silver/"
-        f"lot_assessed_values/<YYYY-MM-DD>/<neighborhood>/{LOT_VALUES_FILE} "
+        "property is not a property worth zero. The lots are the cell's rows "
+        "of rag.lots; the roll is the whole snapshot. Written to silver/"
+        f"lot_assessed_values/<YYYY-MM-DD>/<tile>/{LOT_VALUES_FILE} "
         "and upserted into silver.lot_assessed_values on (scrape_date, "
-        "neighborhood, lot_number)."
+        "cell_partition, lot_number)."
     ),
 )
 def lot_assessed_values(
@@ -664,14 +690,8 @@ def lot_assessed_values(
     store: ParquetStore,
     postgis: PostgisResource,
 ) -> MaterializeResult:
-    dimensions = context.partition_key.keys_by_dimension
-    neighborhood = dimensions["neighborhood"]
-    scrape_date = dimensions["date"][:10]
+    tile, scrape_date = tile_partition_of(context)
 
-    lots_path = join(
-        store.partition_dir(neighborhood_lots.key.path[-1], scrape_date, neighborhood),
-        LOTS_FILE,
-    )
     units_path = join(
         store.partition_dir(assessment_units.key.path[-1], scrape_date),
         ASSESSMENT_UNITS_FILE,
@@ -680,11 +700,24 @@ def lot_assessed_values(
         store.partition_dir(property_assessment_roll.key.path[-1], scrape_date),
         CADASTRE_FILE,
     )
-    lots = _read_geoparquet(
-        lots_path,
-        written_by="/".join(neighborhood_lots.key.path),
-        partition=f"{scrape_date} {neighborhood}",
-    )
+    # The cell's lots, out of the table `neighborhood_cadastre` loaded them
+    # into: the bronze parquet is a borough's and a tile is a piece of one or
+    # two of them. Read before the roll so a tile nobody has loaded fails on
+    # the cheap read rather than after the 437-thousand-row parquet.
+    try:
+        with postgis.connect() as connection:
+            lots = fetch_lots(connection, tile=tile, scrape_date=scrape_date)
+    except (PostgresUnavailable, MissingRelation) as exc:
+        raise Failure(f"rag.lots could not be read for tile {tile}: {exc}") from exc
+    if lots.empty:
+        raise Failure(
+            f"rag.lots holds no lot for tile {tile} {scrape_date} - "
+            "materialize neighborhood_cadastre for the boroughs this tile "
+            "covers first."
+        )
+    lots = _as_cadastre_frame(lots)
+    neighborhoods = tuple(sorted(lots["neighborhood"].dropna().unique()))
+
     units = _read_geoparquet(
         units_path,
         written_by="/".join(assessment_units.key.path),
@@ -695,22 +728,14 @@ def lot_assessed_values(
         written_by="/".join(property_assessment_roll.key.path),
         partition=scrape_date,
     )
-    if lots.empty:
-        raise Failure(f"{lots_path} holds no lot to value.")
     if units.empty:
         raise Failure(f"{units_path} holds no assessment unit.")
-    if LOT_NUMBER_COLUMN not in lots.columns:
-        raise Failure(
-            f"{lots_path} has no {LOT_NUMBER_COLUMN} column - it was not "
-            "written by neighborhood_lots."
-        )
 
-    # Bronze reports invalid rings and keeps them. Only the point fallback
-    # below reads the geometry, but it reads it with a point-in-polygon test,
-    # which on a self-intersecting ring either raises or answers a question
-    # nobody asked. The same repair `building_lot_intersections` makes on the
-    # way into PostGIS, made here for the same reason and counted so it stays
-    # visible.
+    # The loader repairs rings on the way into PostGIS, so what comes back
+    # should be valid - but the point fallback below reads the geometry with
+    # a point-in-polygon test, which on a self-intersecting ring either raises
+    # or answers a question nobody asked, so it is checked and counted rather
+    # than assumed.
     repaired = count_invalid_geometries(lots)
     if repaired:
         lots = _make_valid(lots)
@@ -721,7 +746,7 @@ def lot_assessed_values(
             f"{still_invalid} lot geometr(ies) are still invalid after "
             "make_valid; the partition cannot be joined against."
         )
-    _require_unique_lots(lots, neighborhood=neighborhood, scrape_date=scrape_date)
+    _require_unique_lots(lots, tile=tile, scrape_date=scrape_date)
 
     lots = lots.to_crs(units.crs)
     lots = lots.assign(lot_key=lots[LOT_NUMBER_COLUMN].map(lot_key))
@@ -744,21 +769,22 @@ def lot_assessed_values(
     by_number = pairs[~pairs["by_point"]]
     by_point = pairs[pairs["by_point"]]
     if pairs.empty:
-        # Not "this borough has no assessed property": no unit in the snapshot
+        # Not "this tile has no assessed property": no unit in the snapshot
         # reaches any of its lots by either route, which means the two sides do
         # not overlap at all - a municipality filter that excluded this
-        # borough, or a cadastre and a roll from territories that do not meet.
+        # tile's city, or a cadastre and a roll from territories that do not
+        # meet.
         raise Failure(
-            f"No assessment unit could be placed on any {neighborhood} lot for "
-            f"{scrape_date}. {units_path} holds {len(units)} unit(s), "
-            f"{cadastre_path} {len(crosswalk)} crosswalk row(s), and "
-            f"{lots_path} {len(lots)} lot(s); check that "
-            "property_assessment_roll kept this borough's municipality."
+            f"No assessment unit could be placed on any lot of tile {tile} "
+            f"for {scrape_date}. {units_path} holds {len(units)} unit(s), "
+            f"{cadastre_path} {len(crosswalk)} crosswalk row(s), and rag.lots "
+            f"{len(lots)} lot(s) in {', '.join(neighborhoods)}; check that "
+            "property_assessment_roll kept those boroughs' municipality."
         )
 
     # Apportioned over the lots the unit covers *in the snapshot*, not over the
-    # ones in this borough: a unit straddling a borough line should contribute
-    # its share here and the rest there, and dividing by the local lots alone
+    # ones in this tile: a unit straddling a cell edge should contribute its
+    # share here and the rest there, and dividing by the local lots alone
     # would hand this partition the whole of it.
     pairs["value_share"] = pairs[VALUE_COLUMN] / pairs["num_lots"]
     totals = (
@@ -788,14 +814,12 @@ def lot_assessed_values(
     for column in ("total_assessed_value", "total_assessed_value_apportioned"):
         valued[column] = valued[column].astype("Float64")
     valued["roll_year"] = int(units["roll_year"].iloc[0])
-    # `scrape_date` is already a column, from bronze, and is overwritten rather
-    # than trusted: this partition's date is the one that was asked for.
-    valued["neighborhood"] = neighborhood
+    # The borough is the lot's own, off `rag.lots`, and is not stamped: a tile
+    # can span two. The date is this partition's, which is the one that was
+    # asked for.
     valued["scrape_date"] = scrape_date
 
-    output_dir = store.partition_dir(
-        context.asset_key.path[-1], scrape_date, neighborhood
-    )
+    output_dir = store.partition_dir(context.asset_key.path[-1], scrape_date, tile)
     removed = clear_parquet(output_dir)
     if removed:
         context.log.info("Removed %d file(s) from a previous run", len(removed))
@@ -807,13 +831,13 @@ def lot_assessed_values(
         loaded = publish(
             postgis.connect,
             {"lot_assessed_values": valued},
-            neighborhood=neighborhood,
+            partition=tile,
             scrape_date=scrape_date,
         )
     except (PostgresUnavailable, MissingRelation) as exc:
         raise Failure(
             f"{path} was written, but silver.lot_assessed_values could not be "
-            f"updated for {neighborhood} {scrape_date}: {exc}"
+            f"updated for tile {tile} {scrape_date}: {exc}"
         ) from exc
 
     lots_valued = len(totals)
@@ -825,7 +849,7 @@ def lot_assessed_values(
     context.log.info(
         "%s %s: %d unit(s) on %d of %d lot(s) - %d by lot number, %d by point "
         "- $%.2fB assessed, $%.2fB apportioned -> %s",
-        neighborhood,
+        tile,
         scrape_date,
         units_matched,
         lots_valued,
@@ -840,10 +864,14 @@ def lot_assessed_values(
     return MaterializeResult(
         metadata={
             "dagster/row_count": len(valued),
+            "tile": tile,
+            # Whose lots the cell holds - one borough for most tiles, two
+            # where a cut cell straddles a borough line.
+            "neighborhoods": ", ".join(neighborhoods),
             "num_lots": len(lots),
             "num_lots_valued": lots_valued,
             # The symptom worth seeing. A few lanes and parks is the honest
-            # reading; a third of the borough is the cadastre and the roll
+            # reading; a third of the tile is the cadastre and the roll
             # disagreeing about where the ground is.
             "num_lots_unvalued": len(lots) - lots_valued,
             "num_units_in_snapshot": len(units),
@@ -859,14 +887,14 @@ def lot_assessed_values(
             "num_units_on_several_lots": int(
                 by_number.loc[by_number["num_lots"] > 1, JOIN_KEY].nunique()
             ),
-            # Units that name no lot of this borough and whose point falls in
-            # none either. Almost all are in another borough; what is left this
+            # Units that name no lot of this tile and whose point falls in
+            # none either. Almost all are in another tile; what is left this
             # partition attributes to nobody.
             "num_units_unmatched_in_snapshot": len(units) - units_matched,
             "num_geometries_repaired": repaired,
-            # Sum over lots of each unit's whole value. Over-counts the borough
+            # Sum over lots of each unit's whole value. Over-counts the tile
             # by exactly the multi-lot units' repeated value - read one lot's
-            # row with this, and the borough's total with the one below.
+            # row with this, and the tile's total with the one below.
             "total_assessed_value": round(full_total, 2),
             "total_assessed_value_billions": round(full_total / 1e9, 2),
             # Each unit's value split across the lots it covers, so this one
@@ -1306,6 +1334,31 @@ def _missing(path: str, written_by: str, partition: str) -> str:
     return f"{path} does not exist - materialize {written_by} for {partition} first."
 
 
+def _as_cadastre_frame(lots: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """`fetch_lots`' rows, shaped the way the bronze cadastre parquet was.
+
+    Two things, both so nothing downstream has to know the lots changed
+    source. The lot number goes back under `LOT_NUMBER_COLUMN` - `rag.lots`
+    calls it `lot_number`, and every reader of this asset's file joins on
+    `NO_LOT`. And Infolot's own columns come back out of the `attributes`
+    jsonb they were loaded into, as top-level columns: that is where the
+    bronze file carried them, and it is what `warehouse.publish` folds into
+    the table's own `attributes`, so the table keeps saying what sql/013
+    promises it says. A column the frame already has is not overwritten by a
+    key of the same name.
+    """
+    frame = lots.rename(columns={"lot_number": LOT_NUMBER_COLUMN})
+    if "attributes" not in frame.columns:
+        return frame
+    published = pd.DataFrame.from_records(
+        [value if isinstance(value, dict) else {} for value in frame["attributes"]],
+        index=frame.index,
+    )
+    frame = frame.drop(columns=["attributes"])
+    fresh = [name for name in published.columns if name not in frame.columns]
+    return frame.join(published[fresh]) if fresh else frame
+
+
 def _make_valid(lots: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """``lots`` with every self-intersecting ring repaired.
 
@@ -1381,13 +1434,14 @@ def _require_agreement(points, units, *, scrape_date: str) -> None:
 
 
 def _require_unique_lots(
-    lots: gpd.GeoDataFrame, *, neighborhood: str, scrape_date: str
+    lots: gpd.GeoDataFrame, *, tile: str, scrape_date: str
 ) -> None:
     """One row per lot number - the grain the totals are grouped at.
 
     Infolot answers a boundary query by object id, so the same lot can come
     back twice when a borough outline is a multipolygon and the lot straddles
-    two of its rings. Bronze keeps both rows; a duplicate here would count
+    two of its rings, and a lot on a borough line can be fetched under both
+    boroughs. `rag.lots` keeps what was loaded; a duplicate here would count
     every unit on that lot twice and inflate its total by exactly as much.
     """
     numbers = lots[LOT_NUMBER_COLUMN]
@@ -1395,7 +1449,7 @@ def _require_unique_lots(
     if not duplicated.empty:
         repeated = sorted(set(duplicated.astype(str)))
         raise Failure(
-            f"{neighborhood} {scrape_date}: {len(repeated)} lot number(s) appear "
+            f"tile {tile} {scrape_date}: {len(repeated)} lot number(s) appear "
             f"more than once, e.g. {', '.join(repeated[:5])}. "
             f"One row per {LOT_NUMBER_COLUMN} is the grain this asset groups at."
         )

@@ -35,6 +35,17 @@ two different streets, and the commercial strip on Jarry used to be solved as
 though the housing behind it shared its frontage. See
 `urban_rag.zone_piece_assets`.
 
+**Two axes meet here.** `lot_zone_pieces` runs per tile - a cut cell's lots -
+and `zoning_grid_columns` runs per borough, because a grid is something a
+borough publishes. A tile can span two boroughs, and Montreal restarts its zone
+numbers at C01-001 in every one of them, so the join is not on the zone number
+alone: each piece is joined to *its own lot's* borough's grid, read for every
+borough the tile's lots belong to. That is the bridge every tile asset with a
+borough-axis upstream crosses, and it is spelled out in the deps as a
+`MultiPartitionMapping` on the date alone - the borough dimension is left to
+"all", which is what a tile that does not know its boroughs until it reads its
+lots needs.
+
 **Why denormalised.** The alternative is three tables and a join at read time,
 and the reader is a solver that runs per lot: every column it needs on one row
 is what makes "solve this borough" a scan rather than a query plan. The cost
@@ -59,20 +70,32 @@ from the piece, so nothing about reading this table back has changed.
 """
 
 import json
+from collections.abc import Sequence
 
 import pandas as pd
 from dagster import (
+    AssetDep,
     AssetExecutionContext,
+    DimensionPartitionMapping,
     Failure,
+    IdentityPartitionMapping,
     MaterializeResult,
     MetadataValue,
+    MultiPartitionMapping,
     asset,
 )
 
 from urban_rag.assets import neighborhood_features
 from urban_rag.frames import write_frame
 from urban_rag.layers import key_prefix
-from urban_rag.partitions import City, city_of, scrape_partitions
+from urban_rag.partitions import (
+    City,
+    borough_partition_of,
+    city_of,
+    scrape_partitions,
+    tile_partition_of,
+    tile_scrape_partitions,
+)
 from urban_rag.program import (
     ProgramError,
     ZoneColumn,
@@ -105,8 +128,22 @@ GROUP = "silver_zoning"
 ZONE_COLUMNS_FILE = "zone_columns.parquet"
 
 #: One file per partition, under
-#: `silver/lot_zoning_envelopes/<YYYY-MM-DD>/<neighborhood>/`.
+#: `silver/lot_zoning_envelopes/<YYYY-MM-DD>/<tile>/`.
 LOT_ENVELOPES_FILE = "lot_zoning_envelopes.parquet"
+
+#: How a tile asset depends on a borough one. The date maps to itself and the
+#: borough dimension is left unlisted, which Dagster reads as "all of them":
+#: a tile does not know which boroughs it holds until it reads its lots, so
+#: the dependency cannot name them. See the module docstring.
+_BOROUGH_BRIDGE = MultiPartitionMapping(
+    {"date": DimensionPartitionMapping("date", IdentityPartitionMapping())}
+)
+
+#: What every row of a tile-axis table carries about the lot it belongs to,
+#: taken off `lot_zone_pieces` and never stamped here: a tile can span two
+#: boroughs, so the borough is the lot's own, and the two cell columns are the
+#: address the warehouse partitions on.
+_OWNERSHIP_COLUMNS = ("neighborhood", "cell_key", "cell_partition")
 
 #: What each row carries about the ground it describes, taken straight from
 #: `lot_zone_pieces` and not recomputed here.
@@ -224,7 +261,7 @@ def zoning_grid_columns(
     pdf_cache: PdfCache,
     postgis: PostgisResource,
 ) -> MaterializeResult:
-    neighborhood, scrape_date = _partition(context)
+    neighborhood, scrape_date = borough_partition_of(context)
     if city_of(neighborhood) is City.QUEBEC:
         # The city publishes its norms as a workbook, snapshotted beside the
         # zoning layer by `neighborhood_features`; there is no PDF to read.
@@ -328,7 +365,7 @@ def zoning_grid_columns(
     loaded = _publish(
         postgis,
         {"zoning_grid_columns": keyed},
-        neighborhood=neighborhood,
+        partition=neighborhood,
         scrape_date=scrape_date,
     )
 
@@ -377,28 +414,35 @@ def zoning_grid_columns(
 
 @asset(
     key_prefix=key_prefix("lot_zoning_envelopes"),
-    partitions_def=scrape_partitions,
-    deps=[lot_zone_pieces, zoning_grid_columns],
+    partitions_def=tile_scrape_partitions,
+    deps=[
+        lot_zone_pieces,
+        # A borough-axis upstream of a tile asset: the date maps across and
+        # the borough is resolved at run time from the lots - see
+        # `_BOROUGH_BRIDGE`.
+        AssetDep(zoning_grid_columns, partition_mapping=_BOROUGH_BRIDGE),
+    ],
     group_name=GROUP,
     kinds={"postgres", "parquet"},
     description=(
-        "Every zoning envelope in one borough, denormalised to the grain "
+        "Every zoning envelope in one tile, denormalised to the grain "
         "urban_rag.program reads: one row per (lot, zone, grid column), "
         "carrying the piece of the lot *that zone governs* - its own area and "
         "its own primary and secondary street frontage, from lot_zone_pieces "
         "- and every norm the column states: storeys and the levels the usage "
         "may occupy, minimum lot width, site coverage, density, dwelling "
         "ceiling, heights and margins. Joins lot_zone_pieces to "
-        "zoning_grid_columns on the zone number, and nothing else. "
+        "zoning_grid_columns on the lot's own borough and the zone number, "
+        "and nothing else - a tile spanning two boroughs reads both grids. "
         "piece_area_m2 is what the solver sizes a building on and lot_area_m2 "
         "is the parcel it belongs to; on a split lot they differ and the "
         "frontage can be a different street on each piece. Which pieces exist "
         "is lot_zone_pieces' decision and its three cutoffs travel on every "
         "row here. governs_residential marks the column "
         "select_residential_column picks for that piece's width. Writes "
-        f"silver/lot_zoning_envelopes/<YYYY-MM-DD>/<neighborhood>/"
+        f"silver/lot_zoning_envelopes/<YYYY-MM-DD>/<tile>/"
         f"{LOT_ENVELOPES_FILE} and upserts silver.lot_zoning_envelopes on "
-        "(scrape_date, neighborhood, lot_uid, feature_id, column_index)."
+        "(scrape_date, cell_partition, lot_uid, feature_id, column_index)."
     ),
 )
 def lot_zoning_envelopes(
@@ -406,47 +450,75 @@ def lot_zoning_envelopes(
     store: ParquetStore,
     postgis: PostgisResource,
 ) -> MaterializeResult:
-    neighborhood, scrape_date = _partition(context)
+    tile, scrape_date = tile_partition_of(context)
     pieces = _read(
-        store.partition_dir(
-            lot_zone_pieces.key.path[-1], scrape_date, neighborhood
-        ),
+        store.partition_dir(lot_zone_pieces.key.path[-1], scrape_date, tile),
         LOT_ZONE_PIECES_FILE,
-    )
-    columns = _read(
-        store.partition_dir(
-            zoning_grid_columns.key.path[-1], scrape_date, neighborhood
-        ),
-        ZONE_COLUMNS_FILE,
     )
 
     if pieces.empty:
         raise Failure(
-            f"{neighborhood} {scrape_date}: lot_zone_pieces holds no piece, so "
+            f"tile {tile} {scrape_date}: lot_zone_pieces holds no piece, so "
             "no envelope can be built. Materialize it for this partition "
             "first."
         )
+    missing = [name for name in _OWNERSHIP_COLUMNS if name not in pieces.columns]
+    if missing:
+        raise Failure(
+            f"tile {tile} {scrape_date}: lot_zone_pieces carries no "
+            f"{', '.join(missing)} column - the file predates the tile axis. "
+            "Re-materialize lot_zone_pieces for this partition."
+        )
     # The geometry stays in `silver.lot_zone_pieces` and on the map. This table
-    # is read by a solver scanning a borough, and a polygon on every row of it
+    # is read by a solver scanning a tile, and a polygon on every row of it
     # is weight nothing here reads - the same reason `lot_buildable_setbacks`
     # publishes its envelope and the programs do not carry it.
     pieces = pieces.drop(columns=["geom"], errors="ignore")
     num_lots = int(pieces["lot_uid"].nunique())
 
+    # The boroughs the tile's lots belong to, read off the lots themselves:
+    # the grid is a borough's, and a piece is joined to its own lot's borough's
+    # grid, so this is exactly the set of grid partitions to read. Off the
+    # rows rather than out of Postgres so a database that is down still costs
+    # the load and not the join - the posture `_publish` keeps.
+    neighborhoods = tuple(sorted(pieces["neighborhood"].dropna().unique()))
+    columns = _read_grid_columns(store, scrape_date, neighborhoods)
+
     # An inner join on purpose: a zone that published no readable grid has no
-    # envelope to state, and a row of nulls would be one to solve.
+    # envelope to state, and a row of nulls would be one to solve. On the
+    # borough as well as the zone number, because Montreal restarts its zone
+    # numbers in every borough and a tile can hold two of them.
     envelopes = pieces.merge(
         columns,
-        on=["source_table", "feature_id"],
+        on=["neighborhood", "source_table", "feature_id"],
         how="inner",
         suffixes=("", "_grid"),
     )
     if envelopes.empty:
-        raise Failure(
-            f"{neighborhood} {scrape_date}: the {len(pieces)} lot x zone "
-            f"piece(s) and the {len(columns)} grid column(s) share no zone "
-            "number. The map's feature id and the grid's are the same column "
-            "(NUMERO_COMPLET) and should match."
+        # Two different things look alike here, and only one is a fault. A
+        # join that is broken - a renamed column, a slug that no longer
+        # matches - breaks for every zone, so the pieces and the grid do not
+        # even share a zoning *layer*. A cell that simply holds a handful of
+        # zones with no readable grid - Saguenay has dozens city-wide, and a
+        # cell on the edge of the cadastre can hold one piece - shares the
+        # layer and misses the zones. On a borough the two could not be told
+        # apart and both failed; on a cell the second is an empty partition.
+        shared_layers = set(pieces["source_table"]) & set(columns["source_table"])
+        if not shared_layers:
+            raise Failure(
+                f"tile {tile} {scrape_date}: the {len(pieces)} lot x zone "
+                f"piece(s) and the {len(columns)} grid column(s) of "
+                f"{', '.join(neighborhoods)} share no zoning layer "
+                "(source_table), so the join itself is broken rather than a "
+                "zone missing its grid. The map's feature id and the grid's "
+                "are the same column (NUMERO_COMPLET) and should match."
+            )
+        context.log.warning(
+            "tile %s %s: none of its %d lot x zone piece(s) is in a zone "
+            "with a readable grid; publishing an empty partition",
+            tile,
+            scrape_date,
+            len(pieces),
         )
 
     # The piece's frontage, not its lot's - which is the whole reason
@@ -476,15 +548,13 @@ def lot_zoning_envelopes(
             "%s %s: %d duplicate (lot, zone, column) row(s) - the same "
             "envelope reached by more than one grid citing the zone; keeping "
             "the first of each",
-            neighborhood,
+            tile,
             scrape_date,
             num_duplicates,
         )
         frame = frame.drop_duplicates(subset=keyed, keep="first")
 
-    output_dir = store.partition_dir(
-        context.asset_key.path[-1], scrape_date, neighborhood
-    )
+    output_dir = store.partition_dir(context.asset_key.path[-1], scrape_date, tile)
     removed = clear_parquet(output_dir)
     if removed:
         context.log.info("Removed %d file(s) from a previous run", len(removed))
@@ -492,7 +562,7 @@ def lot_zoning_envelopes(
     loaded = _publish(
         postgis,
         {"lot_zoning_envelopes": frame},
-        neighborhood=neighborhood,
+        partition=tile,
         scrape_date=scrape_date,
     )
 
@@ -503,7 +573,7 @@ def lot_zoning_envelopes(
         "%s %s: %d of %d lot(s) covered by a zone -> %d envelope row(s) over "
         "%d piece(s), %d of them on lots split between two or more zones; "
         "%d solvable on %d lot(s), %d row(s) with a measured frontage -> %s",
-        neighborhood,
+        tile,
         scrape_date,
         int(frame["lot_uid"].nunique()),
         num_lots,
@@ -519,6 +589,10 @@ def lot_zoning_envelopes(
     return MaterializeResult(
         metadata={
             "dagster/row_count": len(frame),
+            "tile": tile,
+            # Whose grids were read - one for most tiles, two where a cut cell
+            # straddles a borough line.
+            "neighborhoods": ", ".join(neighborhoods),
             "num_lots": num_lots,
             "num_lots_zoned": int(frame["lot_uid"].nunique()),
             # A lot no grid reaches cannot be solved at all, and the two
@@ -629,7 +703,9 @@ def _threshold(frame: pd.DataFrame, column: str) -> float:
 _OUTPUT_COLUMNS = (
     "lot_uid",
     "lot_number",
-    "neighborhood",
+    # The lot's own borough and its cell address, off the piece - see
+    # `_OWNERSHIP_COLUMNS`.
+    *_OWNERSHIP_COLUMNS,
     "scrape_date",
     # The parcel, then the piece of it this row is about. Both, always: a
     # reader holding one row has to be able to tell a whole lot from a tenth
@@ -855,7 +931,7 @@ def _publish(
     postgis: PostgisResource,
     datasets: dict[str, pd.DataFrame],
     *,
-    neighborhood: str,
+    partition: str,
     scrape_date: str,
 ) -> dict[str, dict[str, int]]:
     """Upsert what was just written, naming the file already on disk if not.
@@ -863,24 +939,52 @@ def _publish(
     After the parquet, deliberately: parsing a borough's grids is minutes of
     pypdf over documents a later run may no longer be able to fetch, and a
     database that is down should cost the load rather than the parse.
+
+    ``partition`` is the borough for `zoning_grid_columns` and the tile for
+    `lot_zoning_envelopes` - whichever axis the table is on.
     """
     try:
         return publish(
             postgis.connect,
             datasets,
-            neighborhood=neighborhood,
+            partition=partition,
             scrape_date=scrape_date,
         )
     except (PostgresUnavailable, MissingRelation) as exc:
         raise Failure(
-            f"{', '.join(datasets)} for {neighborhood} {scrape_date} were "
+            f"{', '.join(datasets)} for {partition} {scrape_date} were "
             f"written to the tree but could not be published: {exc}"
         ) from exc
 
 
-def _partition(context: AssetExecutionContext) -> tuple[str, str]:
-    dimensions = context.partition_key.keys_by_dimension
-    return dimensions["neighborhood"], dimensions["date"][:10]
+def _read_grid_columns(
+    store: ParquetStore, scrape_date: str, neighborhoods: Sequence[str]
+) -> pd.DataFrame:
+    """Every borough's `zoning_grid_columns` partition, as one frame.
+
+    One parquet per borough, because that asset is on the borough axis, and
+    the `neighborhood` column is set from the partition read rather than
+    trusted off the file: it is what the join back to the pieces is keyed on,
+    and a stale file stamped with another borough would join its grids to the
+    wrong lots. A tile whose lots belong to no borough at all has nothing to
+    read, which is a fact about `neighborhood_cadastre` and is raised as one.
+    """
+    if not neighborhoods:
+        raise Failure(
+            f"{scrape_date}: the pieces name no borough, so there is no grid "
+            "to read them against - rag.lots carries no neighborhood for "
+            "these lots."
+        )
+    frames = []
+    for neighborhood in neighborhoods:
+        frame = _read(
+            store.partition_dir(
+                zoning_grid_columns.key.path[-1], scrape_date, neighborhood
+            ),
+            ZONE_COLUMNS_FILE,
+        )
+        frames.append(frame.assign(neighborhood=neighborhood))
+    return pd.concat(frames, ignore_index=True)
 
 
 def _read(partition_dir: str, name: str) -> pd.DataFrame:

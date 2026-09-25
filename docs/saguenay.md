@@ -18,10 +18,16 @@ not encode the arrondissement the way Quebec City's leading digit does.
 Splitting the city would put three partitions through the same city-wide
 sources to no purpose.
 
-What that costs is size: the partition is a municipality of 2,839 zones rather
-than a borough of 800. The arrondissement and the secteur travel as columns on
-the street network and are there for a reader who wants them; nothing in the
-pipeline cuts on them.
+What that costs is size: the bronze partition is a municipality of 2,839
+zones rather than a borough of 800. The arrondissement and the secteur travel
+as columns on the street network and are there for a reader who wants them;
+nothing in the pipeline cuts on them. The lot chain does not run on the key
+at all, though - it runs per cell of the tile cut, and a 1,150 km² city is
+several cells at z9–z11 where a borough is one or two at z13–z14, which is
+the point: the cell is about one run's worth of lots wherever it is. See
+[Two spatial axes](architecture.md#two-spatial-axes). Saguenay's cells are
+not in the cut until it is re-seeded over its cadastre (`scripts/seed_tile_cut.py`);
+until then `neighborhood_cadastre` refuses to land it, naming the ground.
 
 ## Sources
 
@@ -223,7 +229,8 @@ left to be noticed.
 ## Running it
 
 Saguenay is one `make neighborhood-add` and then the same targets as any other
-key:
+key - the script runs the borough steps once and each tile step once per cell
+the city's lots fell in:
 
 ```sh
 make neighborhood-add NEIGHBORHOOD=SAG

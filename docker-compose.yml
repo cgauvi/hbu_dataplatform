@@ -24,8 +24,11 @@ services:
       - "${PORT:-2500}:2500"
     environment:
       # Set these on a machine behind a TLS-inspecting proxy; requests and
-      # huggingface_hub both read them (see docs/setup.md).
-      REQUESTS_CA_BUNDLE: ${REQUESTS_CA_BUNDLE:-}
+      # huggingface_hub both read them (see docs/setup.md). DOCKER_CA_BUNDLE
+      # is a path inside the container, e.g. the ~/.certs mount below; boto3
+      # ignores REQUESTS_CA_BUNDLE, so Secrets Manager needs AWS_CA_BUNDLE.
+      REQUESTS_CA_BUNDLE: ${DOCKER_CA_BUNDLE:-${REQUESTS_CA_BUNDLE:-}}
+      AWS_CA_BUNDLE: ${DOCKER_CA_BUNDLE:-}
       URBAN_RAG_EMBEDDING_MODEL: ${URBAN_RAG_EMBEDDING_MODEL:-}
       # When S3_BUCKET is set, (geo)parquet output goes to s3://S3_BUCKET/...
       # instead of the /data volume, authenticated with AWS_PROFILE via the
@@ -39,6 +42,9 @@ services:
       # docs/corpus.md, "The shared vector store".
       URBAN_RAG_PG_HOST: ${URBAN_RAG_PG_HOST:-}
       URBAN_RAG_PG_HOSTADDR: ${URBAN_RAG_PG_HOSTADDR:-}
+      # Unset means the port in the secret (5432); `make up-tunnel` sets it to
+      # TUNNEL_PORT so the tunnel on the host is reached instead.
+      URBAN_RAG_PG_PORT: ${URBAN_RAG_PG_PORT:-}
       URBAN_RAG_PG_DATABASE: ${URBAN_RAG_PG_DATABASE:-}
       URBAN_RAG_PG_USER: ${URBAN_RAG_PG_USER:-}
       URBAN_RAG_PG_PASSWORD: ${URBAN_RAG_PG_PASSWORD:-}
@@ -61,6 +67,7 @@ services:
       #   curl -o ~/.postgresql/root.crt --create-dirs \
       #        https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
       - ${HOME}/.postgresql:/home/app/.postgresql:ro
+      - ${HOME}/.certs:/home/app/.certs:ro
     extra_hosts:
       - "${URBAN_RAG_PG_HOST:-host.docker.internal}:host-gateway"
     restart: unless-stopped
@@ -72,7 +79,8 @@ services:
     image: urban-rag:latest
     command: ["dagster-daemon", "run", "-m", "urban_rag.definitions"]
     environment:
-      REQUESTS_CA_BUNDLE: ${REQUESTS_CA_BUNDLE:-}
+      REQUESTS_CA_BUNDLE: ${DOCKER_CA_BUNDLE:-${REQUESTS_CA_BUNDLE:-}}
+      AWS_CA_BUNDLE: ${DOCKER_CA_BUNDLE:-}
       URBAN_RAG_EMBEDDING_MODEL: ${URBAN_RAG_EMBEDDING_MODEL:-}
       S3_BUCKET: ${S3_BUCKET:-}
       AWS_PROFILE: ${AWS_PROFILE:-charles_gauvin_east_1}
@@ -83,6 +91,9 @@ services:
       # docs/corpus.md, "The shared vector store".
       URBAN_RAG_PG_HOST: ${URBAN_RAG_PG_HOST:-}
       URBAN_RAG_PG_HOSTADDR: ${URBAN_RAG_PG_HOSTADDR:-}
+      # Unset means the port in the secret (5432); `make up-tunnel` sets it to
+      # TUNNEL_PORT so the tunnel on the host is reached instead.
+      URBAN_RAG_PG_PORT: ${URBAN_RAG_PG_PORT:-}
       URBAN_RAG_PG_DATABASE: ${URBAN_RAG_PG_DATABASE:-}
       URBAN_RAG_PG_USER: ${URBAN_RAG_PG_USER:-}
       URBAN_RAG_PG_PASSWORD: ${URBAN_RAG_PG_PASSWORD:-}
@@ -105,6 +116,7 @@ services:
       #   curl -o ~/.postgresql/root.crt --create-dirs \
       #        https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
       - ${HOME}/.postgresql:/home/app/.postgresql:ro
+      - ${HOME}/.certs:/home/app/.certs:ro
     extra_hosts:
       - "${URBAN_RAG_PG_HOST:-host.docker.internal}:host-gateway"
     restart: unless-stopped

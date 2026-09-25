@@ -1,5 +1,5 @@
-"""Offline tests for the street network: the RQTT snapshot and the borough
-slice cut out of it.
+"""Offline tests for the street network: the RQTT snapshot and the tile's
+sides selected out of it.
 
 Nothing here touches the network. The province-wide archive is stubbed the way
 `test_rqtt` stubs it - a tiny real GeoPackage, written in the MTQ Lambert the
@@ -9,9 +9,12 @@ directory through `dagster.materialize`.
 
 The geometry is deliberately small and rectilinear, and sits where the three
 cities do, because `neighborhood_streets` measures in each city's MTM zone and
-a shape somewhere else would project to numbers that mean nothing. The
-fixture's `AQRP_UUID`s are numeric strings rather than real uuids so the
-assertions below can read as `[1, 2]`.
+a shape somewhere else would project to numbers that mean nothing. The Montreal
+segments sit under one cell of the cut - `TILE`, which holds Villeray - and
+`test_the_fixture_sits_where_the_tests_say_it_does` checks that against
+`tile_grid.quadkey_bounds` rather than assuming it. The fixture's `AQRP_UUID`s
+are numeric strings rather than real uuids so the assertions below can read
+as `[1, 2]`.
 """
 
 from __future__ import annotations
@@ -21,12 +24,14 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import geopandas as gpd
+import pandas as pd
 import pytest
 from dagster import Failure, MultiPartitionKey, materialize
-from shapely.geometry import LineString, MultiLineString, Polygon, box
+from shapely.geometry import LineString, MultiLineString, box
 
 from asset_helpers import materialization_metadata
 
+from urban_rag import tile_grid
 from urban_rag.frames import write_frame
 from urban_rag.open_data_assets import (
     QUARTIERS_FILE,
@@ -48,15 +53,21 @@ from urban_rag.rqtt import (
 )
 from urban_rag.storage import join
 from urban_rag import street_assets
-from urban_rag.street_assets import STREETS_FILE_OUT, neighborhood_streets
+from urban_rag.street_assets import STREETS_FILE_OUT, _length_m, neighborhood_streets
 
 DATE = "2026-08-01"
+#: The cut cell the Montreal fixture sits under: a z14 cell holding Villeray,
+#: -73.630 to -73.608 by 45.537 to 45.553.
+TILE = "0302303330102"
+#: The borough whose outline the fixture draws inside that cell - what a
+#: side's `neighborhood` resolves to, as an attribute rather than a bound.
 NEIGHBORHOOD = "VSMPE"
 #: `partitions.NEIGHBORHOOD_BOROUGH_CODES["VSMPE"]` - what `borough_boundary`
 #: cuts the reference layer on.
 BOROUGH_CODE = "25"
 
-#: A square kilometre of "borough", give or take, in the middle of the island.
+#: A square kilometre of "borough", give or take, in the middle of the island,
+#: and inside `TILE` with room to spare on the east.
 BOROUGH = box(-73.630, 45.540, -73.620, 45.550)
 #: One arrondissement each for the other two cities, drawn where they are.
 QUEBEC_BOROUGH = box(-71.25, 46.79, -71.20, 46.84)
@@ -92,10 +103,15 @@ def segment(
 
 
 #: Three Montreal segments: one wholly inside the borough, one running out
-#: through its eastern edge, and one a kilometre beyond it.
+#: through its eastern edge (midpoint on the line, still under `TILE`), and
+#: one a kilometre beyond it whose midpoint is in the cell to the east even
+#: though its western end reaches back into `TILE`.
 INSIDE = segment("1", "Jarry", [[-73.628, 45.545], [-73.624, 45.545]])
 STRADDLING = segment("2", "Papineau", [[-73.624, 45.547], [-73.616, 45.547]])
 OUTSIDE = segment("3", "Saint-Denis", [[-73.610, 45.547], [-73.605, 45.547]])
+#: Under `TILE`, and in no registered borough's outline: the island past the
+#: line, which is still the tile's ground.
+NO_BOROUGH = segment("5", "Hors", [[-73.615, 45.547], [-73.611, 45.547]])
 
 #: One segment in each of the other two cities, so the bbox-per-city read has
 #: something to find and `num_segments_by_city` has something to report.
@@ -369,13 +385,37 @@ def write_bronze(store, *segments, scrape_date=DATE):
     )
 
 
+def midpoint_key(item: dict) -> str:
+    """The zoom-19 quadkey of a fixture segment's midpoint - what the asset
+    selects on."""
+    point = LineString(item["coordinates"]).interpolate(0.5, normalized=True)
+    return tile_grid.quadkey_of(point.x, point.y)
+
+
+def test_the_fixture_sits_where_the_tests_say_it_does():
+    """Checked rather than assumed: `INSIDE` and `STRADDLING` have their
+    midpoints under `TILE`, `OUTSIDE` has its midpoint in the cell to the
+    east while its western end still reaches into `TILE` - which is what
+    makes it the case that separates selection by midpoint from selection
+    by intersection."""
+    lo, hi = tile_grid.quadkey_bounds(TILE)
+    assert lo <= tile_grid.quadkey_of(-73.6210, 45.5395) < hi
+    assert lo <= midpoint_key(INSIDE) < hi
+    assert lo <= midpoint_key(STRADDLING) < hi
+    assert not lo <= midpoint_key(OUTSIDE) < hi
+    z, x, y = tile_grid.cell_of_quadkey(TILE)
+    west, south, east, north = tile_grid.tile_bounds(z, x, y)
+    assert west < OUTSIDE["coordinates"][0][0] < east
+    assert south < OUTSIDE["coordinates"][0][1] < north
+
+
 @pytest.fixture(autouse=True)
 def stub_postgis(monkeypatch):
     """The upsert into `silver.neighborhood_streets`, recorded rather than run.
 
     The asset publishes the same frame it writes to the tree, which needs a
-    database; every test here is about the cut, so the load is stubbed and the
-    frame it was handed is kept for the two tests that do care.
+    database; every test here is about the selection, so the load is stubbed
+    and the frame it was handed is kept for the tests that do care.
     """
     seen: dict[str, object] = {}
 
@@ -383,9 +423,9 @@ def stub_postgis(monkeypatch):
     def connect(self):
         yield object()
 
-    def load_streets(connection, frame, *, neighborhood, scrape_date):
+    def load_streets(connection, frame, *, tile, scrape_date):
         seen["frame"] = frame
-        seen["partition"] = (neighborhood, scrape_date)
+        seen["partition"] = (tile, scrape_date)
         return {
             "copied": len(frame),
             "duplicates": 0,
@@ -401,9 +441,7 @@ def stub_postgis(monkeypatch):
 def materialize_silver(store):
     return materialize(
         [neighborhood_streets],
-        partition_key=MultiPartitionKey(
-            {"date": DATE, "neighborhood": NEIGHBORHOOD}
-        ),
+        partition_key=MultiPartitionKey({"date": DATE, "tile": TILE}),
         resources={"store": store, "postgis": PostgisResource()},
     )
 
@@ -415,19 +453,20 @@ def read_silver(tmp_path) -> gpd.GeoDataFrame:
         / "silver"
         / "neighborhood_streets"
         / DATE
-        / NEIGHBORHOOD
+        / TILE
         / STREETS_FILE_OUT
     )
 
 
-def test_only_the_segments_reaching_the_borough_are_kept(store, tmp_path):
+def test_only_the_sides_whose_midpoint_is_in_the_tile_are_kept(store, tmp_path):
     write_quartiers(store)
     write_bronze(store)
 
     assert materialize_silver(store).success
 
     frame = read_silver(tmp_path)
-    # `Saint-Denis` is a kilometre east of the boundary.
+    # `Saint-Denis` reaches into the tile and has its midpoint in the cell
+    # to the east; it is that cell's side, and it is whole there.
     assert sorted(frame[STREET_ID_COLUMN].astype(int)) == [1, 2]
 
 
@@ -445,26 +484,27 @@ def test_the_publishers_key_becomes_this_platforms(store, tmp_path):
     assert {"ClsRte", "IdRte"} <= set(frame.columns)
 
 
-def test_a_segment_crossing_the_boundary_is_cut_at_it(store, tmp_path):
+def test_a_side_is_stored_whole_wherever_its_ends_reach(store, tmp_path):
+    """Selected, not clipped. `Papineau` runs out through the borough's
+    eastern edge, and nothing is taken off it: the cell is a write-ownership
+    claim, and a lot on the line measures its frontage on the whole side."""
     write_quartiers(store)
     write_bronze(store)
 
     materialize_silver(store)
 
     frame = read_silver(tmp_path).set_index(STREET_ID_COLUMN)
-    inside = frame.loc["1"]
     straddling = frame.loc["2"]
-    # Wholly inside: nothing was taken off it.
-    assert inside["length_in_borough_m"] == pytest.approx(
-        inside["segment_length_m"], rel=1e-9
-    )
-    assert inside["pct_in_borough"] == pytest.approx(100.0, abs=0.01)
-    # Half in, half out: the published length survives as its own column so the
-    # cut is visible rather than silently making the street shorter.
-    assert straddling["length_in_borough_m"] < straddling["segment_length_m"]
-    assert 45.0 < straddling["pct_in_borough"] < 55.0
-    # Clipped, not selected: the geometry stops at the boundary.
-    assert straddling.geometry.within(BOROUGH.buffer(1e-9))
+    assert straddling.geometry.equals(LineString(STRADDLING["coordinates"]))
+    assert not straddling.geometry.within(BOROUGH.buffer(1e-9))
+    # The published length is the side's length; there is no surviving piece
+    # to report beside it any more.
+    assert {"length_in_borough_m", "pct_in_borough"}.isdisjoint(frame.columns)
+    published = _length_m(
+        gpd.GeoSeries([LineString(STRADDLING["coordinates"])], crs=WGS84),
+        "EPSG:32188",
+    ).iloc[0]
+    assert straddling["segment_length_m"] == pytest.approx(published, rel=1e-9)
 
 
 def test_lengths_are_metres_and_not_degrees(store, tmp_path):
@@ -486,38 +526,74 @@ def test_the_partition_travels_as_columns(store, tmp_path):
     materialize_silver(store)
 
     frame = read_silver(tmp_path)
-    assert set(frame["neighborhood"]) == {NEIGHBORHOOD}
+    assert set(frame["cell_partition"]) == {TILE}
     assert set(frame["scrape_date"]) == {DATE}
     assert frame.crs.to_string() == WGS84
+    # The row's own address at full depth: every key is under the tile.
+    assert (frame["cell_key"].str.len() == tile_grid.BASE_CELL_ZOOM).all()
+    assert frame["cell_key"].str.startswith(TILE).all()
+    keyed = frame.set_index(STREET_ID_COLUMN)
+    assert keyed.loc["1", "cell_key"] == midpoint_key(INSIDE)
+    assert keyed.loc["2", "cell_key"] == midpoint_key(STRADDLING)
 
 
-def test_silver_metadata_reports_the_cut(store):
+def test_the_borough_is_the_outline_holding_the_midpoint(store, tmp_path):
+    """An attribute, not a bound: `Jarry` sits in VSMPE's outline, `Hors`
+    sits in the tile but in no registered borough, and both are the tile's."""
+    write_quartiers(store)
+    write_bronze(store, INSIDE, NO_BOROUGH)
+
+    result = materialize_silver(store)
+
+    frame = read_silver(tmp_path).set_index(STREET_ID_COLUMN)
+    assert frame.loc["1", "neighborhood"] == NEIGHBORHOOD
+    # NULL in the file, whichever spelling of null the reader hands back.
+    assert pd.isna(frame.loc["5", "neighborhood"])
+    metadata = materialization_metadata(result, neighborhood_streets)
+    assert metadata["num_without_borough"].value == 1
+    assert metadata["neighborhoods"].value == NEIGHBORHOOD
+
+
+def test_a_borough_whose_outline_cannot_be_read_is_skipped(store, tmp_path):
+    """`CIL` is registered by default and the fixture writes no Quebec City
+    arrondissements: the sides still land, without a borough from it."""
+    write_quartiers(store)
+    write_bronze(store)
+
+    result = materialize_silver(store)
+
+    assert result.success
+    frame = read_silver(tmp_path)
+    assert set(frame["neighborhood"]) == {NEIGHBORHOOD}
+
+
+def test_silver_metadata_reports_the_selection(store):
     write_quartiers(store)
     write_bronze(store)
 
     metadata = materialization_metadata(materialize_silver(store), neighborhood_streets)
 
+    assert metadata["tile"].value == TILE
     assert metadata["dagster/row_count"].value == 2
-    assert metadata["num_street_sides"].value == 2
+    assert metadata["num_sides"].value == 2
     assert metadata["num_segments_in_snapshot"].value == 3
     assert metadata["num_streets_named"].value == 2
-    # One of the two straddles the boundary; the other is wholly inside.
-    assert metadata["num_boundary_clipped"].value == 1
+    assert metadata["num_without_borough"].value == 0
     assert metadata["num_invalid_geometries"].value == 0
     assert metadata["total_length_km"].value > 0
+    assert "num_boundary_clipped" not in metadata
 
 
-def test_a_segment_that_only_grazes_the_boundary_is_dropped(store, tmp_path):
-    """It intersects, and clips to a point. A point is not a street inside the
-    borough, and a zero-length row would be one."""
-    grazing = segment("4", "Grazing", [[-73.620, 45.545], [-73.615, 45.545]])
+def test_the_load_is_handed_the_tile(store, stub_postgis):
     write_quartiers(store)
-    write_bronze(store, INSIDE, grazing)
+    write_bronze(store)
 
-    assert materialize_silver(store).success
+    materialize_silver(store)
 
-    frame = read_silver(tmp_path)
-    assert sorted(frame[STREET_ID_COLUMN].astype(int)) == [1]
+    assert stub_postgis["partition"] == (TILE, DATE)
+    loaded = stub_postgis["frame"]
+    assert {"cell_key", "cell_partition", "neighborhood"} <= set(loaded.columns)
+    assert set(loaded["cell_partition"]) == {TILE}
 
 
 def test_the_same_segment_arriving_twice_is_refused(store):
@@ -532,13 +608,13 @@ def test_the_same_segment_arriving_twice_is_refused(store):
         materialize_silver(store)
 
 
-def test_a_borough_no_street_reaches_is_a_failure(store):
-    """Not an empty partition: an empty street layer for a borough is a broken
-    boundary or a broken snapshot, never a borough with no streets."""
-    write_quartiers(store, geometry=Polygon.from_bounds(-73.50, 45.60, -73.49, 45.61))
-    write_bronze(store)
+def test_a_tile_no_midpoint_falls_in_is_a_failure(store):
+    """Not an empty partition: a cut cell holds lots, so a snapshot with no
+    side under it is missing the ground, never a cell with no streets."""
+    write_quartiers(store)
+    write_bronze(store, OUTSIDE)
 
-    with pytest.raises(Failure, match="No street side intersects"):
+    with pytest.raises(Failure, match="No street side has its midpoint in tile"):
         materialize_silver(store)
 
 
@@ -549,7 +625,9 @@ def test_a_missing_snapshot_names_the_asset_to_run(store):
         materialize_silver(store)
 
 
-def test_a_missing_boundary_names_the_asset_to_run(store):
+def test_no_outline_at_all_names_the_asset_to_run(store):
+    """One borough's outline missing is skipped; every outline missing is
+    the reference layer missing, and that is fatal."""
     write_bronze(store)
 
     with pytest.raises(Failure, match="materialize reference_neighborhoods"):
@@ -557,9 +635,7 @@ def test_a_missing_boundary_names_the_asset_to_run(store):
 
 
 def test_a_silver_rerun_replaces_the_previous_partition(store, tmp_path):
-    partition = (
-        tmp_path / "store" / "silver" / "neighborhood_streets" / DATE / NEIGHBORHOOD
-    )
+    partition = tmp_path / "store" / "silver" / "neighborhood_streets" / DATE / TILE
     partition.mkdir(parents=True)
     stale = partition / "neighborhood_streets_retired.parquet"
     gpd.GeoDataFrame(
@@ -574,29 +650,15 @@ def test_a_silver_rerun_replaces_the_previous_partition(store, tmp_path):
     assert (partition / STREETS_FILE_OUT).exists()
 
 
-def test_the_helper_that_keeps_only_linework(store):
-    """`_lines_only` is what stops a graze from becoming a zero-length street."""
-    from shapely.geometry import GeometryCollection, Point
-
-    from urban_rag.street_assets import _lines_only
-
-    line = LineString([(0, 0), (1, 0)])
-    assert _lines_only(line) is line
-    assert _lines_only(Point(0, 0)) is None
-    assert _lines_only(GeometryCollection([Point(0, 0)])) is None
-    mixed = GeometryCollection([Point(2, 2), line])
-    assert _lines_only(mixed).geom_type in ("LineString", "MultiLineString")
-
-
 def test_a_failure_message_carries_the_partition(store):
-    """Every guard in this asset names the borough and the date, because a
+    """Every guard in this asset names the tile and the date, because a
     backfill fails one partition at a time and the message is what says which."""
     write_quartiers(store)
     write_bronze(
         store, INSIDE, segment("1", "Jarry", [[-73.627, 45.546], [-73.625, 45.546]])
     )
 
-    with pytest.raises(Failure, match=f"{NEIGHBORHOOD} {DATE}"):
+    with pytest.raises(Failure, match=f"{TILE} {DATE}"):
         materialize_silver(store)
 
 
@@ -632,9 +694,7 @@ def test_load_streets_promotes_every_segment_to_multi(monkeypatch):
         crs=WGS84,
     )
 
-    postgis.load_streets(
-        object(), frame, neighborhood=NEIGHBORHOOD, scrape_date=DATE
-    )
+    postgis.load_streets(object(), frame, tile=TILE, scrape_date=DATE)
 
     loaded = seen["frame"]
     assert set(loaded.geometry.geom_type) == {"MultiLineString"}

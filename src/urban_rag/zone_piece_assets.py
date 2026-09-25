@@ -51,6 +51,13 @@ runs: `silver.lot_features` and `silver.building_lot_intersections` because
 table from one file in two transactions is the race `building_lots_assets`
 describes.
 
+**A run is one tile.** The lots whose pieces are stated are the ones a cut
+cell owns, and the three inputs above are read for those lots - they are
+lot-keyed, so they are same-tile by ownership. The clip is the whole clip: a
+zone's feature is not cut at a tile edge any more than at a borough line, so
+`min_piece_area_m2` is applied to the piece as it lies on the parcel. See
+`urban_rag.partitions.tile_partitions`.
+
 **`silver.lot_zone_pieces` is owned by hbu_infra**, like every other table this
 repo writes into - sql/025_silver_lot_zone_pieces.sql. Until it is applied a
 run fails naming the file, which is why this asset is registered and given a
@@ -72,7 +79,12 @@ from urban_rag.building_lots_assets import building_lot_intersections
 from urban_rag.frames import write_frame
 from urban_rag.frontage_assets import lot_frontage
 from urban_rag.layers import key_prefix
-from urban_rag.partitions import metric_srid_for, scrape_partitions
+from urban_rag.partitions import (
+    city_of_tile,
+    metric_srid_for_city,
+    tile_partition_of,
+    tile_scrape_partitions,
+)
 from urban_rag.postgis import (
     DEFAULT_ZONE_PIECE_EDGE_TOLERANCE_M,
     MIN_ZONE_OVERLAP_M2,
@@ -90,7 +102,7 @@ from urban_rag.storage import clear_parquet, join
 GROUP = "silver_zoning"
 
 #: One file per partition, under
-#: `silver/lot_zone_pieces/<YYYY-MM-DD>/<neighborhood>/`.
+#: `silver/lot_zone_pieces/<YYYY-MM-DD>/<tile>/`.
 LOT_ZONE_PIECES_FILE = "lot_zone_pieces.parquet"
 
 
@@ -163,7 +175,7 @@ class ZonePieceConfig(Config):
 
 @asset(
     key_prefix=key_prefix("lot_zone_pieces"),
-    partitions_def=scrape_partitions,
+    partitions_def=tile_scrape_partitions,
     deps=[building_lot_intersections, lot_frontage],
     group_name=GROUP,
     kinds={"postgres", "geoparquet"},
@@ -180,12 +192,12 @@ class ZonePieceConfig(Config):
         "min_overlap_m2 (1 m2) of a lot gets no piece unless it clears "
         "min_piece_area_m2 (500 m2) outright. is_primary_zone marks the "
         "largest piece, which is the row a reader wanting one answer per lot "
-        "takes. Computed against the silver.lot_features, silver.lot_frontage "
-        "and silver.building_lot_intersections rows already in Postgres for "
-        "this partition, upserted into silver.lot_zone_pieces on "
-        "(scrape_date, neighborhood, lot_uid, feature_id) and written to "
-        f"silver/lot_zone_pieces/<YYYY-MM-DD>/<neighborhood>/"
-        f"{LOT_ZONE_PIECES_FILE}."
+        "takes. Computed for the lots one tile owns, against the "
+        "silver.lot_features, silver.lot_frontage and "
+        "silver.building_lot_intersections rows already in Postgres for them, "
+        "upserted into silver.lot_zone_pieces on (scrape_date, "
+        "cell_partition, lot_uid, feature_id) and written to "
+        f"silver/lot_zone_pieces/<YYYY-MM-DD>/<tile>/{LOT_ZONE_PIECES_FILE}."
     ),
 )
 def lot_zone_pieces(
@@ -194,15 +206,15 @@ def lot_zone_pieces(
     store: ParquetStore,
     postgis: PostgisResource,
 ) -> MaterializeResult:
-    neighborhood, scrape_date = _partition(context)
+    tile, scrape_date = tile_partition_of(context)
 
     try:
         with postgis.connect() as connection:
             result = compute_lot_zone_pieces(
                 connection,
-                neighborhood=neighborhood,
+                tile=tile,
                 scrape_date=scrape_date,
-                metric_srid=metric_srid_for(neighborhood),
+                metric_srid=metric_srid_for_city(city_of_tile(tile)),
                 zone_sources=tuple(ZONING_SOURCES),
                 min_pct_of_lot=config.min_pct_of_lot,
                 min_overlap_m2=config.min_overlap_m2,
@@ -216,28 +228,27 @@ def lot_zone_pieces(
                 # are named: no lot x zone rows at all, or every one of them
                 # under the cutoffs.
                 raise Failure(
-                    f"{neighborhood} {scrape_date}: no lot is covered by a "
+                    f"tile {tile} {scrape_date}: no lot is covered by a "
                     f"{'/'.join(ZONING_SOURCES)} feature at or above "
                     f"{config.min_pct_of_lot}% and {config.min_overlap_m2} m2, "
                     f"or {config.min_piece_area_m2} m2 outright, so there is "
-                    "no piece to state. Check that "
-                    "building_lot_intersections loaded the zoning layer for "
-                    "this partition."
+                    "no piece to state. Check that neighborhood_cadastre "
+                    "loaded the zoning layer for the boroughs this tile "
+                    "covers, and that building_lot_intersections computed "
+                    "lot_features for it."
                 )
             # Inside the transaction that computed it, so the file is that
             # answer rather than whatever a concurrent run leaves after the
             # commit - the posture `lot_frontage` takes.
             frame = fetch_lot_zone_pieces(
-                connection, neighborhood=neighborhood, scrape_date=scrape_date
+                connection, tile=tile, scrape_date=scrape_date
             )
     except PostgresUnavailable as exc:
-        raise Failure(f"Postgres unreachable for {neighborhood} {scrape_date}: {exc}")
+        raise Failure(f"Postgres unreachable for tile {tile} {scrape_date}: {exc}")
     except MissingRelation as exc:
         raise Failure(str(exc))
 
-    output_dir = store.partition_dir(
-        context.asset_key.path[-1], scrape_date, neighborhood
-    )
+    output_dir = store.partition_dir(context.asset_key.path[-1], scrape_date, tile)
     removed = clear_parquet(output_dir)
     if removed:
         context.log.info("Removed %d file(s) from a previous run", len(removed))
@@ -250,7 +261,7 @@ def lot_zone_pieces(
         "%s %s: %d piece(s) over %d lot(s), %d of them split between two or "
         "more zones; %d secondary piece(s) of %g m2 or more holding %.1f ha "
         "that the primary zone's grid used to answer for -> %s",
-        neighborhood,
+        tile,
         scrape_date,
         num_pieces,
         num_lots,
@@ -264,14 +275,14 @@ def lot_zone_pieces(
     if without_frontage:
         # Said out loud rather than left in metadata: a piece with no street of
         # its own qualifies for no column its grid prints a *Largeur du terrain
-        # min* for, so this is the count that explains a borough of
+        # min* for, so this is the count that explains a tile of
         # `no_governing_column` rows downstream. It is not a new gap - see the
         # module docstring - but it is the one worth being able to size.
         context.log.info(
             "%s %s: %d of %d piece(s) share no street edge and read 0 m of "
             "frontage - interior remnants, and pieces of lots lot_frontage "
             "could not measure at all",
-            neighborhood,
+            tile,
             scrape_date,
             without_frontage,
             num_pieces,
@@ -282,8 +293,8 @@ def lot_zone_pieces(
             "%s %s: %d of %d piece(s) carry no measured footprint, so their "
             "share of the roll falls back to area rather than to where the "
             "building stands - check that building_lot_intersections landed "
-            "this partition's buildings",
-            neighborhood,
+            "this tile's buildings",
+            tile,
             scrape_date,
             by_area,
             num_pieces,
@@ -292,10 +303,11 @@ def lot_zone_pieces(
     return MaterializeResult(
         metadata={
             "dagster/row_count": num_pieces,
+            "tile": tile,
             "num_pieces": num_pieces,
             "num_lots": num_lots,
             # The two numbers that say whether this grain is doing anything on
-            # this borough, and the pair to read together: how many parcels are
+            # this tile, and the pair to read together: how many parcels are
             # really split, and how much land the pieces that used to be
             # discarded actually hold.
             "num_split_lots": num_split,
@@ -321,8 +333,3 @@ def lot_zone_pieces(
             "rows_deleted": int(result.get("deleted", 0)),
         }
     )
-
-
-def _partition(context: AssetExecutionContext) -> tuple[str, str]:
-    dimensions = context.partition_key.keys_by_dimension
-    return dimensions["neighborhood"], dimensions["date"][:10]

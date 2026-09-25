@@ -22,7 +22,7 @@ from urban_rag.postgis import (
     compute_intersections,
 )
 
-NEIGHBORHOOD = "VSMPE"
+TILE = "0302303330102"
 DATE = "2026-09-01"
 
 
@@ -67,7 +67,7 @@ def captured(monkeypatch):
 def run(**kwargs):
     cursor = FakeCursor()
     result = compute_intersections(
-        FakeConnection(cursor), neighborhood=NEIGHBORHOOD, scrape_date=DATE, **kwargs
+        FakeConnection(cursor), tile=TILE, scrape_date=DATE, **kwargs
     )
     return result, cursor
 
@@ -106,11 +106,38 @@ def test_the_cutoffs_are_bound_parameters_at_their_documented_values(captured):
 
     assert captured["params"]["min_overlap_m2"] == MIN_BUILDING_OVERLAP_M2
     assert captured["params"]["min_pct_of_building"] == MIN_BUILDING_PCT_OF_BUILDING
-    # The partition still keys the write, and the cutoffs are not part of it.
+    # The partition still keys the write - the cell, now - and the cutoffs are
+    # not part of it.
     assert captured["kwargs"] == {
-        "neighborhood": NEIGHBORHOOD,
+        "partition": TILE,
         "scrape_date": DATE,
     }
+
+
+def test_the_write_is_the_cells_lots_and_the_buildings_are_the_snapshots(captured):
+    """The owned set and the pool, told apart in the statement.
+
+    A building is joined to a lot by geometry and date alone. The old join
+    also demanded `l.neighborhood = b.neighborhood`, which is how a terrace
+    digitised across a borough line lost the lots on the far side of it - and
+    how "ten per cent of the building" came to be ten per cent of the part one
+    borough's load held.
+    """
+    run()
+    select = captured["select"]
+
+    assert "l.cell_partition = %(tile)s" in select
+    assert "b.scrape_date = l.scrape_date" in select
+    assert "%(neighborhood)s" not in select
+    assert "neighborhood = b.neighborhood" not in select
+    assert "b.neighborhood" not in select
+    # Stamped with the lot's own borough and cell, never a literal.
+    assert "l.neighborhood," in select
+    assert "l.cell_key," in select
+    assert "l.cell_partition," in select
+    assert captured["params"]["tile"] == TILE
+    for column in ("neighborhood", "cell_key", "cell_partition"):
+        assert column in captured["columns"]
 
 
 def test_a_caller_can_ask_at_another_value(captured):

@@ -18,19 +18,29 @@ than written down twice, the same way `ParquetStore.partition_dir` gets its
 prefix - so moving an asset between layers moves its table with it instead of
 leaving the two disagreeing about which layer it is in.
 
-**The grain is (neighborhood, scrape_date, natural key).** Every table is
-declaratively partitioned `PARTITION BY LIST (neighborhood)` and then
-`PARTITION BY RANGE (scrape_date)` by month, so a borough's month is a leaf a
-reader's `WHERE` prunes to and an operator can detach. Postgres requires a
-partitioned table's unique constraint to contain its partition keys, which is
-not a tax here but the grain restated: the primary key is
-``(scrape_date, neighborhood, <key>)`` and that is exactly what a write
-conflicts on::
+**The grain is (partition, scrape_date, natural key).** Every table is
+declaratively partitioned `PARTITION BY LIST (<partition column>)` and then
+`PARTITION BY RANGE (scrape_date)` by month, so a partition's month is a leaf a
+reader's `WHERE` prunes to and an operator can detach. Which column leads is
+the table's `Axis`: the lot chain is partitioned on `cell_partition`, a cell of
+the tile cut (`urban_rag.tile_cut`), because a cell is ground that cannot be
+redrawn and holds about one run's worth of lots wherever it is; what a
+*publisher* bounds - the CMHC and C&W tables, the zoning grid, the corpus, the
+roll - is partitioned on `neighborhood`, because that is the unit it was
+published for. Postgres requires a partitioned table's unique constraint to
+contain its partition keys, which is not a tax here but the grain restated:
+the primary key is ``(scrape_date, <partition column>, <key>)`` and that is
+exactly what a write conflicts on::
 
-    INSERT INTO silver.neighborhood_streets (...)
+    INSERT INTO silver.lot_frontage (...)
     VALUES (...)
-    ON CONFLICT (scrape_date, neighborhood, cote_rue_id)
+    ON CONFLICT (scrape_date, cell_partition, lot_uid, cote_rue_id)
     DO UPDATE SET ...
+
+A tile-axis row still carries `neighborhood`, as an attribute: the borough its
+lot was fetched for, indexed so the map's per-borough reads keep working. And
+it carries `cell_key`, the lot's full-depth address, which is what makes a
+re-cut a string operation on the row rather than a recomputation.
 
 **A write is an upsert, and a partition is still a snapshot.** `upsert_frame`
 COPYs into a staging table shaped `LIKE` the target, upserts the whole
@@ -63,6 +73,7 @@ import json
 import math
 from dataclasses import dataclass, field
 from datetime import date, datetime
+from enum import Enum
 from typing import TYPE_CHECKING, Any, Iterable, Mapping, Sequence
 
 from urban_rag.layers import layer_of
@@ -70,11 +81,21 @@ from urban_rag.layers import layer_of
 if TYPE_CHECKING:  # pragma: no cover - typing only, psycopg is imported lazily
     from psycopg import Connection, Cursor
 
-#: The two columns every warehouse table is partitioned on, in the order they
-#: lead the primary key. `scrape_date` first because that is the axis a reader
-#: filters on without naming a borough - "the 26th, everywhere" is a question,
-#: "VSMPE, any date" is not.
-PARTITION_COLUMNS: tuple[str, str] = ("scrape_date", "neighborhood")
+
+class Axis(str, Enum):
+    """Which spatial column a table is partitioned on.
+
+    The value is the column name, so ``table.axis.value`` is what goes in the
+    SQL. `scrape_date` is the second partition column on either axis and is
+    not named here: every table has it, in the same place.
+    """
+
+    #: The borough the rows were published for - `VSMPE`, `CIL`, `SAG`. The
+    #: axis of what a publisher bounds.
+    NEIGHBORHOOD = "neighborhood"
+    #: The cell of the tile cut the rows' ground falls in - a quadkey such as
+    #: `0302303330102`. The axis of the lot chain.
+    TILE = "cell_partition"
 
 
 class MissingRelation(RuntimeError):
@@ -94,9 +115,13 @@ class Table:
     schema is derived from - not a schema name written out here, which would
     be the second place a layer is declared and the one that goes stale.
 
+    ``axis`` is the spatial column the table is partitioned on - see `Axis`.
+    The borough by default, because that is what every table started on; the
+    lot chain says `Axis.TILE` explicitly.
+
     ``keys`` are the natural-key columns *beyond* the partition ones. They are
     what a re-run conflicts on, so they have to identify a row within one
-    (neighborhood, scrape_date) and nothing wider: `cote_rue_id` is unique
+    (partition, scrape_date) and nothing wider: `cote_rue_id` is unique
     across the island, but two scrape dates legitimately both carry it, which
     is why the date leads the key rather than being left out of it.
 
@@ -118,6 +143,7 @@ class Table:
     columns: Mapping[str, str] = field(default_factory=dict)
     geometry: str | None = None
     attributes: str | None = None
+    axis: Axis = Axis.NEIGHBORHOOD
 
     @property
     def schema(self) -> str:
@@ -129,9 +155,22 @@ class Table:
         return f"{self.schema}.{self.name}"
 
     @property
+    def partition_column(self) -> str:
+        """The LIST partition column: `neighborhood` or `cell_partition`."""
+        return self.axis.value
+
+    @property
+    def partition_columns(self) -> tuple[str, str]:
+        """The two columns the table is partitioned on, in the order they
+        lead the primary key. `scrape_date` first because that is the axis a
+        reader filters on without naming ground - "the 26th, everywhere" is a
+        question, "VSMPE, any date" is not."""
+        return ("scrape_date", self.partition_column)
+
+    @property
     def conflict_columns(self) -> tuple[str, ...]:
         """The `ON CONFLICT` target: the partition keys, then the natural key."""
-        return (*PARTITION_COLUMNS, *self.keys)
+        return (*self.partition_columns, *self.keys)
 
 
 #: Every silver and gold dataset that has a table, keyed by the name it is
@@ -188,6 +227,7 @@ TABLES: dict[str, Table] = {
         keys=("building_uid", "lot_uid"),
         source="sql/004_silver_building_lots.sql",
         geometry="geom",
+        axis=Axis.TILE,
     ),
     "lot_features": Table(
         asset="building_lot_intersections",
@@ -195,6 +235,7 @@ TABLES: dict[str, Table] = {
         keys=("lot_uid", "source_table", "feature_id"),
         source="sql/005_silver_lot_features.sql",
         geometry="geom",
+        axis=Axis.TILE,
     ),
     "neighborhood_streets": Table(
         asset="neighborhood_streets",
@@ -204,6 +245,7 @@ TABLES: dict[str, Table] = {
         columns={"cote_rue_id": "COTE_RUE_ID", "street_name": "NOM_VOIE"},
         geometry="geom",
         attributes="attributes",
+        axis=Axis.TILE,
     ),
     "lot_frontage": Table(
         asset="lot_frontage",
@@ -211,6 +253,7 @@ TABLES: dict[str, Table] = {
         keys=("lot_uid", "cote_rue_id"),
         source="sql/008_silver_lot_frontage.sql",
         geometry="geom",
+        axis=Axis.TILE,
     ),
     # Keyed on the publisher's own address UUID rather than on (lot, zone):
     # the grain is one address point, and an address stands on exactly one
@@ -224,12 +267,23 @@ TABLES: dict[str, Table] = {
         keys=("address_id",),
         source="sql/026_silver_lot_addresses.sql",
         geometry="geom",
+        axis=Axis.TILE,
     ),
     "document_chunks": Table(
         asset="document_chunks",
         name="document_chunks",
         keys=("chunk_id",),
         source="sql/011_silver_corpus.sql",
+    ),
+    # One row per planning item of one council document: an agenda item of
+    # a minute (item_index is the agenda number) or one trail document
+    # (item_index 0). The doc_id is the document's, so a minute's four items
+    # and the sommaire it led to are keyed apart.
+    "council_planning_items": Table(
+        asset="council_planning_items",
+        name="council_planning_items",
+        keys=("doc_id", "item_index"),
+        source="sql/030_silver_council_planning_items.sql",
     ),
     "zoning_grid_columns": Table(
         asset="zoning_grid_columns",
@@ -249,12 +303,14 @@ TABLES: dict[str, Table] = {
         keys=("lot_uid", "feature_id"),
         source="sql/025_silver_lot_zone_pieces.sql",
         geometry="geom",
+        axis=Axis.TILE,
     ),
     "lot_zoning_envelopes": Table(
         asset="lot_zoning_envelopes",
         name="lot_zoning_envelopes",
         keys=("lot_uid", "feature_id", "column_index"),
         source="sql/012_silver_zoning.sql",
+        axis=Axis.TILE,
     ),
     # The same key as the envelopes it subtracts the margins from, because it
     # is the same grain: one candidate envelope per (lot, zone, column), and
@@ -265,6 +321,7 @@ TABLES: dict[str, Table] = {
         keys=("lot_uid", "feature_id", "column_index"),
         source="sql/015_silver_lot_buildable_setbacks.sql",
         geometry="geom",
+        axis=Axis.TILE,
     ),
     # The roll is published for the province, so the asset that merges it is
     # partitioned by date alone and its parquet stays province-wide. The
@@ -317,6 +374,7 @@ TABLES: dict[str, Table] = {
         columns={"lot_number": "NO_LOT"},
         geometry="geom",
         attributes="attributes",
+        axis=Axis.TILE,
     ),
     # The same grain and the same key as the table above, because it is the
     # same lot: this one carries what that one does not - the roll's
@@ -351,6 +409,7 @@ TABLES: dict[str, Table] = {
         columns={"lot_number": "NO_LOT"},
         geometry="geom",
         attributes="attributes",
+        axis=Axis.TILE,
     ),
     # The same key as the envelopes it solves, because it is the same grain:
     # one candidate program per (lot, zone, column). A losing column keeps its
@@ -361,6 +420,7 @@ TABLES: dict[str, Table] = {
         name="lot_development_programs",
         keys=("lot_uid", "feature_id", "column_index"),
         source="sql/017_silver_lot_development_programs.sql",
+        axis=Axis.TILE,
     ),
     # -- gold --------------------------------------------------------------
     "lot_profiles": Table(
@@ -369,6 +429,7 @@ TABLES: dict[str, Table] = {
         keys=("lot_number",),
         source="sql/009_gold_lot_profiles.sql",
         geometry="geom",
+        axis=Axis.TILE,
     ),
     # Keyed on `lot_uid` and not on `lot_number`, unlike every other per-lot
     # table here. These are downstream of `lot_zoning_envelopes`, whose own
@@ -389,6 +450,7 @@ TABLES: dict[str, Table] = {
         name="lot_highest_best_use",
         keys=("lot_uid", "feature_id"),
         source="sql/018_gold_lot_highest_best_use.sql",
+        axis=Axis.TILE,
     ),
     # The shortlist, keyed the way the gap table it ranks is. No geometry:
     # a reader who wants the parcel drawn joins gold.lot_profiles on
@@ -400,12 +462,14 @@ TABLES: dict[str, Table] = {
         keys=("lot_uid", "feature_id"),
         source="sql/021_gold_lot_investment_opportunities.sql",
         attributes="attributes",
+        axis=Axis.TILE,
     ),
     "lot_redevelopment_gap": Table(
         asset="lot_redevelopment_gap",
         name="lot_redevelopment_gap",
         keys=("lot_uid", "feature_id"),
         source="sql/019_gold_lot_redevelopment_gap.sql",
+        axis=Axis.TILE,
     ),
     # The same key as the two above, and the one spatial table of the three.
     # `geometry` is what makes it one, and it has a consequence worth naming
@@ -421,6 +485,7 @@ TABLES: dict[str, Table] = {
         keys=("lot_uid", "feature_id"),
         source="sql/022_gold_lot_building_massing.sql",
         geometry="geom",
+        axis=Axis.TILE,
     ),
     # The other polygon that asset draws, and the reason it is a second *table*
     # rather than a second geometry column on the one above: a `Table` carries
@@ -440,6 +505,7 @@ TABLES: dict[str, Table] = {
         keys=("lot_uid", "feature_id"),
         source="sql/024_gold_lot_surface_parking.sql",
         geometry="geom",
+        axis=Axis.TILE,
     ),
     # The one table here keyed by a *pixel* rather than by a parcel: five map
     # layers dissolved onto the Web Mercator tile grid, one row per (layer,
@@ -493,7 +559,7 @@ def upsert_frame(
     dataset: str,
     frame: Any,
     *,
-    neighborhood: str,
+    partition: str,
     scrape_date: str,
     prune: bool = True,
 ) -> dict[str, int]:
@@ -505,11 +571,13 @@ def upsert_frame(
     the geometry column travels as hex EWKB, and anything left over goes to the
     table's jsonb catch-all if it has one and is dropped if it does not.
 
-    ``neighborhood`` and ``scrape_date`` are written onto every row rather than
-    taken from the frame. They are the partition being published, and a frame
-    that disagrees with its own partition key - a stale file, a mis-set
-    dependency - would otherwise write rows into a partition it was not asked
-    to write, where the prune below would not see them.
+    ``partition`` is the value of the table's partition column - a borough key
+    or a cut cell, whichever `Table.axis` says - and it and ``scrape_date``
+    are written onto every row rather than taken from the frame. They are the
+    partition being published, and a frame that disagrees with its own
+    partition key - a stale file, a mis-set dependency - would otherwise write
+    rows into a partition it was not asked to write, where the prune below
+    would not see them.
 
     Runs in ``connection``'s transaction and does not commit: the caller
     decides what else belongs in the same one. Returns the counts the asset
@@ -519,7 +587,7 @@ def upsert_frame(
     cursor = connection.cursor()
     require_table(cursor, table)
     leaf = ensure_partition(
-        cursor, table, neighborhood=neighborhood, scrape_date=scrape_date
+        cursor, table, partition=partition, scrape_date=scrape_date
     )
 
     target = _target_columns(cursor, table)
@@ -533,7 +601,7 @@ def upsert_frame(
         selected,
         leftover,
         frame,
-        neighborhood=neighborhood,
+        partition=partition,
         scrape_date=scrape_date,
     )
     return _row_counts(
@@ -543,7 +611,7 @@ def upsert_frame(
             table,
             staging,
             [name for name, _ in selected],
-            neighborhood=neighborhood,
+            partition=partition,
             scrape_date=scrape_date,
             prune=prune,
             leaf=leaf,
@@ -558,7 +626,7 @@ def upsert_select(
     select: str,
     params: Any = None,
     *,
-    neighborhood: str,
+    partition: str,
     scrape_date: str,
     prune: bool = True,
 ) -> dict[str, int]:
@@ -577,7 +645,7 @@ def upsert_select(
     table = table_for(dataset)
     require_table(cursor, table)
     leaf = ensure_partition(
-        cursor, table, neighborhood=neighborhood, scrape_date=scrape_date
+        cursor, table, partition=partition, scrape_date=scrape_date
     )
 
     staging = _create_staging(cursor, table)
@@ -591,7 +659,7 @@ def upsert_select(
             table,
             staging,
             list(columns),
-            neighborhood=neighborhood,
+            partition=partition,
             scrape_date=scrape_date,
             prune=prune,
             leaf=leaf,
@@ -603,7 +671,7 @@ def publish(
     connect: Any,
     datasets: Mapping[str, Any],
     *,
-    neighborhood: str,
+    partition: str,
     scrape_date: str,
 ) -> dict[str, dict[str, int]]:
     """Upsert several frames in one transaction, keyed by dataset name.
@@ -629,7 +697,7 @@ def publish(
                 connection,
                 name,
                 frame,
-                neighborhood=neighborhood,
+                partition=partition,
                 scrape_date=scrape_date,
             )
             for name, frame in datasets.items()
@@ -668,7 +736,7 @@ def publish_by_neighborhood(
                 connection,
                 dataset,
                 frame,
-                neighborhood=neighborhood,
+                partition=neighborhood,
                 scrape_date=scrape_date,
             )
             for neighborhood, frame in frames.items()
@@ -893,22 +961,25 @@ def _require_key_columns(
 
 
 def ensure_partition(
-    cursor: "Cursor", table: Table, *, neighborhood: str, scrape_date: str
+    cursor: "Cursor", table: Table, *, partition: str, scrape_date: str
 ) -> str:
-    """Create this partition's leaf, if the borough or the month is new.
+    """Create this partition's leaf, if the partition or the month is new.
 
     Cheap enough to call on every load - it is two catalog lookups when the
     leaf is already there - and the alternative is a partition set an operator
-    has to remember to extend before each new month.
+    has to remember to extend before each new month. hbu_infra's function
+    does not know which column the LIST is on: it creates a child `FOR VALUES
+    IN (partition)` of whatever the parent is partitioned by, so a borough key
+    and a cut cell go through the same call.
 
     Returns the leaf's qualified name, which hbu_infra's function has always
     handed back and this module used to discard. `_analyze` needs it: what a
     load has to leave behind is fresh statistics on the *leaf* it wrote, and
-    ANALYZE on the parent walks every borough-month the table has ever held.
+    ANALYZE on the parent walks every partition-month the table has ever held.
     """
     cursor.execute(
         "SELECT warehouse.ensure_partition(%s::regclass, %s, %s::date)",
-        [table.qualified, neighborhood, scrape_date],
+        [table.qualified, partition, scrape_date],
     )
     row = cursor.fetchone()
     return row[0] if row else table.qualified
@@ -975,7 +1046,7 @@ def _merge(
     staging: str,
     columns: Sequence[str],
     *,
-    neighborhood: str,
+    partition: str,
     scrape_date: str,
     prune: bool,
     leaf: str | None = None,
@@ -1041,9 +1112,9 @@ def _merge(
         )
         cursor.execute(
             f"DELETE FROM {table.qualified} t "
-            "WHERE t.neighborhood = %s AND t.scrape_date = %s::date "
+            f"WHERE t.{table.partition_column} = %s AND t.scrape_date = %s::date "
             f"AND NOT EXISTS (SELECT 1 FROM {staging} s WHERE {match})",
-            [neighborhood, scrape_date],
+            [partition, scrape_date],
         )
         pruned = max(cursor.rowcount, 0)
 
@@ -1140,7 +1211,7 @@ def _match_columns(
     matched: list[tuple[str, str | None]] = []
 
     for name in target:
-        if name in PARTITION_COLUMNS:
+        if name in table.partition_columns:
             # Written from the partition key, and the frame's own copy is
             # claimed so it does not also land in the jsonb catch-all - where
             # it would be a second, unpruned answer to which partition this is.
@@ -1177,7 +1248,7 @@ def _copy_frame(
     leftover: Sequence[str],
     frame: Any,
     *,
-    neighborhood: str,
+    partition: str,
     scrape_date: str,
 ) -> int:
     """COPY ``frame`` into ``staging``, one row per row that has a geometry.
@@ -1210,8 +1281,8 @@ def _copy_frame(
                 continue
             values: list[str | None] = []
             for name, source in selected:
-                if name == "neighborhood":
-                    values.append(neighborhood)
+                if name == table.partition_column:
+                    values.append(partition)
                 elif name == "scrape_date":
                     values.append(str(scrape_date))
                 elif table.geometry and name == table.geometry:

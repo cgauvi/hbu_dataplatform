@@ -462,6 +462,11 @@ def test_an_enhancement_that_adds_nothing_is_worth_exactly_holding(standing_floo
     "hbu_overrides, existing_overrides, expected",
     [
         ({"hbu_status": "road_parcel", "solved": False}, {}, "no_program"),
+        (
+            {"hbu_status": "single_family_zone", "solved": None},
+            {},
+            "single_family_zone",
+        ),
         ({}, {"num_storeys": None}, "no_building"),
         ({}, {"residential_floor_area_m2": 0.0}, "no_building"),
         ({"gross_floor_area_m2": 200.0}, {}, "not_underbuilt"),

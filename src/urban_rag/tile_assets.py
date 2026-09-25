@@ -51,7 +51,7 @@ from urban_rag.hbu_assets import lot_highest_best_use, lot_redevelopment_gap
 from urban_rag.layers import key_prefix
 from urban_rag.massing_assets import lot_building_massing
 from urban_rag.opportunity_assets import lot_investment_opportunities
-from urban_rag.partitions import scrape_partitions
+from urban_rag.partitions import borough_partition_of, scrape_partitions
 from urban_rag.pmtiles_archive import ArchiveSummary, write_archive
 from urban_rag.rag.pgvector import PostgresUnavailable
 from urban_rag.resources import ParquetStore, PostgisResource
@@ -127,7 +127,7 @@ def map_tiles_asset(
     store: ParquetStore,
     postgis: PostgisResource,
 ) -> MaterializeResult:
-    neighborhood, scrape_date = _partition(context)
+    neighborhood, scrape_date = borough_partition_of(context)
 
     unknown = sorted(set(config.layers) - set(map_tiles.LAYERS))
     if unknown:
@@ -389,8 +389,3 @@ def _union(
         max(current[2], bounds[2]),
         max(current[3], bounds[3]),
     ]
-
-
-def _partition(context: AssetExecutionContext) -> tuple[str, str]:
-    dimensions = context.partition_key.keys_by_dimension
-    return dimensions["neighborhood"], dimensions["date"][:10]

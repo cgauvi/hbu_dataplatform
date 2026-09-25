@@ -119,9 +119,9 @@ redeveloping would not improve.
 > reproduces the flat ratio exactly, and is one setting rather than a code path.
 
 ```bash
-make comparables DATE=2026-08-26 NEIGHBORHOOD=VSMPE
-make comparables DATE=2026-08-26 NEIGHBORHOOD=VSMPE MAINTENANCE_PER_YEAR=0     # flat, as before
-make comparables DATE=2026-08-26 NEIGHBORHOOD=VSMPE MAINTENANCE_PER_YEAR=0.002 MAX_MAINTENANCE=0.15
+make comparables DATE=2026-09-01 NEIGHBORHOOD=VSMPE
+make comparables DATE=2026-09-01 NEIGHBORHOOD=VSMPE MAINTENANCE_PER_YEAR=0     # flat, as before
+make comparables DATE=2026-09-01 NEIGHBORHOOD=VSMPE MAINTENANCE_PER_YEAR=0.002 MAX_MAINTENANCE=0.15
 ```
 
 ## What is still not modelled

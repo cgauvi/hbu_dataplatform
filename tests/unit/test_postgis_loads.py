@@ -50,14 +50,20 @@ class FakeCopy:
 
 
 class FakeCursor:
-    def __init__(self):
+    def __init__(self, outside_cut: tuple[int, list[str]] = (0, [])):
         self.statements: list[tuple[str, object]] = []
         self.copied: list[list[object]] = []
         self.rowcount = 0
+        #: What the loaders' ownership guard reads back: rows loaded with a
+        #: `cell_key` and no `cell_partition`, and a sample of their keys.
+        self.outside_cut = outside_cut
 
     def execute(self, statement: str, params=None):
         self.statements.append((statement, params))
         return self
+
+    def fetchone(self):
+        return self.outside_cut
 
     def copy(self, statement: str):
         self.statements.append((statement, None))
@@ -171,3 +177,37 @@ def test_an_empty_feature_layer_is_analyzed_too(cursor):
     )
     assert written == 0
     assert cursor.analyzed() == ["ANALYZE rag.features"]
+
+
+# -- the address every row is loaded with ------------------------------------
+
+
+def test_every_load_writes_the_cell_key_and_its_cut_cell(cursor):
+    """`cell_partition` is what every tile run selects its lots by, so it is
+    computed on the way in rather than left to a backfill a reload erases."""
+    postgis.load_lots(
+        FakeConnection(cursor), lots(),
+        neighborhood=NEIGHBORHOOD, scrape_date=DATE,
+    )
+    insert = next(t for t in cursor.issued() if t.startswith("INSERT INTO rag.lots"))
+    assert "cell_key, cell_partition" in insert
+    assert "warehouse.tile_of(cell_key, %(cut)s::text[])" in insert
+    params = next(
+        p for s, p in cursor.statements if s.lstrip().startswith("INSERT INTO rag.lots")
+    )
+    assert params["cut"] == sorted(postgis.tile_cut.CUT)
+
+
+def test_ground_outside_the_cut_fails_the_load_naming_it():
+    """A row with no cut cell is a row no tile run will ever compute over."""
+    cursor = FakeCursor(outside_cut=(3, ["0302310000000000000"]))
+
+    with pytest.raises(postgis.GroundOutsideCut) as caught:
+        postgis.load_lots(
+            FakeConnection(cursor), lots(),
+            neighborhood=NEIGHBORHOOD, scrape_date=DATE,
+        )
+
+    assert caught.value.num_rows == 3
+    assert "0302310000000000000" in str(caught.value)
+    assert "seed_tile_cut" in str(caught.value)

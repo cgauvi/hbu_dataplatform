@@ -39,6 +39,7 @@ section; this one states them. Read it with
 | the column governing a family is the widest *Largeur min* the lot meets, and among ties the most permissive dwelling ceiling | `select_governing_column` | design | on print order the duplex column won 14,937 of Villeray's lot × zone pairs |
 | a program is called by a family's name at ≥ 70% of its usage floor, `mixed` below | `DOMINANT_USE_SHARE` | constant | reporting only; nothing in the solve reads it |
 | a `road_parcel` (a road CUBF on the roll, or the cadastre's road lots) and an `equipment_zone` piece (only *E* authorised) get no program | `hbu_status` | design | a street and a park are not sites |
+| a piece whose governing columns cap it at one dwelling and permit no commerce or industry is not solved: `single_family_zone` | `SINGLE_FAMILY_MAX_DWELLINGS` | constant | the rental objective can only build one small unit there; a house needs a sale-price thesis — [single-family.md](single-family.md) |
 | the roll's building quantities are split across a lot's pieces by footprint share, its ground by area share, and unit counts are rounded | `_allocate_existing` | design | a borough's totals are unchanged by the split; the rounding is why `existing_num_assessment_units` and not `has_assessment` says whether the roll reached a piece |
 
 ## What stands today: the roll's side and its income

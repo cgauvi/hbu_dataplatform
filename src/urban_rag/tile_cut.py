@@ -67,39 +67,84 @@ DEFAULT_BUDGET = 20_000
 #: Bumped whenever `CUT` changes. Stored beside the data so a partition can say
 #: which cut minted it, and so a reader can tell a re-cut from a reload.
 #: ``0`` means the cut has not been seeded yet.
-CUT_VERSION = 1
+CUT_VERSION = 2
 
 #: The live cut: every cell the pipeline partitions on, as quadkeys.
 #:
-#: Seeded 2026-09-22 by `scripts/seed_tile_cut.py` over hbu-dev's 69,995 lots -
-#: VSMPE and CIL at 2026-09-01 - at `DEFAULT_BUDGET`. Ten cells, zooms 9 to 14,
-#: largest holding 17,954 lots and none over budget.
+#: Seeded 2026-09-25 by `scripts/seed_tile_cut.py` over hbu-dev's 147,147 lots
+#: of 2026-09-01 - VSMPE, CIL, SSC and SAG - at `DEFAULT_BUDGET`. 23 cells,
+#: zooms 9 to 13, largest holding 18,239 lots and none over budget.
 #:
-#: The spread is the design working: Montreal's eight cells are z13 and z14,
-#: Quebec City's two are z10, and the one at z9 is the rest of the island that
-#: has few lots on it. A fixed zoom that suited either city would have been
-#: wrong for the other.
+#: The spread is the design working: Montreal's five cells are z13 but for the
+#: z9 that is the rest of the island with few lots on it, Quebec City's six are
+#: z10 and z12 where SSC's density pushed a branch down, and Saguenay's twelve
+#: run z9 to z12 over a 1,150 km² city. A fixed zoom that suited one city would
+#: have been wrong for the others.
+#:
+#: Version 1 (2026-09-22, ten cells) was replaced before anything was
+#: partitioned on it: it counted VSMPE's two scrape dates as two sets of lots,
+#: which split its cell into four z14s it did not need, and SSC and SAG were
+#: not in it. The script now cuts over one date.
 #:
 #: **This grows when a city is loaded, and that is additive** - new ground is
 #: under cells nothing else uses. Re-cutting an existing branch is the
 #: disruptive case; see the module docstring for what it costs and the trap in
 #: `warehouse.dataset_versions` that comes with it.
-CUT: frozenset[str] = frozenset(
-    (
-        # Montreal - VSMPE and the island around it
-        "030230331",
-        "0302303330100",
-        "0302303330101",
-        "03023033301020",
-        "03023033301021",
-        "03023033301022",
-        "03023033301023",
-        "0302303330103",
-        # Quebec City - CIL
-        "0302312101",
-        "0302312103",
-    )
-)
+#:
+#: Each cell names the city whose publishers its ground belongs to, as the
+#: plain value of `urban_rag.partitions.City` (a string here rather than the
+#: enum, because `partitions` imports this module and not the other way
+#: round). A cell has exactly one city by construction: the cut is built per
+#: city's lots and two cities' ground diverges high in the tree - Montreal
+#: and Quebec City part at the seventh digit. A run on the tile axis has no
+#: borough to ask the CRS or the CMHC centre of, so it asks the cell.
+TILE_CITIES: dict[str, str] = {
+    # Montreal - VSMPE and the island around it
+    "030230331": "montreal",
+    "0302303330100": "montreal",
+    "0302303330101": "montreal",
+    "0302303330102": "montreal",
+    "0302303330103": "montreal",
+    # Quebec City - CIL and SSC
+    "0302312100": "quebec",
+    "0302312101": "quebec",
+    "0302312102": "quebec",
+    "030231210300": "quebec",
+    "030231210301": "quebec",
+    "030231210302": "quebec",
+    # Saguenay - SAG
+    "030231010": "saguenay",
+    "030231011": "saguenay",
+    "0302310120": "saguenay",
+    "03023101210": "saguenay",
+    "030231012110": "saguenay",
+    "030231012111": "saguenay",
+    "030231012112": "saguenay",
+    "030231012113": "saguenay",
+    "03023101212": "saguenay",
+    "03023101213": "saguenay",
+    "0302310123": "saguenay",
+    "030231013": "saguenay",
+}
+
+CUT: frozenset[str] = frozenset(TILE_CITIES)
+
+
+def city_value_of(tile: str) -> str:
+    """The city a cut cell's ground belongs to, as a `City` value string.
+
+    ``tile`` is a member of `CUT`, not a full-depth key: resolve a lot's
+    `cell_key` with `cell_partition_of` first. Raises `KeyError` for a cell
+    that is not in the cut, which is the same answer `cell_partition_of` gives
+    for ground the cut does not cover.
+    """
+    try:
+        return TILE_CITIES[tile]
+    except KeyError:
+        raise KeyError(
+            f"{tile!r} is not a cell of the cut (version {CUT_VERSION}); "
+            f"the cut has {len(CUT)} cell(s)"
+        ) from None
 
 
 def build_cut(

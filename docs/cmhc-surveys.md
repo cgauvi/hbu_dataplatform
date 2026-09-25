@@ -99,7 +99,7 @@ to `URBAN_RAG_CMHC_SURVEY_YEAR`, so pointing a run at another year takes:
 
 ```powershell
 $env:URBAN_RAG_CMHC_SURVEY_YEAR = "2022"
-uv run dagster asset materialize --select silver/vacancy_rates --partition "2026-08-20|VSMPE" -m urban_rag.definitions
+uv run dagster asset materialize --select silver/vacancy_rates --partition "2026-09-01|VSMPE" -m urban_rag.definitions
 ```
 
 An env var rather than config alone because `--config-json` replaces a
@@ -119,7 +119,7 @@ final.
 same `CMHC_QUARTIERS` crosswalk as `vacancy_rates`:
 
 ```powershell
-uv run dagster asset materialize --select silver/average_rents --partition "2026-08-20|VSMPE" -m urban_rag.definitions
+uv run dagster asset materialize --select silver/average_rents --partition "2026-09-01|VSMPE" -m urban_rag.definitions
 ```
 
 It writes five borough rows, one per `bedroom_type`, plus the quartier cells
