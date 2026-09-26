@@ -5643,6 +5643,10 @@ def load_addresses(
     from psycopg.types.json import Jsonb
     import shapely.wkb
 
+    # Dropped rather than left to ON COMMIT, for the reason `load_features`
+    # gives: a cell holding two boroughs' lots loads both in one transaction,
+    # and the second call would meet the first's staging table still there.
+    cursor.execute("DROP TABLE IF EXISTS rag_addresses_load")
     cursor.execute(
         "CREATE TEMP TABLE rag_addresses_load "
         "(address_id text, neighborhood text, scrape_date date, "

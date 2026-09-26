@@ -1133,8 +1133,22 @@ def lot_highest_best_use(
     # borough, because that is the grain they vary at - the surveyed rents in
     # them are the lot's borough's - and every piece of a borough carries its
     # borough's object, the ones with no program included.
-    frame["program_assumptions"] = _by_borough(
-        frame, _first_by_borough(programs, "program_assumptions")
+    by_borough = _first_by_borough(programs, "program_assumptions")
+    frame["program_assumptions"] = _by_borough(frame, by_borough)
+    # A piece whose borough solved no program at all - every piece a road or an
+    # equipment zone, or a row that reached here with no `neighborhood` - has
+    # nothing to look up, and the column is NOT NULL. It takes the tile's
+    # object instead: exact when the tile holds one borough, which is every
+    # cell but the few straddling a line, and what the whole partition carried
+    # before the assumptions went per borough.
+    # And a tile where nothing was solved at all - a Saguenay cell of roads,
+    # parks and zones that authorise no use - carries `{}`: no program, so no
+    # assumptions stood behind one. `program_assumptions_of` reads it as the
+    # module defaults, field by field, which is what the enhancement solve
+    # downstream then prices at.
+    fallback = next(iter(by_borough.values())) if by_borough else "{}"
+    frame["program_assumptions"] = frame["program_assumptions"].where(
+        frame["program_assumptions"].notna(), fallback
     )
     frame["scrape_date"] = scrape_date
     frame["computed_at"] = datetime.now(timezone.utc).isoformat()
