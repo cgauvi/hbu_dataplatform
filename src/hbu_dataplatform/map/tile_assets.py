@@ -144,10 +144,26 @@ def map_tiles_asset(
     removed = clear_files(
         output_dir,
         *[map_tiles.archive_file(layer) for layer in config.layers],
-        map_tiles.MANIFEST_FILE,
     )
     if removed:
         context.log.info("Removed %d file(s) from a previous run", len(removed))
+    # The manifest is what the map reads, so it is rewritten rather than
+    # removed: minus the layers this run is replacing, whose archives are gone,
+    # and still naming the ones it is not touching. A municipality is rendered
+    # in batches that take hours each, and a partition with no manifest is a
+    # partition the map cannot draw at all - so between batches, and if a
+    # batch is killed, what was built stays visible. Only when nothing is
+    # left to name (a full run, or a first one) does the file go.
+    interim = _interim_manifest(previous, config.layers)
+    if interim is None:
+        clear_files(output_dir, map_tiles.MANIFEST_FILE)
+    else:
+        _write_json(join(output_dir, map_tiles.MANIFEST_FILE), interim)
+        context.log.info(
+            "Manifest keeps %s while %s render(s)",
+            ", ".join(interim["layers"]),
+            ", ".join(config.layers),
+        )
 
     params = map_tiles.layer_params(neighborhood, scrape_date)
     built: dict[str, dict[str, Any]] = {}
@@ -369,6 +385,46 @@ def _read_manifest(output_dir: str) -> dict[str, Any] | None:
         return json.loads(text)
     except ValueError:
         return None
+
+
+def _interim_manifest(
+    previous: dict[str, Any] | None, rendering: list[str]
+) -> dict[str, Any] | None:
+    """The previous manifest with the layers now being re-rendered taken out.
+
+    None when there is nothing left to describe - no previous manifest, or
+    one whose every layer is in ``rendering`` - which the caller turns into
+    no manifest at all, since a file naming archives that were just deleted
+    is worse than none. The bounds are re-united over what remains, and the
+    layers under way are named under ``rendering`` so a reader of the file
+    can tell a batch in progress from a partition that was never built.
+    """
+    if not previous:
+        return None
+    kept = {
+        layer: entry
+        for layer, entry in (previous.get("layers") or {}).items()
+        if layer not in rendering
+    }
+    if not kept:
+        return None
+    bounds: list[float] | None = None
+    for entry in kept.values():
+        bounds = _union(bounds, tuple(entry.get("bounds") or ()) or None)
+    return {
+        **previous,
+        "bounds": bounds,
+        "layers": kept,
+        "empty_layers": [
+            layer for layer in previous.get("empty_layers") or [] if layer not in rendering
+        ],
+        "skipped_layers": {
+            layer: why
+            for layer, why in (previous.get("skipped_layers") or {}).items()
+            if layer not in rendering
+        },
+        "rendering": sorted(rendering),
+    }
 
 
 def _write_json(path: str, payload: dict[str, Any]) -> None:

@@ -519,6 +519,53 @@ def test_a_narrowed_run_keeps_the_other_archives_and_their_manifest_entries(
     assert "zones" in manifest["layers"] and "lots" in manifest["layers"]
 
 
+def test_a_narrowed_run_keeps_the_manifest_while_it_renders(
+    tmp_path, stubbed_renderer, monkeypatch
+):
+    """Between batches the map still draws what the earlier ones built.
+
+    A municipality is rendered in batches of hours; the manifest used to be
+    deleted on entry and rewritten at the end, so a partition vanished from
+    the map for the whole of every batch, and for good if one was killed.
+    """
+    assert _materialize(tmp_path).success
+    out = _partition_dir(tmp_path)
+    seen: list[dict] = []
+    extent = tile_assets.layer_extent
+
+    def peeking_extent(cursor, spec, params):
+        seen.append(json.loads((out / map_tiles.MANIFEST_FILE).read_text()))
+        return extent(cursor, spec, params)
+
+    monkeypatch.setattr(tile_assets, "layer_extent", peeking_extent)
+    assert _materialize(tmp_path, layers=["lots"]).success
+
+    (during,) = seen
+    assert "zones" in during["layers"] and "lots" not in during["layers"]
+    assert during["rendering"] == ["lots"]
+    assert during["bounds"] == list(BOUNDS)
+    after = json.loads((out / map_tiles.MANIFEST_FILE).read_text())
+    assert "rendering" not in after
+    assert "lots" in after["layers"] and "zones" in after["layers"]
+
+
+def test_a_full_run_starts_without_a_manifest(tmp_path, stubbed_renderer, monkeypatch):
+    """Nothing survives a full run, so nothing is named while it renders."""
+    assert _materialize(tmp_path).success
+    out = _partition_dir(tmp_path)
+    present: list[bool] = []
+    extent = tile_assets.layer_extent
+
+    def peeking_extent(cursor, spec, params):
+        present.append((out / map_tiles.MANIFEST_FILE).exists())
+        return extent(cursor, spec, params)
+
+    monkeypatch.setattr(tile_assets, "layer_extent", peeking_extent)
+    assert _materialize(tmp_path).success
+    assert present and not any(present)
+    assert (out / map_tiles.MANIFEST_FILE).exists()
+
+
 def test_a_layer_whose_relations_are_missing_is_skipped_not_fatal(
     tmp_path, stubbed_renderer, monkeypatch
 ):
