@@ -966,6 +966,62 @@ def monthly_neighborhood_streets_schedule(context: ScheduleEvaluationContext):
     yield from _tile_requests("neighborhood-streets", _scrape_month(context))
 
 
+# ---------------------------------------------------------------------------
+# The corpus
+# ---------------------------------------------------------------------------
+#
+# These two were the only jobs in this file with no schedule at all, which is
+# why a borough whose corpus run failed stayed failed: nothing ever tried it
+# again. Saguenay sat with 2,837 documents announced and none encoded, and from
+# the map that reads as the by-law being silent rather than as missing data.
+#
+# Kept as two schedules because they are two jobs for a reason the jobs
+# themselves give: building the corpus talks to the city's servers, publishing
+# it talks to a database that has to be reachable, and the second failing
+# should not cost the first.
+
+
+@schedule(
+    job=rag_corpus_job,
+    # Well behind features (20 4), which mints the LIEN_GRILLE this reads: for
+    # Quebec City and Saguenay the document URL does not exist until that asset
+    # has run, so a corpus run that overtakes it fetches nothing.
+    cron_schedule="40 8 1 * *",
+    execution_timezone=TIMEZONE,
+    description="Fetch, chunk and embed this month's zoning sheets per borough.",
+)
+def monthly_rag_corpus_schedule(context: ScheduleEvaluationContext):
+    scrape_date = _scrape_month(context)
+    for neighborhood in enabled_neighborhoods(context.instance):
+        yield RunRequest(
+            run_key=f"rag-corpus-{neighborhood}-{scrape_date}",
+            partition_key=MultiPartitionKey(
+                {"date": scrape_date, "neighborhood": neighborhood}
+            ),
+        )
+
+
+@schedule(
+    job=document_index_job,
+    # Behind the corpus it publishes. Saguenay's sheets are one HTTP round trip
+    # per zone, so the gap is wide on purpose - a partition still fetching when
+    # this fires simply publishes nothing and is picked up next month, which is
+    # the failure mode worth having.
+    cron_schedule="30 10 1 * *",
+    execution_timezone=TIMEZONE,
+    description="Publish this month's embedded chunks into rag.chunks.",
+)
+def monthly_document_index_schedule(context: ScheduleEvaluationContext):
+    scrape_date = _scrape_month(context)
+    for neighborhood in enabled_neighborhoods(context.instance):
+        yield RunRequest(
+            run_key=f"document-index-{neighborhood}-{scrape_date}",
+            partition_key=MultiPartitionKey(
+                {"date": scrape_date, "neighborhood": neighborhood}
+            ),
+        )
+
+
 # Every scheduled silver asset above now publishes to Postgres as well as to
 # the tree - `neighborhood_streets` to `silver.neighborhood_streets`, the two
 # CMHC assets to `silver.vacancy_rates`/`silver.average_rents` and the quartier
@@ -1117,6 +1173,8 @@ defs = Definitions(
         monthly_vacancy_rates_schedule,
         monthly_average_rents_schedule,
         monthly_neighborhood_streets_schedule,
+        monthly_rag_corpus_schedule,
+        monthly_document_index_schedule,
     ],
     resources={
         "spectrum": SpectrumResource(),
