@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 #: Bumped when the schema changes in a way an existing store cannot satisfy.
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 
 #: Selected in this order by every load and every search, so `Hit` can be built
 #: positionally from a result row.
@@ -29,6 +29,11 @@ COLUMNS = (
     "feature_ids",
     "model",
     "text",
+    # Appended rather than inserted: `Hit` is built positionally from a row in
+    # this order, so inserting anywhere else silently shifts every field after
+    # it. Nullable, because a chunk indexed before this existed has no page.
+    "page_from",
+    "page_to",
 )
 
 
@@ -52,6 +57,11 @@ class Hit:
     feature_ids: str
     model: str
     text: str
+    # In COLUMNS order and before `similarity`, which every caller passes by
+    # keyword: `Hit(*row[:len(COLUMNS)], similarity=...)` fills these
+    # positionally, so their place here is the wire format.
+    page_from: int | None
+    page_to: int | None
     similarity: float
 
     @property
@@ -69,5 +79,7 @@ class Hit:
             "num_tokens": self.num_tokens,
             "feature_ids": self.feature_ids,
             "model": self.model,
+            "page_from": self.page_from,
+            "page_to": self.page_to,
             "similarity": self.similarity,
         }

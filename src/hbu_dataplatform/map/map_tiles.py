@@ -679,11 +679,18 @@ def link_attribute_agrees() -> bool:
     """Whether every zoning source's link attribute is the one the tile reads.
 
     `ZONING_URL_ATTRIBUTE` is one name for what `DOCUMENT_SOURCES` records
-    per source. The two agree today; this is what a test asserts so a city
-    whose polygons link their grid under another attribute is caught here
-    rather than as a zone with no PDF on the map.
+    per source. They agree for the ZONING sources, and this is what says so,
+    so a city whose polygons link their grid under another attribute is caught
+    here rather than as a zone with no PDF on the map.
+
+    Restricted to `ZONING_SOURCES` rather than every document source, because
+    this is about the zone TILE. Montreal's projets particuliers are indexed
+    from `EN_SAVOIR_PLUS` and are not drawn as zones, so including them would
+    make this permanently false about a layer they are not on.
     """
-    return all(attribute == ZONING_URL_ATTRIBUTE for attribute in DOCUMENT_SOURCES.values())
+    return all(
+        DOCUMENT_SOURCES[source] == ZONING_URL_ATTRIBUTE for source in ZONING_SOURCES
+    )
 
 
 def hilbert_sorted(tiles: list[tuple[int, int, bytes]], zoom: int) -> list[tuple[int, int, bytes]]:

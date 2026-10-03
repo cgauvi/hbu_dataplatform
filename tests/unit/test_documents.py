@@ -10,8 +10,10 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
+from hbu_dataplatform.rag import documents
 from hbu_dataplatform.rag.documents import (
     DOCUMENT_SOURCES,
+    MIN_PDF_BYTES,
     ZONING_SOURCES,
     DocumentError,
     PdfFetcher,
@@ -64,30 +66,45 @@ def make_fetcher(tmp_path, response):
     return fetcher, session
 
 
-def test_the_corpus_is_built_from_the_zoning_grids():
+def test_the_corpus_is_built_from_the_zoning_grids_and_the_resolutions():
     """The registry is the whole definition of what gets indexed.
 
-    One table per city, and only Montreal's publishes the link itself.
-    `_saguenay_features` resolves one grid id per zone and
-    `_quebec_features` formats a handler URL from the zone code; both write it
-    under Montreal's column name, which is what lets one corpus pipeline serve
-    three cities.
+    One grid table per city, and only Montreal's publishes the link itself.
+    `_saguenay_features` resolves one grid id per zone and `_quebec_features`
+    formats a handler URL from the zone code; both write it under Montreal's
+    column name, which is what lets one corpus pipeline serve three cities.
+
+    Plus Montreal's projets particuliers, which are the other half of "what
+    may be built here": a PPCMOI resolution overrides the grid for one site,
+    so a grid-only answer about such a site is confidently wrong.
     """
     assert DOCUMENT_SOURCES == {
         "Reglement_urbanisme__VSP_REG_ZONE": "LIEN_GRILLE",
         "Zonage__ZONAGE_SAGUENAY": "LIEN_GRILLE",
         "Zonage__ZONAGE_EN_VIGUEUR": "LIEN_GRILLE",
+        "Reglement_urbanisme__VSP_REG_PPCMOI": "EN_SAVOIR_PLUS",
     }
 
 
 def test_every_zoning_layer_is_also_a_document_source():
-    """True today, and the names stay apart because it need not be.
+    """A subset, not an equality - and the difference is load-bearing.
 
-    A table is a zone source if lots are cut against it and a document source
-    if it links prose worth retrieving. Quebec City was a zone source and not
-    a document source until its per-zone sheet was found.
+    A table is a ZONE source if lots are cut against it, and a DOCUMENT source
+    if it links prose worth retrieving. They were the same list until PPCMOI
+    joined the corpus: a projet particulier is a document about one site and
+    emphatically not a zone, so cutting lots against it would invent a zone
+    piece per resolution - and the whole HBU chain is keyed on
+    (lot_uid, feature_id), so that is a second, bogus development site for
+    every lot a PPCMOI touches, not a cosmetic error.
     """
-    assert set(ZONING_SOURCES) == set(DOCUMENT_SOURCES)
+    assert set(ZONING_SOURCES) <= set(DOCUMENT_SOURCES)
+
+
+def test_a_projet_particulier_is_not_a_zone_source():
+    """Named explicitly, because deriving one list from the other is exactly
+    the mistake this guards."""
+    assert "Reglement_urbanisme__VSP_REG_PPCMOI" in DOCUMENT_SOURCES
+    assert "Reglement_urbanisme__VSP_REG_PPCMOI" not in ZONING_SOURCES
 
 
 def test_document_urls_are_distinct_and_keep_their_first_seen_order():
@@ -111,12 +128,13 @@ def test_document_id_is_stable_for_a_url():
 
 
 def test_fetch_caches_by_url_and_does_not_hit_the_server_twice(tmp_path):
-    fetcher, session = make_fetcher(tmp_path, FakeResponse(b"%PDF-1.4 body"))
+    body = b"%PDF-1.4 body"
+    fetcher, session = make_fetcher(tmp_path, FakeResponse(body))
 
     first, cached = fetcher.fetch("http://x/a.pdf")
     second, cached_again = fetcher.fetch("http://x/a.pdf")
 
-    assert first == second == b"%PDF-1.4 body"
+    assert first == second == body
     assert (cached, cached_again) == (False, True)
     assert session.calls == ["http://x/a.pdf"]
 
@@ -263,3 +281,38 @@ def test_montreals_zone_number_still_wins_where_both_columns_exist():
 
     assert entry["feature_ids"] == '["C01-001"]'
     assert entry["title"] == "Commerce"
+
+
+def test_a_publishers_empty_sheet_is_told_apart_from_a_scan():
+    """Both are "a PDF with no text", and only one is an OCR candidate.
+
+    Quebec City answers an unknown zone code with a valid, empty PDF of about
+    850 bytes where a real sheet is 110-125 kB. Counted as a scan it inflates
+    the OCR backlog with files that have nothing to read.
+
+    The size test belongs here and not in `fetch`, because size alone says
+    nothing: the empty sheet below is 600-odd bytes and so is a perfectly
+    valid two-line council minute.
+    """
+    from test_quebec_council import make_pdf
+
+    empty = make_pdf([])
+    assert len(empty) < MIN_PDF_BYTES
+
+    with pytest.raises(DocumentError, match="empty sheet"):
+        read_pdf("http://x/unknown-zone.pdf", empty)
+
+
+def test_a_big_pdf_with_no_text_is_still_an_ocr_candidate(monkeypatch):
+    """The other half: past the threshold, no text means a scan.
+
+    The threshold is lowered rather than the file padded - trailing bytes
+    after a PDF's trailer make it unreadable, which is a third failure and not
+    the one under test.
+    """
+    from test_quebec_council import make_pdf
+
+    monkeypatch.setattr(documents, "MIN_PDF_BYTES", 1)
+
+    with pytest.raises(DocumentError, match="would need OCR"):
+        read_pdf("http://x/scanned.pdf", make_pdf([]))
