@@ -259,6 +259,33 @@ its instance-storage connections open indefinitely, so a durable password or a
 Secrets Manager id is required here — `dagster_home.py` says so rather than
 failing later.
 
+### Which database: `DB_TARGET`
+
+Every target that opens the database takes one switch, carried under the same
+name and with the same two values by all three urban repos:
+
+```bash
+make db-target                 # which database the next command will use
+make hbu                       # DB_TARGET=local - the postgis container
+make hbu DB_TARGET=rds         # hbu-dev, through an open db-tunnel
+```
+
+`local` is the default. It sets `URBAN_RAG_PG_DSN` to the container
+hbu_rag_map runs (`cd ../hbu_rag_map && make db-up`), which `core.pg` reads
+ahead of everything else: no secret lookup, no CA bundle, no AWS call.
+`dagster_home.py` reads the same variable, so the run storage follows into
+that database's `dagster` schema.
+
+Both branches override `.env` rather than leaning on it — python-dotenv does
+not override a variable already in the environment — and each blanks what the
+other sets. `.env` names the RDS endpoint and the container at once, and the
+failure worth guarding against is not an error: it is half of one branch left
+standing beside the other.
+
+`DB_TARGET=rds` takes the endpoint from `URBAN_RAG_PG_HOST` in the
+environment, or from `.env`, and dials it at `127.0.0.1:5433` with
+`verify-full` — which is the split described next.
+
 When a laptop reaches RDS through `make db-tunnel`, keep TLS and the tunnel's
 address separate. With `sslmode=verify-full`, `URBAN_RAG_PG_HOST` must stay as
 the RDS endpoint, because that is the name in the server certificate. Point the
@@ -279,5 +306,9 @@ cd ../hbu_infra
 make db-tunnel ENV=dev LOCAL_PORT=5433
 
 cd ../hbu_dataplatform
-make up-tunnel TUNNEL_DB_HOST=hbu-dev.cedzstv1bm7z.us-east-1.rds.amazonaws.com TUNNEL_PORT=5433
+make up DB_TARGET=rds     # or `make up-tunnel`, the same thing under its old name
 ```
+
+`make up` on its own takes the switch's default and points the stack at the
+local container through `host.docker.internal`, which is also the one shape of
+this that needs no AWS credentials inside the container at all.

@@ -40,6 +40,11 @@ services:
       # no host set that asset has nowhere to write and fails; every other
       # asset is unaffected. Prefer SECRET_ID or IAM_AUTH over PASSWORD - see
       # docs/corpus.md, "The shared vector store".
+      # A full libpq URL, read before anything else by both core.pg and
+      # the entrypoint that writes dagster.yaml. `make up` sets it when
+      # DB_TARGET=local, pointing at the postgis container on the host
+      # through host.docker.internal, and clears it for DB_TARGET=rds.
+      URBAN_RAG_PG_DSN: ${URBAN_RAG_PG_DSN:-}
       URBAN_RAG_PG_HOST: ${URBAN_RAG_PG_HOST:-}
       URBAN_RAG_PG_HOSTADDR: ${URBAN_RAG_PG_HOSTADDR:-}
       # Unset means the port in the secret (5432); `make up-tunnel` sets it to
@@ -89,6 +94,11 @@ services:
       # no host set that asset has nowhere to write and fails; every other
       # asset is unaffected. Prefer SECRET_ID or IAM_AUTH over PASSWORD - see
       # docs/corpus.md, "The shared vector store".
+      # A full libpq URL, read before anything else by both core.pg and
+      # the entrypoint that writes dagster.yaml. `make up` sets it when
+      # DB_TARGET=local, pointing at the postgis container on the host
+      # through host.docker.internal, and clears it for DB_TARGET=rds.
+      URBAN_RAG_PG_DSN: ${URBAN_RAG_PG_DSN:-}
       URBAN_RAG_PG_HOST: ${URBAN_RAG_PG_HOST:-}
       URBAN_RAG_PG_HOSTADDR: ${URBAN_RAG_PG_HOSTADDR:-}
       # Unset means the port in the secret (5432); `make up-tunnel` sets it to
