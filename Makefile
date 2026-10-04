@@ -299,7 +299,7 @@ DOCKER_RUN := docker run --rm -it \
 	quartiers cmhc costs vacancy rents zone-pieces addresses envelopes setbacks \
 	lot-profiles programs hbu opportunities massing map_cells map_tiles \
 	streets tile-streets roll lot-values comparables cadastre grid-columns \
-	lot-addresses council-minutes tiles tiles-of tiles-ensure \
+	lot-addresses council-minutes council-publish tiles tiles-of tiles-ensure \
 	rent-sources commercial-rents \
 	frontage corpus publish index search ask status \
 	require-q validate_defs clean clean-data clean-silver \
@@ -677,9 +677,15 @@ corpus: | $(UV_SYNC_STAMP) ## Fetch, chunk and embed the PDFs linked from DATE x
 # takes every council of the borough. A Montreal or Saguenay key has none and
 # writes an empty file. See docs/council-minutes.md.
 COUNCILS ?=
-council-minutes: | $(UV_SYNC_STAMP) ## Fetch the conseils de quartier minutes + their trail, read the planning items (COUNCILS=12)
-	$(DAGSTER) asset materialize --select "bronze/council_minutes,bronze/council_minutes_documents,silver/council_planning_items" --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE) \
+council-minutes: | $(UV_SYNC_STAMP) ## Fetch the conseils de quartier minutes + their trail, chunk and embed them, read the planning items and place them (COUNCILS=12)
+	$(DAGSTER) asset materialize --select "bronze/council_minutes,bronze/council_minutes_documents,silver/council_minutes_chunks,silver/council_planning_items,silver/council_minutes_embeddings" --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE) \
 		--config-json '{"ops":{"bronze__council_minutes":{"config":{"council_ids":[$(COUNCILS)]}},"bronze__council_minutes_documents":{"config":{"council_ids":[$(COUNCILS)]}}}}'
+
+# The council corpus' load into rag.chunks, apart from `council-minutes` the
+# way `publish` is apart from `corpus`: it needs the database and the
+# embedding does not. Upserts beside the zoning grids' chunks; prunes nothing.
+council-publish: | $(UV_SYNC_STAMP) ## Load DATE x NEIGHBORHOOD's council corpus into Postgres/pgvector
+	$(DAGSTER) asset materialize --select gold/council_minutes_index --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
 
 materialize: catalog features ## Full scrape for DATE x NEIGHBORHOOD
 

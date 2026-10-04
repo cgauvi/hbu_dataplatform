@@ -83,6 +83,13 @@ replaced it, because a project-specific resolution answers a different question
 than a zone's standing rules. Add it back to the registry when that question is
 worth indexing.
 
+A second corpus shares the table. Quebec City's *conseils de quartier*
+minutes and the documents they trail to are chunked, embedded and loaded by
+three assets of their own (`council_minutes_chunks`,
+`council_minutes_embeddings`, `council_minutes_index`) under source tables
+that start with `council_`, cited not by zones but by the planning items read
+out of them — see [council-minutes.md](council-minutes.md).
+
 ## Retrieval
 
 `embeddings.parquet` is the corpus; the query side is a DuckDB database with an

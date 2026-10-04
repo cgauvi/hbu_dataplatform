@@ -190,6 +190,11 @@ class Table:
 #:   `ON CONFLICT DO UPDATE` this module performs; repartitioning it would cut
 #:   one HNSW index into one index per borough-month, which changes what a
 #:   recall number from it means. See `PgVectorStore.load_partition`.
+#: * `council_minutes_chunks`, `council_minutes_embeddings` and
+#:   `council_minutes_index` - the council corpus, walked through the same
+#:   three steps. The chunks land in `silver.document_chunks`, the table
+#:   registered under `document_chunks` (upserted without the prune, so the
+#:   two corpora of one partition coexist); the vectors' home is rag.chunks.
 #: * `map_tiles` (gold) - its product is not rows. It renders the map's layers
 #:   out of tables this registry already publishes and packs them into PMTiles
 #:   archives that hbu_rag_map reads off S3 with range requests; a table of
@@ -284,6 +289,18 @@ TABLES: dict[str, Table] = {
         name="council_planning_items",
         keys=("doc_id", "item_index"),
         source="sql/030_silver_council_planning_items.sql",
+    ),
+    # One row per (planning item, site): the lot, the parcel under a civic
+    # address, or the zone an item names, with its geometry - the join from
+    # 030's text columns to the ground, computed in PostGIS by the same
+    # asset (cities.quebec_city.council.sites) and written through
+    # `upsert_select`.
+    "council_item_sites": Table(
+        asset="council_planning_items",
+        name="council_item_sites",
+        keys=("doc_id", "item_index", "site_kind", "site_key"),
+        source="sql/032_silver_council_item_sites.sql",
+        geometry="geom",
     ),
     "zoning_grid_columns": Table(
         asset="zoning_grid_columns",

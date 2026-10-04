@@ -281,3 +281,24 @@ make db-tunnel ENV=dev LOCAL_PORT=5433
 cd ../hbu_dataplatform
 make up-tunnel TUNNEL_DB_HOST=hbu-dev.cedzstv1bm7z.us-east-1.rds.amazonaws.com TUNNEL_PORT=5433
 ```
+
+#### Or the local Docker database
+
+The same database also runs on the laptop, in hbu_rag_map's postgis+pgvector
+container — no AWS and no tunnel. This repo has no `DB_TARGET` switch (that is
+hbu_rag_map's); point it there with the environment instead:
+
+```bash
+cd ../hbu_rag_map && make db-up                        # start the container
+cd ../hbu_infra   && make db-dump-pull db-restore-local  # first time: copy dev into it
+
+# then, in this repo's .env (or the shell):
+URBAN_RAG_PG_DSN=postgresql://urban_rag:urban_rag@127.0.0.1:5432/urban_rag?sslmode=disable
+DAGSTER_POSTGRES_URL=postgresql://urban_rag:urban_rag@127.0.0.1:5432/urban_rag?sslmode=disable
+```
+
+From inside a container (`make up`), `127.0.0.1` is the container itself:
+use `host.docker.internal` instead. Comment the `URBAN_RAG_PG_HOST` lines out
+while the DSN is set, so the two targets are never half-mixed. If the
+container is up but nothing answers on 5432, `make db-up` in hbu_rag_map
+recreates it — it can lose its network after a Docker restart.

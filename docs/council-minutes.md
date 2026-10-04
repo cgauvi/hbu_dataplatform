@@ -10,19 +10,22 @@ the pipeline reads them, follows them to the decision behind each one, and
 harvests what all of it says about zoning, lots and dwellings into one silver
 table. Montcalm, in La Cité-Limoilou (`CIL`), was the first council run.
 
-Three assets on the borough axis, one job (`council_minutes_job`), one make
-target:
+Six assets on the borough axis, two jobs, two make targets:
 
 ```
-make council-minutes NEIGHBORHOOD=CIL COUNCILS=12      # Montcalm alone
+make council-minutes NEIGHBORHOOD=CIL COUNCILS=12      # Montcalm alone: fetch, chunk, embed, read, place
 make council-minutes NEIGHBORHOOD=CIL                  # every CIL council
+make council-publish NEIGHBORHOOD=CIL                  # load the corpus into rag.chunks
 ```
 
 | Asset | Output |
 | --- | --- |
 | `bronze/council_minutes` | One row per minute: the PDF fetched and flattened to text, the meeting date the listing states, the links the PDF carries |
 | `bronze/council_minutes_documents` | One row per document the minutes trail to — fiche, sommaire, resolution, report — with the hop it was reached by |
-| `silver/council_planning_items` | One row per planning item read out of either, as columns — and `silver.council_planning_items` (hbu_infra `sql/030`) |
+| `silver/council_minutes_chunks` | Both cut into retrieval chunks, filed under `council_*` source tables — and into `silver.document_chunks` beside the grids' |
+| `silver/council_planning_items` | One row per planning item read out of either, as columns, with `citations` and `outcome` — and `silver.council_planning_items` (hbu_infra `sql/030`, `032`); plus every item put on the ground — `sites.parquet` and `silver.council_item_sites` (`sql/032`) |
+| `silver/council_minutes_embeddings` | One bge-m3 vector per council chunk |
+| `gold/council_minutes_index` | Those vectors upserted into `rag.chunks` beside the zoning grids' (`council_minutes_index_job`) |
 
 ## Where the minutes are
 
@@ -127,7 +130,8 @@ The fields, every one a regular expression with its excerpt kept:
 | `usage_groups` | `H1`, `C2`: the groups named after "groupe d'usages" |
 | `dwelling_changes` | Every "de N à M" about dwellings, scoped `zoning` when "maximal", "autorisé", "limite" or "règlement" is within reach and `project` otherwise; `max_dwellings_before` / `_after` are the first zoning-scoped one, `project_dwellings` the first project-scoped one or "un total de N logements" |
 | `max_height_m`, `storeys` | "13 m de hauteur", "hauteur permise, qui est de 13 m"; "trois étages" |
-| `decision` | `adopted` ("il est résolu d'adopter le Règlement"), `draft_adopted`, `notice_of_motion`, `consultation`, first match wins so an extract's operative words beat a sommaire's recommendation listing every stage |
+| `decision` | `adopted` ("il est résolu d'adopter le Règlement"), `draft_adopted`, `approved` ("il est résolu d'accorder", "la demande de démolition est acceptée", "autorise la démolition"), `refused` ("il est résolu de refuser", "la demande est refusée"), `notice_of_motion`, `consultation`, first match wins so an extract's operative words beat a sommaire's recommendation listing every stage. A by-law is adopted; a request — a demolition, a dérogation mineure, a PPCMOI — is granted or refused |
+| `outcome` | The decision folded to what "approved or rejected" means: `adopted` and `approved` → `approved`, `refused` → `refused`, the three stages short of a decision → `in_progress`, nothing stated → null. The council's opinion is **not** folded in — it advises, the arrondissement decides |
 | `decision_date` | The sitting on an extract ("tenue le lundi 7 juillet 2025"), the assembly on a report, "Date :" on a sommaire |
 | `council_opinion` | `favorable`, `favorable_with_conditions`, `unfavorable`, read off the sentence where the council speaks — "est d'accord", "recommande", "s'oppose" — and kept in `council_opinion_excerpt` |
 | `votes` | The consultation report's table: A accept, B refuse, C accept with adjustments, abstention |
@@ -158,16 +162,93 @@ truer signal, and it is kept. And the minute misspells the zone once as
 "140040 Hb", which no pattern reads as a zone; the correct spelling two
 paragraphs up is what `subject_zone_codes` carries.
 
-## What it is for, and what it is not yet
+## From an item to the ground, and to the corpus
 
 A zoning grid states what a zone permits *today*. This table is the record of
 what is being asked to change and what was decided — the one the grids are
 silent about, and the one that says where the by-law is moving before the
-grid workbook does. Joining `subject_zone_codes` onto
-`silver.zoning_grid_columns.feature_id` puts an amendment's history on the
-zone a lot sits in; joining `subject_addresses` onto `silver.lot_addresses`
-puts it on the parcel. Neither join is made yet, and nothing downstream reads
-the table.
+grid workbook does. Two joins make it askable, and the same asset makes both.
+
+**The sites.** `silver.council_item_sites` (hbu_infra `sql/032`,
+`council.sites`) is one row per (item, site), computed in PostGIS once the
+items are in their table: every lot number an item names against `rag.lots`
+— the cadastre writes `1 303 691` and the parser strips the spaces, so the
+key is the digits — every address against `silver.lot_addresses` on the
+civic number and the street folded by `silver.street_key` (the fold
+hbu_rag_map applies to what a person types, so the minute's "chemin
+Ste-Foy" reaches the layer's "Chemin Sainte-Foy"; a dropped cardinal takes
+the first door with that number on Est or Ouest and says so), every zone
+code against `rag.features` in the borough's namespace. A lot or an address
+site carries the *parcel's* polygon, so a distance is to the lot; a zone
+site carries the zone's, and is kept apart by `site_kind` because a zone is
+within 500 m of most of itself. `is_subject` says whether the item is about
+the site or merely names it — the assembly's venue is an address too.
+
+What reaches nothing is counted, not written: the asset's `unplaced`
+metadata says how many of the lots, addresses and zones the items name
+found no ground, with a sample. On Montcalm that is mostly addresses outside
+Quebec City (a mémoire about 7665 boulevard Lacordaire) and lots in a
+borough whose cadastre is not loaded.
+
+**The citations.** Each item carries `citations`, a jsonb of what states it:
+the PDF's url and `doc_id`, `source_kind`, `document_number`, and
+`chunk_ids` — the rows of `rag.chunks` whose span covers the agenda item. A
+minute's items also carry `trail`, every document the minute led to; a trail
+document carries `minutes`, the minutes that led to it. The chunk ids are
+the bridge to the corpus below, and `rag.search_council_chunks` (`sql/033`)
+walks it from the other side.
+
+Together they answer the question the grids cannot:
+
+```sql
+-- Demolitions decided within 500 m of 439 rue Jeanne-d'Arc, last year
+SELECT item_date, outcome, council_opinion, title, distance_m, url
+  FROM rag.council_items_near(-71.23612, 46.80413, 500,
+                              ARRAY['demolition'], ARRAY['approved', 'refused'],
+                              since => current_date - interval '1 year');
+```
+
+hbu_rag_map's `council_decisions_near` tool is that call with an address
+resolved in front of it; see its README.
+
+## The corpus
+
+The minutes and their trail are chunked and embedded into `rag.chunks`
+beside the zoning grids, by the same three steps `hbu_dataplatform.rag`
+takes — `council_minutes_chunks`, `council_minutes_embeddings`,
+`council_minutes_index` — with three differences, all in `council.corpus`:
+
+* **the text is repaired first.** `read_minutes` reads a span of
+  `repair_text(text)`, so the chunks are cut from that repaired text too and
+  an item and a chunk meet by character offset. `chunk_spans` finds each
+  chunk in the text it came from on its first and last twelve words, any
+  whitespace between — because a paragraph the tokenizer had to split comes
+  back with its line breaks as spaces — and a chunk found neither way takes
+  the previous one's end and is marked as a guess.
+* **the title names the document.** "Procès-verbal du conseil de quartier
+  de Montcalm, 16 juin 2025", "Sommaire décisionnel GT2025-233 — …",
+  "Résolution CA1-2025-0215". `rag.chunks.title` is what the lexical arm of
+  the search weights highest, so a sommaire is found by its number.
+* **`source_table` is the document kind** — `council_minutes`,
+  `council_gpd`, `council_fiche`, `council_consultation_file` — so a reader
+  can search the minutes alone, and `rag.search_council_chunks` finds the
+  council corpus by the prefix. `feature_ids` carries the zone codes the
+  chunk itself names: the grids' "which zones cite this" column read as
+  "which zones this passage is about", which is what lets a question
+  naming 14040Hb reach the minute that discussed it the way it reaches the
+  zone's sheet.
+
+Two things the loads do differently from the grids', and both on purpose.
+The chunks go into `silver.document_chunks` through `upsert_frame` with the
+prune off and a prune of the council rows alone done by hand, because
+`publish`'s prune drops every row of the (borough, date) the frame does not
+carry — which would be the zoning corpus of the same partition. And
+`council_minutes_index` loads with `prune=False`: `load_partition`'s prune
+drops the borough's *older* scrape dates, which is right when the two
+corpora land on the same date and would delete the grids when the council
+run lags them by a month. `document_index` prunes; this one does not.
+
+## What it is not yet
 
 The reading is regular expressions, chosen so a reader can check every value
 against its excerpt and so the table rebuilds from bronze without a model in

@@ -79,7 +79,10 @@ from hbu_dataplatform.partitions.axes import (
 )
 from hbu_dataplatform.cities.quebec_city.council.assets import (
     council_minutes,
+    council_minutes_chunks,
     council_minutes_documents,
+    council_minutes_embeddings,
+    council_minutes_index,
     council_planning_items,
 )
 from hbu_dataplatform.rag.assets import (
@@ -161,6 +164,8 @@ ASSETS = [
     lot_frontage,
     document_chunks,
     document_embeddings,
+    council_minutes_chunks,
+    council_minutes_embeddings,
     council_planning_items,
     zoning_grid_columns,
     lot_zone_pieces,
@@ -176,6 +181,7 @@ ASSETS = [
     map_cell_aggregates,
     map_tiles_asset,
     document_index,
+    council_minutes_index,
 ]
 
 
@@ -562,15 +568,28 @@ rag_corpus_job = define_asset_job(
     partitions_def=scrape_partitions,
 )
 
-# The conseils de quartier minutes, the documents they trail to, and the
-# planning items read out of both. Its own job rather than part of the corpus:
-# it reads a Quebec City institution the other two cities do not have, and
-# nothing downstream of the corpus depends on it yet.
+# The conseils de quartier minutes, the documents they trail to, the corpus
+# cut and embedded from both, and the planning items read out of them with
+# their sites. Its own job rather than part of the corpus: it reads a Quebec
+# City institution the other two cities do not have. The embeddings are in
+# it because the items cite the chunks and the two are read together; the
+# load into rag.chunks is `council_minutes_index_job` below, apart for the
+# reason document_index_job is apart from rag_corpus_job.
 council_minutes_job = define_asset_job(
     "council_minutes_job",
     selection=AssetSelection.assets(
-        council_minutes, council_minutes_documents, council_planning_items
+        council_minutes,
+        council_minutes_documents,
+        council_minutes_chunks,
+        council_planning_items,
+        council_minutes_embeddings,
     ),
+    partitions_def=scrape_partitions,
+)
+
+council_minutes_index_job = define_asset_job(
+    "council_minutes_index_job",
+    selection=AssetSelection.assets(council_minutes_index),
     partitions_def=scrape_partitions,
 )
 
@@ -1151,6 +1170,7 @@ defs = Definitions(
         average_rents_job,
         rag_corpus_job,
         council_minutes_job,
+        council_minutes_index_job,
         document_index_job,
     ],
     schedules=[

@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from hbu_dataplatform.cities.quebec_city.council import items as council_items
 from hbu_dataplatform.cities.quebec_city.council.items import (
     PLANNING_KINDS,
     addresses,
@@ -267,3 +268,56 @@ def test_dwelling_changes_are_scoped():
 )
 def test_item_kinds(text, kind):
     assert classify_item(text) == kind
+
+
+# ---------------------------------------------------------------------------
+# decisions on a request, and the outcome they fold to
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("Il est résolu d'adopter le Règlement modifiant le Règlement de l'Arrondissement.", "adopted"),
+        ("il est résolu d'accorder la demande de démolition du bâtiment sis au 439, rue Jeanne-d'Arc", "approved"),
+        ("Le comité autorise la démolition de l'immeuble.", "approved"),
+        ("La demande de dérogation mineure est acceptée.", "approved"),
+        ("Il est résolu de refuser la demande de démolition.", "refused"),
+        ("La demande de démolition a été refusée par le comité.", "refused"),
+        ("Le comité refuse la demande.", "refused"),
+        ("Avis de motion est donné.", "notice_of_motion"),
+        ("Consultation publique sur le projet.", "consultation"),
+        ("Rien de décidé.", None),
+    ],
+)
+def test_requests_are_granted_or_refused_not_adopted(text, expected):
+    assert council_items.decision(text) == expected
+
+
+def test_outcome_folds_the_stages_to_three_states():
+    assert council_items.outcome("adopted") == "approved"
+    assert council_items.outcome("approved") == "approved"
+    assert council_items.outcome("refused") == "refused"
+    assert council_items.outcome("draft_adopted") == "in_progress"
+    assert council_items.outcome("notice_of_motion") == "in_progress"
+    assert council_items.outcome("consultation") == "in_progress"
+    assert council_items.outcome(None) is None
+
+
+def test_an_item_carries_its_outcome():
+    item = council_items.read_item(
+        "Demande de démolition au 439, rue Jeanne-d'Arc. Il est résolu de refuser la demande de démolition.",
+        item_index=4, title="Demande de démolition",
+    )
+    assert item.item_kind == "demolition"
+    assert item.decision == "refused" and item.outcome == "refused"
+    # repair_text writes the typographic apostrophe.
+    assert item.subject_addresses == ["439, rue Jeanne-d’Arc"]
+    assert item.as_row()["outcome"] == "refused"
+
+
+def test_an_address_stops_at_the_end_of_its_sentence():
+    assert council_items.addresses("Le projet au 100, chemin Sainte-Foy. Le conseil est d'accord.") == ["100, chemin Sainte-Foy"]
+    assert council_items.addresses("au 888, rue Saint-Jean. Dans la zone") == ["888, rue Saint-Jean"]
+    # An abbreviation's period inside the name survives.
+    assert council_items.addresses("au 12, rue St. Louis Est") == ["12, rue St. Louis Est"]

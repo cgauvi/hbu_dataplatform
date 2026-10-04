@@ -251,6 +251,14 @@ def test_the_registry_covers_every_silver_and_gold_asset_but_the_three_named():
         "document_embeddings",
         "document_index",
         "map_tiles",
+        # The council corpus takes the same three steps as the zoning corpus
+        # and is absent for the same reasons: its chunks land in
+        # silver.document_chunks, the table registered under
+        # `document_chunks` (one table, two assets filling it under different
+        # source tables); its vectors' home is rag.chunks.
+        "council_minutes_chunks",
+        "council_minutes_embeddings",
+        "council_minutes_index",
         "neighborhood_cadastre",
     }
 

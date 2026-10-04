@@ -98,6 +98,23 @@ _ADDRESS = re.compile(
     r"(?:[ ](?:de|des|du|d[’']|la|le|les|et)[ ][A-ZÉÈÀ][\w’'\-\.]+|[ ][A-ZÉÈÀÎÔ][\w’'\-\.]+){0,3})"
     r"(?:[ ]+(Ouest|Est|Nord|Sud|ouest|est|nord|sud))?",
 )
+#: A period before a space inside a captured street name, with the token it
+#: closes. It ends the sentence - "Sainte-Foy. Le" - unless that token is an
+#: abbreviation a street name is written with: "St. Louis", "Mgr. Gauthier".
+_PERIOD_IN_NAME = re.compile(r"([^\s.]+)\.(?=\s)")
+_NAME_ABBREVIATIONS = frozenset(
+    {"st", "ste", "sts", "mgr", "dr", "boul", "av", "ave", "ch", "rte", "pl", "bd", "no"}
+)
+
+
+def _sentence_end(name: str) -> int | None:
+    """Where a captured street name runs into the next sentence, or None."""
+    for match in _PERIOD_IN_NAME.finditer(name):
+        token = re.split(r"[-’']", match.group(1))[-1].lower()
+        if token not in _NAME_ABBREVIATIONS:
+            return match.end() - 1
+    return None
+
 #: Where the zone an item is *about* is named, as opposed to every zone the
 #: annexed plan extract labels: the by-law's title, the fiche's "zone visée",
 #: the description's "dans la zone".
@@ -161,14 +178,60 @@ _STOREYS = re.compile(rf"\b{_NUM}\s+[ée]tages?\b", re.I)
 
 #: The `decision` column, first match wins: the extract's operative words
 #: come before the sommaire's recommendation, which lists every stage.
+#:
+#: A by-law is *adopted*; a request - a demolition, a dérogation mineure, a
+#: usage conditionnel, a PPCMOI - is *granted or refused*, so those two are
+#: decisions in their own right. They sit after the two adoption forms (an
+#: extract that adopts says so in its first operative line) and before the
+#: stages, so a resolution that refuses a demolition after a public hearing
+#: reads `refused`, not `consultation`.
 _DECISIONS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("adopted", re.compile(r"il est r[ée]solu\s+d[’']adopter\s+le\s+r[èe]glement", re.I)),
     ("draft_adopted", re.compile(r"il est r[ée]solu\s+d[’']adopter\s+le\s+projet", re.I)),
+    (
+        "refused",
+        re.compile(
+            r"il est r[ée]solu\s+de\s+(?:refuser|rejeter|ne\s+pas\s+(?:accorder|autoriser|approuver))"
+            # "la demande de dérogation mineure est refusée": whatever the
+            # request is called sits between "demande" and the verb.
+            r"|\bdemande\b[^.;\n]{0,60}?\s(?:est|a\s+[ée]t[ée])\s+(?:refus[ée]e|rejet[ée]e)\b"
+            r"|(?:refuse|rejette)\s+la\s+demande"
+            r"|d[ée]molition\s+(?:est|a\s+[ée]t[ée])\s+refus[ée]e",
+            re.I,
+        ),
+    ),
+    (
+        "approved",
+        re.compile(
+            r"il est r[ée]solu\s+d[’'](?:accorder|autoriser|approuver|accepter)"
+            r"|\bdemande\b[^.;\n]{0,60}?\s(?:est|a\s+[ée]t[ée])\s+(?:accord[ée]e|accept[ée]e|autoris[ée]e|approuv[ée]e)\b"
+            r"|(?:accorde|autorise|approuve|accepte)\s+la\s+demande"
+            r"|d[ée]molition\s+(?:est|a\s+[ée]t[ée])\s+(?:autoris[ée]e|accord[ée]e|approuv[ée]e)"
+            r"|autorise\s+la\s+d[ée]molition",
+            re.I,
+        ),
+    ),
     ("notice_of_motion", re.compile(r"avis de motion", re.I)),
     ("adopted", re.compile(r"^\s*adoption du r[èe]glement", re.I | re.M)),
     ("draft_adopted", re.compile(r"adopter le projet du r[èe]glement", re.I)),
     ("consultation", re.compile(r"consultation publique|demande d[’']opinion", re.I)),
 )
+
+#: `outcome`: the decision collapsed to the three states a reader filtering
+#: on "approved or rejected" means. A by-law adopted and a request granted
+#: are both `approved`; a request refused is `refused`; every stage short of
+#: a decision - the notice of motion, the draft, the consultation - is
+#: `in_progress`. A document stating none is null, never guessed. The
+#: council's own opinion is *not* folded in: a conseil de quartier advises,
+#: the arrondissement decides, and `council_opinion` keeps the advice apart.
+OUTCOMES: dict[str, str] = {
+    "adopted": "approved",
+    "approved": "approved",
+    "refused": "refused",
+    "draft_adopted": "in_progress",
+    "notice_of_motion": "in_progress",
+    "consultation": "in_progress",
+}
 
 #: The `council_opinion` column, read off the sentence where the council
 #: speaks: "le conseil de quartier ... est d'accord", "recommande ... de ne
@@ -237,6 +300,8 @@ class PlanningItem:
     max_height_m: float | None = None
     storeys: list[int] = field(default_factory=list)
     decision: str | None = None
+    #: `OUTCOMES[decision]`: approved | refused | in_progress, or None.
+    outcome: str | None = None
     decision_date: date | None = None
     council_opinion: str | None = None
     council_opinion_excerpt: str | None = None
@@ -424,6 +489,15 @@ def addresses(text: str) -> list[str]:
     found = []
     for match in _ADDRESS.finditer(text):
         number, street_type, name, direction = match.groups()
+        # "100, chemin Sainte-Foy. Le conseil est d'accord" - the name
+        # pattern tolerates a period inside a token for "St." and so ran on
+        # into the next sentence, and then read its "est" as a cardinal. A
+        # period ends the sentence unless the token before it is one of the
+        # abbreviations a street is written with.
+        sentence_end = _sentence_end(name)
+        if sentence_end is not None:
+            name = name[:sentence_end]
+            direction = None
         name = name.strip().rstrip(".,;:")
         if len(name) < 3:
             continue
@@ -492,6 +566,11 @@ def decision(text: str) -> str | None:
         if pattern.search(text):
             return name
     return None
+
+
+def outcome(decision_name: str | None) -> str | None:
+    """`OUTCOMES` applied to a decision, None for None or an unknown one."""
+    return OUTCOMES.get(decision_name) if decision_name else None
 
 
 def decision_date(text: str) -> date | None:
@@ -595,6 +674,7 @@ def read_item(text: str, *, item_index: int, title: str | None, kind: str | None
     item.max_height_m = max_height(text)
     item.storeys = storeys(text)
     item.decision = decision(text)
+    item.outcome = outcome(item.decision)
     item.decision_date = decision_date(text)
     item.council_opinion, item.council_opinion_excerpt = council_opinion(text)
     item.votes = votes(text)
@@ -643,15 +723,40 @@ def read_minutes(text: str) -> tuple[list[PlanningItem], int]:
     return kept, dropped
 
 
+def item_spans(text: str) -> list[tuple[int, int, int]]:
+    """``[(item_index, start, end)]``: where each agenda item of a minute
+    sits in `repair_text(text)`, planning items and dropped ones alike.
+
+    What `read_minutes` reads is a span of the repaired text, and the
+    corpus is chunked from the same repaired text - so a chunk and an item
+    overlap, or do not, by character offset. A minute whose agenda cannot
+    be cut is one item at index 0 spanning the whole text, as
+    `read_minutes` reads it.
+    """
+    text = repair_text(text)
+    items = agenda_items(text)
+    if not items:
+        return [(0, 0, len(text))]
+    spans: list[tuple[int, int, int]] = []
+    cursor = 0
+    for agenda in items:
+        start = text.find(agenda.text, cursor)
+        if start < 0:  # pragma: no cover - agenda.text is a slice of `text`
+            continue
+        spans.append((agenda.number, start, start + len(agenda.text)))
+        cursor = start + 1
+    return spans
+
+
 def read_document(text: str, *, title: str | None = None) -> PlanningItem:
     """One trail document - sommaire, extract, report, fiche - as one item."""
     text = repair_text(text)
     if title is None:
-        title = _first_title(text)
+        title = first_title(text)
     return read_item(text, item_index=0, title=title)
 
 
-def _first_title(text: str) -> str | None:
+def first_title(text: str) -> str | None:
     """The sommaire's *Objet*, an extract's resolution line, a report's
     subject, a fiche's heading - the first line that reads like a title."""
     # A sommaire prints its *Objet* over several lines, between the
@@ -673,10 +778,14 @@ __all__ = [
     "AgendaItem",
     "DwellingChange",
     "ITEM_KINDS",
+    "OUTCOMES",
     "PLANNING_KINDS",
     "PlanningItem",
     "agenda_items",
     "classify_item",
+    "first_title",
+    "item_spans",
+    "outcome",
     "read_document",
     "read_item",
     "read_minutes",

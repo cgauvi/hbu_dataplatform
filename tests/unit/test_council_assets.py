@@ -10,10 +10,12 @@ import pytest
 from dagster import MultiPartitionKey, materialize
 
 from asset_helpers import stub_publish
+from test_documents import WordRuler
 from test_quebec_council import FakeResponse, make_pdf
 from hbu_dataplatform.cities.quebec_city.council import assets as council_assets
 from hbu_dataplatform.cities.quebec_city.council.assets import (
     council_minutes,
+    council_minutes_chunks,
     council_minutes_documents,
     council_planning_items,
 )
@@ -21,7 +23,7 @@ from hbu_dataplatform.rag.documents import PdfFetcher
 from hbu_dataplatform.cities.quebec_city.council.councils import CouncilFetcher
 from hbu_dataplatform.cities.quebec_city.resources import CouncilMinutesResource
 from hbu_dataplatform.core.resources import ParquetStore, PostgisResource
-from hbu_dataplatform.rag.resources import PdfCache
+from hbu_dataplatform.rag.resources import EmbeddingModel, PdfCache
 
 DATE = "2026-08-01"
 
@@ -162,10 +164,76 @@ def run(assets, store, tmp_path, *, neighborhood="CIL", council_ids=(12,)):
             "pdf_cache": PdfCache(cache_dir=str(tmp_path / "cache")),
             "council_minutes_source": CouncilMinutesResource(),
             "postgis": PostgisResource(),
+            # Small chunks, measured in words: the point is the cut and the
+            # join back to the items, not the encoder.
+            "embedding_model": EmbeddingModel(max_tokens=40, overlap_tokens=0),
         },
         run_config={"ops": ops},
         raise_on_error=False,
     )
+
+
+@pytest.fixture
+def word_ruler(monkeypatch):
+    monkeypatch.setattr(EmbeddingModel, "ruler", lambda self: WordRuler())
+
+
+@pytest.fixture
+def stub_corpus_db(monkeypatch):
+    """The chunks' upsert into silver.document_chunks and the items' sites,
+    both of which need PostGIS, recorded rather than run."""
+    from contextlib import contextmanager
+
+    import geopandas as gpd
+
+    seen: dict[str, object] = {"chunks": None, "sites": None, "datasets": {}, "partition": None}
+
+    def publish(connect_fn, datasets, *, partition, scrape_date):
+        # `stub_publish` would also replace the connection with a bare object,
+        # which the chunks asset cannot take a cursor from - so the items'
+        # publish is recorded here, the same way, on the same connection.
+        seen["datasets"] = dict(datasets)
+        seen["partition"] = (partition, scrape_date)
+        return {
+            name: {"copied": len(frame), "duplicates": 0, "upserted": len(frame), "pruned": 0}
+            for name, frame in datasets.items()
+        }
+
+    def upsert_frame(connection, dataset, frame, *, partition, scrape_date, prune=True):
+        seen["chunks"] = (dataset, frame, partition, scrape_date, prune)
+        return {"copied": len(frame), "duplicates": 0, "upserted": len(frame), "pruned": 0}
+
+    def compute(connection, *, neighborhood, scrape_date):
+        seen["sites"] = (neighborhood, scrape_date)
+        return {
+            "loaded": {}, "num_sites": 0, "sites_by_kind": {}, "sites_by_match_basis": {},
+            "num_items": 0, "num_items_on_a_parcel": 0, "num_items_placed": 0,
+            "named": {}, "unplaced": {}, "unplaced_sample": {},
+        }
+
+    def read(connection, *, neighborhood, scrape_date):
+        return gpd.GeoDataFrame({"doc_id": []}, geometry=gpd.GeoSeries([], crs="EPSG:4326"))
+
+    class _Cursor:
+        rowcount = 0
+
+        def execute(self, *_a, **_k):
+            return None
+
+    class _Connection:
+        def cursor(self):
+            return _Cursor()
+
+    @contextmanager
+    def connect(self):
+        yield _Connection()
+
+    monkeypatch.setattr(PostgisResource, "connect", connect)
+    monkeypatch.setattr(council_assets, "publish", publish)
+    monkeypatch.setattr(council_assets, "upsert_frame", upsert_frame)
+    monkeypatch.setattr(council_assets, "compute_council_item_sites", compute)
+    monkeypatch.setattr(council_assets, "read_council_item_sites", read)
+    return seen
 
 
 def test_the_minutes_land_as_one_row_per_pdf_with_their_links(host, store, tmp_path):
@@ -227,14 +295,17 @@ def test_the_trail_follows_the_fiche_to_the_sommaire_to_the_extract(host, store,
     assert host.calls.count(SOMMAIRE) == 1
 
 
-def test_the_planning_items_are_one_per_agenda_item_and_one_per_document(host, store, tmp_path, monkeypatch):
-    seen = stub_publish(monkeypatch, council_assets)
+def test_the_planning_items_are_one_per_agenda_item_and_one_per_document(host, store, tmp_path, monkeypatch, stub_corpus_db):
+    seen = stub_corpus_db
     result = run([council_minutes, council_minutes_documents, council_planning_items], store, tmp_path)
     assert result.success
     frame = pd.read_parquet(store.partition_dir("council_planning_items", DATE, "CIL") + "/items.parquet")
 
     assert seen["partition"] == ("CIL", DATE)
     assert list(seen["datasets"]) == ["council_planning_items"]
+    # The sites are computed once the items are in the table, and kept.
+    assert stub_corpus_db["sites"] == ("CIL", DATE)
+    assert pd.read_parquet(store.partition_dir("council_planning_items", DATE, "CIL") + "/sites.parquet").empty
 
     minute_items = frame[frame["source_kind"] == "minutes"]
     # The June minute's item 3 is the only agenda item about planning; the
@@ -264,17 +335,27 @@ def test_the_planning_items_are_one_per_agenda_item_and_one_per_document(host, s
     assert fiche["title"].startswith("Augmentation du nombre de logements")
     assert fiche["max_dwellings_after"] == 10
 
+    # Outcome: the extract adopted; the sommaire and the consultation are
+    # stages short of a decision.
+    assert extract["outcome"] == "approved"
+    assert sommaire["outcome"] == "in_progress" and consultation["outcome"] == "in_progress"
+    # Without a corpus run, the citations carry the PDFs and the trail alone.
+    cited = json.loads(consultation["citations"])
+    assert cited["url"] == MINUTE_JUNE and cited["chunk_ids"] == []
+    assert [t["url"] for t in cited["trail"]] == [FICHE, SOMMAIRE, EXTRACT]
+    assert json.loads(extract["citations"])["minutes"] == [{"doc_id": consultation["doc_id"], "url": MINUTE_JUNE}]
+
     metadata = result.asset_materializations_for_node("silver__council_planning_items")[0].metadata
     assert metadata["num_from_minutes"].value == 1
     assert metadata["num_from_documents"].value == 3
     assert metadata["num_agenda_items_dropped"].value == 4 + 3
     assert metadata["num_minutes_without_items"].value == 1
     assert metadata["num_with_dwelling_cap"].value == 3
+    assert metadata["num_with_chunk_citations"].value == 0
 
 
-def test_the_items_survive_without_a_trail(host, store, tmp_path, monkeypatch):
+def test_the_items_survive_without_a_trail(host, store, tmp_path, monkeypatch, stub_corpus_db):
     """A partition whose trail asset never ran still reads its minutes."""
-    stub_publish(monkeypatch, council_assets)
     assert run([council_minutes], store, tmp_path).success
     result = materialize(
         [council_planning_items],
@@ -284,3 +365,66 @@ def test_the_items_survive_without_a_trail(host, store, tmp_path, monkeypatch):
     assert result.success
     frame = pd.read_parquet(store.partition_dir("council_planning_items", DATE, "CIL") + "/items.parquet")
     assert list(frame["source_kind"]) == ["minutes"]
+
+
+# ---------------------------------------------------------------------------
+# the corpus
+# ---------------------------------------------------------------------------
+
+
+def test_the_corpus_chunks_every_document_under_its_own_source_table(host, store, tmp_path, word_ruler, stub_corpus_db):
+    result = run([council_minutes, council_minutes_documents, council_minutes_chunks], store, tmp_path)
+    assert result.success
+    chunks = pd.read_parquet(store.partition_dir("council_minutes_chunks", DATE, "CIL") + "/chunks.parquet")
+    assert set(chunks["source_table"]) == {"council_minutes", "council_fiche", "council_gpd"}
+    minutes = pd.read_parquet(store.partition_dir("council_minutes", DATE, "CIL") + "/minutes.parquet")
+    june = chunks[chunks["doc_id"] == minutes["doc_id"].iloc[0]]
+    assert len(june) >= 2, "a 40-word budget cuts the June minute into several chunks"
+    assert list(june["chunk_index"]) == list(range(len(june)))
+    assert june["chunk_id"].iloc[0] == f"{minutes['doc_id'].iloc[0]}:0000"
+    assert june["title"].iloc[0] == "Procès-verbal du conseil de quartier de Montcalm, 16 juin 2025"
+    # The chunk naming the zone carries it as its feature id.
+    assert any(json.loads(ids) == ["14040Hb"] for ids in june["feature_ids"])
+    gpd_titles = list(chunks[chunks["source_table"] == "council_gpd"]["title"])
+    assert any(t.startswith("Sommaire décisionnel GT2025-233") for t in gpd_titles)
+    assert any(t.startswith("Résolution CA1-2025-0215") for t in gpd_titles)
+    # Upserted into the grids' chunk table without pruning the grids.
+    dataset, frame, partition, scrape_date, prune = stub_corpus_db["chunks"]
+    assert (dataset, partition, scrape_date, prune) == ("document_chunks", "CIL", DATE, False)
+    assert len(frame) == len(chunks)
+    metadata = result.asset_materializations_for_node("silver__council_minutes_chunks")[0].metadata
+    assert metadata["num_documents"].value == 5
+
+
+def test_the_items_cite_the_chunks_that_cover_them(host, store, tmp_path, monkeypatch, word_ruler, stub_corpus_db):
+    result = run(
+        [council_minutes, council_minutes_documents, council_minutes_chunks, council_planning_items],
+        store, tmp_path,
+    )
+    assert result.success
+    items = pd.read_parquet(store.partition_dir("council_planning_items", DATE, "CIL") + "/items.parquet")
+    chunks = pd.read_parquet(store.partition_dir("council_minutes_chunks", DATE, "CIL") + "/chunks.parquet")
+    by_id = chunks.set_index("chunk_id")["text"]
+
+    consultation = items[items["source_kind"] == "minutes"].iloc[0]
+    cited = json.loads(consultation["citations"])["chunk_ids"]
+    assert cited, "the consultation item is covered by at least one chunk"
+    covered = " ".join(by_id[c] for c in cited)
+    assert "14040Hb" in covered and "est d’accord" in covered
+    # Every cited chunk is the minute's own.
+    assert all(c.startswith(consultation["doc_id"] + ":") for c in cited)
+
+    # A trail document is one item, so it cites every chunk of itself.
+    extract = items[items["document_number"] == "CA1-2025-0215"].iloc[0]
+    assert json.loads(extract["citations"])["chunk_ids"] == list(chunks[chunks["doc_id"] == extract["doc_id"]]["chunk_id"])
+
+    metadata = result.asset_materializations_for_node("silver__council_planning_items")[0].metadata
+    assert metadata["num_with_chunk_citations"].value == len(items)
+
+
+def test_a_borough_without_councils_has_an_empty_corpus(host, store, tmp_path, word_ruler, stub_corpus_db):
+    result = run([council_minutes, council_minutes_chunks], store, tmp_path, neighborhood="VSMPE", council_ids=())
+    assert result.success
+    chunks = pd.read_parquet(store.partition_dir("council_minutes_chunks", DATE, "VSMPE") + "/chunks.parquet")
+    assert chunks.empty
+    assert stub_corpus_db["chunks"] is None, "nothing is upserted for an empty corpus"
