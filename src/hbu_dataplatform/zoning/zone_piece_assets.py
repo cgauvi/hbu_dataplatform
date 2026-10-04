@@ -59,7 +59,7 @@ zone's feature is not cut at a tile edge any more than at a borough line, so
 `hbu_dataplatform.partitions.axes.tile_partitions`.
 
 **`silver.lot_zone_pieces` is owned by hbu_infra**, like every other table this
-repo writes into - sql/025_silver_lot_zone_pieces.sql. Until it is applied a
+repo writes into - sql/027_silver_lot_zone_pieces.sql. Until it is applied a
 run fails naming the file, which is why this asset is registered and given a
 job but left off the daily schedules. See `hbu_dataplatform.definitions`, and
 `lot_frontage` and `lot_buildable_setbacks` for the same posture.

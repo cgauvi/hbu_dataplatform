@@ -79,7 +79,7 @@ uv run dagster asset materialize --select silver/lot_assessed_values --partition
 uv run dagster asset materialize --select silver/lot_assessment_comparables --partition "2026-09-01|0302303330102" -m hbu_dataplatform.definitions
 
 # how much street each lot faces — needs neighborhood_cadastre first, for the
-# rag.lots this reads, and hbu_infra's sql/007 + sql/008 applied
+# rag.lots this reads, and hbu_infra's sql/009 + sql/010 applied
 uv run dagster asset materialize --select silver/lot_frontage --partition "2026-09-01|0302303330102" -m hbu_dataplatform.definitions
 
 # then the corpus over that snapshot's linked PDFs
@@ -99,7 +99,7 @@ uv run dagster asset materialize --select silver/zoning_grid_columns --partition
 uv run dagster asset materialize --select silver/lot_zoning_envelopes --partition "2026-09-01|0302303330102" -m hbu_dataplatform.definitions
 
 # finally the gold row per lot, which reads the silver parquet partitions
-# above as well as rag.lots — needs hbu_infra's sql/009 + sql/006
+# above as well as rag.lots — needs hbu_infra's sql/011 + sql/008
 uv run dagster asset materialize --select gold/lot_profiles --partition "2026-09-01|0302303330102" -m hbu_dataplatform.definitions
 ```
 
@@ -204,7 +204,7 @@ What that changes for an operator:
 - **A new city is a re-seed, not a registration.** The cut only covers
   ground that has been loaded, so the first `neighborhood_cadastre` run of
   a fourth city fails with `num_rows_outside_cut`. Apply hbu_infra's
-  `028_cell_key.sql` so its lots have a `cell_key`, run
+  `030_cell_key.sql` so its lots have a `cell_key`, run
   `scripts/seed_tile_cut.py` behind the tunnel, paste the `TILE_CITIES` it
   prints into `tile_cut.py` (it refuses to print a cut that moves an
   existing cell — adding a city is additive), and deploy. The new cells

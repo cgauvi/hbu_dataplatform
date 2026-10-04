@@ -53,7 +53,7 @@ TILE = "0302303330102"
 DATE = "2026-08-26"
 
 #: `silver.neighborhood_streets` as `_target_columns` reads it back, in catalog
-#: order - see hbu_infra's sql/007_silver_streets.sql. The one table with both
+#: order - see hbu_infra's sql/009_silver_streets.sql. The one table with both
 #: a column map and a jsonb catch-all, so it exercises every branch of the
 #: matcher; and `loaded_at` is the column no frame ever fills, which is the
 #: other branch.
@@ -329,7 +329,7 @@ def test_a_missing_table_names_the_file_to_apply():
 
     message = str(caught.value)
     assert "silver.neighborhood_streets" in message
-    assert "sql/007_silver_streets.sql" in message
+    assert "sql/009_silver_streets.sql" in message
     assert "db.py init" in message
 
 
@@ -667,7 +667,7 @@ def test_numpy_and_pandas_scalars_survive_the_trip():
 def test_an_integral_float_is_written_without_its_point_zero():
     """A count pandas widened to float64 still has to reach an integer column.
 
-    `num_frontages` is `integer` in sql/012_silver_zoning.sql and comes from a
+    `num_frontages` is `integer` in sql/014_silver_zoning.sql and comes from a
     `groupby().agg(size)`, but it is left-joined onto every lot - and a lot
     facing no street gets NaN, which promotes the whole column to float64. The
     count 1 then reaches the COPY as "1.0" and Postgres refuses it with

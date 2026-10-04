@@ -181,7 +181,7 @@ commercial-rents   06:10   →  silver.commercial_rents
 comparables        06:40   →  prices every square foot against the above
 ```
 
-`sql/020_silver_commercial_rents.sql` has no `-- requires:` header, so the table
+`sql/022_silver_commercial_rents.sql` has no `-- requires:` header, so the table
 lands on the first `db.py init`.
 
 ## What is still stated

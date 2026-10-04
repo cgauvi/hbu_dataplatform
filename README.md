@@ -162,7 +162,7 @@ face of the same server can. `make addresses`, and
 registered and have jobs,
 but **no schedule**: each reads a relation hbu_infra creates. The SQL files all exist; what is
 outstanding is `db.py init` against the target database — twice for
-`lot_profiles`, since `sql/006_lot_documents.sql` carries a
+`lot_profiles`, since `sql/008_lot_documents.sql` carries a
 `-- requires: rag.chunks` header and only lands after `document_index`
 has run.
 

@@ -102,7 +102,7 @@ of it, and a borough-wide run could not see that lot at all. See
 for the read.
 
 **`silver.lot_frontage` is owned by hbu_infra**, like every other table this
-repo writes into - sql/008_silver_lot_frontage.sql. Until it is applied to the
+repo writes into - sql/010_silver_lot_frontage.sql. Until it is applied to the
 database, a run fails naming the file to apply, which is why this asset is
 registered and given a job but left off the daily schedules. See
 `hbu_dataplatform.definitions`, and `lot_profiles` for the same posture.

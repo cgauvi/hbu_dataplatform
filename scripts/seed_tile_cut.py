@@ -3,7 +3,7 @@
 Two jobs, in this order, because the second is worthless if the first fails.
 
 **Does the SQL address the same cell as the Python?** `warehouse.quadkey`
-(hbu_infra/sql/028_cell_key.sql), `hbu_dataplatform.core.tile_grid.quadkey_of` and
+(hbu_infra/sql/030_cell_key.sql), `hbu_dataplatform.core.tile_grid.quadkey_of` and
 `postgis._cell_x_sql` are three spellings of one grid. The unit tests compare
 the first two as arithmetic; this compares them on the rows actually in the
 database, which is the only place a difference between Postgres's `asinh` and
@@ -101,7 +101,7 @@ def main() -> int:
         total, addressed, shortest, longest = cursor.fetchone()
         print(f"rag.lots: {total} row(s), {addressed} addressed")
         if addressed == 0:
-            print("  no cell_key at all - apply hbu_infra/sql/028_cell_key.sql first")
+            print("  no cell_key at all - apply hbu_infra/sql/030_cell_key.sql first")
             return 2
         if (shortest, longest) != (tile_grid.BASE_CELL_ZOOM,) * 2:
             print(
@@ -115,7 +115,7 @@ def main() -> int:
         if check_agreement(cursor, args.sample):
             print(
                 "  !! the SQL and the Python disagree. Do NOT seed a cut from "
-                "this - fix 028_cell_key.sql first."
+                "this - fix 030_cell_key.sql first."
             )
             return 2
 

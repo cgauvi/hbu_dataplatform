@@ -59,24 +59,24 @@ SCHEMA_FILES = (
     "003_warehouse.sql",
     # The lot x feature clips `compute_lot_zone_pieces` cuts its pieces out of,
     # and the building x lot clips it measures each piece's footprint against.
-    "004_silver_building_lots.sql",
-    "005_silver_lot_features.sql",
-    "007_silver_streets.sql",
-    "008_silver_lot_frontage.sql",
+    "006_silver_building_lots.sql",
+    "007_silver_lot_features.sql",
+    "009_silver_streets.sql",
+    "010_silver_lot_frontage.sql",
     # What `compute_lot_buildable_setbacks` reads the margins from, and the
     # table it writes. Neither declares a foreign key on the frontage above, so
     # the order here is only the order the files are numbered in.
-    "012_silver_zoning.sql",
-    "015_silver_lot_buildable_setbacks.sql",
+    "014_silver_zoning.sql",
+    "017_silver_lot_buildable_setbacks.sql",
     # The ground each zone governs. Last because its own migration block
     # re-keys the gold tables, and those are not applied here at all - the
     # block is written to skip a table that is not there, which this ordering
     # is what exercises.
-    "025_silver_lot_zone_pieces.sql",
+    "027_silver_lot_zone_pieces.sql",
     # rag.addresses and silver.lot_addresses. After 025 because the join it
     # backs places every address on a zone piece, so the table it reads has to
     # exist before anything can be written against it.
-    "026_silver_lot_addresses.sql",
+    "028_silver_lot_addresses.sql",
 )
 
 #: The feature layer a zoning clip is filed under, and the one

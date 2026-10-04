@@ -206,31 +206,31 @@ TABLES: dict[str, Table] = {
         asset="vacancy_rates",
         name="vacancy_rates",
         keys=("dwelling_type", "bedroom_type"),
-        source="sql/010_silver_cmhc.sql",
+        source="sql/012_silver_cmhc.sql",
     ),
     "quartier_vacancy_rates": Table(
         asset="vacancy_rates",
         name="quartier_vacancy_rates",
         keys=("quartier", "dwelling_type", "bedroom_type"),
-        source="sql/010_silver_cmhc.sql",
+        source="sql/012_silver_cmhc.sql",
     ),
     "average_rents": Table(
         asset="average_rents",
         name="average_rents",
         keys=("bedroom_type",),
-        source="sql/010_silver_cmhc.sql",
+        source="sql/012_silver_cmhc.sql",
     ),
     "quartier_average_rents": Table(
         asset="average_rents",
         name="quartier_average_rents",
         keys=("quartier", "bedroom_type"),
-        source="sql/010_silver_cmhc.sql",
+        source="sql/012_silver_cmhc.sql",
     ),
     "building_lot_intersections": Table(
         asset="building_lot_intersections",
         name="building_lot_intersections",
         keys=("building_uid", "lot_uid"),
-        source="sql/004_silver_building_lots.sql",
+        source="sql/006_silver_building_lots.sql",
         geometry="geom",
         axis=Axis.TILE,
     ),
@@ -238,7 +238,7 @@ TABLES: dict[str, Table] = {
         asset="building_lot_intersections",
         name="lot_features",
         keys=("lot_uid", "source_table", "feature_id"),
-        source="sql/005_silver_lot_features.sql",
+        source="sql/007_silver_lot_features.sql",
         geometry="geom",
         axis=Axis.TILE,
     ),
@@ -246,7 +246,7 @@ TABLES: dict[str, Table] = {
         asset="neighborhood_streets",
         name="neighborhood_streets",
         keys=("cote_rue_id",),
-        source="sql/007_silver_streets.sql",
+        source="sql/009_silver_streets.sql",
         columns={"cote_rue_id": "COTE_RUE_ID", "street_name": "NOM_VOIE"},
         geometry="geom",
         attributes="attributes",
@@ -256,7 +256,7 @@ TABLES: dict[str, Table] = {
         asset="lot_frontage",
         name="lot_frontage",
         keys=("lot_uid", "cote_rue_id"),
-        source="sql/008_silver_lot_frontage.sql",
+        source="sql/010_silver_lot_frontage.sql",
         geometry="geom",
         axis=Axis.TILE,
     ),
@@ -270,7 +270,7 @@ TABLES: dict[str, Table] = {
         asset="lot_addresses",
         name="lot_addresses",
         keys=("address_id",),
-        source="sql/026_silver_lot_addresses.sql",
+        source="sql/028_silver_lot_addresses.sql",
         geometry="geom",
         axis=Axis.TILE,
     ),
@@ -278,7 +278,7 @@ TABLES: dict[str, Table] = {
         asset="document_chunks",
         name="document_chunks",
         keys=("chunk_id",),
-        source="sql/011_silver_corpus.sql",
+        source="sql/013_silver_corpus.sql",
     ),
     # One row per planning item of one council document: an agenda item of
     # a minute (item_index is the agenda number) or one trail document
@@ -288,7 +288,7 @@ TABLES: dict[str, Table] = {
         asset="council_planning_items",
         name="council_planning_items",
         keys=("doc_id", "item_index"),
-        source="sql/030_silver_council_planning_items.sql",
+        source="sql/032_silver_council_planning_items.sql",
     ),
     # One row per (planning item, site): the lot, the parcel under a civic
     # address, or the zone an item names, with its geometry - the join from
@@ -299,14 +299,14 @@ TABLES: dict[str, Table] = {
         asset="council_planning_items",
         name="council_item_sites",
         keys=("doc_id", "item_index", "site_kind", "site_key"),
-        source="sql/032_silver_council_item_sites.sql",
+        source="sql/035_silver_council_item_sites.sql",
         geometry="geom",
     ),
     "zoning_grid_columns": Table(
         asset="zoning_grid_columns",
         name="zoning_grid_columns",
         keys=("source_table", "feature_id", "column_index"),
-        source="sql/012_silver_zoning.sql",
+        source="sql/014_silver_zoning.sql",
     ),
     # One row per (lot, zone) - the piece of a parcel one grid governs, as a
     # site in its own right. Narrower than the envelopes below on purpose: a
@@ -318,7 +318,7 @@ TABLES: dict[str, Table] = {
         asset="lot_zone_pieces",
         name="lot_zone_pieces",
         keys=("lot_uid", "feature_id"),
-        source="sql/025_silver_lot_zone_pieces.sql",
+        source="sql/027_silver_lot_zone_pieces.sql",
         geometry="geom",
         axis=Axis.TILE,
     ),
@@ -326,7 +326,7 @@ TABLES: dict[str, Table] = {
         asset="lot_zoning_envelopes",
         name="lot_zoning_envelopes",
         keys=("lot_uid", "feature_id", "column_index"),
-        source="sql/012_silver_zoning.sql",
+        source="sql/014_silver_zoning.sql",
         axis=Axis.TILE,
     ),
     # The same key as the envelopes it subtracts the margins from, because it
@@ -336,7 +336,7 @@ TABLES: dict[str, Table] = {
         asset="lot_buildable_setbacks",
         name="lot_buildable_setbacks",
         keys=("lot_uid", "feature_id", "column_index"),
-        source="sql/015_silver_lot_buildable_setbacks.sql",
+        source="sql/017_silver_lot_buildable_setbacks.sql",
         geometry="geom",
         axis=Axis.TILE,
     ),
@@ -358,7 +358,7 @@ TABLES: dict[str, Table] = {
         asset="assessment_units",
         name="assessment_units",
         keys=("id_provinc",),
-        source="sql/014_silver_assessment_units.sql",
+        source="sql/016_silver_assessment_units.sql",
         columns={
             "use_code": "rl0105a",
             # No entry needed for `use_description` beside it: that column is
@@ -384,7 +384,7 @@ TABLES: dict[str, Table] = {
         asset="lot_assessed_values",
         name="lot_assessed_values",
         keys=("lot_number",),
-        source="sql/013_silver_lot_assessed_values.sql",
+        source="sql/015_silver_lot_assessed_values.sql",
         # Infolot shouts its columns, this platform does not - the same one
         # entry `neighborhood_streets` needs for `COTE_RUE_ID`. Everything
         # else the cadastre publishes about the lot lands in `attributes`.
@@ -415,14 +415,14 @@ TABLES: dict[str, Table] = {
         asset="commercial_rents",
         name="commercial_rents",
         keys=("rent_class",),
-        source="sql/020_silver_commercial_rents.sql",
+        source="sql/022_silver_commercial_rents.sql",
         attributes="attributes",
     ),
     "lot_assessment_comparables": Table(
         asset="lot_assessment_comparables",
         name="lot_assessment_comparables",
         keys=("lot_number",),
-        source="sql/016_silver_lot_assessment_comparables.sql",
+        source="sql/018_silver_lot_assessment_comparables.sql",
         columns={"lot_number": "NO_LOT"},
         geometry="geom",
         attributes="attributes",
@@ -436,7 +436,7 @@ TABLES: dict[str, Table] = {
         asset="lot_development_programs",
         name="lot_development_programs",
         keys=("lot_uid", "feature_id", "column_index"),
-        source="sql/017_silver_lot_development_programs.sql",
+        source="sql/019_silver_lot_development_programs.sql",
         axis=Axis.TILE,
     ),
     # -- gold --------------------------------------------------------------
@@ -444,7 +444,7 @@ TABLES: dict[str, Table] = {
         asset="lot_profiles",
         name="lot_profiles",
         keys=("lot_number",),
-        source="sql/009_gold_lot_profiles.sql",
+        source="sql/011_gold_lot_profiles.sql",
         geometry="geom",
         axis=Axis.TILE,
     ),
@@ -466,7 +466,7 @@ TABLES: dict[str, Table] = {
         asset="lot_highest_best_use",
         name="lot_highest_best_use",
         keys=("lot_uid", "feature_id"),
-        source="sql/018_gold_lot_highest_best_use.sql",
+        source="sql/020_gold_lot_highest_best_use.sql",
         axis=Axis.TILE,
     ),
     # The shortlist, keyed the way the gap table it ranks is. No geometry:
@@ -477,7 +477,7 @@ TABLES: dict[str, Table] = {
         asset="lot_investment_opportunities",
         name="lot_investment_opportunities",
         keys=("lot_uid", "feature_id"),
-        source="sql/021_gold_lot_investment_opportunities.sql",
+        source="sql/023_gold_lot_investment_opportunities.sql",
         attributes="attributes",
         axis=Axis.TILE,
     ),
@@ -485,7 +485,7 @@ TABLES: dict[str, Table] = {
         asset="lot_redevelopment_gap",
         name="lot_redevelopment_gap",
         keys=("lot_uid", "feature_id"),
-        source="sql/019_gold_lot_redevelopment_gap.sql",
+        source="sql/021_gold_lot_redevelopment_gap.sql",
         axis=Axis.TILE,
     ),
     # The same key as the two above, and the one spatial table of the three.
@@ -500,7 +500,7 @@ TABLES: dict[str, Table] = {
         asset="lot_building_massing",
         name="lot_building_massing",
         keys=("lot_uid", "feature_id"),
-        source="sql/022_gold_lot_building_massing.sql",
+        source="sql/024_gold_lot_building_massing.sql",
         geometry="geom",
         axis=Axis.TILE,
     ),
@@ -520,7 +520,7 @@ TABLES: dict[str, Table] = {
         asset="lot_building_massing",
         name="lot_surface_parking",
         keys=("lot_uid", "feature_id"),
-        source="sql/024_gold_lot_surface_parking.sql",
+        source="sql/026_gold_lot_surface_parking.sql",
         geometry="geom",
         axis=Axis.TILE,
     ),
@@ -538,7 +538,7 @@ TABLES: dict[str, Table] = {
         asset="map_cell_aggregates",
         name="map_cell_aggregates",
         keys=("layer", "cell_z", "cell_x", "cell_y"),
-        source="sql/023_gold_map_cell_aggregates.sql",
+        source="sql/025_gold_map_cell_aggregates.sql",
         geometry="geom",
         attributes="attributes",
     ),
@@ -782,7 +782,7 @@ def published_metadata(results: Mapping[str, dict[str, int]]) -> dict[str, int]:
 #
 # `hbu_dataplatform.core.digest` decides what a dataset's content hashes to. This is where
 # the answer is kept and compared, in `warehouse.dataset_versions`
-# (029_dataset_versions.sql).
+# (031_dataset_versions.sql).
 #
 # The shape a caller uses:
 #

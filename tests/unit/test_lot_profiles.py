@@ -673,11 +673,11 @@ def test_a_missing_hbu_infra_relation_names_the_file_to_apply(store, monkeypatch
         monkeypatch,
         compute_raises=MissingRelation(
             "hbu_infra has not created: rag.lot_documents "
-            "(sql/006_lot_documents.sql)"
+            "(sql/008_lot_documents.sql)"
         ),
     )
 
-    with pytest.raises(Failure, match="sql/006_lot_documents.sql"):
+    with pytest.raises(Failure, match="sql/008_lot_documents.sql"):
         run(store)
 
 

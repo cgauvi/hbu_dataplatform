@@ -430,7 +430,7 @@ def test_zero_selects_only_the_lots_no_building_touches():
 def test_a_missing_relation_names_the_hbu_infra_file_to_apply():
     """`rag.lot_documents` is the one most likely to be absent.
 
-    sql/006 carries a `-- requires: rag.chunks` header, so `db.py init` skips
+    sql/008 carries a `-- requires: rag.chunks` header, so `db.py init` skips
     it until a corpus has been indexed.
     """
     cursor = FakeCursor(missing=("rag.lot_documents",))
@@ -440,7 +440,7 @@ def test_a_missing_relation_names_the_hbu_infra_file_to_apply():
 
     message = str(caught.value)
     assert "rag.lot_documents" in message
-    assert "sql/006_lot_documents.sql" in message
+    assert "sql/008_lot_documents.sql" in message
     assert not any(
         "INSERT" in statement or "DELETE" in statement
         for statement, _ in cursor.statements
@@ -462,7 +462,7 @@ def test_an_outdated_view_names_the_file_to_re_apply():
 
     message = str(caught.value)
     assert "rag.lot_documents.overlap_area_m2" in message
-    assert "sql/006_lot_documents.sql" in message
+    assert "sql/008_lot_documents.sql" in message
     assert not any(
         "INSERT" in statement or "DELETE" in statement
         for statement, _ in cursor.statements
@@ -518,8 +518,8 @@ def test_every_missing_relation_is_reported_at_once():
         compute(cursor)
 
     message = str(caught.value)
-    assert "sql/008_silver_lot_frontage.sql" in message
-    assert "sql/009_gold_lot_profiles.sql" in message
+    assert "sql/010_silver_lot_frontage.sql" in message
+    assert "sql/011_gold_lot_profiles.sql" in message
 
 
 def test_the_default_threshold_keeps_a_shed_and_drops_a_garage():
@@ -740,7 +740,7 @@ def test_a_partition_with_no_cost_guide_writes_an_empty_object_not_null():
 
 
 def test_a_partition_with_no_cmhc_figures_writes_an_empty_object_not_null():
-    """`vacancy_rates` is NOT NULL in 009_gold_lot_profiles.sql, and '{}' is a
+    """`vacancy_rates` is NOT NULL in 011_gold_lot_profiles.sql, and '{}' is a
     different answer from a suppressed grid."""
     cursor = FakeCursor()
 

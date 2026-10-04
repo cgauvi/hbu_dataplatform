@@ -30,7 +30,7 @@ Quebec's cadastre, keyed by `NO_LOT`; the features come from Montreal's
 Spectrum service, keyed by `NUMERO_COMPLET`, and neither publisher carries the
 other's key. Geometry is the only thing the two share, so the join is spatial
 by necessity rather than by choice - see `compute_lot_features`, and
-hbu_infra's sql/005_silver_lot_features.sql for the table.
+hbu_infra's sql/007_silver_lot_features.sql for the table.
 
 `silver.lot_frontage` is the third derived join, and the one that answers "how
 much of this lot faces a street". Its right-hand side is the cadastre itself:
@@ -44,7 +44,7 @@ taken on `ST_Boundary` rather than on the lot - a lot is a polygon, and
 `ST_Length` of a polygon is zero, so intersecting the two solids would report
 nothing. See `compute_lot_frontage`, and `DEFAULT_ROAD_LOT_MIN_STREET_M` for
 why the roll cannot identify a road lot here. hbu_infra's
-sql/007_silver_streets.sql and sql/008_silver_lot_frontage.sql have the two
+sql/009_silver_streets.sql and sql/010_silver_lot_frontage.sql have the two
 tables.
 
 `gold.lot_profiles` is where the three joins above come back together, at the
@@ -1209,7 +1209,7 @@ _LOTS_WITHOUT_FRONTAGE_SAMPLE = 20
 #: whichever the planner resolved first.
 _FRONTAGE_RELATIONS: tuple[tuple[str, str], ...] = (
     ("rag.lots", "sql/002_spatial.sql"),
-    ("silver.neighborhood_streets", "sql/007_silver_streets.sql"),
+    ("silver.neighborhood_streets", "sql/009_silver_streets.sql"),
 )
 
 
@@ -2060,12 +2060,12 @@ SIDE_SETBACK_FACTORS: dict[str, float] = {
 #: them - it is the target, and `warehouse.upsert_select` checks that one.
 _BUILDABLE_RELATIONS: tuple[tuple[str, str], ...] = (
     ("rag.lots", "sql/002_spatial.sql"),
-    ("silver.lot_frontage", "sql/008_silver_lot_frontage.sql"),
-    ("silver.lot_zoning_envelopes", "sql/012_silver_zoning.sql"),
+    ("silver.lot_frontage", "sql/010_silver_lot_frontage.sql"),
+    ("silver.lot_zoning_envelopes", "sql/014_silver_zoning.sql"),
     # The ground each zone actually governs. Without it the margins would come
     # off the whole parcel for every zone that touches it, and two columns of
     # two different grids would each be handed the same lot.
-    ("silver.lot_zone_pieces", "sql/025_silver_lot_zone_pieces.sql"),
+    ("silver.lot_zone_pieces", "sql/027_silver_lot_zone_pieces.sql"),
 )
 
 #: The per-lot temp table the boundary sort lands in, named to the same
@@ -3023,7 +3023,7 @@ DEFAULT_MAX_BUILT_AREA_M2 = 30.0
 #: cadastral boundary and a zoning boundary are drawn by two offices from two
 #: surveys, so they miss each other by centimetres along every lot line and
 #: each parcel clips a corner of its neighbour's zone. `silver.lot_features`
-#: keeps those rows deliberately - 005_silver_lot_features.sql argues that the
+#: keeps those rows deliberately - 007_silver_lot_features.sql argues that the
 #: cutoff belongs to the question being asked - and this is the value each
 #: question that asks "which zone governs this lot" answers at.
 #:
@@ -3134,11 +3134,11 @@ ZONE_PIECE_METRIC_SRID = FRONTAGE_METRIC_SRID
 #: creates each. `silver.lot_zone_pieces` is deliberately not among them - it
 #: is the target, and `warehouse.upsert_select` checks that one.
 _ZONE_PIECE_RELATIONS: tuple[tuple[str, str], ...] = (
-    ("silver.lot_features", "sql/005_silver_lot_features.sql"),
-    ("silver.lot_frontage", "sql/008_silver_lot_frontage.sql"),
+    ("silver.lot_features", "sql/007_silver_lot_features.sql"),
+    ("silver.lot_frontage", "sql/010_silver_lot_frontage.sql"),
     (
         "silver.building_lot_intersections",
-        "sql/004_silver_building_lots.sql",
+        "sql/006_silver_building_lots.sql",
     ),
 )
 
@@ -3605,20 +3605,20 @@ SELECT
 #: rather than on whichever identifier the planner happened to resolve first.
 _LOT_PROFILE_RELATIONS: tuple[tuple[str, str], ...] = (
     ("rag.lots", "sql/002_spatial.sql"),
-    ("silver.building_lot_intersections", "sql/004_silver_building_lots.sql"),
-    ("silver.lot_frontage", "sql/008_silver_lot_frontage.sql"),
+    ("silver.building_lot_intersections", "sql/006_silver_building_lots.sql"),
+    ("silver.lot_frontage", "sql/010_silver_lot_frontage.sql"),
     # A view, and the one most likely to be missing: 006 carries a
     # `-- requires: rag.chunks` header, so `db.py init` skips it on a database
     # that has never held a corpus and it only lands on the *next* init after
     # document_index has run.
-    ("rag.lot_documents", "sql/006_lot_documents.sql"),
+    ("rag.lot_documents", "sql/008_lot_documents.sql"),
     (
         "silver.lot_assessed_values",
-        "sql/013_silver_lot_assessed_values.sql",
+        "sql/015_silver_lot_assessed_values.sql",
     ),
     (
         "silver.lot_assessment_comparables",
-        "sql/016_silver_lot_assessment_comparables.sql",
+        "sql/018_silver_lot_assessment_comparables.sql",
     ),
     # Read twice below - once narrowed to the row governing each lot, once at
     # its own grain to merge into the envelope entries - so a database without
@@ -3626,9 +3626,9 @@ _LOT_PROFILE_RELATIONS: tuple[tuple[str, str], ...] = (
     # planner resolved first.
     (
         "silver.lot_buildable_setbacks",
-        "sql/015_silver_lot_buildable_setbacks.sql",
+        "sql/017_silver_lot_buildable_setbacks.sql",
     ),
-    ("gold.lot_profiles", "sql/009_gold_lot_profiles.sql"),
+    ("gold.lot_profiles", "sql/011_gold_lot_profiles.sql"),
 )
 
 #: Columns `compute_lot_profiles` reads that arrived after the relation holding
@@ -3640,7 +3640,7 @@ _LOT_PROFILE_RELATIONS: tuple[tuple[str, str], ...] = (
 #: been. Without this the partition fails on `column ld.overlap_area_m2 does
 #: not exist`, which names neither the view nor the file to re-apply.
 _LOT_PROFILE_REQUIRED_COLUMNS: tuple[tuple[str, str, str], ...] = (
-    ("rag.lot_documents", "overlap_area_m2", "sql/006_lot_documents.sql"),
+    ("rag.lot_documents", "overlap_area_m2", "sql/008_lot_documents.sql"),
 )
 
 
@@ -5013,7 +5013,7 @@ def compute_map_cell_aggregates(
     cursor = connection.cursor()
     _require_relations(
         cursor,
-        (("gold.map_cell_aggregates", "sql/023_gold_map_cell_aggregates.sql"),),
+        (("gold.map_cell_aggregates", "sql/025_gold_map_cell_aggregates.sql"),),
     )
     _create_aggregate_staging(cursor)
 
@@ -5565,9 +5565,9 @@ def fetch_lot_zone_pieces(
 #: `rag.lots` is checked too, and separately from `WORKING_SET_RELATIONS`,
 #: because a database can legitimately hold the working set and not this.
 _ADDRESS_RELATIONS: tuple[tuple[str, str], ...] = (
-    ("rag.addresses", "sql/026_silver_lot_addresses.sql"),
+    ("rag.addresses", "sql/028_silver_lot_addresses.sql"),
     ("rag.lots", "sql/002_spatial.sql"),
-    ("silver.lot_zone_pieces", "sql/025_silver_lot_zone_pieces.sql"),
+    ("silver.lot_zone_pieces", "sql/027_silver_lot_zone_pieces.sql"),
 )
 
 #: How far off a parcel an address point may sit and still be that parcel's.

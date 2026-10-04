@@ -50,7 +50,7 @@ side of it, and a borough-wide run read that side as open ground. See
 `hbu_dataplatform.partitions.axes.tile_partitions`.
 
 **`silver.lot_buildable_setbacks` is owned by hbu_infra**, like every other
-table this repo writes into - sql/015_silver_lot_buildable_setbacks.sql. Until
+table this repo writes into - sql/017_silver_lot_buildable_setbacks.sql. Until
 it is applied a run fails naming the file, which is why this asset is
 registered and given a job but left off the daily schedules. See
 `hbu_dataplatform.definitions`, and `lot_frontage` and `lot_profiles` for the same

@@ -101,7 +101,7 @@ rag.lots  ──ST_Intersection──▶  silver.lot_features  ──feature_id�
  NO_LOT                          pct_of_lot                        url, text
 ```
 
-and `rag.lot_documents` (hbu_infra, `sql/006_lot_documents.sql`) is that chain
+and `rag.lot_documents` (hbu_infra, `sql/008_lot_documents.sql`) is that chain
 written once:
 
 ```sql

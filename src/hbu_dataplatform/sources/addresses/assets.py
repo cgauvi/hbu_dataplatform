@@ -41,7 +41,7 @@ points go into `rag.addresses`. The join then reads the parts back out of the
 jsonb rather than re-implementing a regex in SQL.
 
 **`silver.lot_addresses` and `rag.addresses` are owned by hbu_infra** —
-sql/026_silver_lot_addresses.sql. Until it is applied a run fails naming the
+sql/028_silver_lot_addresses.sql. Until it is applied a run fails naming the
 file, which is why the silver asset is registered and given a job but left off
 the daily schedules, the posture `lot_frontage` and `lot_zone_pieces` take.
 """

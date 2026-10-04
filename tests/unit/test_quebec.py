@@ -54,7 +54,7 @@ def test_every_key_belongs_to_one_city():
 def test_the_collision_source_namespace_exists_to_resolve_is_real():
     """Two Montreal boroughs publish the same zone number under the same slug.
 
-    This is what 005_silver_lot_features.sql widened the uniqueness of
+    This is what 007_silver_lot_features.sql widened the uniqueness of
     `rag.features` for, and it is the whole reason a fourth column is in that
     key at all. `frames.table_slug` drops the namespace deliberately - the slug
     has to match `rag.chunks.source_table` - so the slug alone cannot tell the

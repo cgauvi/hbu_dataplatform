@@ -726,7 +726,7 @@ def monthly_assessment_roll_schedule(context: ScheduleEvaluationContext) -> RunR
     #
     # Scheduled, unlike `lot_frontage` and `lot_profiles`: this asset also
     # upserts into silver.lot_assessed_values, but hbu_infra's
-    # sql/013_silver_lot_assessed_values.sql carries no `-- requires:` header,
+    # sql/015_silver_lot_assessed_values.sql carries no `-- requires:` header,
     # so it lands on the *first* `db.py init` - the same footing
     # `neighborhood_streets` and the CMHC pair are on.
     cron_schedule="40 7 1 * *",
@@ -788,7 +788,7 @@ def monthly_commercial_rents_schedule(context: ScheduleEvaluationContext):
     # it.
     #
     # Scheduled for the reason lot_assessed_values is: hbu_infra's
-    # sql/016_silver_lot_assessment_comparables.sql carries no `-- requires:`
+    # sql/018_silver_lot_assessment_comparables.sql carries no `-- requires:`
     # header, so the table lands on the first `db.py init` rather than waiting
     # on a corpus the way sql/006 does.
     cron_schedule="20 8 1 * *",
@@ -1054,7 +1054,7 @@ def monthly_document_index_schedule(context: ScheduleEvaluationContext):
 
 # No schedule for `lot_frontage`, and for the same reason as `lot_profiles`
 # below: `silver.lot_frontage` is hbu_infra's to create, and until
-# sql/008_silver_lot_frontage.sql has been applied to the database a nightly
+# sql/010_silver_lot_frontage.sql has been applied to the database a nightly
 # run fails naming it every morning. The file exists in that repo; what is
 # outstanding is `db.py init` against the target database. It is registered and
 # has a job, so it appears in the lineage and can be run by hand the moment the
@@ -1064,7 +1064,7 @@ def monthly_document_index_schedule(context: ScheduleEvaluationContext):
 
 # No schedule for `lot_buildable_setbacks` either, and for the same reason as
 # `lot_frontage` above: `silver.lot_buildable_setbacks` is hbu_infra's to
-# create, and until sql/015_silver_lot_buildable_setbacks.sql has been applied
+# create, and until sql/017_silver_lot_buildable_setbacks.sql has been applied
 # a nightly run fails naming it every morning. It is registered and has a job -
 # see `lot_buildable_setbacks_job` and `make setbacks`. Add the schedule when
 # the table lands, at 35 7: behind `lot_frontage`, whose street edges it sorts
@@ -1114,8 +1114,8 @@ def monthly_document_index_schedule(context: ScheduleEvaluationContext):
 
 # No schedule for `lot_profiles`, unlike every other asset here, and not an
 # oversight: it reads two relations hbu_infra has to create first.
-# sql/009_gold_lot_profiles.sql creates the table it writes into, and
-# sql/006_lot_documents.sql creates the `rag.lot_documents` view it takes the
+# sql/011_gold_lot_profiles.sql creates the table it writes into, and
+# sql/008_lot_documents.sql creates the `rag.lot_documents` view it takes the
 # document columns from - and that second file carries a `-- requires:
 # rag.chunks` header, so `db.py init` skips it on a database that has never
 # held a corpus and it only lands on the *next* init after `document_index` has

@@ -21,7 +21,7 @@ make comparables DATE=2026-09-01 NEIGHBORHOOD=VSMPE OPEX=0.40 K_COMPARABLES=12
 The arithmetic is in [`hbu_dataplatform.hbu.comparables`](../src/hbu_dataplatform/hbu/comparables.py),
 which has no Dagster imports; the partition handling is in
 [`hbu_dataplatform.hbu.comparables_assets`](../src/hbu_dataplatform/hbu/comparables_assets.py). The
-table is hbu_infra's `sql/016_silver_lot_assessment_comparables.sql`.
+table is hbu_infra's `sql/018_silver_lot_assessment_comparables.sql`.
 
 ## It re-derives the placement rather than copying the totals
 

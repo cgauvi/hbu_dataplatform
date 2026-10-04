@@ -14,7 +14,7 @@ into the piece rather than the parcel, so neither program is offered a yard the
 other has already built on.
 
 Written by the `lot_building_massing` asset over `hbu_dataplatform.hbu.massing`; the table
-is hbu_infra's [sql/022](../../hbu_infra/sql/022_gold_lot_building_massing.sql).
+is hbu_infra's [sql/022](../../hbu_infra/sql/024_gold_lot_building_massing.sql).
 
 That asset draws a **second** polygon beside it — the surface parking, on the
 yard the building leaves, in `gold.lot_surface_parking`. It is a separate shape
@@ -93,7 +93,7 @@ to `height_m` would raise a solid where there is a parking lot.
 
 So the same asset draws a second shape and publishes it to
 `gold.lot_surface_parking`, hbu_infra's
-[sql/024](../../hbu_infra/sql/024_gold_lot_surface_parking.sql). One asset, one
+[sql/024](../../hbu_infra/sql/026_gold_lot_surface_parking.sql). One asset, one
 parquet with two geometry columns, two tables in one transaction.
 
 **The yard is the ground, not the envelope.** A setback is a margin a

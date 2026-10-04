@@ -10,7 +10,7 @@ The answer is an integer program, solved by Google OR-Tools' CP-SAT
 (`ortools>=9.10`), and the module is
 [`src/hbu_dataplatform/hbu/program.py`](../src/hbu_dataplatform/hbu/program.py). One call to
 `solve_program` is one row of `silver.lot_development_programs` — hbu_infra's
-[sql/017](../../hbu_infra/sql/017_silver_lot_development_programs.sql).
+[sql/017](../../hbu_infra/sql/019_silver_lot_development_programs.sql).
 
 | | |
 | --- | --- |

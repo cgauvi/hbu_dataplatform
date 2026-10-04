@@ -197,7 +197,7 @@ make addresses DATE=2026-09-01 NEIGHBORHOOD=VSMPE
 make addresses DATE=2026-09-01 NEIGHBORHOOD=VSMPE ADDRESS_SNAP_M=0
 ```
 
-Needs `hbu_infra` `sql/026_silver_lot_addresses.sql` applied — it creates both
+Needs `hbu_infra` `sql/028_silver_lot_addresses.sql` applied — it creates both
 `rag.addresses` and `silver.lot_addresses` — and `make zone-pieces` run first
 for the same partition, since an address is placed on the piece grain and
 without the pieces there is nothing to key it to. Until 026 is applied the run

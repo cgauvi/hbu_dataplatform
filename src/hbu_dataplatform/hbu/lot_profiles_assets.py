@@ -150,7 +150,7 @@ well - `gold.lot_profiles` is what the query side reads, and
 `gold/lot_profiles/<date>/<tile>/` is the record it can be rebuilt from.
 
 **Two of the relations this reads are hbu_infra's to create.**
-sql/009_gold_lot_profiles.sql creates the table itself, and sql/006_lot_documents.sql
+sql/011_gold_lot_profiles.sql creates the table itself, and sql/008_lot_documents.sql
 creates the `rag.lot_documents` view - the second carries a
 `-- requires: rag.chunks` header, so `db.py init` skips it on a database that
 has never held a corpus and it only lands on the next init after

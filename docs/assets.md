@@ -74,8 +74,8 @@ deliberately: it is a *load* of `document_embeddings`, which is already in the
 tree. Its record is that file.
 
 `lot_profiles` is registered and has a job, but **no schedule**, because it
-reads two relations hbu_infra has to create first. `sql/009_gold_lot_profiles.sql`
-creates the table it writes into, and `sql/006_lot_documents.sql` creates the
+reads two relations hbu_infra has to create first. `sql/011_gold_lot_profiles.sql`
+creates the table it writes into, and `sql/008_lot_documents.sql` creates the
 `rag.lot_documents` view it takes the document columns from — and that second
 file carries a `-- requires: rag.chunks` header, so `db.py init` skips it on a
 database that has never held a corpus and it only lands on the *next* init,
@@ -96,18 +96,18 @@ are partitioned by date alone, so one run of them serves every borough of that
 day.
 
 `lot_frontage` is blocked the same way, one step further along: hbu_infra
-*has* `sql/007_silver_streets.sql` and `sql/008_silver_lot_frontage.sql`, but a database
+*has* `sql/009_silver_streets.sql` and `sql/010_silver_lot_frontage.sql`, but a database
 they have not been applied to yet answers `relation "silver.neighborhood_streets" does not
 exist`. So it too is registered, given a job, and left off the schedules
 until `db.py init` has run against the target database. Run it by hand with
 `make frontage`. Its upstream `neighborhood_streets` now owns
 `silver.neighborhood_streets` itself rather than being loaded by this asset on
-the way past, so it needs `sql/007_silver_streets.sql` applied too — and it is
+the way past, so it needs `sql/009_silver_streets.sql` applied too — and it is
 still scheduled normally, since that file has no `-- requires:` header and lands
 on the first `db.py init`.
 
 `lot_zone_pieces` is blocked for the same reason —
-`sql/025_silver_lot_zone_pieces.sql` has to be applied first — and has the same
+`sql/027_silver_lot_zone_pieces.sql` has to be applied first — and has the same
 shape of fix: registered, given a job, run by hand with `make zone-pieces`. It
 sits behind `building_lot_intersections` (the clip and the buildings) and
 `lot_frontage` (the street edges it cuts to each piece), and **ahead of the
@@ -115,7 +115,7 @@ whole zoning chain**: the envelopes join it rather than the raw overlaps, so it
 is the first step of that chain and not an addition to the end of it.
 
 `lot_addresses` is blocked for the same reason once more —
-`sql/026_silver_lot_addresses.sql` has to be applied first, and it creates both
+`sql/028_silver_lot_addresses.sql` has to be applied first, and it creates both
 `rag.addresses` (the working set the join is computed over) and the published
 table. Registered, given a job, run by hand with `make addresses`. It sits
 behind `building_lot_intersections` for the cadastre and `lot_zone_pieces` for
@@ -129,7 +129,7 @@ join alone after a change to the snap tolerance is
 thousand points.
 
 `lot_buildable_setbacks` is blocked for the same reason again —
-`sql/015_silver_lot_buildable_setbacks.sql` has to be applied first — and has
+`sql/017_silver_lot_buildable_setbacks.sql` has to be applied first — and has
 the same shape of fix: registered, given a job, run by hand with `make
 setbacks`. It sits behind `lot_frontage`, `lot_zone_pieces` and the envelope
 pair: the first supplies the street edge it sorts a boundary against, the

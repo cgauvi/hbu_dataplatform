@@ -218,7 +218,7 @@ def test_a_missing_relation_names_the_file_to_apply():
 
     message = str(caught.value)
     assert "silver.lot_zoning_envelopes" in message
-    assert "sql/012_silver_zoning.sql" in message
+    assert "sql/014_silver_zoning.sql" in message
     assert not any(
         "INSERT" in statement or "DELETE" in statement
         for statement, _ in cursor.statements
@@ -242,7 +242,7 @@ def test_the_target_table_is_left_for_the_warehouse_to_check():
     Listing it in `_BUILDABLE_RELATIONS` too would report the same absence from
     two places with two different messages, and the warehouse's is the one that
     knows about partitions. So a database missing only the target still fails
-    naming sql/015 - just not from the pre-flight guard, which by then has
+    naming sql/017 - just not from the pre-flight guard, which by then has
     already passed.
     """
     cursor = FakeCursor(missing=("silver.lot_buildable_setbacks",))
@@ -250,7 +250,7 @@ def test_the_target_table_is_left_for_the_warehouse_to_check():
     with pytest.raises(MissingRelation) as caught:
         compute(cursor)
 
-    assert "sql/015_silver_lot_buildable_setbacks.sql" in str(caught.value)
+    assert "sql/017_silver_lot_buildable_setbacks.sql" in str(caught.value)
     # The pre-flight guard ran and did not ask about the target: every
     # to_regclass before the warehouse's own is one of the three inputs.
     checked = [

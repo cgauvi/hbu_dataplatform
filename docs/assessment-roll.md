@@ -262,7 +262,7 @@ same reason and made visible the same way.
 ## Both have a table, and one of them fills several partitions at once
 
 `lot_assessed_values` owns `silver.lot_assessed_values`
-(`sql/013_silver_lot_assessed_values.sql`), like every other borough-scoped
+(`sql/015_silver_lot_assessed_values.sql`), like every other borough-scoped
 silver asset — one row per `(scrape_date, neighborhood, lot_number)`, the
 cadastre's other columns in the jsonb catch-all, upserted then pruned by
 `hbu_dataplatform.core.warehouse` like all the rest. That file has no `-- requires:`
@@ -270,7 +270,7 @@ header, so it lands on the first `db.py init` and the asset is scheduled
 normally.
 
 `assessment_units` owns `silver.assessment_units`
-(`sql/014_silver_assessment_units.sql`) and is the one asset in the platform
+(`sql/016_silver_assessment_units.sql`) and is the one asset in the platform
 that does **not** publish the partition it was asked for. The roll has no
 borough axis — it is one publication for the province, merged once — so the
 asset stays partitioned by date and its parquet stays province-wide, and the

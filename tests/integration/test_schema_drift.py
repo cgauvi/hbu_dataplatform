@@ -6,15 +6,15 @@ at any point, legible as what it was.
 `gold.lot_profiles` failed to materialize with ``column
 assessed.num_shared_units does not exist``. That reads as a bug in the profile
 query. It was not: `silver.lot_assessed_values` on the dev database had nine
-columns where sql/013 declares twelve, because those three were added to the
+columns where sql/015 declares twelve, because those three were added to the
 file's ``CREATE TABLE IF NOT EXISTS`` *after* the table's first release - and
 that statement is a no-op on a database which already has the table. Every
 `db.py init` since had reported "24 file(s) applied" and changed nothing.
 
 **So the drift is silent by construction, and it is silent for as long as
 nothing selects the column.** hbu_infra's answer is an explicit
-``ALTER TABLE ... ADD COLUMN IF NOT EXISTS`` block per widening - sql/009,
-sql/013, sql/016, sql/019 and sql/021 all carry one - and the failure mode is
+``ALTER TABLE ... ADD COLUMN IF NOT EXISTS`` block per widening - sql/011,
+sql/015, sql/018, sql/021 and sql/023 all carry one - and the failure mode is
 simply forgetting to write it. Nothing checked, which is what this module is.
 
 **It is a check on a deployment, not on the files.** A freshly created database
@@ -228,7 +228,7 @@ def test_every_column_the_map_cell_asset_writes_is_declared_by_its_file(infra):
 
     `postgis.MAP_CELL_COLUMNS` is the list `warehouse.upsert_select` names in
     its INSERT, and the table it inserts into is a temp copy made `LIKE
-    gold.map_cell_aggregates`. So a column the code writes and sql/023 never
+    gold.map_cell_aggregates`. So a column the code writes and sql/025 never
     declares is not a wrong number in a cell - it is ``column
     "dissolved_length_m" of relation "gold_map_cell_aggregates_load" does not
     exist``, on every materialisation, on a fresh database as surely as on an
@@ -299,7 +299,7 @@ def test_a_file_declaring_several_tables_gives_each_only_its_own_columns(infra):
     quartier = _declared_columns(infra, TABLES["quartier_vacancy_rates"])
 
     assert vacancy and quartier
-    # Both live in sql/010 and they are not the same table: the quartier rows
+    # Both live in sql/012 and they are not the same table: the quartier rows
     # are the survey as published, the other is the borough average over them.
     assert "num_quartiers" in vacancy
     assert "num_quartiers" not in quartier

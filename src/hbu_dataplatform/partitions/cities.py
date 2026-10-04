@@ -149,7 +149,7 @@ def source_namespace_for(neighborhood: str) -> str:
     ``(source_table, feature_id, ...)`` plus something, because `source_table`
     is the file slug - `Reglement_urbanisme__VSP_REG_ZONE` - and Montreal
     restarts its zone numbers at C01-001 in every borough. The something has
-    been `neighborhood` since 005_silver_lot_features.sql widened the
+    been `neighborhood` since 007_silver_lot_features.sql widened the
     constraint, and `neighborhood` happens to work only because it is 1:1 with
     the Spectrum namespace that actually distinguishes the two rows. This names
     the real qualifier, so the constraint stops depending on that coincidence.

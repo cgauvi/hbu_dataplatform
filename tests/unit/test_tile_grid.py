@@ -502,7 +502,7 @@ def _quadkey_sql_expressions():
     """
     import re
 
-    path = _infra_sql_dir() / "028_cell_key.sql"
+    path = _infra_sql_dir() / "030_cell_key.sql"
     if not path.is_file():
         pytest.skip(f"hbu_infra sql/ not found at {path.parent} - set {INFRA_ENV}")
     body = path.read_text(encoding="utf-8")
@@ -513,7 +513,7 @@ def _quadkey_sql_expressions():
         body,
         re.DOTALL,
     )
-    assert match, "028_cell_key.sql no longer has the two clamped expressions"
+    assert match, "030_cell_key.sql no longer has the two clamped expressions"
     return match.group(1), match.group(2)
 
 
@@ -557,7 +557,7 @@ def test_the_sql_function_addresses_the_same_cell_as_the_python(monkeypatch):
 def test_the_sql_stores_the_address_at_the_zoom_the_pyramid_is_seeded_at():
     """19 in the file has to be `BASE_CELL_ZOOM`, or every coarser address a
     prefix of it would name the wrong cell."""
-    path = _infra_sql_dir() / "028_cell_key.sql"
+    path = _infra_sql_dir() / "030_cell_key.sql"
     if not path.is_file():
         pytest.skip(f"hbu_infra sql/ not found at {path.parent} - set {INFRA_ENV}")
     body = path.read_text(encoding="utf-8")

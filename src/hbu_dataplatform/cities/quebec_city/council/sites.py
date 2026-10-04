@@ -46,11 +46,11 @@ if TYPE_CHECKING:  # pragma: no cover
 
 #: Every relation the join reads, with the file that creates it.
 _SITE_RELATIONS: tuple[tuple[str, str], ...] = (
-    ("silver.council_planning_items", "hbu_infra sql/030_silver_council_planning_items.sql"),
-    ("silver.council_item_sites", "hbu_infra sql/032_silver_council_item_sites.sql"),
+    ("silver.council_planning_items", "hbu_infra sql/032_silver_council_planning_items.sql"),
+    ("silver.council_item_sites", "hbu_infra sql/035_silver_council_item_sites.sql"),
     ("rag.lots", "hbu_infra sql/002_spatial.sql"),
     ("rag.features", "hbu_infra sql/002_spatial.sql"),
-    ("silver.lot_addresses", "hbu_infra sql/026_silver_lot_addresses.sql"),
+    ("silver.lot_addresses", "hbu_infra sql/028_silver_lot_addresses.sql"),
 )
 
 #: The columns `_SITES_SELECT` produces, in its order - the target's, less
