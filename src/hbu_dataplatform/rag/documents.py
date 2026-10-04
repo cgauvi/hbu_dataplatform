@@ -14,6 +14,7 @@ loading a 2 GB model.
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 import io
 import re
@@ -31,16 +32,16 @@ from hbu_dataplatform.core.http import default_ca_bundle
 
 #: Tables whose URL column points at a document worth indexing, keyed by the
 #: file slug written by ``neighborhood_features``. The zoning grids are the
-#: corpus: one PDF per zone, so a retrieved passage is already scoped to the
-#: parcel the map is asking about.
+#: standing rules: one PDF per zone, so a retrieved passage is already scoped
+#: to the parcel the map is asking about. ``VSP_REG_PPCMOI`` is the other half
+#: of the answer - a *projet particulier* is a resolution that overrides the
+#: grid for one site, so a question about what may be built there is wrong
+#: without it.
 #:
 #: Other tables carry links too, but to web pages (``Education__*``,
 #: ``VSP_REG_BATIMENT_*``), photos (``Ruelle_verte__*``) or a single shared
-#: modality page (``Stationnement__*``, ``VSP_REG_PIIA``). ``VSP_REG_PPCMOI``
-#: is the one genuine second corpus - 227 per-resolution PDFs behind
-#: ``EN_SAVOIR_PLUS`` - and is left out only because a project-specific
-#: resolution answers a different question than a zone's standing rules; add
-#: it here when that question is worth indexing.
+#: modality page (``Stationnement__*``, ``VSP_REG_PIIA``) - none of which is a
+#: document about one place.
 #:
 #: All three cities are here on the same terms, and none of the other two
 #: publishes the link as an attribute. Saguenay's polygons carry no link, so
@@ -54,18 +55,38 @@ DOCUMENT_SOURCES: dict[str, str] = {
     "Reglement_urbanisme__VSP_REG_ZONE": "LIEN_GRILLE",
     "Zonage__ZONAGE_SAGUENAY": "LIEN_GRILLE",
     "Zonage__ZONAGE_EN_VIGUEUR": "LIEN_GRILLE",
+    # 227 per-resolution PDFs behind 229 polygons. Its parquet carries `ID`,
+    # which is already in `assets._ID_COLUMNS`, so the resolutions are filed
+    # against the same feature ids `rag.features` holds and the spatial
+    # searches reach them without further work.
+    "Reglement_urbanisme__VSP_REG_PPCMOI": "EN_SAVOIR_PLUS",
 }
 
 #: Every scraped table that *is* a zoning layer - the ones `lot_zone_pieces`
-#: cuts lots against and `lot_zoning_envelopes` joins grid columns to. Equal to
-#: `DOCUMENT_SOURCES` today, and kept as its own name because the two answer
-#: different questions: a table is a zone source if lots are cut against it,
-#: and a document source if it links prose worth retrieving. Quebec City was
-#: the case that separated them - it is a zone source whose norms are read
-#: from a workbook, and it became a document source only once the per-zone
-#: sheet behind `quebec.DEFAULT_SHEET_URL_TEMPLATE` was found. A table could
-#: still be one and not the other, so the distinction stays.
-ZONING_SOURCES: tuple[str, ...] = tuple(DOCUMENT_SOURCES)
+#: cuts lots against and `lot_zoning_envelopes` joins grid columns to.
+#:
+#: This USED to be `tuple(DOCUMENT_SOURCES)`, and stopped being so the moment
+#: PPCMOI joined the corpus. A projet particulier is a document about a site;
+#: it is not a zone. Cutting lots against it would invent a zone piece per
+#: resolution, and since the whole HBU chain is keyed on (lot_uid, feature_id)
+#: that is not a cosmetic error - it is a second, bogus development site for
+#: every lot a PPCMOI touches.
+#:
+#: So the two lists are now genuinely different, which is what the names
+#: always said they were for: a table is a zone source if lots are cut against
+#: it, and a document source if it links prose worth retrieving.
+ZONING_SOURCES: tuple[str, ...] = (
+    "Reglement_urbanisme__VSP_REG_ZONE",
+    "Zonage__ZONAGE_SAGUENAY",
+    "Zonage__ZONAGE_EN_VIGUEUR",
+)
+
+#: Below this, a PDF with NO TEXT is a publisher's placeholder rather than a
+#: scan. Quebec City serves an unknown zone code as a valid, empty about 850-byte
+#: PDF; a real grid sheet is 110-125 kB. Only ever applied together with "has
+#: no text layer" - on its own it would reject valid small documents, and a
+#: two-line council minute is a perfectly good 622-byte PDF.
+MIN_PDF_BYTES = 2048
 
 DEFAULT_MAX_TOKENS = 512
 DEFAULT_OVERLAP_TOKENS = 64
@@ -99,10 +120,26 @@ class Document:
     num_pages: int
     content_sha256: str
     num_bytes: int
+    #: Character offset into ``text`` where each kept page starts, in order.
+    #: Empty for a document read before this existed, which is why every
+    #: reader of it treats "no offsets" as "page unknown" rather than page 1.
+    page_offsets: tuple[int, ...] = ()
 
     @property
     def num_chars(self) -> int:
         return len(self.text)
+
+    def page_of(self, offset: int) -> int | None:
+        """The 1-based page a character offset falls on, if it is known.
+
+        Pages with no text are dropped before the offsets are built, so this
+        numbers the pages that *have* text. For a grid sheet - one page, or two
+        - that is the same thing; for a long minute it is not, and the number
+        is the nth page with text rather than the nth sheet of paper.
+        """
+        if not self.page_offsets:
+            return None
+        return bisect.bisect_right(self.page_offsets, offset)
 
 
 @dataclass(frozen=True)
@@ -111,6 +148,12 @@ class Chunk:
     chunk_index: int
     text: str
     num_tokens: int
+    #: The pages this chunk's text came from, 1-based and inclusive. None when
+    #: the document carried no page map, or when the chunk could not be placed
+    #: in it - a citation then names the document and says nothing about where,
+    #: which is the honest answer rather than a guess at page 1.
+    page_from: int | None = None
+    page_to: int | None = None
 
     @property
     def chunk_id(self) -> str:
@@ -201,6 +244,7 @@ class PdfFetcher:
                 f"{len(content)} bytes)"
             )
 
+
         cached.parent.mkdir(parents=True, exist_ok=True)
         cached.write_bytes(content)
         return content, False
@@ -222,10 +266,41 @@ def read_pdf(url: str, content: bytes, *, keep_hyphens: bool = False) -> Documen
     except (PdfReadError, ValueError, OSError) as exc:
         raise DocumentError(f"{url}: unreadable PDF ({exc})") from exc
 
-    text = normalize_text(
-        "\n\n".join(page for page in pages if page.strip()), keep_hyphens=keep_hyphens
-    )
+    # Normalised per page and then joined, rather than joined and then
+    # normalised, so that each page's start offset is known in the final
+    # string. The two are byte-identical - verified over 120 of the cached
+    # sheets - because no rule in `normalize_text` reaches across the "\n\n"
+    # the pages are joined with: the hyphen rule needs a single newline, and
+    # the whitespace rule does not match newlines at all. Were that to change,
+    # every chunk boundary would move and the whole corpus would need
+    # rebuilding rather than upserting, so it is worth the test that pins it.
+    kept = [
+        normalize_text(page, keep_hyphens=keep_hyphens)
+        for page in pages
+        if page.strip()
+    ]
+    offsets: list[int] = []
+    cursor = 0
+    for page in kept:
+        offsets.append(cursor)
+        cursor += len(page) + 2  # the "\n\n" each join adds
+    text = "\n\n".join(kept)
     if not text:
+        # Two different failures wearing the same error, and the OCR backlog
+        # is the thing that cares. A scan is a big file with no text layer; a
+        # publisher's "no such zone" is a tiny file with no text layer -
+        # Quebec City answers an unknown code with a valid, empty, about 850-byte
+        # PDF where a real sheet is 110-125 kB.
+        #
+        # The size test lives here rather than in `fetch` because size ALONE
+        # says nothing: a two-line council minute is a valid 622-byte PDF.
+        # Textless *and* tiny is the pair that means "placeholder".
+        if len(content) < MIN_PDF_BYTES:
+            raise DocumentError(
+                f"{url}: {len(content)}-byte PDF with no text - the publisher "
+                f"served an empty sheet, which usually means it does not know "
+                f"this code. Not a scan, and not one for OCR."
+            )
         raise DocumentError(
             f"{url}: no text layer over {len(pages)} page(s); "
             "a scanned document would need OCR"
@@ -237,6 +312,7 @@ def read_pdf(url: str, content: bytes, *, keep_hyphens: bool = False) -> Documen
         num_pages=len(pages),
         content_sha256=hashlib.sha256(content).hexdigest(),
         num_bytes=len(content),
+        page_offsets=tuple(offsets),
     )
 
 
@@ -314,15 +390,48 @@ def chunk_document(
     pieces = chunk_text(
         document.text, ruler, max_tokens=max_tokens, overlap_tokens=overlap_tokens
     )
-    return [
-        Chunk(
-            doc_id=document.doc_id,
-            chunk_index=index,
-            text=piece,
-            num_tokens=ruler.count(piece),
+    chunks: list[Chunk] = []
+    cursor = 0
+    for index, piece in enumerate(pieces):
+        start, end = _locate(document.text, piece, cursor)
+        if start is not None:
+            # Chunks overlap, so the next one may begin before this one ended.
+            # Advancing to this chunk's start - not its end - keeps the search
+            # moving forward without stepping over the overlap.
+            cursor = start
+        chunks.append(
+            Chunk(
+                doc_id=document.doc_id,
+                chunk_index=index,
+                text=piece,
+                num_tokens=ruler.count(piece),
+                page_from=None if start is None else document.page_of(start),
+                page_to=None if end is None else document.page_of(end - 1),
+            )
         )
-        for index, piece in enumerate(pieces)
-    ]
+    return chunks
+
+
+def _locate(text: str, piece: str, cursor: int) -> tuple[int | None, int | None]:
+    """Where a chunk sits in the document it came from.
+
+    Found by its first and last paragraph rather than by the chunk string: the
+    chunker rejoins paragraphs with a single blank line, so a chunk whose
+    source had three newlines between two paragraphs is not a literal
+    substring of the document. The paragraphs themselves are.
+
+    Returns ``(None, None)`` when the text cannot be placed, which a caller
+    reads as "page unknown". Better a citation with no page than a wrong one.
+    """
+    paragraphs = [p for p in _PARAGRAPH_BREAK.split(piece) if p.strip()]
+    if not paragraphs:
+        return None, None
+    start = text.find(paragraphs[0].strip(), cursor)
+    if start < 0:
+        return None, None
+    last = paragraphs[-1].strip()
+    end = text.find(last, start)
+    return (start, end + len(last)) if end >= 0 else (start, start + len(piece))
 
 
 def _paragraph_units(text: str, ruler: TokenRuler, max_tokens: int) -> Iterator[str]:

@@ -87,6 +87,12 @@ class VectorStore:
             dimension, model = _describe_source(
                 connection, source, where, [pattern, *parameters]
             )
+            # Page offsets were added to the chunker later than the rest of
+            # these columns, so an embeddings parquet written before that has
+            # no page_from/page_to. Selected as NULL rather than demanded,
+            # because a store that refuses to read last month's export is a
+            # worse failure than a citation without a page.
+            pages = _page_columns(connection, source, where, [pattern, *parameters])
 
             connection.execute(f"DROP INDEX IF EXISTS {_HNSW_INDEX}")
             connection.execute("DROP TABLE IF EXISTS chunks")
@@ -106,6 +112,7 @@ class VectorStore:
                        feature_ids,
                        model,
                        text,
+                       {pages}
                        CAST(embedding AS FLOAT[{dimension}]) AS embedding
                 FROM {source}
                 {where}
@@ -267,6 +274,23 @@ def _filters(
         clauses.append("CAST(scrape_date AS VARCHAR) = ?")
         parameters.append(scrape_date)
     return clauses, parameters
+
+
+def _page_columns(connection, source: str, where: str, parameters: list) -> str:
+    """The page columns to select, or NULLs when the source predates them."""
+    rows = connection.execute(
+        f"DESCRIBE SELECT * FROM {source} {where} LIMIT 0", parameters
+    ).fetchall()
+    available = {str(row[0]) for row in rows}
+    if {"page_from", "page_to"} <= available:
+        return (
+            "CAST(page_from AS INTEGER)       AS page_from,\n"
+            "                       CAST(page_to   AS INTEGER)       AS page_to,"
+        )
+    return (
+        "CAST(NULL AS INTEGER)            AS page_from,\n"
+        "                       CAST(NULL AS INTEGER)            AS page_to,"
+    )
 
 
 def _describe_source(

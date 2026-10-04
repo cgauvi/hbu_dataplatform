@@ -157,6 +157,11 @@ def linked_documents(
                     "scrape_date": scrape_date,
                     "url": url,
                     "num_pages": document.num_pages,
+                    # Where each page starts in `text`. Carried because the
+                    # chunker needs it and runs in a different asset: without
+                    # it every chunk comes out with no page, which is how this
+                    # looked when it was first written.
+                    "page_offsets": list(document.page_offsets),
                     "num_chars": document.num_chars,
                     "num_bytes": document.num_bytes,
                     "content_sha256": document.content_sha256,
@@ -237,6 +242,11 @@ def document_chunks(
                 "chunk_index": chunk.chunk_index,
                 "num_tokens": chunk.num_tokens,
                 "text": chunk.text,
+                # Nullable: a chunk the chunker could not place in its
+                # document's page map has no page, and "unknown" is the honest
+                # citation rather than a guess at page 1.
+                "page_from": chunk.page_from,
+                "page_to": chunk.page_to,
                 "source_table": document.source_table,
                 "neighborhood": document.neighborhood,
                 "scrape_date": document.scrape_date,
@@ -455,6 +465,17 @@ def _features_by_url(frame: pd.DataFrame, url_column: str) -> dict[str, dict]:
 
 
 def _as_document(row) -> Document:
+    """One bronze row back into a Document, page map included.
+
+    `page_offsets` is absent from any parquet written before it existed, and
+    pandas hands back a float NaN for a missing column rather than raising.
+    Both read as "no page map", which `Document.page_of` answers with None -
+    so an old partition chunks exactly as it did, with no page on its
+    citations, instead of failing or inventing page 1.
+    """
+    offsets = getattr(row, "page_offsets", None)
+    if offsets is None or isinstance(offsets, float):
+        offsets = ()
     return Document(
         doc_id=row.doc_id,
         url=row.url,
@@ -462,6 +483,7 @@ def _as_document(row) -> Document:
         num_pages=int(row.num_pages),
         content_sha256=row.content_sha256,
         num_bytes=int(row.num_bytes),
+        page_offsets=tuple(int(o) for o in offsets),
     )
 
 

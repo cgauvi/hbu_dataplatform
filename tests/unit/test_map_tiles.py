@@ -21,7 +21,7 @@ from dagster import MultiPartitionKey, materialize
 
 from hbu_dataplatform.map import map_tiles, pmtiles_archive, tile_assets, tile_render
 from hbu_dataplatform.core import tile_grid
-from hbu_dataplatform.rag.documents import DOCUMENT_SOURCES
+from hbu_dataplatform.rag.documents import DOCUMENT_SOURCES, ZONING_SOURCES
 from hbu_dataplatform.core.resources import ParquetStore, PostgisResource
 
 DATE = "2026-08-01"
@@ -89,9 +89,13 @@ def test_an_aggregate_tile_is_filled_from_cells_four_zooms_finer():
 
 def test_the_link_attribute_agrees_with_the_document_registry():
     """The zone tile reads one attribute for the grid link; the corpus records
-    one per source. They agree today, and this is what says so."""
+    one per source. They agree for the sources the tile draws.
+
+    Only the ZONING sources: Montreal's projets particuliers are a document
+    source read from `EN_SAVOIR_PLUS`, and they are not a zone layer.
+    """
     assert map_tiles.link_attribute_agrees()
-    assert set(DOCUMENT_SOURCES.values()) == {map_tiles.ZONING_URL_ATTRIBUTE}
+    assert {DOCUMENT_SOURCES[s] for s in ZONING_SOURCES} == {map_tiles.ZONING_URL_ATTRIBUTE}
 
 
 # ---------------------------------------------------------------------------
@@ -261,7 +265,9 @@ def test_the_zone_tile_matches_every_zoning_source():
     spec = map_tiles.layer_spec("zones")
     assert "f.source_table = ANY(%(source_tables)s)" in spec.where
     params = map_tiles.layer_params(NEIGHBORHOOD, DATE)
-    assert set(params["source_tables"]) == set(DOCUMENT_SOURCES)
+    # ZONING_SOURCES, not DOCUMENT_SOURCES: the zone tile draws zones, and
+    # PPCMOI is a document about a site rather than a zone.
+    assert set(params["source_tables"]) == set(ZONING_SOURCES)
     assert f"'{map_tiles.ZONING_URL_ATTRIBUTE}' AS zoning_pdf_url" in spec.columns
 
 

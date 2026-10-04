@@ -80,11 +80,43 @@ _COPY_TYPES = (
     "jsonb",  # feature_ids
     "text",  # model
     "text",  # text
+    "int4",  # page_from
+    "int4",  # page_to
     "vector",  # embedding
 )
 assert len(_COPY_COLUMNS) == len(_COPY_TYPES)
 
+#: How many values `_copy_into` must write per row. It is checked there,
+#: because the assert above cannot see the writer: when `page_from`/`page_to`
+#: were added, `_COPY_COLUMNS` and `_COPY_TYPES` grew together, that assert
+#: stayed true, and the writer went on sending 13 values into 15 columns. It
+#: surfaced as `expected 15 values in row, got 13` raised four frames down in
+#: psycopg's Cython formatter, naming neither the column nor this file.
+_COPY_ARITY = len(_COPY_COLUMNS)
+
+
 #: Columns an upsert overwrites: everything but the key it conflicted on.
+#: Accents, folded away before indexing. `to_tsvector('french', ...)` does NOT
+#: strip them - `marges latérales` and `marges laterales` produce different
+#: lexemes and match nothing of each other - and French is routinely typed
+#: without accents. Measured on this corpus: the accented spelling matched
+#: 4,831 chunks and the unaccented one matched 0.
+#:
+#: `translate` rather than the `unaccent` extension: unaccent is available but
+#: not installed here, installing it needs superuser, and `unaccent()` is only
+#: IMMUTABLE once wrapped - whereas `translate` is immutable as it stands and
+#: so is allowed in a generated column. The same pairs fold street names in
+#: `hbu_rag_map`'s `queries._FOLD_FROM`; the two have to agree, because one
+#: writes the index and the other writes the query.
+FOLD_FROM = "àâäéèêëîïôöùûüçñ"
+FOLD_TO = "aaaeeeeiioouuucn"
+
+
+def folded(expression: str) -> str:
+    """A SQL expression with accents folded, for indexing or for querying."""
+    return f"translate(lower({expression}), '{FOLD_FROM}', '{FOLD_TO}')"
+
+
 _UPDATED_COLUMNS = tuple(column for column in _COPY_COLUMNS if column != "chunk_id")
 
 #: The search's select list: `COLUMNS`, with the two that Postgres stores in a
@@ -215,6 +247,8 @@ class PgVectorStore:
         self._ensure_schema(cursor)
         self._create_table(cursor, dimension)
         self._widen_primary_key(cursor)
+        self._add_search_column(cursor)
+        self._add_page_columns(cursor)
         self._create_meta_table(cursor)
 
     def _ensure_schema(self, cursor: "Cursor") -> None:
@@ -284,6 +318,10 @@ class PgVectorStore:
                 feature_ids  jsonb       NOT NULL DEFAULT '[]'::jsonb,
                 model        text        NOT NULL,
                 text         text        NOT NULL,
+                -- Nullable on purpose: rows indexed before pages were carried
+                -- have none, and so does a chunk that could not be placed.
+                page_from    integer,
+                page_to      integer,
                 embedding    vector({int(dimension)}) NOT NULL,
                 indexed_at   timestamptz NOT NULL DEFAULT now(),
                 -- The borough is in the key, and that is not redundancy.
@@ -371,6 +409,80 @@ class PgVectorStore:
             """
         )
 
+    def _add_page_columns(self, cursor: "Cursor") -> None:
+        """Where in its document a chunk came from, on an existing table.
+
+        Same reason as `_widen_primary_key` and `_add_search_column`:
+        `CREATE TABLE IF NOT EXISTS` ignores its body once the table is there.
+
+        Nullable, and left NULL until the corpus is published again - the
+        offsets are computed at chunking time, so a row written before this
+        existed cannot gain one retroactively. A citation then names the
+        document and not the page, which is what it did before.
+        """
+        for column in ("page_from", "page_to"):
+            cursor.execute(
+                f"ALTER TABLE {self.table} ADD COLUMN IF NOT EXISTS {column} integer"
+            )
+
+    def _add_search_column(self, cursor: "Cursor") -> None:
+        """Add the lexical half of retrieval to a table that already exists.
+
+        `_create_table` cannot do this, for the reason `_widen_primary_key`
+        gives above: `CREATE TABLE IF NOT EXISTS` does not read its own body
+        when the table is there, so a column named only in the CREATE would
+        silently never appear on a database that has already loaded once.
+
+        Why a column at all. Ranking was cosine distance alone, and a vector is
+        poor at the one thing a zoning question most often turns on: an exact
+        term. "C01-001" and "C01-007" embed almost identically, so the grid
+        that phrases the question's words most fluently outranks the grid that
+        actually governs. A tsvector gives the ranking something exact to fuse
+        with.
+
+        Why `french`, checked against this corpus rather than assumed:
+          * `french_stem` folds the terms of art - implantation/implantations
+            to `implant`, logement/logements to `log`, marge/marges to `marg`.
+          * Every code form still matches: `11004Mc`, `70520` and `C.4`
+            tokenise whole; `C01-001` and `GT2025-233` split into their parts
+            on both sides, so `websearch_to_tsquery` matches them as a phrase.
+            All six verified matching.
+        Accents are folded first - see FOLD_FROM - because `french` does not do
+        it, and a question typed without them would otherwise match nothing.
+
+        One column rather than two: a `simple` twin would double the index and
+        the write cost to buy back the elided single letters in `french.stop`,
+        and a bare "c" is not a search term.
+
+        Title and feature_ids are weighted A because that is what makes naming
+        a zone find its sheet: the code is not reliably in the body text - that
+        depends where pypdf put the sheet header - but it is always in
+        `feature_ids`.
+
+        GENERATED ... STORED backfills itself over the existing rows, and a
+        later upsert recomputes it because `text`, `title` and `feature_ids`
+        are all in `_UPDATED_COLUMNS`. So this needs no corpus re-run.
+        """
+        title = folded("coalesce(title, '')")
+        # Single braces: this string is interpolated into the f-string below as
+        # a VALUE, and a value is not rescanned for escapes. Doubling them
+        # here would emit `#>> '{{}}'`, which is a two-dimensional array
+        # literal and a syntax error - on a fresh database only, since an
+        # existing one skips the ADD COLUMN.
+        codes = folded("coalesce(feature_ids #>> '{}', '')")
+        body = folded("text")
+        cursor.execute(
+            f"ALTER TABLE {self.table} ADD COLUMN IF NOT EXISTS tsv tsvector "
+            f"GENERATED ALWAYS AS ("
+            # The two-argument to_tsvector is IMMUTABLE; the one-argument form
+            # reads default_text_search_config, is only STABLE, and Postgres
+            # refuses it in a generated column.
+            f"    setweight(to_tsvector('french', {title}), 'A') "
+            f" || setweight(to_tsvector('french', {codes}), 'A') "
+            f" || setweight(to_tsvector('french', {body}), 'B')"
+            f") STORED"
+        )
+
     def _create_indexes(self, cursor: "Cursor") -> None:
         cursor.execute(
             f"CREATE INDEX IF NOT EXISTS {self.settings.table}_embedding_hnsw "
@@ -382,6 +494,15 @@ class PgVectorStore:
         cursor.execute(
             f"CREATE INDEX IF NOT EXISTS {self.settings.table}_partition "
             f"ON {self.table} (neighborhood, scrape_date)"
+        )
+
+        # The lexical half. `fastupdate = off` because this table is written in
+        # one batch per borough and read constantly: a pending list would make
+        # the first searches after every publish slow and the planner's
+        # estimates wrong.
+        cursor.execute(
+            f"CREATE INDEX IF NOT EXISTS {self.settings.table}_tsv_gin "
+            f"ON {self.table} USING gin (tsv) WITH (fastupdate = off)"
         )
 
     def _drop(self, cursor: "Cursor") -> None:
@@ -940,24 +1061,41 @@ def _copy_into(
     with cursor.copy(statement) as copy:
         # Binary COPY carries no types of its own; these are `_COPY_COLUMNS`'.
         copy.set_types(list(_COPY_TYPES))
+        checked = False
         for position, row in enumerate(frame.itertuples(index=False)):
-            copy.write_row(
-                (
-                    str(row.chunk_id),
-                    str(row.doc_id),
-                    str(row.url),
-                    _optional(row.title),
-                    str(row.source_table),
-                    str(row.neighborhood),
-                    _as_date(row.scrape_date),
-                    int(row.chunk_index),
-                    int(row.num_tokens),
-                    Jsonb(_json_array(row.feature_ids)),
-                    str(row.model),
-                    str(row.text),
-                    vectors[position],
-                )
+            # In `_COPY_COLUMNS` order - that is what `_COPY_ARITY` checks.
+            # `page_from`/`page_to` go through getattr because a frame written
+            # before those columns existed does not carry them, and a
+            # re-publish of such a partition should leave the page unknown
+            # rather than fail.
+            values = (
+                str(row.chunk_id),
+                str(row.doc_id),
+                str(row.url),
+                _optional(row.title),
+                str(row.source_table),
+                str(row.neighborhood),
+                _as_date(row.scrape_date),
+                int(row.chunk_index),
+                int(row.num_tokens),
+                Jsonb(_json_array(row.feature_ids)),
+                str(row.model),
+                str(row.text),
+                _optional_int(getattr(row, "page_from", None)),
+                _optional_int(getattr(row, "page_to", None)),
+                vectors[position],
             )
+            if not checked:
+                # Once per COPY rather than per row: this catches a column
+                # added to `_COPY_COLUMNS` and not to the tuple above, which is
+                # a coding error and so is the same on every row.
+                assert len(values) == _COPY_ARITY, (
+                    f"_copy_into writes {len(values)} values per row but "
+                    f"_COPY_COLUMNS has {_COPY_ARITY}: "
+                    f"{', '.join(_COPY_COLUMNS)}"
+                )
+                checked = True
+            copy.write_row(values)
     return len(frame)
 
 
@@ -978,7 +1116,27 @@ def _optional(value: object) -> str | None:
     return text or None
 
 
+def _optional_int(value: object) -> int | None:
+    """`None` for NULL and for pandas' several kinds of missing, else an int.
+
+    `page_from`/`page_to` are nullable by design - a chunk the page map could
+    not place carries no page, and a document read before page offsets existed
+    carries none at all - so pandas types the column float64 and spells the
+    gaps NaN. `int(nan)` raises, and what COPY wants out of a
+    `numpy.float64(3.0)` is a 3.
+    """
+    if value is None:
+        return None
+    try:
+        if bool(pd.isna(value)):
+            return None
+    except (TypeError, ValueError):
+        pass  # pd.isna on an array-like answers element-wise
+    return int(value)
+
+
 def _as_date(value: object) -> date:
+
     """The partition's date, as a `date`.
 
     `datetime` first: `pandas.Timestamp` is a `date` subclass, and a midnight

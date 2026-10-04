@@ -259,6 +259,33 @@ its instance-storage connections open indefinitely, so a durable password or a
 Secrets Manager id is required here — `dagster_home.py` says so rather than
 failing later.
 
+### Which database: `DB_TARGET`
+
+Every target that opens the database takes one switch, carried under the same
+name and with the same two values by all three urban repos:
+
+```bash
+make db-target                 # which database the next command will use
+make hbu                       # DB_TARGET=local - the postgis container
+make hbu DB_TARGET=rds         # hbu-dev, through an open db-tunnel
+```
+
+`local` is the default. It sets `URBAN_RAG_PG_DSN` to the container
+hbu_rag_map runs (`cd ../hbu_rag_map && make db-up`), which `core.pg` reads
+ahead of everything else: no secret lookup, no CA bundle, no AWS call.
+`dagster_home.py` reads the same variable, so the run storage follows into
+that database's `dagster` schema.
+
+Both branches override `.env` rather than leaning on it — python-dotenv does
+not override a variable already in the environment — and each blanks what the
+other sets. `.env` names the RDS endpoint and the container at once, and the
+failure worth guarding against is not an error: it is half of one branch left
+standing beside the other.
+
+`DB_TARGET=rds` takes the endpoint from `URBAN_RAG_PG_HOST` in the
+environment, or from `.env`, and dials it at `127.0.0.1:5433` with
+`verify-full` — which is the split described next.
+
 When a laptop reaches RDS through `make db-tunnel`, keep TLS and the tunnel's
 address separate. With `sslmode=verify-full`, `URBAN_RAG_PG_HOST` must stay as
 the RDS endpoint, because that is the name in the server certificate. Point the
@@ -279,26 +306,25 @@ cd ../hbu_infra
 make db-tunnel ENV=dev LOCAL_PORT=5433
 
 cd ../hbu_dataplatform
-make up-tunnel TUNNEL_DB_HOST=hbu-dev.cedzstv1bm7z.us-east-1.rds.amazonaws.com TUNNEL_PORT=5433
+make up DB_TARGET=rds     # or `make up-tunnel`, the same thing under its old name
 ```
 
 #### Or the local Docker database
 
-The same database also runs on the laptop, in hbu_rag_map's postgis+pgvector
-container — no AWS and no tunnel. This repo has no `DB_TARGET` switch (that is
-hbu_rag_map's); point it there with the environment instead:
+`make up` on its own takes the switch's default and points the stack at the
+postgis+pgvector container hbu_rag_map runs, through `host.docker.internal` —
+the one shape of this that needs no AWS credentials inside the container at
+all.
 
 ```bash
-cd ../hbu_rag_map && make db-up                        # start the container
+cd ../hbu_rag_map && make db-up                          # start the container
 cd ../hbu_infra   && make db-dump-pull db-restore-local  # first time: copy dev into it
-
-# then, in this repo's .env (or the shell):
-URBAN_RAG_PG_DSN=postgresql://urban_rag:urban_rag@127.0.0.1:5432/urban_rag?sslmode=disable
-DAGSTER_POSTGRES_URL=postgresql://urban_rag:urban_rag@127.0.0.1:5432/urban_rag?sslmode=disable
 ```
 
-From inside a container (`make up`), `127.0.0.1` is the container itself:
-use `host.docker.internal` instead. Comment the `URBAN_RAG_PG_HOST` lines out
-while the DSN is set, so the two targets are never half-mixed. If the
-container is up but nothing answers on 5432, `make db-up` in hbu_rag_map
+The switch sets the DSN itself, so `.env` needs no hand edit here. From inside
+a container `127.0.0.1` would be the container, and the compose file maps
+`host.docker.internal` to the host gateway whenever `URBAN_RAG_PG_HOST` is
+empty — which the local branch makes sure it is.
+
+If the container is up but nothing answers on 5432, `make db-up` in hbu_rag_map
 recreates it — it can lose its network after a Docker restart.

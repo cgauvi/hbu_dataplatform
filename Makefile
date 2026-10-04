@@ -41,6 +41,90 @@ endif
 # `rm -rf .venv` also arms the next re-sync.
 UV_SYNC_STAMP := $(CURDIR)/.venv/.uv-sync-stamp
 
+# -- which database --------------------------------------------------------
+#
+# One switch, carried by all three urban repos under the same name and with
+# the same two values:
+#
+#   DB_TARGET=local  (default) the postgis+pgvector container hbu_rag_map
+#                    runs - `cd ../hbu_rag_map && make db-up` - published on
+#                    127.0.0.1:$(LOCAL_PG_PORT). No AWS, no tunnel; this is
+#                    where `make db-restore-local` in hbu_infra puts the dump.
+#   DB_TARGET=rds    hbu-$(ENV), through an open port-forward:
+#                    `cd ../hbu_infra && make db-tunnel ENV=dev LOCAL_PORT=5433`
+#
+# Per command - `make hbu DB_TARGET=rds` - or exported once for a shell.
+#
+# It overrides .env rather than leaning on it, and that is the whole design:
+# python-dotenv does not override a variable already in the environment, so a
+# value set in a recipe wins over the same name in .env. Each branch therefore
+# blanks what the other one sets. .env here names the RDS endpoint (HOST, a
+# Secrets Manager id, verify-full) *and* the container (DATABASE_URL), and the
+# failure that matters is not an error - it is half of one branch left standing
+# beside the other, connecting to a database nobody asked for and saying
+# nothing about it.
+#
+# URBAN_RAG_PG_DSN is the whole of the local branch because core.pg reads it
+# first and short-circuits on it: no secret lookup, no CA bundle, no AWS call
+# at all. hbu_dataplatform.dagster_home reads it too, so Dagster's own
+# run/event/schedule storage follows the switch into the same database's
+# `dagster` schema - which is the schema the restored dump already carries.
+DB_TARGET ?= local
+
+# The container's published port. HBU_LOCAL_PG_PORT is the name hbu_rag_map's
+# compose file reads, so a shell that moved the container moves this with it.
+LOCAL_PG_PORT ?= $(or $(HBU_LOCAL_PG_PORT),5432)
+# 127.0.0.1 rather than localhost, for the reason the tunnel address below
+# carries: a machine that resolves localhost to ::1 first makes libpq spend the
+# whole connect_timeout on a dead address before falling back, which reads as a
+# slow database rather than as a misresolution.
+LOCAL_PG_URL ?= postgresql://urban_rag:urban_rag@127.0.0.1:$(LOCAL_PG_PORT)/urban_rag?sslmode=disable
+# The same container as seen from inside another container: 127.0.0.1 there is
+# the container itself. The compose file already maps host.docker.internal to
+# the host gateway whenever URBAN_RAG_PG_HOST is empty, which the local branch
+# makes sure it is.
+DOCKER_LOCAL_PG_URL ?= postgresql://urban_rag:urban_rag@host.docker.internal:$(LOCAL_PG_PORT)/urban_rag?sslmode=disable
+
+# Where `make db-tunnel ENV=dev` in hbu_infra listens, and the endpoint name
+# the certificate is issued to. The two are split for the reason .env splits
+# them: verify-full checks the hostname against HOST while the socket goes to
+# HOSTADDR, which is what lets a port-forward keep a verified connection.
+TUNNEL_PORT ?= 5433
+TUNNEL_HOST ?= 127.0.0.1
+# From the shell first - `eval "$(cd ../hbu_infra && make -s db-app-env ENV=dev)"
+# exports it - and from .env otherwise.
+TUNNEL_DB_HOST ?= $(if $(URBAN_RAG_PG_HOST),$(URBAN_RAG_PG_HOST),$(shell awk -F= '/^[[:space:]]*URBAN_RAG_PG_HOST[[:space:]]*=/ {gsub(/^[[:space:]]+|[[:space:]]+$$/, "", $$2); gsub(/\r/, "", $$2); print $$2; exit}' .env 2>/dev/null))
+
+ifeq (local,$(DB_TARGET))
+DB_TARGET_DESC = the local container, 127.0.0.1:$(LOCAL_PG_PORT)
+PG_ENV = URBAN_RAG_PG_DSN="$(LOCAL_PG_URL)" DATABASE_URL="$(LOCAL_PG_URL)" \
+	URBAN_RAG_PG_HOST= URBAN_RAG_PG_HOSTADDR= URBAN_RAG_PG_PORT= \
+	URBAN_RAG_PG_SECRET_ID= URBAN_RAG_PG_PASSWORD= URBAN_RAG_PG_IAM_AUTH= \
+	URBAN_RAG_PG_SSLMODE=disable URBAN_RAG_PG_SSLROOTCERT= DAGSTER_POSTGRES_URL=
+COMPOSE_PG_ENV = URBAN_RAG_PG_DSN="$(DOCKER_LOCAL_PG_URL)" \
+	URBAN_RAG_PG_HOST= URBAN_RAG_PG_HOSTADDR= URBAN_RAG_PG_PORT= \
+	URBAN_RAG_PG_SECRET_ID= URBAN_RAG_PG_PASSWORD= URBAN_RAG_PG_IAM_AUTH= \
+	URBAN_RAG_PG_SSLMODE=disable URBAN_RAG_PG_SSLROOTCERT= DAGSTER_POSTGRES_URL=
+else ifeq (rds,$(DB_TARGET))
+DB_TARGET_DESC = $(if $(TUNNEL_DB_HOST),$(TUNNEL_DB_HOST),<no URBAN_RAG_PG_HOST in .env>) through $(TUNNEL_HOST):$(TUNNEL_PORT)
+# Everything the endpoint needs that is not an address - the user, the secret
+# id, the region, the statement timeout - still comes from .env. What this sets
+# is where to dial and how to verify, and what it clears is the local branch.
+PG_ENV = URBAN_RAG_PG_DSN= DATABASE_URL= DAGSTER_POSTGRES_URL= \
+	URBAN_RAG_PG_HOST="$(TUNNEL_DB_HOST)" URBAN_RAG_PG_HOSTADDR="$(TUNNEL_HOST)" \
+	URBAN_RAG_PG_PORT="$(TUNNEL_PORT)" URBAN_RAG_PG_SSLMODE=verify-full
+# The container reaches the tunnel through the host gateway, which compose
+# maps onto the endpoint name itself (extra_hosts), so HOSTADDR stays empty
+# here and the name alone resolves to the host. SSLROOTCERT names the mounted
+# path rather than a host one.
+COMPOSE_PG_ENV = URBAN_RAG_PG_DSN= DATABASE_URL= DAGSTER_POSTGRES_URL= \
+	URBAN_RAG_PG_HOST="$(TUNNEL_DB_HOST)" URBAN_RAG_PG_HOSTADDR= \
+	URBAN_RAG_PG_PORT="$(TUNNEL_PORT)" URBAN_RAG_PG_SSLMODE=verify-full \
+	URBAN_RAG_PG_SSLROOTCERT=/home/app/.postgresql/root.crt
+else
+$(error DB_TARGET must be `local` or `rds`, not `$(DB_TARGET)`)
+endif
+
 # Every dagster invocation goes through hbu_dataplatform.dagster_home, which writes
 # $(DAGSTER_HOME)/dagster.yaml from the environment and then execs the command
 # it was handed - the same entrypoint the image uses, so a laptop run and a
@@ -56,10 +140,13 @@ UV_SYNC_STAMP := $(CURDIR)/.venv/.uv-sync-stamp
 # and then ignore an environment that had changed underneath it. It also does
 # its own mkdir -p, which is why these targets no longer take $(DAGSTER_HOME)
 # as a prerequisite - only the docker ones, which bind-mount it, still do.
-DAGSTER := uv run python -m hbu_dataplatform.dagster_home dagster
-DAGSTER_DAEMON := uv run python -m hbu_dataplatform.dagster_home dagster-daemon
+DAGSTER := $(PG_ENV) uv run python -m hbu_dataplatform.dagster_home dagster
+DAGSTER_DAEMON := $(PG_ENV) uv run python -m hbu_dataplatform.dagster_home dagster-daemon
 # The same instance config, for a command of this package's own.
-URBAN_RAG_PYTHON := uv run python -m hbu_dataplatform.dagster_home python
+URBAN_RAG_PYTHON := $(PG_ENV) uv run python -m hbu_dataplatform.dagster_home python
+# The retrieval CLI, under the same switch: `--backend postgres` reads and
+# writes the same database every asset above does.
+URBAN_RAG := $(PG_ENV) uv run urban-rag
 
 # Assets are selected by their full `<layer>/<asset>` key, which is what
 # `key_prefix` in hbu_dataplatform.core.layers gives them. A bare name resolves to no
@@ -287,8 +374,6 @@ MAX_ADDED_STOREYS ?= 1
 
 IMAGE ?= urban-rag
 TAG ?= latest
-TUNNEL_PORT ?= 5433
-TUNNEL_DB_HOST ?= $(shell awk -F= '/^[[:space:]]*URBAN_RAG_PG_HOST[[:space:]]*=/ {gsub(/^[[:space:]]+|[[:space:]]+$$/, "", $$2); gsub(/\r/, "", $$2); print $$2; exit}' .env 2>/dev/null)
 DOCKER_RUN := docker run --rm -it \
 	-v $(CURDIR)/data:/data \
 	-v $(CURDIR)/.dagster_home:/dagster_home \
@@ -302,14 +387,15 @@ DOCKER_RUN := docker run --rm -it \
 	lot-addresses council-minutes council-publish tiles tiles-of tiles-ensure \
 	rent-sources commercial-rents \
 	frontage corpus publish index search ask status \
-	require-q validate_defs clean clean-data clean-silver \
+	require-q validate_defs db-target db-target-check clean clean-data clean-silver \
 	docker-build docker-build-slim docker-run docker-shell docker-test up up-tunnel down logs
 
 help: ## Show this help
 	@echo "Targets:"
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  %-18s %s\n", $$1, $$2}'
 	@echo ""
-	@echo "Vars: DATE=$(DATE) NEIGHBORHOOD=$(NEIGHBORHOOD) PORT=$(PORT) K=$(K)"
+	@echo "Vars: DB_TARGET=$(DB_TARGET) -> $(DB_TARGET_DESC)"
+	@echo "      DATE=$(DATE) NEIGHBORHOOD=$(NEIGHBORHOOD) PORT=$(PORT) K=$(K)"
 	@echo "      BACKEND=$(BACKEND) MIN_STREET_M=$(MIN_STREET_M)"
 	@echo "      K_COMPARABLES=$(K_COMPARABLES) MAX_DISTANCE_M=$(MAX_DISTANCE_M) OPEX=$(OPEX) MARKET_FACTOR=$(MARKET_FACTOR)"
 	@echo "      RETAIL_BASE=$(RETAIL_BASE) RETAIL_BASE_PERIOD=$(RETAIL_BASE_PERIOD)"
@@ -698,7 +784,7 @@ publish: | $(UV_SYNC_STAMP) ## Load DATE x NEIGHBORHOOD into Postgres/pgvector
 	$(DAGSTER) asset materialize --select gold/document_index --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
 
 index: | $(UV_SYNC_STAMP) ## (Re)build the vector store from the latest snapshot (BACKEND=...)
-	uv run urban-rag index --backend $(BACKEND) --neighborhood $(NEIGHBORHOOD)
+	$(URBAN_RAG) index --backend $(BACKEND) --neighborhood $(NEIGHBORHOOD)
 
 # Q is required by both; an empty one would otherwise reach argparse as a
 # perfectly valid empty question and embed it.
@@ -706,13 +792,13 @@ require-q:
 	@[ -n "$(Q)" ] || { echo 'usage: make $(MAKECMDGOALS) Q="your question"' >&2; exit 2; }
 
 search: require-q | $(UV_SYNC_STAMP) ## Retrieve passages, no generation: make search Q="..."
-	uv run urban-rag search "$(Q)" -k $(K) --backend $(BACKEND)
+	$(URBAN_RAG) search "$(Q)" -k $(K) --backend $(BACKEND)
 
 ask: require-q | $(UV_SYNC_STAMP) ## Retrieve then answer with a local LLM: make ask Q="..."
-	uv run urban-rag ask "$(Q)" -k $(K) --backend $(BACKEND)
+	$(URBAN_RAG) ask "$(Q)" -k $(K) --backend $(BACKEND)
 
 status: | $(UV_SYNC_STAMP) ## What is in the vector store
-	uv run urban-rag status --backend $(BACKEND)
+	$(URBAN_RAG) status --backend $(BACKEND)
 
 # -- docker ----------------------------------------------------------------
 
@@ -744,12 +830,30 @@ docker-test: ## Run the test suite inside the image
 	docker run --rm -v $(CURDIR):/app -w /app $(IMAGE):dev \
 		bash -c "uv sync --locked --extra dev --extra rag && uv run pytest"
 
-up: ## Start webserver + daemon via compose
-	docker compose up --build -d
+up: db-target-check ## Start webserver + daemon via compose, against DB_TARGET
+	$(COMPOSE_PG_ENV) docker compose up --build -d
 
-up-tunnel: ## Start compose through an open hbu_infra db-tunnel
+# Kept as the name the README and the runbooks use. It is now one spelling of
+# the switch rather than a second configuration: everything it used to set
+# inline is COMPOSE_PG_ENV's rds branch.
+up-tunnel: ## Start compose through an open hbu_infra db-tunnel (= DB_TARGET=rds)
+	@$(MAKE) up DB_TARGET=rds
+
+db-target: ## Print which database DB_TARGET resolves to
+	@echo "DB_TARGET=$(DB_TARGET) -> $(DB_TARGET_DESC)"
+
+# In rds mode the endpoint *name* is required, not the address the tunnel
+# listens on: sslmode=verify-full matches the certificate against it, and RDS
+# issues that certificate to the endpoint. Empty (no URBAN_RAG_PG_HOST in .env)
+# or a loopback address are the two ways to get this wrong, and both would
+# otherwise fail much later - mid-materialisation, as a certificate error that
+# names neither this switch nor .env. Nothing to check in local mode: the DSN
+# is self-contained, and a container that is not up fails on connect.
+db-target-check:
+ifeq (rds,$(DB_TARGET))
 	@test -n "$(TUNNEL_DB_HOST)" || { \
-	  echo "TUNNEL_DB_HOST is empty; set it to the RDS endpoint, not localhost"; \
+	  echo "DB_TARGET=rds needs the RDS endpoint; URBAN_RAG_PG_HOST is unset in .env."; \
+	  echo "  cd ../hbu_infra && make -s db-app-env ENV=dev   # prints it"; \
 	  exit 1; \
 	}
 	@case "$(TUNNEL_DB_HOST)" in \
@@ -757,14 +861,7 @@ up-tunnel: ## Start compose through an open hbu_infra db-tunnel
 	    echo "TUNNEL_DB_HOST must be the RDS endpoint, not $(TUNNEL_DB_HOST), when sslmode=verify-full"; \
 	    exit 1 ;; \
 	esac
-	URBAN_RAG_PG_HOST="$(TUNNEL_DB_HOST)" \
-	URBAN_RAG_PG_HOSTADDR= \
-	URBAN_RAG_PG_PORT="$(TUNNEL_PORT)" \
-	URBAN_RAG_PG_SSLMODE=verify-full \
-	URBAN_RAG_PG_SSLROOTCERT=/home/app/.postgresql/root.crt \
-	URBAN_RAG_PG_DSN= \
-	DAGSTER_POSTGRES_URL= \
-	docker compose up --build -d
+endif
 
 down: ## Stop the compose stack
 	docker compose down
