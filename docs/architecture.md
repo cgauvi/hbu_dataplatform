@@ -64,7 +64,7 @@ hbu_dataplatform/
   cities/               one package per publisher city
     montreal/           registry (boroughs, Spectrum namespaces, CMHC quartiers,
                         MarketBeat submarkets), spectrum, costs/, rents/
-    quebec_city/        registry (arrondissements, quartiers), zoning, council/
+    quebec_city/        registry (arrondissements, quartiers), zoning, council/, cucq/
     saguenay/           registry (the one key, the limit layer), zoning
   sources/              province- or nation-wide publishers, one package each:
                         infolot, bdoi, addresses, roll, cubf, rfu, rqtt, cmhc

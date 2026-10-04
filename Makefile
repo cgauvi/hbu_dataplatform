@@ -384,7 +384,7 @@ DOCKER_RUN := docker run --rm -it \
 	quartiers cmhc costs vacancy rents zone-pieces addresses envelopes setbacks \
 	lot-profiles programs hbu opportunities massing map_cells map_tiles \
 	streets tile-streets roll lot-values comparables cadastre grid-columns \
-	lot-addresses council-minutes council-publish tiles tiles-of tiles-ensure \
+	lot-addresses council-minutes council-publish cucq-minutes tiles tiles-of tiles-ensure \
 	rent-sources commercial-rents \
 	frontage corpus publish index search ask status \
 	require-q validate_defs db-target db-target-check clean clean-data clean-silver \
@@ -772,6 +772,19 @@ council-minutes: | $(UV_SYNC_STAMP) ## Fetch the conseils de quartier minutes + 
 # embedding does not. Upserts beside the zoning grids' chunks; prunes nothing.
 council-publish: | $(UV_SYNC_STAMP) ## Load DATE x NEIGHBORHOOD's council corpus into Postgres/pgvector
 	$(DAGSTER) asset materialize --select gold/council_minutes_index --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
+
+# The Commission d'urbanisme et de conservation de Québec's minutes: city-wide,
+# so on the date axis. Lists them through the city's decisions portal, fetches
+# the PDFs (about a gigabyte the first time, cached after), reads one decision
+# per permit request, places each on a borough by its address against
+# silver.lot_addresses (hbu_infra sql/028) and publishes the placed ones into
+# silver.cucq_decisions (sql/037) and their chunks into silver.document_chunks.
+# SINCE_YEAR narrows the fetch - the text layer starts in 2013. See
+# docs/cucq-minutes.md.
+SINCE_YEAR ?=
+cucq-minutes: | $(UV_SYNC_STAMP) ## Fetch the CUCQ minutes for DATE, read the decisions, place and chunk them (SINCE_YEAR=2024)
+	$(DAGSTER) asset materialize --select "bronze/cucq_minutes,silver/cucq_decisions,silver/cucq_minutes_chunks" --partition $(DATE) -m $(MODULE) \
+		--config-json '{"ops":{"bronze__cucq_minutes":{"config":{"since_year":$(if $(SINCE_YEAR),$(SINCE_YEAR),null)}}}}'
 
 materialize: catalog features ## Full scrape for DATE x NEIGHBORHOOD
 

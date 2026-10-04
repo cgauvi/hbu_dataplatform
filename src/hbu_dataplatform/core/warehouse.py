@@ -302,6 +302,18 @@ TABLES: dict[str, Table] = {
         source="sql/035_silver_council_item_sites.sql",
         geometry="geom",
     ),
+    # One row per permit request the Commission d'urbanisme et de
+    # conservation de Québec ruled on, keyed by the minute it is read from
+    # and its place in it. The borough is the one its address was placed in
+    # (cities.quebec_city.cucq.placement), so one date partition publishes
+    # several boroughs out of a city-wide parquet, the way assessment_units
+    # does; what was not placed stays in the parquet alone.
+    "cucq_decisions": Table(
+        asset="cucq_decisions",
+        name="cucq_decisions",
+        keys=("doc_id", "item_index"),
+        source="sql/037_silver_cucq_decisions.sql",
+    ),
     "zoning_grid_columns": Table(
         asset="zoning_grid_columns",
         name="zoning_grid_columns",

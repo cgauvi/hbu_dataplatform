@@ -250,6 +250,12 @@ run lags them by a month. `document_index` prunes; this one does not.
 
 ## What it is not yet
 
+The corpus holds no per-building demolition decision, and will not: a
+conseil de quartier discussed the 2022–2023 demolition by-law's consultation,
+but each request to demolish is decided by the *Commission d'urbanisme et de
+conservation de Québec*, whose minutes are a different publisher and are
+read by their own assets — see [cucq-minutes.md](cucq-minutes.md).
+
 The reading is regular expressions, chosen so a reader can check every value
 against its excerpt and so the table rebuilds from bronze without a model in
 the loop. It is a harvest rather than an understanding: a minute that

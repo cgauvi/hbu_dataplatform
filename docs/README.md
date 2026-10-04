@@ -30,6 +30,7 @@ reasons the code reads it the way it does.
 | [construction-costs.md](construction-costs.md) | The Altus cost guide's Montreal column — and why parking is priced per stall |
 | [lot-documents.md](lot-documents.md) | The spatial join from a lot to the map features covering it, and on to their PDFs |
 | [council-minutes.md](council-minutes.md) | Quebec City's *conseils de quartier*: where their minutes are listed, the trail from a minute to the sommaire and the resolution behind an amendment, and the planning items read out of all of them — zones, by-laws, addresses, dwelling caps before and after, the council's opinion |
+| [cucq-minutes.md](cucq-minutes.md) | Quebec City's *Commission d'urbanisme et de conservation*: the decisions portal its minutes are listed on, the two layouts of a sitting's annexed list of requests, one decision per request — address, works, verdict — placed on a borough by its address, and the per-decision corpus cut from them |
 | [street-frontage.md](street-frontage.md) | The RQTT road network, and how much street each lot actually fronts on |
 | [rqtt.md](rqtt.md) | The province-wide road network: the archive, its vintages, and what it replaced |
 | [addresses.md](addresses.md) | Adresses Québec's official address points, and the spatial join that puts each one on a parcel — the key that lets a map and the corpus name a site by its street rather than by its lot number |

@@ -70,20 +70,21 @@ tree: [docs/architecture.md](docs/architecture.md).
 
 ## The assets
 
-42 assets, listed with their partitions and outputs in
+52 assets, listed with their partitions and outputs in
 [docs/assets.md](docs/assets.md).
 
 | Layer | |
 | --- | --- |
-| **bronze** | `spectrum_table_catalog` `neighborhood_features` `reference_neighborhoods` `neighborhood_lots` `neighborhood_buildings` `cmhc_vacancy_survey` `cmhc_rent_survey` `street_network` `neighborhood_addresses` `linked_documents` `montreal_residential_costs` `montreal_nonresidential_costs` `property_assessment_roll` `cubf_use_codes` `uniformized_property_wealth` `montreal_commercial_rents` `commercial_rent_index` |
-| **silver** | `assessment_units` `lot_assessed_values` `lot_assessment_comparables` `commercial_rents` `vacancy_rates` `average_rents` `building_lot_intersections` `neighborhood_streets` `lot_addresses` `lot_frontage` `document_chunks` `document_embeddings` `zoning_grid_columns` `lot_zone_pieces` `lot_zoning_envelopes` `lot_buildable_setbacks` `lot_development_programs` |
-| **gold** | `lot_profiles` `lot_highest_best_use` `lot_redevelopment_gap` `lot_building_massing` `lot_investment_opportunities` `map_cell_aggregates` `map_tiles` `document_index` |
+| **bronze** | `spectrum_table_catalog` `neighborhood_features` `reference_neighborhoods` `neighborhood_lots` `neighborhood_buildings` `cmhc_vacancy_survey` `cmhc_rent_survey` `street_network` `neighborhood_addresses` `linked_documents` `council_minutes` `council_minutes_documents` `cucq_minutes` `montreal_residential_costs` `montreal_nonresidential_costs` `property_assessment_roll` `cubf_use_codes` `uniformized_property_wealth` `montreal_commercial_rents` `commercial_rent_index` |
+| **silver** | `assessment_units` `lot_assessed_values` `lot_assessment_comparables` `commercial_rents` `vacancy_rates` `average_rents` `building_lot_intersections` `neighborhood_streets` `lot_addresses` `lot_frontage` `document_chunks` `document_embeddings` `council_minutes_chunks` `council_planning_items` `council_minutes_embeddings` `cucq_decisions` `cucq_minutes_chunks` `zoning_grid_columns` `lot_zone_pieces` `lot_zoning_envelopes` `lot_buildable_setbacks` `lot_development_programs` |
+| **gold** | `lot_profiles` `lot_highest_best_use` `lot_redevelopment_gap` `lot_building_massing` `lot_investment_opportunities` `map_cell_aggregates` `map_tiles` `document_index` `council_minutes_index` |
 
 They read publishers at four levels:
 
 - **the cities**: Montreal's Spectrum Feature Service and open-data portal;
-  Quebec City's ArcGIS zoning layer and grid workbook; Saguenay's zone lookup
-  and per-zone grid documents.
+  Quebec City's ArcGIS zoning layer and grid workbook, the minutes of its
+  conseils de quartier and of its Commission d'urbanisme et de conservation;
+  Saguenay's zone lookup and per-zone grid documents.
 - **the province**: the Registre foncier's Infolot cadastre; the MRNF's
   Adresses Québec points and RQTT road network; the MAMH's assessment roll,
   from its own open-data site, and its *richesse foncière uniformisée*, from

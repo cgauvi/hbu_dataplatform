@@ -259,6 +259,9 @@ def test_the_registry_covers_every_silver_and_gold_asset_but_the_three_named():
         "council_minutes_chunks",
         "council_minutes_embeddings",
         "council_minutes_index",
+        # The CUCQ corpus, on the same terms as the council's: its chunks
+        # land in silver.document_chunks under `cucq_*` source tables.
+        "cucq_minutes_chunks",
         "neighborhood_cadastre",
     }
 

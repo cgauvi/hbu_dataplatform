@@ -85,6 +85,11 @@ from hbu_dataplatform.cities.quebec_city.council.assets import (
     council_minutes_index,
     council_planning_items,
 )
+from hbu_dataplatform.cities.quebec_city.cucq.assets import (
+    cucq_decisions,
+    cucq_minutes,
+    cucq_minutes_chunks,
+)
 from hbu_dataplatform.rag.assets import (
     document_chunks,
     document_embeddings,
@@ -96,6 +101,7 @@ from hbu_dataplatform.sources.bdoi.resources import BdoiResource
 from hbu_dataplatform.sources.cmhc.resources import CmhcResource
 from hbu_dataplatform.cities.quebec_city.resources import (
     CouncilMinutesResource,
+    CucqMinutesResource,
     QuebecZoningResource,
 )
 from hbu_dataplatform.cities.montreal.resources import (
@@ -143,6 +149,7 @@ ASSETS = [
     linked_documents,
     council_minutes,
     council_minutes_documents,
+    cucq_minutes,
     montreal_residential_costs,
     montreal_nonresidential_costs,
     property_assessment_roll,
@@ -167,6 +174,8 @@ ASSETS = [
     council_minutes_chunks,
     council_minutes_embeddings,
     council_planning_items,
+    cucq_decisions,
+    cucq_minutes_chunks,
     zoning_grid_columns,
     lot_zone_pieces,
     lot_zoning_envelopes,
@@ -591,6 +600,19 @@ council_minutes_index_job = define_asset_job(
     "council_minutes_index_job",
     selection=AssetSelection.assets(council_minutes_index),
     partitions_def=scrape_partitions,
+)
+
+# The Commission d'urbanisme et de conservation de Québec's minutes, the
+# decisions read out of them and the corpus cut from those. On the date axis
+# rather than the borough's: the Commission is one body for the city and the
+# borough of a decision is found from its address, after the fact, so one
+# date partition publishes every borough it placed something in. No
+# schedule yet: the first run is a gigabyte of PDFs and its placement needs
+# silver.lot_addresses loaded for the boroughs the decisions fall in.
+cucq_minutes_job = define_asset_job(
+    "cucq_minutes_job",
+    selection=AssetSelection.assets(cucq_minutes, cucq_decisions, cucq_minutes_chunks),
+    partitions_def=date_partitions,
 )
 
 # Separate from rag_corpus_job on purpose: the corpus is built from the city's
@@ -1171,6 +1193,7 @@ defs = Definitions(
         rag_corpus_job,
         council_minutes_job,
         council_minutes_index_job,
+        cucq_minutes_job,
         document_index_job,
     ],
     schedules=[
@@ -1225,6 +1248,10 @@ defs = Definitions(
         # The conseils de quartier listing host and the fiche pages; its PDFs
         # share `pdf_cache` above, since a filed minute never changes either.
         "council_minutes_source": CouncilMinutesResource(),
+        # The decisions portal's search index, where the CUCQ's minutes are
+        # listed; the PDFs share `pdf_cache` too. The query key it carries is
+        # the public one the portal page ships; a rotation is a new value here.
+        "cucq_source": CucqMinutesResource(),
         "bdoi": BdoiResource(
             # Same posture as pdf_cache: a published BDOI extract never
             # changes, so it is cached once, outside the partition tree, and
