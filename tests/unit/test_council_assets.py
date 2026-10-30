@@ -21,7 +21,8 @@ from hbu_dataplatform.cities.quebec_city.council.assets import (
 )
 from hbu_dataplatform.rag.documents import PdfFetcher
 from hbu_dataplatform.cities.quebec_city.council.councils import CouncilFetcher
-from hbu_dataplatform.cities.quebec_city.resources import CouncilMinutesResource
+from hbu_dataplatform.cities.quebec_city.council.assets import council_items_llm
+from hbu_dataplatform.cities.quebec_city.resources import CouncilItemsLlmResource, CouncilMinutesResource
 from hbu_dataplatform.core.resources import ParquetStore, PostgisResource
 from hbu_dataplatform.rag.resources import EmbeddingModel, PdfCache
 
@@ -428,3 +429,81 @@ def test_a_borough_without_councils_has_an_empty_corpus(host, store, tmp_path, w
     chunks = pd.read_parquet(store.partition_dir("council_minutes_chunks", DATE, "VSMPE") + "/chunks.parquet")
     assert chunks.empty
     assert stub_corpus_db["chunks"] is None, "nothing is upserted for an empty corpus"
+
+
+# ---------------------------------------------------------------------------
+# The model's second reading
+# ---------------------------------------------------------------------------
+
+
+class _FakeJsonModel:
+    """Answers nulls for every item: the loop, the cache and the write-back
+    are what is under test, not the model."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def invoke(self, messages):
+        self.calls += 1
+        return json.dumps({"decision": None})
+
+
+def run_llm(store, tmp_path, *, max_items=20, only_incomplete=True, force=False):
+    return materialize(
+        [council_items_llm],
+        partition_key=MultiPartitionKey({"date": DATE, "neighborhood": "CIL"}),
+        resources={
+            "store": store,
+            "postgis": PostgisResource(),
+            "council_llm": CouncilItemsLlmResource(cache_dir=str(tmp_path / "llm_cache"), model_path="fake.gguf"),
+        },
+        run_config={"ops": {"silver__council_items_llm": {"config": {
+            "max_items": max_items, "only_incomplete": only_incomplete, "force": force,
+        }}}},
+        raise_on_error=False,
+    )
+
+
+def test_the_model_is_asked_about_the_incomplete_items_only_and_cached(host, store, tmp_path, monkeypatch, stub_corpus_db):
+    assert run([council_minutes, council_minutes_documents, council_planning_items], store, tmp_path).success
+    items = pd.read_parquet(store.partition_dir("council_planning_items", DATE, "CIL") + "/items.parquet")
+    fake = _FakeJsonModel()
+    monkeypatch.setattr(CouncilItemsLlmResource, "model", lambda self, schema: fake)
+
+    # The worked case's four seats are read in full by the patterns: with
+    # `only_incomplete` nothing is asked, and the asset still lands a row-less
+    # file rather than failing.
+    result = run_llm(store, tmp_path)
+    assert result.success
+    metadata = result.asset_materializations_for_node("silver__council_items_llm")[0].metadata
+    assert metadata["num_items"].value == len(items)
+    assert metadata["num_candidates"].value == 0 and metadata["num_selected"].value == 0
+    assert fake.calls == 0
+    assert pd.read_parquet(store.partition_dir("council_items_llm", DATE, "CIL") + "/llm_items.parquet").empty
+
+    # Asked about every item, capped: that many, newest first, each once.
+    result = run_llm(store, tmp_path, max_items=2, only_incomplete=False)
+    assert result.success
+    frame = pd.read_parquet(store.partition_dir("council_items_llm", DATE, "CIL") + "/llm_items.parquet")
+    metadata = result.asset_materializations_for_node("silver__council_items_llm")[0].metadata
+    assert metadata["num_selected"].value == 2
+    assert len(frame) == 2
+    assert fake.calls == len(frame)
+    assert metadata["num_cached"].value == 0
+    assert set(frame["status"]) <= {"nothing_found", "filled", "rejected"}
+    assert (frame["model"] == "fake.gguf").all()
+    assert (frame["schema_version"] == "1").all()
+    # Published under its own dataset; the write-back ran on the connection.
+    assert list(stub_corpus_db["datasets"]) == ["council_item_llm_fields"]
+    assert stub_corpus_db["partition"] == ("CIL", DATE)
+
+    # A second run answers from the cache and never reaches the model;
+    # `force` does.
+    again = run_llm(store, tmp_path, max_items=2, only_incomplete=False)
+    assert again.success
+    metadata = again.asset_materializations_for_node("silver__council_items_llm")[0].metadata
+    assert metadata["num_cached"].value == 2
+    assert fake.calls == 2
+    forced = run_llm(store, tmp_path, max_items=2, only_incomplete=False, force=True)
+    assert forced.success
+    assert fake.calls == 4

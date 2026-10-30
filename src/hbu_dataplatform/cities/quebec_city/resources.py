@@ -26,6 +26,10 @@ from hbu_dataplatform.cities.quebec_city.zoning import (
     DEFAULT_ZONING_LAYER_URL as QUEBEC_ZONING_LAYER_URL,
     QuebecZoningClient,
 )
+from hbu_dataplatform.cities.quebec_city.council.llm_items import (
+    DEFAULT_FILENAME,
+    DEFAULT_REPO_ID,
+)
 from hbu_dataplatform.rag.documents import PdfFetcher
 
 
@@ -84,6 +88,64 @@ class QuebecZoningResource(ConfigurableResource):
             batch_size=self.batch_size,
             ca_bundle=self.ca_bundle,
         )
+
+
+class CouncilItemsLlmResource(ConfigurableResource):
+    """The local model that gives the planning items a second reading.
+
+    Qwen3-14B as a 4-bit GGUF through llama.cpp, grammar-constrained to
+    `llm_items.LlmPlanningItem` - see `hbu_dataplatform.rag.structured` for
+    why that runtime and not `transformers`. Built once per process on first
+    use, since the weights are 8 GB and loading them is the slow part. The
+    `llm` extra installs the wheel; without it `model()` raises ImportError
+    naming it, and nothing else in the code location is affected.
+    """
+
+    repo_id: str = DEFAULT_REPO_ID
+    filename: str = DEFAULT_FILENAME
+    model_path: str | None = Field(
+        default=None, description="A local GGUF file; when set, the hub is never asked."
+    )
+    n_ctx: int = 4096
+    n_threads: int | None = Field(default=None, description="Defaults to the machine's cores less two.")
+    max_new_tokens: int = 400
+    cache_dir: str | None = Field(
+        default=None, description="Where each item's answer is kept, keyed by text, schema, prompt and model."
+    )
+    ca_bundle: str | None = Field(
+        default=None,
+        description="PEM bundle for the hub download; the encoder's `trusted_ca` swap applies.",
+    )
+
+    @property
+    def model_id(self) -> str:
+        if self.model_path:
+            return self.model_path.replace("\\", "/").rsplit("/", 1)[-1]
+        return f"{self.repo_id}/{self.filename}"
+
+    def model(self, schema):
+        """The grammar-bound model for `schema`, loaded once per process."""
+        from hbu_dataplatform.rag.structured import (
+            LlamaJsonModel,
+            cached_json_model,
+            grammar_for,
+            load_llama,
+        )
+
+        def build() -> LlamaJsonModel:
+            llama = load_llama(
+                repo_id=self.repo_id,
+                filename=self.filename,
+                model_path=self.model_path,
+                n_ctx=self.n_ctx,
+                n_threads=self.n_threads,
+                ca_bundle=self.ca_bundle,
+            )
+            return LlamaJsonModel(
+                llama, grammar=grammar_for(schema), max_tokens=self.max_new_tokens, model_id=self.model_id
+            )
+
+        return cached_json_model(self.model_id, build)
 
 
 class CouncilMinutesResource(ConfigurableResource):

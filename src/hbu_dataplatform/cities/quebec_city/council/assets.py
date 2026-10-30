@@ -64,12 +64,25 @@ from dagster import (
     asset,
 )
 
+from hbu_dataplatform.cities.quebec_city.council.amendments import (
+    AMENDMENT_COLUMNS,
+    BYLAW_STATUS_COLUMNS,
+    bylaw_status,
+    consolidate,
+)
 from hbu_dataplatform.cities.quebec_city.council.corpus import (
     chunk_council_document,
     chunk_ids_covering,
     chunk_spans,
     council_title,
     source_table_for,
+)
+from hbu_dataplatform.cities.quebec_city.council.llm_items import (
+    LlmCache,
+    extract,
+    gaps,
+    json_schema,
+    merge,
 )
 from hbu_dataplatform.cities.quebec_city.council.items import (
     item_spans,
@@ -96,11 +109,11 @@ from hbu_dataplatform.cities.quebec_city.council.councils import (
     pdf_links,
     urls_in_text,
 )
-from hbu_dataplatform.rag.documents import Document, DocumentError, document_id, read_pdf
+from hbu_dataplatform.rag.documents import ZONING_SOURCES, Document, DocumentError, document_id, read_pdf
 from hbu_dataplatform.rag.results import IndexMismatch
 from hbu_dataplatform.core.frames import write_frame, write_vectors
 from hbu_dataplatform.core.pg import PostgresUnavailable
-from hbu_dataplatform.cities.quebec_city.resources import CouncilMinutesResource
+from hbu_dataplatform.cities.quebec_city.resources import CouncilItemsLlmResource, CouncilMinutesResource
 from hbu_dataplatform.core.resources import ParquetStore, PostgisResource
 from hbu_dataplatform.rag.resources import EmbeddingModel, PdfCache, PgVectorResource
 from hbu_dataplatform.core.storage import dirname, filesystem, join, storage_options
@@ -121,6 +134,16 @@ ITEMS_FILE = "items.parquet"
 SITES_FILE = "sites.parquet"
 CHUNKS_FILE = "chunks.parquet"
 EMBEDDINGS_FILE = "embeddings.parquet"
+AMENDMENTS_FILE = "amendments.parquet"
+BYLAW_STATUS_FILE = "bylaw_status.parquet"
+LLM_ITEMS_FILE = "llm_items.parquet"
+
+#: The columns of silver.council_item_llm_fields, in the parquet's order.
+LLM_COLUMNS: tuple[str, ...] = (
+    "scrape_date", "neighborhood", "doc_id", "item_index", "cache_key", "text_sha256",
+    "model", "schema_version", "prompt_version", "gaps", "status", "fields", "provenance",
+    "rejected", "raw", "elapsed_s",
+)
 
 #: Hops from a minute the trail follows: minute -> fiche -> sommaire ->
 #: resolution is three. A fourth would be a resolution's own links, which
@@ -779,6 +802,334 @@ def council_planning_items(
     )
 
 
+@asset(
+    key_prefix=key_prefix("zoning_amendments"),
+    partitions_def=scrape_partitions,
+    deps=[council_planning_items],
+    group_name=GOLD_GROUP,
+    kinds={"postgres", "parquet"},
+    description=(
+        "The planning items folded to one row per zoning decision - the "
+        "seats that share a sommaire number, an amending by-law or a subject "
+        "zone at one assembly are one decision, with its furthest stage, its "
+        "dates, its dwelling caps before and after, the council's opinion "
+        "and the seats it was folded from - into gold.zoning_amendments; and "
+        "beside it, read off each zone's grid sheet in silver.document_chunks, "
+        "the by-law in force and its date, into gold.zone_bylaw_status. The "
+        "record the zoning-change outlook counts precedents from."
+    ),
+)
+def zoning_amendments(
+    context: AssetExecutionContext,
+    store: ParquetStore,
+    postgis: PostgisResource,
+) -> MaterializeResult:
+    neighborhood, scrape_date = borough_partition_of(context)
+    items = _read(store.partition_dir(council_planning_items.key.path[-1], scrape_date, neighborhood), ITEMS_FILE)
+    output_dir = store.partition_dir(context.asset_key.path[-1], scrape_date, neighborhood)
+
+    try:
+        with postgis.connect() as connection:
+            caps = _current_caps(connection, neighborhood)
+            chunks = _sheet_chunks(connection, neighborhood)
+    except (PostgresUnavailable, MissingRelation) as exc:
+        raise Failure(f"{neighborhood} {scrape_date}: the grid and the sheet chunks could not be read: {exc}") from exc
+
+    records, overlaid = _overlay_llm(items.to_dict("records"), store, scrape_date, neighborhood)
+    if overlaid:
+        context.log.info("%s %s: %d item(s) carry the model's reading over the patterns' gaps", neighborhood, scrape_date, overlaid)
+    rows = consolidate(records, neighborhood=neighborhood, scrape_date=scrape_date, current_caps=caps)
+    status = bylaw_status(chunks, neighborhood=neighborhood, scrape_date=scrape_date)
+    frame = pd.DataFrame(rows, columns=list(AMENDMENT_COLUMNS))
+    status_frame = pd.DataFrame(status, columns=list(BYLAW_STATUS_COLUMNS))
+    path = _write(frame, output_dir, AMENDMENTS_FILE)
+    status_path = _write(status_frame, output_dir, BYLAW_STATUS_FILE)
+    try:
+        loaded = publish(
+            postgis.connect,
+            {"zoning_amendments": frame, "zone_bylaw_status": status_frame},
+            partition=neighborhood,
+            scrape_date=scrape_date,
+        )
+    except (PostgresUnavailable, MissingRelation) as exc:
+        raise Failure(
+            f"{path} was written, but gold.zoning_amendments could not be "
+            f"updated for {neighborhood} {scrape_date}: {exc}"
+        ) from exc
+
+    raised = frame[frame["raises_cap"].fillna(False).astype(bool)] if len(frame) else frame
+    return MaterializeResult(
+        metadata={
+            "dagster/row_count": len(frame),
+            "num_amendments": len(frame),
+            "num_items_read": len(items),
+            "num_items_with_llm_fields": overlaid,
+            "num_seats_folded": int(frame["seats"].sum()) if len(frame) else 0,
+            "kinds": MetadataValue.json(frame["kind"].value_counts().to_dict() if len(frame) else {}),
+            "outcomes": MetadataValue.json(frame["outcome"].fillna("none").value_counts().to_dict() if len(frame) else {}),
+            "num_raising_a_cap": len(raised),
+            "num_raising_a_cap_approved": int((raised["outcome"] == "approved").sum()) if len(raised) else 0,
+            "num_with_subject_zone": int((frame["subject_zone_codes"] != "[]").sum()) if len(frame) else 0,
+            "num_zones_with_bylaw_status": int(status_frame["feature_id"].nunique()) if len(status_frame) else 0,
+            "num_sheet_chunks_read": len(chunks),
+            "num_zones_with_a_cap": len(caps),
+            "output_path": MetadataValue.path(str(path)),
+            "bylaw_status_path": MetadataValue.path(str(status_path)),
+            **published_metadata(loaded),
+            **({"preview": MetadataValue.md(_amendments_preview(frame))} if len(frame) else {}),
+        }
+    )
+
+
+def _overlay_llm(records: list[dict], store: ParquetStore, scrape_date: str, neighborhood: str) -> tuple[list[dict], int]:
+    """The items with the model's accepted fields laid over the patterns'
+    gaps, when `council_items_llm` has run for the partition. Regex values
+    stay; see `llm_items.merge`."""
+    path = join(store.partition_dir("council_items_llm", scrape_date, neighborhood), LLM_ITEMS_FILE)
+    if not filesystem(path).exists(path):
+        return records, 0
+    llm = pd.read_parquet(path, storage_options=storage_options(path))
+    filled = {
+        (str(row.doc_id), int(row.item_index)): json.loads(row.fields or "{}")
+        for row in llm.itertuples(index=False)
+        if row.status == "filled"
+    }
+    if not filled:
+        return records, 0
+    merged: list[dict] = []
+    count = 0
+    for record in records:
+        fields = filled.get((str(record["doc_id"]), int(record["item_index"])))
+        if fields:
+            record, provenance = merge(record, fields)
+            count += any(source == "llm" for source in provenance.values())
+        merged.append(record)
+    return merged, count
+
+
+class CouncilItemsLlmConfig(Config):
+    """Which items the model is asked about, and how many.
+
+    ``only_incomplete`` keeps the run to the items `llm_items.gaps` flags;
+    ``max_items`` caps it, because the model costs minutes per item on this
+    hardware; ``doc_ids`` narrows to some documents; ``force`` ignores the
+    cache; ``max_chars`` bounds the text the model sees.
+    """
+
+    max_items: int = 20
+    only_incomplete: bool = True
+    doc_ids: list[str] = []
+    force: bool = False
+    max_chars: int = 7000
+
+
+class _LazyModel:
+    """The resource's model, loaded on the first item the cache does not
+    answer - a fully cached run never pays the 8 GB load."""
+
+    def __init__(self, resource: CouncilItemsLlmResource) -> None:
+        self._resource = resource
+        self._model = None
+
+    def invoke(self, messages):
+        if self._model is None:
+            self._model = self._resource.model(json_schema())
+        return self._model.invoke(messages)
+
+
+@asset(
+    key_prefix=key_prefix("council_items_llm"),
+    partitions_def=scrape_partitions,
+    deps=[council_planning_items],
+    group_name=SILVER_GROUP,
+    kinds={"postgres", "parquet"},
+    description=(
+        "A local model's second reading of the planning items the patterns "
+        "left short - an amendment that speaks of dwellings and states no "
+        "cap, no subject zone, no decision - answering in JSON constrained to "
+        "a schema, every value with the excerpt it was read from and kept "
+        "only when that excerpt is a quote of the item. One row per item "
+        "asked, into silver.council_item_llm_fields; the accepted values are "
+        "then written onto the item's row (llm_fields, extraction_source) "
+        "without touching what the patterns read. Minutes per item on CPU, "
+        "cached by text, schema, prompt and model."
+    ),
+)
+def council_items_llm(
+    context: AssetExecutionContext,
+    config: CouncilItemsLlmConfig,
+    store: ParquetStore,
+    postgis: PostgisResource,
+    council_llm: CouncilItemsLlmResource,
+) -> MaterializeResult:
+    neighborhood, scrape_date = borough_partition_of(context)
+    items = _read(store.partition_dir(council_planning_items.key.path[-1], scrape_date, neighborhood), ITEMS_FILE)
+    output_dir = store.partition_dir(context.asset_key.path[-1], scrape_date, neighborhood)
+
+    records = items.to_dict("records")
+    if config.doc_ids:
+        wanted = set(config.doc_ids)
+        records = [r for r in records if str(r["doc_id"]) in wanted]
+    candidates: list[tuple[dict, list[str]]] = []
+    for record in records:
+        found = gaps(record)
+        if config.only_incomplete and not found:
+            continue
+        candidates.append((record, found))
+    # Amendments about a named zone first, then the other amendments, then
+    # the rest; newest assembly first within each.
+    candidates.sort(key=lambda c: str(c[0].get("meeting_date") or ""), reverse=True)
+    candidates.sort(key=lambda c: _llm_rank(c[0]))
+    selected = candidates[: max(0, config.max_items)]
+    context.log.info(
+        "%s %s: %d item(s), %d with a gap, %d selected (max_items=%d)",
+        neighborhood, scrape_date, len(records), len(candidates), len(selected), config.max_items,
+    )
+
+    cache = LlmCache(council_llm.cache_dir) if council_llm.cache_dir else None
+    model = _LazyModel(council_llm)
+    rows: list[dict] = []
+    for record, found in selected:
+        result = extract(
+            record, model=model, model_id=council_llm.model_id, cache=cache,
+            force=config.force, max_chars=config.max_chars, gap_fields=found,
+        )
+        context.log.info(
+            "%s#%s: %s in %.0fs%s - %s",
+            record["doc_id"], record["item_index"], result["status"], result["elapsed_s"],
+            " (cached)" if result.get("cached") else "", ", ".join(result["provenance"].get(k, "") == "llm" and k or "" for k in result["fields"] if k in result["provenance"]).strip(", ") or "nothing filled",
+        )
+        rows.append(
+            {
+                **{column: result.get(column) for column in LLM_COLUMNS if column not in ("scrape_date", "neighborhood")},
+                "scrape_date": scrape_date,
+                "neighborhood": neighborhood,
+                "_cached": bool(result.get("cached")),
+            }
+        )
+
+    frame = pd.DataFrame(rows, columns=[*LLM_COLUMNS, "_cached"])
+    cached = int(frame["_cached"].sum()) if len(frame) else 0
+    frame = frame.drop(columns=["_cached"])
+    for column in ("gaps", "fields", "provenance", "rejected"):
+        frame[column] = frame[column].map(lambda value: json.dumps(value, ensure_ascii=False, default=str) if value is not None else None)
+    path = _write(frame, output_dir, LLM_ITEMS_FILE)
+
+    try:
+        loaded = publish(postgis.connect, {"council_item_llm_fields": frame}, partition=neighborhood, scrape_date=scrape_date)
+        with postgis.connect() as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                UPDATE silver.council_planning_items i
+                   SET llm_fields = f.fields,
+                       extraction_source = f.provenance
+                  FROM silver.council_item_llm_fields f
+                 WHERE f.scrape_date = i.scrape_date AND f.neighborhood = i.neighborhood
+                   AND f.doc_id = i.doc_id AND f.item_index = i.item_index
+                   AND f.status = 'filled'
+                   AND i.neighborhood = %s AND i.scrape_date = %s::date
+                """,
+                [neighborhood, scrape_date],
+            )
+            written_back = max(cursor.rowcount, 0)
+    except (PostgresUnavailable, MissingRelation) as exc:
+        raise Failure(
+            f"{path} was written, but silver.council_item_llm_fields could not be "
+            f"updated for {neighborhood} {scrape_date}: {exc}"
+        ) from exc
+
+    filled_by_field: dict[str, int] = {}
+    for row in rows:
+        for name, source in (row.get("provenance") or {}).items():
+            if source == "llm":
+                filled_by_field[name] = filled_by_field.get(name, 0) + 1
+    ran = [row for row in rows if not row.get("_cached")]
+    return MaterializeResult(
+        metadata={
+            "dagster/row_count": len(frame),
+            "num_items": len(records),
+            "num_candidates": len(candidates),
+            "num_selected": len(selected),
+            "num_run": len(frame) - cached,
+            "num_cached": cached,
+            "statuses": MetadataValue.json(frame["status"].value_counts().to_dict() if len(frame) else {}),
+            "num_filled_by_field": MetadataValue.json(filled_by_field),
+            "num_rejected_values": int(sum(len(row.get("rejected") or []) for row in rows)),
+            "seconds_per_item": round(float(frame["elapsed_s"].mean()), 1) if len(frame) and len(frame) > cached else None,
+            "num_written_back": written_back,
+            "model": council_llm.model_id,
+            "output_path": MetadataValue.path(str(path)),
+            **published_metadata(loaded),
+        }
+    )
+
+
+def _llm_rank(record: dict) -> int:
+    kind = record.get("item_kind")
+    zones = record.get("subject_zone_codes")
+    has_zone = bool(zones) and str(zones) not in ("[]", "nan")
+    if kind == "zoning_amendment":
+        return 0 if has_zone else 1
+    return 2
+
+
+def _current_caps(connection, neighborhood: str) -> dict[str, float | None]:
+    """``{zone: max_dwellings}`` off the borough's current grid, through
+    rag.zone_profiles() (hbu_infra sql/038) - the same reading of a zone
+    the outlook and similar_zones use."""
+    from psycopg import errors
+
+    cursor = connection.cursor()
+    try:
+        cursor.execute(
+            "SELECT feature_id, max_dwellings FROM rag.zone_profiles() WHERE neighborhood = %s",
+            [neighborhood],
+        )
+    except errors.UndefinedFunction as exc:
+        raise MissingRelation(
+            "rag.zone_profiles() is not in this database - apply hbu_infra sql/038_zone_similarity.sql"
+        ) from exc
+    return {str(zone): (float(cap) if cap is not None else None) for zone, cap in cursor.fetchall()}
+
+
+def _sheet_chunks(connection, neighborhood: str) -> list[dict]:
+    """The borough's grid-sheet chunks that print an in-force line, from the
+    newest snapshot of silver.document_chunks that holds them."""
+    cursor = connection.cursor()
+    cursor.execute(
+        """
+        WITH current AS (
+            SELECT max(scrape_date) AS scrape_date
+              FROM silver.document_chunks
+             WHERE neighborhood = %(neighborhood)s
+               AND source_table = ANY(%(sources)s)
+        )
+        SELECT c.doc_id, c.url, c.source_table, c.feature_ids, c.text
+          FROM silver.document_chunks c
+          JOIN current cur ON cur.scrape_date = c.scrape_date
+         WHERE c.neighborhood = %(neighborhood)s
+           AND c.source_table = ANY(%(sources)s)
+           AND c.text ~* 'en vigueur le'
+        """,
+        {"neighborhood": neighborhood, "sources": list(ZONING_SOURCES)},
+    )
+    return [
+        {"doc_id": doc_id, "url": url, "source_table": source_table, "feature_ids": feature_ids, "text": text}
+        for doc_id, url, source_table, feature_ids, text in cursor.fetchall()
+    ]
+
+
+def _amendments_preview(frame: pd.DataFrame) -> str:
+    columns = [
+        "amendment_id", "kind", "subject_zone_codes", "max_dwellings_before", "max_dwellings_after",
+        "raises_cap", "stage", "outcome", "decision_date", "council_opinion", "seats", "title",
+    ]
+    head = frame[columns].head(12).copy()
+    head["title"] = head["title"].astype(str).str.slice(0, 60)
+    return head.to_markdown(index=False)
+
+
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
@@ -972,4 +1323,6 @@ __all__ = [
     "council_minutes_embeddings",
     "council_minutes_index",
     "council_planning_items",
+    "council_items_llm",
+    "zoning_amendments",
 ]

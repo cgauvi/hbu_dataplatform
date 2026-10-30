@@ -32,10 +32,12 @@ one with geometry - one point per *unité d'évaluation*, placed at the unit's
 visual centre - and the other four hang off it by `id_provinc`, the municipality
 code and the 18-character matricule concatenated. Three are read:
 `b05v_unite_evaln`, the characteristics table, one row per unit, holding the
-assessed values; and `b05v_lot_cadst`, the crosswalk naming every cadastre lot
-a unit covers, which is what lets a lot be valued by lot number rather than by
-where a point falls. `b05v_adr_unite_evaln` (addresses) and `b05v_repar_fisc`
-(fiscal breakdowns) are not read.
+assessed values; `b05v_lot_cadst`, the crosswalk naming every cadastre lot a
+unit covers, which is what lets a lot be valued by lot number rather than by
+where a point falls; and `b05v_repar_fisc`, the fiscal breakdown - the part of
+a unit's value the roll files under an exemption or a compensation regime, and
+the article of law it files it under. `b05v_adr_unite_evaln` (addresses) is
+not read.
 
 Deliberately free of Dagster imports, mirroring `hbu_dataplatform.sources.bdoi.client` and
 `hbu_dataplatform.core.open_data`.
@@ -84,10 +86,44 @@ UNITS_LAYER = "b05v_unite_evaln"
 #: more - which is why it is its own file and its own grain.
 CADASTRE_LAYER = "b05v_lot_cadst"
 
-#: The two tables this pipeline does not read. Listed so a run can report what
-#: it dropped rather than leaving the archive's other 5 million rows
-#: unaccounted for.
-UNREAD_LAYERS = ("b05v_adr_unite_evaln", "b05v_repar_fisc")
+#: The fiscal breakdown: one row per (unit, part, regime) - the land (`T`),
+#: the building (`B`) and their total (`I`) - for every unit some article of
+#: law takes out of the ordinary tax base. 3,750 of Quebec City's 175,478
+#: units and 9,089 of Montreal's 437,192 have rows here; the rest are taxed
+#: whole and absent. Read since 2026-10-05 for one reason: the open roll
+#: publishes no owner (the whole RL02 section is withheld), and an exemption
+#: under F-2.1 art. 204 - the State, a municipality, a school service centre,
+#: a church - is the one thing in it that says what *kind* of owner holds a
+#: unit. `hbu_dataplatform.sources.roll.assets.fiscal_regimes` folds it onto
+#: the unit.
+FISCAL_LAYER = "b05v_repar_fisc"
+
+#: The one table this pipeline does not read: the roll's own civic addresses,
+#: one to many against the unit. Adresses Quebec's points already put an
+#: address on every lot, and the roll's are the same doors spelled the
+#: assessor's way. Listed so a run can report what it dropped rather than
+#: leaving the archive's other 3.8 million rows unaccounted for.
+UNREAD_LAYERS = ("b05v_adr_unite_evaln",)
+
+#: `FISCAL_LAYER`'s columns, under the MAMH codes they are published as. Two
+#: parallel sets: `rl0504*` is the exemption (*répartition fiscale*), `rl0507*`
+#: the compensation - a hospital or a university pays one in lieu of the tax.
+#: Each set is law, article, paragraph, value, and which part of the unit the
+#: row is about. The `I` row is the sum of that regime's `T` and `B` rows on
+#: every one of the 16,798 units checked, so the value under a regime is read
+#: off `I` and nothing is added twice.
+EXEMPTION_LAW_COLUMN = "rl0504a"
+EXEMPTION_ARTICLE_COLUMN = "rl0504b"
+EXEMPTION_VALUE_COLUMN = "rl0504d"
+EXEMPTION_PART_COLUMN = "rl0504e"
+COMPENSATION_LAW_COLUMN = "rl0507a"
+COMPENSATION_ARTICLE_COLUMN = "rl0507b"
+COMPENSATION_VALUE_COLUMN = "rl0507d"
+COMPENSATION_PART_COLUMN = "rl0507e"
+
+#: The `rl0504e` / `rl0507e` value naming the whole unit, as against its land
+#: (`T`) or its building (`B`).
+WHOLE_UNIT_PART = "I"
 
 #: What every table in the archive is keyed on: the municipality's five-digit
 #: geographic code followed by the 18-character matricule.

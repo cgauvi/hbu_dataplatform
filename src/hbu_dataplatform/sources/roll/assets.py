@@ -4,16 +4,20 @@ Three assets over one publication - Quebec's *rôle d'évaluation foncière*, th
 province-wide property assessment roll the MAMH republishes as open data.
 
 `property_assessment_roll` snapshots it. The archive holds five layers and this
-keeps three: `rol_unite_p`, one point per *unité d'évaluation*;
+keeps four: `rol_unite_p`, one point per *unité d'évaluation*;
 `b05v_unite_evaln`, the characteristics table those points are described by;
-and `b05v_lot_cadst`, the crosswalk naming every cadastre lot a unit covers.
-The other two - addresses and fiscal breakdowns - are not read; `UNREAD_LAYERS`
-names them so a run reports what it left rather than leaving five million rows
-unaccounted for.
+`b05v_lot_cadst`, the crosswalk naming every cadastre lot a unit covers; and
+`b05v_repar_fisc`, the fiscal breakdown naming the article of law that exempts
+or compensates a unit. The fifth - the roll's own civic addresses - is not
+read; `UNREAD_LAYERS` names it so a run reports what it left rather than
+leaving four million rows unaccounted for.
 
 `assessment_units` puts the first two back together on `id_provinc`, which is
 what the publisher splits them by: the geometry is in one file and everything
-true of the property is in the other, and neither is usable alone.
+true of the property is in the other, and neither is usable alone. The other
+two are folded onto the unit as `lot_numbers` and `fiscal_regimes` - see
+`lots_per_unit` and `fiscal_regimes` for why: the open roll publishes no
+owner, and those two columns are what it does say on the subject.
 
 **It also gives the use code its words back.** The roll states `rl0105a` as
 four digits and stops - a unit says ``4611`` and nothing published with it says
@@ -161,6 +165,15 @@ from hbu_dataplatform.core.resources import ParquetStore, PostgisResource
 from hbu_dataplatform.sources.roll.resources import RoleResource
 from hbu_dataplatform.sources.roll.client import (
     CADASTRE_LAYER,
+    COMPENSATION_ARTICLE_COLUMN,
+    COMPENSATION_LAW_COLUMN,
+    COMPENSATION_PART_COLUMN,
+    COMPENSATION_VALUE_COLUMN,
+    EXEMPTION_ARTICLE_COLUMN,
+    EXEMPTION_LAW_COLUMN,
+    EXEMPTION_PART_COLUMN,
+    EXEMPTION_VALUE_COLUMN,
+    FISCAL_LAYER,
     JOIN_KEY,
     MONTREAL_CODE_MUN,
     POINT_LAYER,
@@ -169,6 +182,7 @@ from hbu_dataplatform.sources.roll.client import (
     UNREAD_LAYERS,
     USE_CODE_COLUMN,
     VALUE_COLUMN,
+    WHOLE_UNIT_PART,
     RoleError,
     filename_for,
     layer_named,
@@ -194,7 +208,7 @@ GROUP = OPEN_DATA_GROUP
 #: lineage, and both of its assets are pandas merges over the tree.
 SILVER_GROUP = "silver_assessment"
 
-#: The two files a bronze partition is written to, under
+#: The four files a bronze partition is written to, under
 #: `bronze/property_assessment_roll/<YYYY-MM-DD>/`. Named for the layers they
 #: are, minus the roll-year suffix the publisher stamps on: bronze carries its
 #: publishers' vocabulary, the same way `NO_LOT` and `COTE_RUE_ID` survive
@@ -202,6 +216,18 @@ SILVER_GROUP = "silver_assessment"
 POINTS_FILE = "rol_unite_p.parquet"
 UNITS_FILE = "unite_evaln.parquet"
 CADASTRE_FILE = "lot_cadst.parquet"
+FISCAL_FILE = "repar_fisc.parquet"
+
+#: The three columns `assessment_units` adds to the merge from the two
+#: one-to-many layers, folded to the unit's grain. `LOT_NUMBERS_COLUMN` is
+#: every lot the crosswalk says the unit covers, keyed with `lot_key`, as a
+#: list - what lets a reader ask "are these two addresses one assessment
+#: unit" by lot number, which is the only ownership question the open roll
+#: answers (see `lots_per_unit`). The other two are the fiscal regime
+#: (`fiscal_regimes`).
+LOT_NUMBERS_COLUMN = "lot_numbers"
+FISCAL_REGIMES_COLUMN = "fiscal_regimes"
+FISCAL_REGIME_VALUE_COLUMN = "fiscal_regime_value"
 
 #: The one file `assessment_units` writes, under
 #: `silver/assessment_units/<YYYY-MM-DD>/`.
@@ -340,10 +366,12 @@ class LotValuesConfig(Config):
         "bronze/property_assessment_roll/<YYYY-MM-DD>/: one point per unité "
         f"d'évaluation as {POINTS_FILE}, the characteristics table those "
         f"points are described by as {UNITS_FILE}, and the crosswalk naming "
-        f"every cadastre lot a unit covers as {CADASTRE_FILE}. Three of the "
-        "archive's five layers; the addresses and fiscal breakdowns are not "
-        "read. Scoped to Ville de Montréal by default, out of a province-wide "
-        f"publication. Source: {SOURCE_URL}"
+        f"every cadastre lot a unit covers as {CADASTRE_FILE}, and the fiscal "
+        f"breakdown - which units an article of law exempts or compensates, "
+        f"and for how much of their value - as {FISCAL_FILE}. Four of the "
+        "archive's five layers; the roll's own civic addresses are not read. "
+        "Scoped to the cities this pipeline has partitions in by default, out "
+        f"of a province-wide publication. Source: {SOURCE_URL}"
     ),
 )
 @guard_current_scrape_month
@@ -367,12 +395,14 @@ def property_assessment_roll(
         points_layer = layer_named(geopackage, POINT_LAYER)
         units_layer = layer_named(geopackage, UNITS_LAYER)
         cadastre_layer = layer_named(geopackage, CADASTRE_LAYER)
+        fiscal_layer = layer_named(geopackage, FISCAL_LAYER)
         context.log.info(
-            "%s: reading %s, %s and %s%s",
+            "%s: reading %s, %s, %s and %s%s",
             filename,
             points_layer,
             units_layer,
             cadastre_layer,
+            fiscal_layer,
             f" where {where}" if where else " (whole province)",
         )
         points = read_layer(geopackage, points_layer, where=where)
@@ -380,6 +410,10 @@ def property_assessment_roll(
         cadastre = read_layer(
             geopackage, cadastre_layer, where=where, geometry=False
         )
+        # Allowed to come back empty, unlike the three above: a municipality
+        # whose every unit is taxed whole has no row here, and that is a
+        # fact about its tax base rather than a read that failed.
+        fiscal = read_layer(geopackage, fiscal_layer, where=where, geometry=False)
     except RoleError as exc:
         # One archive, one query each: a failure here costs the whole
         # partition, the way it does for Infolot rather than for the Spectrum
@@ -404,6 +438,7 @@ def property_assessment_roll(
         (points, points_layer, POINTS_FILE),
         (units, units_layer, UNITS_FILE),
         (cadastre, cadastre_layer, CADASTRE_FILE),
+        (fiscal, fiscal_layer, FISCAL_FILE),
     ):
         # Written as columns because the output path holds bare keys rather
         # than hive `key=value` pairs, so a reader that opens one file still
@@ -421,12 +456,13 @@ def property_assessment_roll(
         context.log.warning("%s: %d invalid geometr(ies)", POINTS_FILE, invalid)
     context.log.info(
         "%s %s: %d point(s), %d characteristics row(s), %d lot crosswalk "
-        "row(s) -> %s",
+        "row(s), %d fiscal row(s) -> %s",
         filename,
         scrape_date,
         len(points),
         len(units),
         len(cadastre),
+        len(fiscal),
         output_dir,
     )
 
@@ -436,6 +472,12 @@ def property_assessment_roll(
             "num_assessment_points": len(points),
             "num_characteristics_rows": len(units),
             "num_lot_crosswalk_rows": len(cadastre),
+            "num_fiscal_rows": len(fiscal),
+            # Units some article of law exempts or compensates, in whole or
+            # in part. A share of the tax base, not an error when small.
+            "num_units_with_fiscal_rows": (
+                int(fiscal[JOIN_KEY].nunique()) if not fiscal.empty else 0
+            ),
             # One row per (unit, lot), so this is the lot side of the grain
             # `lot_assessed_values` joins Infolot's polygons on.
             "num_cadastre_lots": int(cadastre[ROLL_LOT_COLUMN].nunique()),
@@ -451,6 +493,7 @@ def property_assessment_roll(
             "points_path": MetadataValue.path(str(paths[POINTS_FILE])),
             "units_path": MetadataValue.path(str(paths[UNITS_FILE])),
             "cadastre_path": MetadataValue.path(str(paths[CADASTRE_FILE])),
+            "fiscal_path": MetadataValue.path(str(paths[FISCAL_FILE])),
             "geopackage_path": MetadataValue.path(str(geopackage)),
             "source_url": MetadataValue.url(f"{SOURCE_URL}{filename}"),
         }
@@ -469,7 +512,12 @@ def property_assessment_roll(
         "built, dwellings, use code. The two bronze files merged on "
         f"{JOIN_KEY}, which is what the publisher splits them by, plus "
         f"{USE_DESCRIPTION_COLUMN} - what the MEFQ's codebook says the unit's "
-        f"{USE_CODE_COLUMN} means, which the roll itself never states. Written "
+        f"{USE_CODE_COLUMN} means, which the roll itself never states - plus "
+        f"{LOT_NUMBERS_COLUMN}, every cadastre lot the roll says the unit "
+        f"covers, and {FISCAL_REGIMES_COLUMN} / {FISCAL_REGIME_VALUE_COLUMN}, "
+        "the article of law that exempts or compensates it and the value "
+        "under that regime, both folded to the unit's grain from the "
+        "one-to-many layers. Written "
         f"to silver/assessment_units/<YYYY-MM-DD>/{ASSESSMENT_UNITS_FILE} as "
         "wide as the bronze snapshot, and upserted into "
         "silver.assessment_units on (scrape_date, neighborhood, id_provinc) - "
@@ -528,6 +576,37 @@ def assessment_units(
     # code twice - which is exactly the failure a 437-thousand-row silver asset
     # should not be one publisher's typo away from.
     uses = _describe_uses(merged, store, scrape_date=scrape_date, log=context.log)
+
+    # The two one-to-many layers, folded to the unit and looked up rather
+    # than merged, for the reason the codebook is: a merge on a one-to-many
+    # side multiplies the frame, and a unit counted twice downstream doubles a
+    # lot's value and reads as a plausible number.
+    crosswalk = _read_parquet(
+        join(bronze_dir, CADASTRE_FILE), written_by=written_by, partition=scrape_date
+    )
+    merged = _attach(merged, lots_per_unit(crosswalk), LOT_NUMBERS_COLUMN)
+    fiscal_path = join(bronze_dir, FISCAL_FILE)
+    try:
+        regimes = fiscal_regimes(
+            _read_parquet(fiscal_path, written_by=written_by, partition=scrape_date)
+        )
+    except Failure:
+        # A bronze partition written before the fiscal layer was read. The
+        # merge still stands; the two columns are null and the run says so,
+        # which is the difference between "taxed whole" and "not looked at".
+        context.log.warning(
+            "%s is absent: this bronze partition predates the fiscal layer, so "
+            "%s and %s are null. Re-materialize property_assessment_roll for "
+            "%s to fill them.",
+            fiscal_path,
+            FISCAL_REGIMES_COLUMN,
+            FISCAL_REGIME_VALUE_COLUMN,
+            scrape_date,
+        )
+        regimes = fiscal_regimes(pd.DataFrame())
+    merged = _attach(merged, regimes, FISCAL_REGIMES_COLUMN, FISCAL_REGIME_VALUE_COLUMN)
+    num_with_lots = int(merged[LOT_NUMBERS_COLUMN].notna().sum())
+    num_under_regime = int(merged[FISCAL_REGIMES_COLUMN].notna().sum())
 
     output_dir = store.partition_dir(context.asset_key.path[-1], scrape_date)
     removed = clear_parquet(output_dir)
@@ -637,6 +716,14 @@ def assessment_units(
                 sorted(uses.unmatched)
             ),
             "mefq_edition": uses.edition or "unknown",
+            # The crosswalk's side: a unit with no lot number is one the roll
+            # places by address alone, which `lot_assessed_values` then puts
+            # on a lot by its point.
+            "num_units_with_lot_numbers": num_with_lots,
+            # Units an article of law exempts or compensates. The roll
+            # publishes no owner, and this is the one column that says what
+            # kind of owner holds a unit - see `fiscal_regimes`.
+            "num_units_under_a_fiscal_regime": num_under_regime,
             "output_path": MetadataValue.path(str(path)),
             **published_metadata(loaded),
         }
@@ -1157,6 +1244,157 @@ def _arrond_mismatches(frames: dict[str, gpd.GeoDataFrame]) -> int:
         stated = frame[ARROND_COLUMN]
         total += int((stated.notna() & (stated != expected)).sum())
     return total
+
+
+def lots_per_unit(crosswalk: pd.DataFrame) -> pd.DataFrame:
+    """Every lot a unit covers, as one sorted list per unit, keyed with `lot_key`.
+
+    The crosswalk is one row per (unit, lot) and the unit table is one row per
+    unit, so this is the fold that lets the first ride on the second without
+    multiplying it. The list is what a reader asking "do 425 and 429 belong
+    to the same person" can actually be answered with: the open roll
+    publishes no owner, but an *unité d'évaluation* is by definition one
+    owner's (LFM art. 34) - so two addresses whose lots are in one unit's list
+    are one owner's, and two in different units are a question the roll
+    cannot settle. The suffix is dropped and the pairs de-duplicated the way
+    `_pairs_by_lot_number` does, so the same lot is never listed twice.
+
+    Sorted, so the list is stable across runs and two units covering the same
+    ground compare equal.
+    """
+    empty = pd.DataFrame(
+        {JOIN_KEY: pd.Series(dtype="object"), LOT_NUMBERS_COLUMN: pd.Series(dtype="object")}
+    )
+    if crosswalk.empty or ROLL_LOT_COLUMN not in crosswalk.columns:
+        return empty
+    edges = crosswalk[[JOIN_KEY, ROLL_LOT_COLUMN]].copy()
+    edges["lot_key"] = edges[ROLL_LOT_COLUMN].map(lot_key)
+    edges = edges[edges["lot_key"].notna()].drop_duplicates(
+        subset=[JOIN_KEY, "lot_key"]
+    )
+    if edges.empty:
+        return empty
+    return (
+        edges.groupby(JOIN_KEY)["lot_key"]
+        .agg(lambda keys: sorted(keys))
+        .rename(LOT_NUMBERS_COLUMN)
+        .reset_index()
+    )
+
+
+def fiscal_regimes(fiscal: pd.DataFrame) -> pd.DataFrame:
+    """The article of law a unit is filed under, and the value it covers.
+
+    `FISCAL_LAYER` is one row per (unit, part, regime): the land, the
+    building and - as `WHOLE_UNIT_PART` - their sum, under the exemption
+    columns (`rl0504*`) or the compensation ones (`rl0507*`). Folded here to
+    one row per unit that cites a regime:
+
+    * `FISCAL_REGIMES_COLUMN` names every regime the unit's rows cite, as
+      ``"F-2.1 art. 204; M-14 art. 36.0.1"`` - the law as the roll spells it
+      and the article, distinct and sorted. F-2.1 is the *Loi sur la
+      fiscalité municipale*: art. 204 is the exemption for the State, the
+      municipalities, the school service centres and the churches, art. 255
+      the compensation a hospital or a university pays in lieu. M-14 is the
+      farm credit. None of this names an owner; it says what kind of body
+      the owner is, which is the one thing the open roll says on the
+      subject.
+    * `FISCAL_REGIME_VALUE_COLUMN` is the value under those regimes, read off
+      the whole-unit rows alone. `I` equals `T` + `B` on every unit checked,
+      so summing all three would count the value twice.
+
+    A unit whose rows cite no article - the 24,000 rows carrying only the
+    `RESID` category code - is left out: it is on the layer for the
+    variable-rate tax, not for any regime, and folds to null upstream.
+    """
+    columns = [JOIN_KEY, FISCAL_REGIMES_COLUMN, FISCAL_REGIME_VALUE_COLUMN]
+    empty = pd.DataFrame({name: pd.Series(dtype="object") for name in columns})
+    if fiscal.empty or JOIN_KEY not in fiscal.columns:
+        return empty
+
+    def column(name: str) -> pd.Series:
+        if name in fiscal.columns:
+            return fiscal[name]
+        return pd.Series([None] * len(fiscal), index=fiscal.index, dtype="object")
+
+    parts = []
+    for law, article, value, part in (
+        (EXEMPTION_LAW_COLUMN, EXEMPTION_ARTICLE_COLUMN,
+         EXEMPTION_VALUE_COLUMN, EXEMPTION_PART_COLUMN),
+        (COMPENSATION_LAW_COLUMN, COMPENSATION_ARTICLE_COLUMN,
+         COMPENSATION_VALUE_COLUMN, COMPENSATION_PART_COLUMN),
+    ):
+        parts.append(pd.DataFrame({
+            JOIN_KEY: fiscal[JOIN_KEY].to_numpy(),
+            "law": column(law).map(_clean_text).to_numpy(),
+            "article": column(article).map(_clean_text).to_numpy(),
+            "value": pd.to_numeric(column(value), errors="coerce").to_numpy(),
+            "part": column(part).map(_clean_text).to_numpy(),
+        }))
+    rows = pd.concat(parts, ignore_index=True)
+    # Cleaned again on the way out: pandas 3 hands a `str` column's missing
+    # cells back as NaN whatever `_clean_text` returned, and NaN is truthy.
+    rows["regime"] = [
+        _regime(_clean_text(law), _clean_text(article))
+        for law, article in zip(rows["law"], rows["article"])
+    ]
+    cited = rows[rows["regime"].notna()]
+    if cited.empty:
+        return empty
+    regimes = (
+        cited.groupby(JOIN_KEY)["regime"]
+        .agg(lambda names: "; ".join(sorted(set(names))))
+        .rename(FISCAL_REGIMES_COLUMN)
+    )
+    whole = rows[(rows["part"] == WHOLE_UNIT_PART) & rows["value"].notna()]
+    values = whole.groupby(JOIN_KEY)["value"].sum().rename(FISCAL_REGIME_VALUE_COLUMN)
+    folded = regimes.to_frame().join(values, how="left").reset_index()
+    folded[FISCAL_REGIME_VALUE_COLUMN] = folded[FISCAL_REGIME_VALUE_COLUMN].astype(
+        "object"
+    ).where(folded[FISCAL_REGIME_VALUE_COLUMN].notna(), None)
+    return folded[columns]
+
+
+def _regime(law: str | None, article: str | None) -> str | None:
+    """``"F-2.1 art. 204"`` from the two cells; the law alone without an article."""
+    if law and article:
+        return f"{law} art. {article}"
+    return law or None
+
+
+def _clean_text(value) -> str | None:
+    """A code cell as text, with every flavour of missing as None."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip()
+    return text or None
+
+
+def _attach(merged: pd.DataFrame, folded: pd.DataFrame, *columns: str) -> pd.DataFrame:
+    """``folded``'s columns onto ``merged`` by `JOIN_KEY`, one row per unit kept.
+
+    A lookup rather than a merge, the posture `_describe_uses` takes with the
+    codebook: ``folded`` is one row per unit by construction, and a lookup
+    cannot widen ``merged`` even if that stopped being true. A unit absent
+    from ``folded`` gets None, never a dropped row.
+    """
+    keyed = folded.set_index(JOIN_KEY) if not folded.empty else None
+    for name in columns:
+        if keyed is None or name not in keyed.columns:
+            merged[name] = None
+            continue
+        lookup = keyed[name].to_dict()
+        merged[name] = pd.Series(
+            [lookup.get(key) for key in merged[JOIN_KEY]],
+            index=merged.index,
+            dtype="object",
+        )
+    return merged
 
 
 def lot_key(number) -> str | None:

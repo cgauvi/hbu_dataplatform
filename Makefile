@@ -384,7 +384,7 @@ DOCKER_RUN := docker run --rm -it \
 	quartiers cmhc costs vacancy rents zone-pieces addresses envelopes setbacks \
 	lot-profiles programs hbu opportunities massing map_cells map_tiles \
 	streets tile-streets roll lot-values comparables cadastre grid-columns \
-	lot-addresses council-minutes council-publish cucq-minutes tiles tiles-of tiles-ensure \
+	lot-addresses council-minutes council-publish zoning-amendments council-llm cucq-minutes tiles tiles-of tiles-ensure \
 	rent-sources commercial-rents \
 	frontage corpus publish index search ask status \
 	require-q validate_defs db-target db-target-check clean clean-data clean-silver \
@@ -409,7 +409,10 @@ help: ## Show this help
 # without it too (see docker-build-slim). The unset works around
 # SSL_CERT_FILE breaking uv's resolver on a managed laptop; it is a no-op
 # everywhere else.
-UV_SYNC := unset SSL_CERT_FILE; UV_SYSTEM_CERTS=1 uv sync --python 3.12 --extra dev --extra rag
+# LLM=1 adds the `llm` extra: llama-cpp-python for council_items_llm's local
+# model. Opt-in because the wheel compiles llama.cpp where no prebuilt one
+# fits, and only that one asset needs it.
+UV_SYNC := unset SSL_CERT_FILE; UV_SYSTEM_CERTS=1 uv sync --python 3.12 --extra dev --extra rag $(if $(LLM),--extra llm,)
 
 sync: ## Install deps, including the retrieval stack
 	$(UV_SYNC)
@@ -772,6 +775,25 @@ council-minutes: | $(UV_SYNC_STAMP) ## Fetch the conseils de quartier minutes + 
 # embedding does not. Upserts beside the zoning grids' chunks; prunes nothing.
 council-publish: | $(UV_SYNC_STAMP) ## Load DATE x NEIGHBORHOOD's council corpus into Postgres/pgvector
 	$(DAGSTER) asset materialize --select gold/council_minutes_index --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
+
+# The planning items folded to one row per decision (gold.zoning_amendments),
+# and each zone's in-force by-law read off its grid sheet
+# (gold.zone_bylaw_status), both hbu_infra sql/039. Reads the items parquet
+# of DATE x NEIGHBORHOOD and the borough's sheet chunks out of
+# silver.document_chunks, so `council-minutes` and `publish` come first.
+# Seconds. See docs/zoning-outlook.md.
+zoning-amendments: | $(UV_SYNC_STAMP) ## Fold DATE x NEIGHBORHOOD's planning items into gold.zoning_amendments + zone_bylaw_status
+	$(DAGSTER) asset materialize --select gold/zoning_amendments --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE)
+
+# The local model's second reading of the planning items the patterns left
+# short (silver.council_item_llm_fields, hbu_infra sql/040). Needs the `llm`
+# extra (`make sync LLM=1`) and, the first time, the 8 GB GGUF from the hub.
+# MAX_ITEMS caps the run - minutes per item on CPU - and LLM_FORCE=1 ignores
+# the cache. Run `zoning-amendments` after it to fold the new values in.
+MAX_ITEMS ?= 20
+council-llm: | $(UV_SYNC_STAMP) ## Ask the local model about DATE x NEIGHBORHOOD's incomplete planning items (MAX_ITEMS=20)
+	$(DAGSTER) asset materialize --select silver/council_items_llm --partition "$(DATE)|$(NEIGHBORHOOD)" -m $(MODULE) \
+		--config-json '{"ops":{"silver__council_items_llm":{"config":{"max_items":$(MAX_ITEMS),"only_incomplete":true,"force":$(if $(LLM_FORCE),true,false)}}}}'
 
 # The Commission d'urbanisme et de conservation de Québec's minutes: city-wide,
 # so on the date axis. Lists them through the city's decisions portal, fetches

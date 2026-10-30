@@ -107,6 +107,7 @@ ASSET_LAYERS: dict[str, Layer] = {
     "council_planning_items": Layer.SILVER,
     "council_minutes_chunks": Layer.SILVER,
     "council_minutes_embeddings": Layer.SILVER,
+    "council_items_llm": Layer.SILVER,
     "cucq_decisions": Layer.SILVER,
     "cucq_minutes_chunks": Layer.SILVER,
     "zoning_grid_columns": Layer.SILVER,
@@ -124,6 +125,7 @@ ASSET_LAYERS: dict[str, Layer] = {
     "map_tiles": Layer.GOLD,
     "document_index": Layer.GOLD,
     "council_minutes_index": Layer.GOLD,
+    "zoning_amendments": Layer.GOLD,
 }
 
 

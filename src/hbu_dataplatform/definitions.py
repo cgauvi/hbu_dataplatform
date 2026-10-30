@@ -82,8 +82,10 @@ from hbu_dataplatform.cities.quebec_city.council.assets import (
     council_minutes_chunks,
     council_minutes_documents,
     council_minutes_embeddings,
+    council_items_llm,
     council_minutes_index,
     council_planning_items,
+    zoning_amendments,
 )
 from hbu_dataplatform.cities.quebec_city.cucq.assets import (
     cucq_decisions,
@@ -100,6 +102,7 @@ from hbu_dataplatform.sources.addresses.resources import AdressesQuebecResource
 from hbu_dataplatform.sources.bdoi.resources import BdoiResource
 from hbu_dataplatform.sources.cmhc.resources import CmhcResource
 from hbu_dataplatform.cities.quebec_city.resources import (
+    CouncilItemsLlmResource,
     CouncilMinutesResource,
     CucqMinutesResource,
     QuebecZoningResource,
@@ -174,6 +177,7 @@ ASSETS = [
     council_minutes_chunks,
     council_minutes_embeddings,
     council_planning_items,
+    council_items_llm,
     cucq_decisions,
     cucq_minutes_chunks,
     zoning_grid_columns,
@@ -191,6 +195,7 @@ ASSETS = [
     map_tiles_asset,
     document_index,
     council_minutes_index,
+    zoning_amendments,
 ]
 
 
@@ -599,6 +604,26 @@ council_minutes_job = define_asset_job(
 council_minutes_index_job = define_asset_job(
     "council_minutes_index_job",
     selection=AssetSelection.assets(council_minutes_index),
+    partitions_def=scrape_partitions,
+)
+
+# The planning items folded to one row per decision, plus each zone's
+# in-force by-law off its sheet (gold.zoning_amendments, gold.zone_bylaw_status
+# - hbu_infra sql/039). Its own job: it reads the items and the corpus back
+# out of the database, so it runs after both have been published, and it is
+# seconds where council_minutes_job is hours.
+# The model's second reading of the items the patterns left short. Its own
+# job for the same reason as zoning_amendments', inverted: it is hours where
+# the fold is seconds, and a regex fix re-reads the items without it.
+council_items_llm_job = define_asset_job(
+    "council_items_llm_job",
+    selection=AssetSelection.assets(council_items_llm),
+    partitions_def=scrape_partitions,
+)
+
+zoning_amendments_job = define_asset_job(
+    "zoning_amendments_job",
+    selection=AssetSelection.assets(zoning_amendments),
     partitions_def=scrape_partitions,
 )
 
@@ -1193,6 +1218,8 @@ defs = Definitions(
         rag_corpus_job,
         council_minutes_job,
         council_minutes_index_job,
+        zoning_amendments_job,
+        council_items_llm_job,
         cucq_minutes_job,
         document_index_job,
     ],
@@ -1248,6 +1275,10 @@ defs = Definitions(
         # The conseils de quartier listing host and the fiche pages; its PDFs
         # share `pdf_cache` above, since a filed minute never changes either.
         "council_minutes_source": CouncilMinutesResource(),
+        # The local model behind council_items_llm. Its answers are cached
+        # beside the PDFs, keyed by text, schema, prompt and model, so a
+        # re-run of a partition costs no model call.
+        "council_llm": CouncilItemsLlmResource(cache_dir=str(DATA_ROOT / "cache" / "council_llm")),
         # The decisions portal's search index, where the CUCQ's minutes are
         # listed; the PDFs share `pdf_cache` too. The query key it carries is
         # the public one the portal page ships; a rotation is a new value here.

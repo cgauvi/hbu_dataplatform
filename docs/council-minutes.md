@@ -248,6 +248,30 @@ drops the borough's *older* scrape dates, which is right when the two
 corpora land on the same date and would delete the grids when the council
 run lags them by a month. `document_index` prunes; this one does not.
 
+## Downstream: decisions, and a second reading
+
+Two assets build on the items since 2026-10-26, both in
+[zoning-outlook.md](zoning-outlook.md):
+
+* `gold/zoning_amendments` (`make zoning-amendments`) folds the seats of one
+  amendment - minute, fiche, sommaire, resolutions, report - into one row of
+  `gold.zoning_amendments`, and reads each zone's in-force by-law off its
+  sheet into `gold.zone_bylaw_status`. It is what the chat's
+  `zoning_change_outlook` counts precedents from.
+* `silver/council_items_llm` (`make council-llm`, needs `make sync LLM=1`)
+  gives the items the patterns left short a second reading by a local model
+  (Qwen3-14B, 4-bit, llama.cpp, grammar-constrained to a pydantic schema -
+  `council.llm_items`, `rag.structured`). Only items with a *gap* are asked:
+  an amendment that speaks of dwellings and states no cap, no subject zone,
+  no decision. Every value comes back with its excerpt and is kept only when
+  the excerpt is a verbatim quote of the item; what is refused is kept too,
+  with its reason (`silver.council_item_llm_fields`, hbu_infra `sql/040`).
+  The accepted values land on the item's row as `llm_fields` with
+  `extraction_source` saying who read what; **a regex value is never
+  overwritten**, and the fold reads the model's values over the patterns'
+  gaps. Minutes per item on this CPU, cached by text, schema, prompt and
+  model, capped by `MAX_ITEMS`.
+
 ## What it is not yet
 
 The corpus holds no per-building demolition decision, and will not: a

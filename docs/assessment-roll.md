@@ -11,7 +11,7 @@ Three assets over it. `property_assessment_roll` snapshots it,
 `assessment_units` makes it readable, and `lot_assessed_values` carries it onto
 the cadastre.
 
-## Five layers, two of them read
+## Five layers, four of them read
 
 The GeoPackage holds one feature class and four tables, all keyed on
 `id_provinc` — the municipality's five-digit code followed by the unit's
@@ -23,17 +23,19 @@ The GeoPackage holds one feature class and four tables, all keyed on
 | `b05v_unite_evaln_2026` | 3 747 176 | The characteristics: values, area, storeys, year built, dwellings, use code | ✅ |
 | `b05v_lot_cadst_2026` | 5 595 995 | The cadastre lot numbers the unit covers, one to many | ✅ |
 | `b05v_adr_unite_evaln_2026` | 3 819 572 | Civic addresses, one to many | — |
-| `b05v_repar_fisc_2026` | 1 626 132 | Fiscal breakdowns and exemptions, one to many | — |
+| `b05v_repar_fisc_2026` | 1 626 132 | Fiscal breakdowns — exemptions and compensations, one to many | ✅ since 2026-10-05 |
 
-The two that are not read are one-to-many against the unit and answer no
-question this pipeline asks. `UNREAD_LAYERS` names them and the asset reports
-them in its `layers_not_read` metadata, so what was dropped is on the record
-rather than inferred from what is absent.
+The one that is not read is the roll's own civic addresses: Adresses Québec's
+points already put a door on every lot, and the roll's are the same doors
+spelled the assessor's way. `UNREAD_LAYERS` names it and the asset reports it
+in its `layers_not_read` metadata, so what was dropped is on the record rather
+than inferred from what is absent.
 
 `b05v_lot_cadst` is the one that makes the lot join possible at all, and it
 keeps its own grain — one row per (unit, lot) — in its own file. It is not
 merged into `assessment_units`, which is one row per unit; the two are put
-together where the lot join happens.
+together where the lot join happens — and, since 2026-10-05, folded onto the
+unit as a list, see [What the roll says about the owner](#what-the-roll-says-about-the-owner-and-what-it-does-not).
 
 The layer names carry the roll year, so they are resolved by prefix rather than
 written out: next year's archive is the same five layers ending `_2027`, and a
@@ -103,6 +105,59 @@ happens inside this asset, on the way to Postgres, because a table partitioned
 by borough needs a borough and the roll supplies none. See
 [Both have a table](#both-have-a-table-and-one-of-them-fills-several-partitions-at-once)
 below.
+
+## What the roll says about the owner, and what it does not
+
+Nothing, by name. The MEFQ prescribes an owner section — RL02: name, status
+for school tax (personne morale or physique), mailing address, date entered
+on the roll — and the open publication carries **none of its columns**, in
+any of the five layers. The Données Québec licence forbids re-identifying
+them. Every city's *own* online roll does show the owner, lawfully, one unit
+at a time behind a search box (Quebec City's behind a reCAPTCHA), and that
+is where the map sends a reader; this pipeline does not go there.
+
+What the roll does say is structural, and `assessment_units` folds it onto
+the unit from the two one-to-many layers so a reader can ask it:
+
+- **`lot_numbers`** — every cadastre lot `b05v_lot_cadst` names for the
+  unit, as a sorted list of lot keys spelled the roll's way (`"5342219"`,
+  see `lot_key`). An *unité d'évaluation* is by definition one owner's (LFM
+  art. 34: contiguous immovables, one owner, one main use, normally sold as
+  a whole), so two addresses whose lots are in one unit's list are one
+  owner's — a definitive answer. Two addresses in two units are a question
+  the roll **cannot** settle: two houses that could be sold apart are two
+  units however they are held. On 425 and 429 rue Jeanne-d'Arc in Limoilou
+  that is the answer — two units, two lots, same build, and the roll silent.
+  Quebec City files exactly one address per unit and 26% of its units cover
+  two lots or more; 6% of Montreal's carry two addresses or more.
+- **`fiscal_regimes`** and **`fiscal_regime_value`** — from
+  `b05v_repar_fisc`, the only layer that says what *kind* of owner holds a
+  unit. It is one row per (unit, part, regime): the land (`T`), the
+  building (`B`) and their sum (`I`), under the exemption columns
+  (`rl0504a` law, `rl0504b` article, `rl0504d` value, `rl0504e` part) or the
+  parallel compensation set (`rl0507*`). `fiscal_regimes` is every regime
+  cited, distinct and sorted — `F-2.1 art. 204` is the *Loi sur la
+  fiscalité municipale*'s exemption for the State, the municipalities, the
+  school service centres and the churches; `F-2.1 art. 255` the
+  compensation a hospital or a university pays in lieu; `M-14 art. 36.0.1`
+  the farm credit. `fiscal_regime_value` is the value under those regimes,
+  read off the `I` rows alone (`I` = `T` + `B` on all 16 798 units checked,
+  so the parts are not added to it). Both are null on a unit taxed whole —
+  98% of them — and on the 24 000 rows that carry only the `RESID` category
+  code for the variable-rate tax.
+
+The fold is a lookup and not a merge, the way the codebook is: a merge on a
+one-to-many side multiplies the unit table, and a unit counted twice
+downstream doubles a lot's value and reads as a plausible number. A bronze
+partition written before the fiscal layer was read still merges, with the two
+columns null and a warning naming the partition to re-materialize.
+
+The three reach `silver.assessment_units` through the ALTER block at the end
+of hbu_infra `sql/016`, so a database that has not had `db-init` since
+2026-10-05 reads NULL on all three — "written before the column existed", not
+"no lots". The map's `same_owner` tool and the Lot pane's *On the roll* block
+are the readers; without the column the map falls back to placing units by
+their point and says so.
 
 ## The use code, and what it says
 

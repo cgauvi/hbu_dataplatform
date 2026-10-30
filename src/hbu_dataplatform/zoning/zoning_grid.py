@@ -240,7 +240,7 @@ _ZONE_LABELS: Mapping[str, str] = {
 #: The zone-level fields, in the order the grid prints them. Exported so the
 #: asset that flattens a column can carry them by name, the way `NORM_FIELDS`
 #: carries the per-column ones.
-ZONE_FIELDS: tuple[str, ...] = tuple(_ZONE_LABELS.values())
+ZONE_FIELDS: tuple[str, ...] = tuple(_ZONE_LABELS.values()) + ("zone_dominance",)
 
 
 class GridParseError(ValueError):
@@ -328,6 +328,12 @@ class GridColumn:
     piia_sector: str | None = None
     pae: str | None = None
     specific_articles: str | None = None
+    #: What the zone is *for*, as its publisher classes it, and so what
+    #: "zones like this one" is defined on. Montreal: the letter the zone code
+    #: starts with (``H01-004`` is an H zone; H, C, I, E). Quebec City: the
+    #: workbook's *Dominante*, the two letters the code ends in (``Hb``,
+    #: ``Mc``). Saguenay prints no such class and gets ``None``.
+    zone_dominance: str | None = None
 
     #: Cells that were printed but could not be read, as ``label: text``. A
     #: column with notes is still returned - see the module docstring.
@@ -476,6 +482,7 @@ def parse_grid_page(rows: Sequence[Sequence[Cell]]) -> list[GridColumn]:
     zone = _zone(rows)
     # Read before the scan is cut at *Patrimoine*: these rows are below it.
     zone_fields = _zone_fields(rows)
+    zone_fields["zone_dominance"] = _dominance(zone)
     rows = list(_grid_block(rows))
 
     centers = _column_centers(rows)
@@ -676,6 +683,19 @@ def _zone(rows: Sequence[Sequence[Cell]]) -> str | None:
             if _normalize(cell.text).startswith("zone :") and index + 1 < len(row):
                 return row[index + 1].text.strip()
     return None
+
+
+_ZONE_PREFIX = re.compile(r"^([A-Z]+)\d")
+
+
+def _dominance(zone: str | None) -> str | None:
+    """The letter a Montreal zone code starts with - ``H01-004`` is an H zone.
+
+    The borough numbers its zones by the family they are for, so the prefix
+    is the zone's class, and it is the only class the grid states.
+    """
+    match = _ZONE_PREFIX.match(zone or "")
+    return match.group(1) if match else None
 
 
 def _grid_block(rows: Iterable[Sequence[Cell]]) -> Iterator[Sequence[Cell]]:

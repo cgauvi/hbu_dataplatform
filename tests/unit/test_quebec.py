@@ -340,6 +340,7 @@ def test_the_norms_are_the_zones_and_shared_by_every_column():
         assert column.excluded_usages.startswith("La location")
         assert column.piia_sector == "PIIA"
         assert column.heritage_sector is None
+        assert column.zone_dominance == "Md"
         # The solver still gets a ceiling: 20 m at the shortest storey this
         # platform builds. Six, not the five a 3.5 m storey used to invent -
         # and `solve_program` enforces the 20 m itself, so a commercial stack
@@ -355,6 +356,7 @@ def test_a_stated_storey_count_wins_over_the_height():
     assert column.implantation_mode == "I"
     assert column.max_dwellings == 3
     assert column.heritage_sector == "Arrondissement historique"
+    assert column.zone_dominance == "Hb"
 
 
 def test_a_park_is_equipment_only_and_not_solver_ready():

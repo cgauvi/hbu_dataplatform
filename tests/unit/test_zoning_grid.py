@@ -412,6 +412,8 @@ def test_the_zone_level_rows_are_read_and_repeated_on_every_column():
         assert column.piia_sector == "3"
         assert column.pae is None
         assert column.specific_articles is None
+        # C01-001 is a C zone: the class is the code's prefix.
+        assert column.zone_dominance == "C"
 
 
 def test_a_heritage_sector_is_read_as_printed():

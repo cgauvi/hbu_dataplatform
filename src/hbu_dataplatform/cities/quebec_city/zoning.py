@@ -898,6 +898,10 @@ def _zone_fields(lookup: _Lookup) -> dict:
         "piia_sector": lookup.text("piia"),
         "pae": lookup.text("pae"),
         "specific_articles": "; ".join(articles) if articles else None,
+        # The workbook's *Dominante* - the two letters the zone code ends in
+        # (``Hb``, ``Mc``, ``Ra``): the family the by-law says the zone is
+        # for, at its grain. What "zones like this one" is defined on.
+        "zone_dominance": lookup.text("dominante"),
     }
 
 

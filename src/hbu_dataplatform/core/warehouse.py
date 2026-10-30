@@ -314,6 +314,33 @@ TABLES: dict[str, Table] = {
         keys=("doc_id", "item_index"),
         source="sql/037_silver_cucq_decisions.sql",
     ),
+    # One row per item the local model was asked about: its answer, what
+    # survived validation and why the rest did not. Keyed on the item like
+    # council_planning_items; the accepted values are also written onto
+    # that table's row (llm_fields, extraction_source) by the same asset.
+    "council_item_llm_fields": Table(
+        asset="council_items_llm",
+        name="council_item_llm_fields",
+        keys=("doc_id", "item_index"),
+        source="sql/040_silver_council_item_llm_fields.sql",
+    ),
+    # One row per zoning decision, folded from the seats above by
+    # cities.quebec_city.council.amendments; and beside it one row per
+    # (zone, by-law) the zone's grid sheet prints as in force. Both gold,
+    # both on the borough axis with the items, both written by the one
+    # asset that reads the items and the sheet chunks back.
+    "zoning_amendments": Table(
+        asset="zoning_amendments",
+        name="zoning_amendments",
+        keys=("amendment_id",),
+        source="sql/039_gold_zoning_amendments.sql",
+    ),
+    "zone_bylaw_status": Table(
+        asset="zoning_amendments",
+        name="zone_bylaw_status",
+        keys=("feature_id", "bylaw_number"),
+        source="sql/039_gold_zoning_amendments.sql",
+    ),
     "zoning_grid_columns": Table(
         asset="zoning_grid_columns",
         name="zoning_grid_columns",

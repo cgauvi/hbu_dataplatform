@@ -44,16 +44,31 @@ from hbu_dataplatform.sources.roll.assets import (
     ARROND_PREFIX,
     ASSESSMENT_UNITS_FILE,
     CADASTRE_FILE,
+    FISCAL_FILE,
+    FISCAL_REGIME_VALUE_COLUMN,
+    FISCAL_REGIMES_COLUMN,
+    LOT_NUMBERS_COLUMN,
     LOT_VALUES_FILE,
     POINTS_FILE,
     UNITS_FILE,
     assessment_units,
+    fiscal_regimes,
     lot_assessed_values,
     lot_key,
+    lots_per_unit,
     property_assessment_roll,
 )
 from hbu_dataplatform.sources.roll.client import (
     CADASTRE_LAYER,
+    COMPENSATION_ARTICLE_COLUMN,
+    COMPENSATION_LAW_COLUMN,
+    COMPENSATION_PART_COLUMN,
+    COMPENSATION_VALUE_COLUMN,
+    EXEMPTION_ARTICLE_COLUMN,
+    EXEMPTION_LAW_COLUMN,
+    EXEMPTION_PART_COLUMN,
+    EXEMPTION_VALUE_COLUMN,
+    FISCAL_LAYER,
     JOIN_KEY,
     MONTREAL_CODE_MUN,
     POINT_LAYER,
@@ -77,10 +92,11 @@ TILE = "0302303330102"
 ROLL_YEAR = 2026
 ARCHIVE = filename_for(ROLL_YEAR)
 
-#: What the publisher calls the three layers this reads, roll year and all.
+#: What the publisher calls the four layers this reads, roll year and all.
 POINT_LAYER_NAME = f"{POINT_LAYER}_{ROLL_YEAR}"
 UNITS_LAYER_NAME = f"{UNITS_LAYER}_{ROLL_YEAR}"
 CADASTRE_LAYER_NAME = f"{CADASTRE_LAYER}_{ROLL_YEAR}"
+FISCAL_LAYER_NAME = f"{FISCAL_LAYER}_{ROLL_YEAR}"
 
 #: Another municipality's code, so the `code_mun` filter has something to drop.
 LAVAL_CODE_MUN = "65005"
@@ -148,15 +164,43 @@ def cadastre_layer(rows: list[tuple[str, str, str]]) -> pd.DataFrame:
     )
 
 
+def fiscal_layer(
+    rows: list[tuple[str, str, str | None, str | None, float, str]],
+) -> pd.DataFrame:
+    """`b05v_repar_fisc`: one row per (unit, part, regime), the exemption columns.
+
+    ``rows`` are (code_mun, matricule, law, article, value, part) - the law and
+    the article None for a row that cites no regime, the way the 24,000 rows
+    carrying only the residential category code do. The compensation columns
+    are published too, and left null here except where a test fills them.
+    """
+    return pd.DataFrame(
+        {
+            JOIN_KEY: [unit_id(code, mat) for code, mat, *_ in rows],
+            "code_mun": [code for code, *_ in rows],
+            "mat18": [mat for _, mat, *_ in rows],
+            EXEMPTION_LAW_COLUMN: [law for _, _, law, *_ in rows],
+            EXEMPTION_ARTICLE_COLUMN: [article for _, _, _, article, *_ in rows],
+            EXEMPTION_VALUE_COLUMN: [value for *_, value, _ in rows],
+            EXEMPTION_PART_COLUMN: [part for *_, part in rows],
+            COMPENSATION_LAW_COLUMN: [None for _ in rows],
+            COMPENSATION_ARTICLE_COLUMN: [None for _ in rows],
+            COMPENSATION_VALUE_COLUMN: [None for _ in rows],
+            COMPENSATION_PART_COLUMN: [None for _ in rows],
+        }
+    )
+
+
 def zipped_geopackage(
     directory: Path,
     points: gpd.GeoDataFrame,
     units: pd.DataFrame,
     cadastre: pd.DataFrame,
+    fiscal: pd.DataFrame | None = None,
     *,
     name: str = ARCHIVE,
 ) -> Path:
-    """Write the three layers as a real GeoPackage, zipped the way the roll is.
+    """Write the four layers as a real GeoPackage, zipped the way the roll is.
 
     The archive nests the GeoPackage under a year-stamped folder and ships a
     codebook and a PDF beside it, so the fixture does too - that is what
@@ -169,6 +213,9 @@ def zipped_geopackage(
     # tables go in through pyogrio, which is what reads them back.
     pyogrio.write_dataframe(units, gpkg, layer=UNITS_LAYER_NAME, append=True)
     pyogrio.write_dataframe(cadastre, gpkg, layer=CADASTRE_LAYER_NAME, append=True)
+    if fiscal is None:
+        fiscal = fiscal_layer([])
+    pyogrio.write_dataframe(fiscal, gpkg, layer=FISCAL_LAYER_NAME, append=True)
 
     zip_path = directory / name
     folder = f"Role{ROLL_YEAR}_geopackage"
@@ -303,10 +350,12 @@ def test_layer_named_resolves_the_roll_year_suffix(tmp_path):
     assert layer_named(gpkg, POINT_LAYER) == POINT_LAYER_NAME
     assert layer_named(gpkg, UNITS_LAYER) == UNITS_LAYER_NAME
     assert layer_named(gpkg, CADASTRE_LAYER) == CADASTRE_LAYER_NAME
+    assert layer_named(gpkg, FISCAL_LAYER) == FISCAL_LAYER_NAME
     # And the prefix match is whole-name: `b05v_unite_evaln` must not also
-    # claim `b05v_adr_unite_evaln`, which the real archive ships beside it.
+    # claim `b05v_adr_unite_evaln`, which the real archive ships beside it
+    # and the fixture does not write.
     with pytest.raises(RoleError, match="no layer named"):
-        layer_named(gpkg, "b05v_repar_fisc")
+        layer_named(gpkg, "b05v_adr_unite_evaln")
 
 
 def test_read_layer_filters_in_ogr_and_reprojects_to_4326(tmp_path):
@@ -453,6 +502,20 @@ def role(tmp_path, monkeypatch):
                 # The condo names its private lot, which has no polygon.
                 (MONTREAL_CODE_MUN, U_CONDO, LOT_UNDRAWN),
                 (LAVAL_CODE_MUN, U_LAVAL, "2000002"),
+            ]
+        ),
+        fiscal_layer(
+            [
+                # U_PAIR_A is the State's: exempt under F-2.1 art. 204 on the
+                # land, the building, and - as `I` - the whole, which is the
+                # one row the value is read off.
+                (MONTREAL_CODE_MUN, U_PAIR_A, "F-2.1", "204", 100_000.0, "T"),
+                (MONTREAL_CODE_MUN, U_PAIR_A, "F-2.1", "204", 200_000.0, "B"),
+                (MONTREAL_CODE_MUN, U_PAIR_A, None, None, 300_000.0, "I"),
+                # U_SPLIT is on the layer for the variable-rate category
+                # alone: no article cited, so no regime.
+                (MONTREAL_CODE_MUN, U_SPLIT, None, None, 500_000.0, "I"),
+                (LAVAL_CODE_MUN, U_LAVAL, "F-2.1", "204", 900_000.0, "I"),
             ]
         ),
     )
@@ -694,12 +757,22 @@ def test_bronze_writes_all_three_layers_under_the_scrape_date(store, role):
     assert len(crosswalk) == 5
     assert set(crosswalk["source_layer"]) == {CADASTRE_LAYER_NAME}
 
+    # The fiscal breakdown, filtered like the rest: Laval's exempt unit stays
+    # out, Montreal's four rows come through.
+    fiscal = pd.read_parquet(output_dir / FISCAL_FILE)
+    assert len(fiscal) == 4
+    assert set(fiscal["code_mun"]) == {MONTREAL_CODE_MUN}
+    assert set(fiscal["source_layer"]) == {FISCAL_LAYER_NAME}
+
     metadata = materialization_metadata(result, property_assessment_roll)
     assert metadata["num_assessment_points"].value == 4
     assert metadata["num_characteristics_rows"].value == 4
     assert metadata["num_lot_crosswalk_rows"].value == 5
     assert metadata["num_cadastre_lots"].value == 4
+    assert metadata["num_fiscal_rows"].value == 4
+    assert metadata["num_units_with_fiscal_rows"].value == 2
     assert metadata["municipality_filter"].value == "code_mun IN ('66023')"
+    assert metadata["layers_not_read"].value == ["b05v_adr_unite_evaln"]
 
 
 def test_bronze_keeps_the_province_when_no_code_is_given(store, role):
@@ -741,6 +814,124 @@ def test_silver_merges_the_two_layers_on_id_provinc(store, role):
     assert metadata["num_assessment_units"].value == 4
     assert metadata["num_points_unmatched"].value == 0
     assert metadata["total_assessed_value"].value == 1_800_000.0
+
+
+def merged_units(store) -> pd.DataFrame:
+    """The merged partition, indexed by matricule."""
+    return gpd.read_parquet(
+        Path(store.partition_dir(assessment_units.key.path[-1], DATE))
+        / ASSESSMENT_UNITS_FILE
+    ).set_index("mat18")
+
+
+def test_silver_lists_every_lot_a_unit_covers(store, role):
+    """The crosswalk folded onto the unit: one sorted list, the roll's spelling.
+
+    This is the column the open roll's one ownership answer rides on - two
+    addresses whose lots are in one unit's list are one owner's - so the
+    list has to be the roll's own statement, every lot of it, and nothing
+    inferred from a point.
+    """
+    run_roll(store)
+
+    result = run_units(store)
+
+    assert result.success
+    lots = merged_units(store)[LOT_NUMBERS_COLUMN]
+    assert list(lots[U_PAIR_A]) == ["1000001"]
+    assert list(lots[U_PAIR_B]) == ["1000001"]
+    assert list(lots[U_SPLIT]) == ["1000002", "1000003"]
+    # The condo's private lot is listed even though Infolot draws no polygon
+    # for it: the list is what the roll says, placement is another asset's.
+    assert list(lots[U_CONDO]) == [LOT_UNDRAWN]
+    metadata = materialization_metadata(result, assessment_units)
+    assert metadata["num_units_with_lot_numbers"].value == 4
+
+
+def test_silver_names_the_regime_a_unit_is_exempt_under(store, role):
+    """F-2.1 art. 204 on U_PAIR_A, read once off the whole-unit row."""
+    run_roll(store)
+
+    result = run_units(store)
+
+    units = merged_units(store)
+    assert units.loc[U_PAIR_A, FISCAL_REGIMES_COLUMN] == "F-2.1 art. 204"
+    # The `I` row alone: 300,000, not 300,000 + 100,000 + 200,000.
+    assert units.loc[U_PAIR_A, FISCAL_REGIME_VALUE_COLUMN] == 300_000.0
+    # On the layer for its category code only, so under no regime. Null,
+    # which parquet hands back as NaN on both columns.
+    assert pd.isna(units.loc[U_SPLIT, FISCAL_REGIMES_COLUMN])
+    assert pd.isna(units.loc[U_SPLIT, FISCAL_REGIME_VALUE_COLUMN])
+    # Not on the layer at all.
+    assert pd.isna(units.loc[U_CONDO, FISCAL_REGIMES_COLUMN])
+    metadata = materialization_metadata(result, assessment_units)
+    assert metadata["num_units_under_a_fiscal_regime"].value == 1
+
+
+def test_silver_survives_a_bronze_partition_without_the_fiscal_file(store, role):
+    """A snapshot taken before the layer was read merges as before, nulls and all."""
+    run_roll(store)
+    bronze = Path(store.partition_dir(property_assessment_roll.key.path[-1], DATE))
+    (bronze / FISCAL_FILE).unlink()
+
+    result = run_units(store)
+
+    assert result.success
+    units = merged_units(store)
+    assert units[FISCAL_REGIMES_COLUMN].isna().all()
+    assert list(units.loc[U_SPLIT, LOT_NUMBERS_COLUMN]) == ["1000002", "1000003"]
+    metadata = materialization_metadata(result, assessment_units)
+    assert metadata["num_units_under_a_fiscal_regime"].value == 0
+
+
+def test_lots_per_unit_drops_the_suffix_duplicates_and_sorts():
+    """Two non-renewed rows naming one renewed lot are one lot, listed once."""
+    crosswalk = pd.DataFrame(
+        {
+            JOIN_KEY: ["a", "a", "a", "b", "c"],
+            ROLL_LOT_COLUMN: ["1000003", "1000002", "1000002", None, "nan"],
+            ROLL_LOT_SUFFIX_COLUMN: [None, "1", "2", None, None],
+        }
+    )
+
+    folded = lots_per_unit(crosswalk).set_index(JOIN_KEY)[LOT_NUMBERS_COLUMN]
+
+    assert list(folded["a"]) == ["1000002", "1000003"]
+    # A unit naming no lot at all is not in the fold; `_attach` makes it None.
+    assert "b" not in folded.index and "c" not in folded.index
+
+
+def test_fiscal_regimes_reads_both_column_sets_and_sums_the_whole_rows_only():
+    """Exemption and compensation cited on one unit: both named, sorted, once."""
+    fiscal = pd.DataFrame(
+        {
+            JOIN_KEY: ["u", "u", "u", "u", "v"],
+            EXEMPTION_LAW_COLUMN: ["F-2.1", "F-2.1", None, None, None],
+            EXEMPTION_ARTICLE_COLUMN: ["204", "204", None, None, None],
+            EXEMPTION_VALUE_COLUMN: [10.0, 20.0, 30.0, None, None],
+            EXEMPTION_PART_COLUMN: ["T", "B", "I", None, None],
+            COMPENSATION_LAW_COLUMN: [None, None, None, "F-2.1", None],
+            COMPENSATION_ARTICLE_COLUMN: [None, None, None, "255", None],
+            COMPENSATION_VALUE_COLUMN: [None, None, None, 5.0, None],
+            COMPENSATION_PART_COLUMN: [None, None, None, "I", None],
+        }
+    )
+
+    folded = fiscal_regimes(fiscal).set_index(JOIN_KEY)
+
+    assert folded.loc["u", FISCAL_REGIMES_COLUMN] == "F-2.1 art. 204; F-2.1 art. 255"
+    assert folded.loc["u", FISCAL_REGIME_VALUE_COLUMN] == 35.0
+    # Cites nothing, so it is not a row: null upstream, not an empty string.
+    assert "v" not in folded.index
+
+
+def test_fiscal_regimes_of_nothing_is_an_empty_frame_with_the_columns():
+    folded = fiscal_regimes(pd.DataFrame())
+
+    assert folded.empty
+    assert list(folded.columns) == [
+        JOIN_KEY, FISCAL_REGIMES_COLUMN, FISCAL_REGIME_VALUE_COLUMN
+    ]
 
 
 def described(store) -> pd.Series:

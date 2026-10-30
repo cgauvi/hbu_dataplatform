@@ -92,6 +92,16 @@ rag = [
     "torch>=2.4",
     "transformers>=4.44",
 ]
+# The local model behind council_items_llm: Qwen3-14B as a 4-bit GGUF through
+# llama.cpp, with the JSON-schema grammar that constrains its answer (see
+# hbu_dataplatform.rag.structured). Its own extra, opt-in with `make sync
+# LLM=1`: the wheel compiles llama.cpp where no prebuilt one matches (minutes,
+# cmake and a C++ toolchain), and only that one asset needs it. Prebuilt CPU
+# wheels: https://abetlen.github.io/llama-cpp-python/whl/cpu
+llm = [
+    "llama-cpp-python>=0.3.9",
+    "huggingface-hub>=0.25",
+]
 
 [project.scripts]
 urban-rag = "hbu_dataplatform.rag.cli:main"
@@ -117,4 +127,5 @@ root_module = "hbu_dataplatform"
 testpaths = ["tests"]
 markers = [
     "scrape_month_guard: keep the bronze scrape-month guard live for this test",
+    "llm: needs the local GGUF model; opt in with URBAN_RAG_TEST_LLM=1",
 ]
